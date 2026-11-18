@@ -409,6 +409,9 @@ input#pair-code {
   font-weight: 650;
   line-height: 1.25;
   letter-spacing: -0.01em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .presence {
   margin: 1px 0 0;
@@ -629,6 +632,10 @@ input#pair-code {
   text-align: center;
   gap: 4px;
   padding-bottom: 6vh;
+  overflow-wrap: anywhere;
+}
+[data-thread-title] {
+  -webkit-touch-callout: none;
 }
 .empty h2 {
   margin: 14px 0 0;
@@ -744,7 +751,10 @@ input#pair-code {
   position: absolute;
   left: var(--gutter);
   right: var(--gutter);
-  bottom: calc(env(safe-area-inset-bottom) + 10px);
+  bottom: calc(env(safe-area-inset-bottom) + var(--vkb, 0px) + 10px);
+  max-height: calc(100dvh - env(safe-area-inset-top) - env(safe-area-inset-bottom) - var(--vkb, 0px) - 20px);
+  overflow: auto;
+  overscroll-behavior: contain;
   max-width: 28rem;
   margin: 0 auto;
   padding: 6px 8px 8px;
@@ -771,8 +781,12 @@ input#pair-code {
   padding: 10px;
   border-radius: 16px;
 }
-.sheet-item:active,
-.sheet-item:hover {
+.sheet-item:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.sheet-item:not(:disabled):is(:hover, :active),
+.thread-row[aria-current="true"] {
   background: var(--muted);
 }
 .sheet-item b {
@@ -810,6 +824,70 @@ input#pair-code {
   padding: 13px;
   font-weight: 600;
   font-size: 1rem;
+}
+.sheet-heading {
+  margin: 8px 10px;
+  font-size: 1.1rem;
+  font-weight: 650;
+}
+.thread-row {
+  min-height: 44px;
+}
+.thread-name {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.thread-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--accent);
+}
+.thread-row .thread-running {
+  color: var(--accent);
+}
+.thread-archive > summary {
+  padding: 12px 10px;
+  color: var(--muted-ink);
+  cursor: pointer;
+}
+.thread-archive .thread-dot {
+  margin-inline-start: 8px;
+}
+.thread-form {
+  display: grid;
+  gap: 8px;
+  padding: 0 10px 8px;
+}
+.thread-form .sheet-heading {
+  margin-inline: 0;
+}
+.thread-form input {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 10px 12px;
+  background: var(--bg);
+  color: var(--ink);
+  font-size: 1rem;
+}
+.sheet-help,
+.archived-hint {
+  margin: 6px 10px;
+  color: var(--muted-ink);
+  font-size: 0.88rem;
+  overflow-wrap: anywhere;
+}
+.archived-hint {
+  text-align: center;
+  padding-block: 8px;
+}
+.archived-hint button {
+  color: var(--accent);
+  text-decoration: underline;
 }
 @keyframes fade {
   from {

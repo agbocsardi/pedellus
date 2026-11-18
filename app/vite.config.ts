@@ -6,7 +6,7 @@ import { VitePWA } from "vite-plugin-pwa";
 // The gateway serves the built dist/ from a configured absolute directory on
 // the same origin as /v1, so all requests here are same-origin and relative.
 const proxy = {
-  "/v1": { target: "http://127.0.0.1:8791", ws: true },
+  "/v1": { target: `http://127.0.0.1:${process.env.MOCK_PORT ?? 8791}`, ws: true },
 };
 
 export default defineConfig({

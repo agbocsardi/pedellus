@@ -1,15 +1,27 @@
 import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
-import { useSyncExternalStore } from "react";
 import { Streamdown } from "streamdown";
 import type { Connection } from "./conn";
 import type { AgentStatus, Outgoing, OutgoingState, Store } from "./store";
-import { LIMITS, type DurableEvent } from "./protocol";
+import { LIMITS, MAIN_THREAD, type DurableEvent, type ThreadInfo } from "./protocol";
 import { Avatar, type AvatarState } from "./Avatar";
 
 const FINE_POINTER = matchMedia("(pointer: fine)").matches;
 
 type Row = { kind: "ev"; ev: DurableEvent } | { kind: "pending"; m: Outgoing };
 type Tone = "ok" | "run" | "warn" | "bad";
+type Sheet = { kind: "list" | "menu" } | { kind: "create" | "rename" | "message"; title: string };
+const LIST_ICON = "M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01";
+const TITLE_CONTROL = /[\p{Cc}\u2028\u2029]/u;
+
+function suggestedTitle(text: string) {
+  return text.replace(/[\p{Cc}\s]+/gu, " ").trim().slice(0, LIMITS.threadTitleChars)
+    .replace(/[\uD800-\uDBFF]$/u, "").trimEnd();
+}
+
+function messageTitle(target: EventTarget | null) {
+  if (!(target instanceof Element) || target.closest("a, button, input, summary")) return;
+  return target.closest<HTMLElement>("[data-thread-title]")?.dataset.threadTitle;
+}
 
 /** One place maps connection + agent status to the header line and avatar. */
 function presence(store: Store): { text: string; tone: Tone; avatar: AvatarState } {
@@ -21,7 +33,7 @@ function presence(store: Store): { text: string; tone: Tone; avatar: AvatarState
     case "replaying":
       return { text: "Catching up…", tone: "warn", avatar: "thinking" };
   }
-  const s: AgentStatus = store.status;
+  const s = store.status(store.openThread);
   switch (s.state) {
     case "idle":
       return { text: "Online", tone: "ok", avatar: "idle" };
@@ -48,19 +60,31 @@ function clock(at: string | number | undefined): string {
 }
 
 export function Chat({ store, conn }: { store: Store; conn: Connection }) {
-  useSyncExternalStore(store.subscribe, store.getSnapshot);
-  const [text, setText] = useState("");
-  const [menuOpen, setMenuOpen] = useState(false);
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [sheet, setSheet] = useState<Sheet | null>(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
   const scroller = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
   const taRef = useRef<HTMLTextAreaElement>(null);
+  const press = useRef<{ x: number; y: number; timer: ReturnType<typeof setTimeout> } | null>(null);
 
-  const running = isRunning(store.status.state);
+  const thread = store.openThread;
+  const main = thread === MAIN_THREAD;
+  const info = store.threads.get(thread);
+  const title = main ? "Durable" : info?.title ?? "New thread";
+  const archived = !!info?.archived;
+  const text = drafts[thread] ?? "";
+  const setText = (value: string) => setDrafts((prev) => ({ ...prev, [thread]: value }));
+  const online = store.connState === "open";
+  const running = !archived && isRunning(store.status(thread).state);
+  const preview = archived ? undefined : store.preview(thread);
   const p = presence(store);
+  const latest = store.latestViewable(thread);
 
-  const rows: Row[] = store.events.map((ev) => ({ kind: "ev", ev }));
+  const rows: Row[] = (store.events.get(thread) ?? []).map((ev) => ({ kind: "ev", ev }));
   for (const m of store.outbox.values()) {
-    if ((m.state === "queued" || m.state === "sent" || m.state === "failed") && !store.hasEcho(m.key)) {
+    if (m.thread === thread && (m.state === "queued" || m.state === "sent" || m.state === "failed") && !store.hasEcho(m.key)) {
       rows.push({ kind: "pending", m });
     }
   }
@@ -71,6 +95,15 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     if (r.kind === "pending" || (r.ev.event === "message" && r.ev.role === "user")) lastUser = i;
   });
   const empty = !rows.some((r) => r.kind === "pending" || r.ev.event === "message");
+
+  useEffect(() => { pinned.current = true; }, [thread]);
+  useEffect(() => {
+    const view = () => { if (!sheet && !document.hidden) store.markViewed(thread, latest); };
+    view();
+    document.addEventListener("visibilitychange", view);
+    return () => document.removeEventListener("visibilitychange", view);
+  }, [store, thread, latest, sheet]);
+  useEffect(() => cancelPress, []);
 
   // Stay glued to the bottom while the user is already there (streams,
   // previews and new events all push without yanking the view otherwise).
@@ -83,25 +116,41 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     if (!ta) return;
     ta.style.height = "auto";
     ta.style.height = `${Math.min(ta.scrollHeight, 140)}px`;
-  }, [text]);
+  }, [text, thread, archived]);
   useEffect(() => {
-    if (!menuOpen) return;
-    const onKey = (e: globalThis.KeyboardEvent) => e.key === "Escape" && setMenuOpen(false);
+    if (!sheet) return;
+    const onKey = (e: globalThis.KeyboardEvent) => e.key === "Escape" && setSheet(null);
     addEventListener("keydown", onKey);
     return () => removeEventListener("keydown", onKey);
-  }, [menuOpen]);
+  }, [sheet]);
+
+  function cancelPress() {
+    if (press.current) clearTimeout(press.current.timer);
+    press.current = null;
+  }
+
+  function show(next: Sheet) {
+    taRef.current?.blur();
+    setError("");
+    setSheet(next);
+  }
 
   async function submit() {
+    if (store.threads.get(thread)?.archived) return;
     if (running) {
-      conn.control("abort");
+      conn.control(thread, "abort");
       return;
     }
     const t = text.trim();
     if (!t || t.length > LIMITS.sendTextChars) return;
     setText("");
     pinned.current = true;
-    const m = await store.createOutgoing(t);
-    conn.sendOutgoing(m);
+    try {
+      conn.sendOutgoing(await store.createOutgoing(thread, t));
+    } catch {
+      setDrafts((prev) => ({ ...prev, [thread]: prev[thread] || text }));
+      setError("Could not save your message on this device.");
+    }
   }
 
   function onKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
@@ -114,9 +163,56 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   }
 
   function command(c: "new" | "status") {
-    conn.control(c);
-    setMenuOpen(false);
+    conn.control(thread, c);
+    setSheet(null);
   }
+
+  async function saveTitle(value: string) {
+    const name = value.trim();
+    if (busy || name.length > LIMITS.threadTitleChars || TITLE_CONTROL.test(name)) return;
+    setBusy(true);
+    setError("");
+    try {
+      if (sheet?.kind === "rename") {
+        if (!name) return;
+        if (!(await conn.rename(thread, name))?.ok) {
+          setError("Could not rename this thread. Check the connection and try again.");
+          return;
+        }
+        setSheet(null);
+      } else {
+        const count = [...store.threads.values()].filter((t) => t.id !== MAIN_THREAD && !t.archived).length;
+        if (count >= LIMITS.maxOpenThreads) {
+          setError("Archive a side thread before creating another.");
+          return;
+        }
+        const create = await store.queueCreate(name || undefined);
+        setSheet({ kind: "list" });
+        conn.sendCreate(create, online ? thread : undefined);
+      }
+    } catch {
+      setError("Could not save the thread on this device.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function toggleArchive() {
+    if (busy || !online) return;
+    setBusy(true);
+    setError("");
+    try {
+      const res = await conn.archive(thread, !archived);
+      if (res?.ok) setSheet(null);
+      else setError(archived && res?.ok === false && res.error === "bad_request"
+        ? "Could not restore this thread. The open thread limit may have been reached."
+        : "Could not change archive status. Check the connection and try again.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  useEffect(() => { setSheet(null); setError(""); }, [thread]);
 
   return (
     <div className="app">
@@ -126,18 +222,22 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
             <Avatar state={p.avatar} />
           </div>
           <div className="who-text">
-            <h1>Durable</h1>
+            <h1>{title}</h1>
             <p className="presence" data-tone={p.tone} aria-live="polite">
               {p.text}
             </p>
           </div>
         </div>
+        <button className="icon-btn" aria-label="Open threads" aria-haspopup="dialog"
+          aria-expanded={sheet?.kind === "list"} onClick={() => show({ kind: "list" })}>
+          <Icon d={LIST_ICON} bold />
+        </button>
         <button
           className="icon-btn"
           aria-label="Thread menu"
-          aria-haspopup="menu"
-          aria-expanded={menuOpen}
-          onClick={() => setMenuOpen(true)}
+          aria-haspopup="dialog"
+          aria-expanded={sheet?.kind === "menu"}
+          onClick={() => show({ kind: "menu" })}
         >
           <Icon d="M6 12h.01M12 12h.01M18 12h.01" bold />
         </button>
@@ -147,17 +247,44 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
         className="messages"
         ref={scroller}
         onScroll={(e) => {
+          cancelPress();
           const el = e.currentTarget;
           pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
         }}
+        onContextMenu={(e) => {
+          const title = messageTitle(e.target);
+          if (title === undefined) return;
+          e.preventDefault();
+          cancelPress();
+          show({ kind: "message", title });
+        }}
+        onPointerDown={(e) => {
+          cancelPress();
+          if (e.button !== 0 || !e.isPrimary) return;
+          const title = messageTitle(e.target);
+          if (title === undefined) return;
+          press.current = { x: e.clientX, y: e.clientY, timer: setTimeout(() => {
+            press.current = null;
+            show({ kind: "message", title });
+          }, 550) };
+        }}
+        onPointerMove={(e) => {
+          const p = press.current;
+          if (p && Math.hypot(e.clientX - p.x, e.clientY - p.y) > 10) cancelPress();
+        }}
+        onPointerUp={cancelPress}
+        onPointerCancel={cancelPress}
+        onPointerLeave={cancelPress}
       >
-        {empty && !running && !store.preview && (
+        {empty && !running && !preview && (
           <div className="empty">
             <div className="avatar-slot big">
               <Avatar state={p.avatar} />
             </div>
-            <h2>Durable</h2>
-            <p>One ongoing thread with your agent. Ask anything to get started.</p>
+            <h2>{title}</h2>
+            <p>{archived ? "No messages in this thread." : main
+              ? "One ongoing thread with your agent. Ask anything to get started."
+              : "A fresh conversation with your agent."}</p>
           </div>
         )}
         {rows.map((r, i) =>
@@ -167,9 +294,9 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
             <UserBubble key={`p${r.m.key}`} text={r.m.text} state={r.m.state} at={r.m.at} last={i === lastUser} />
           ),
         )}
-        {store.preview ? (
+        {preview ? (
           <div className="msg assistant streaming" aria-busy="true">
-            <Streamdown>{store.preview.text}</Streamdown>
+            <Streamdown>{preview.text}</Streamdown>
           </div>
         ) : running ? (
           <div className="typing" role="status" aria-label={p.text}>
@@ -181,7 +308,12 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
       </div>
 
       <footer className="composer">
-        <div className="capsule">
+        {!sheet && error && <p className="error-text" role="alert">{error}</p>}
+        {archived ? (
+          <p className="archived-hint">Archived · {online
+            ? <button disabled={busy} onClick={() => void toggleArchive()}>Restore to reply</button>
+            : "Reconnect to restore"}</p>
+        ) : <div className="capsule">
           <textarea
             ref={taRef}
             value={text}
@@ -207,28 +339,43 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
               <Icon d="M12 19V5M5.5 11.5 12 5l6.5 6.5" bold />
             )}
           </button>
-        </div>
+        </div>}
       </footer>
 
-      {menuOpen && (
+      {sheet && (
         <div className="sheet-layer">
-          <button className="sheet-backdrop" aria-label="Close menu" onClick={() => setMenuOpen(false)} />
-          <div className="sheet" role="menu" aria-label="Thread menu">
+          <button className="sheet-backdrop" aria-label="Dismiss sheet" onClick={() => { setError(""); setSheet(null); }} />
+          <div className="sheet" role="dialog" aria-modal="true" aria-label={sheet.kind === "list" ? "Threads" :
+            sheet.kind === "menu" ? "Thread menu" : sheet.kind === "message" ? "Message actions" :
+              sheet.kind === "rename" ? "Rename thread" : "New thread"}>
             <div className="sheet-grip" aria-hidden="true" />
-            <SheetItem
-              icon="M12 5v14M5 12h14"
-              title="New thread"
-              sub="Start fresh; earlier messages stay above a divider"
-              onClick={() => command("new")}
-            />
-            <SheetItem
-              icon="M3 12h4l3-8 4 16 3-8h4"
-              title="Status"
-              sub="Ask the agent what it is doing"
-              onClick={() => command("status")}
-            />
-            <button className="sheet-cancel" onClick={() => setMenuOpen(false)}>
-              Cancel
+            {sheet.kind === "list" && <ThreadList store={store} onNew={() => show({ kind: "create", title: "" })}
+              onSelect={(id) => { setSheet(null); store.selectThread(id); }} />}
+            {sheet.kind === "menu" && <>
+              {!archived && <>
+                <SheetItem icon="M12 5v14M5 12h14" title="New context"
+                  sub="Start fresh; earlier messages stay above a divider" disabled={!online} onClick={() => command("new")} />
+                <SheetItem icon="M3 12h4l3-8 4 16 3-8h4" title="Status"
+                  sub="Ask the agent what it is doing" disabled={!online} onClick={() => command("status")} />
+              </>}
+              {!main && <>
+                <SheetItem icon="M4 20h4L20 8l-4-4L4 16v4Z" title="Rename thread" disabled={!online || busy}
+                  onClick={() => show({ kind: "rename", title })} />
+                <SheetItem icon="M4 9h16v11H4zM3 4h18v5H3zM10 13h4" title={archived ? "Restore thread" : "Archive thread"}
+                  sub={archived ? "Make this thread writable again" : "Keep the history, but stop new messages"}
+                  disabled={!online || busy} onClick={() => void toggleArchive()} />
+              </>}
+              {!online && <p className="sheet-help">Reconnect to use these controls.</p>}
+            </>}
+            {sheet.kind === "message" && <SheetItem icon={LIST_ICON} title="Start side thread from here"
+              sub="Use this message as the title; the new chat starts empty"
+              onClick={() => show({ kind: "create", title: sheet.title })} />}
+            {(sheet.kind === "create" || sheet.kind === "rename") && (
+              <ThreadTitleForm key={sheet.kind} kind={sheet.kind} initial={sheet.title} busy={busy} online={online} save={saveTitle} />
+            )}
+            {error && <p className="error-text" role="alert">{error}</p>}
+            <button className="sheet-cancel" onClick={() => { setError(""); setSheet(null); }}>
+              {sheet.kind === "list" ? "Done" : "Cancel"}
             </button>
           </div>
         </div>
@@ -237,15 +384,66 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   );
 }
 
-function SheetItem(props: { icon: string; title: string; sub: string; onClick: () => void }) {
+function ThreadList({ store, onNew, onSelect }: {
+  store: Store; onNew: () => void; onSelect: (thread: string) => void;
+}) {
+  const main = store.threads.get(MAIN_THREAD)!;
+  const side = [...store.threads.values()].filter((t) => t.id !== MAIN_THREAD)
+    .sort((a, b) => Date.parse(b.lastAt) - Date.parse(a.lastAt));
+  const archived = side.filter((t) => t.archived);
+  const row = (t: ThreadInfo) => {
+    const unread = store.isUnread(t.id);
+    const active = store.status(t.id).state !== "idle";
+    return <button key={t.id} className="sheet-item thread-row" aria-current={store.openThread === t.id ? "true" : undefined}
+      onClick={() => onSelect(t.id)}>
+      <span className="thread-name"><b>{t.id === MAIN_THREAD ? "Main" : t.title}</b></span>
+      {active && <small className="thread-running">{store.status(t.id).state === "error" ? "Error" : "Running"}</small>}
+      {unread && <span className="thread-dot" role="img" aria-label="Unread" />}
+    </button>;
+  };
+  return <>
+    <h2 className="sheet-heading">Threads</h2>
+    {store.threadListUnavailable && <p className="sheet-help">Could not refresh the thread list. Showing known threads.</p>}
+    <SheetItem icon="M12 5v14M5 12h14" title="New thread" sub="Start a separate conversation" onClick={onNew} />
+    {[...store.creates.values()].map((c) => <p className="sheet-help" key={c.key}>
+      {c.title || "New thread"} · {c.failed ? "Could not create" : "Waiting to sync"}
+    </p>)}
+    {row(main)}
+    {side.filter((t) => !t.archived).map(row)}
+    {archived.length > 0 && <details className="thread-archive">
+      <summary>Archived ({archived.length}){archived.some((t) => store.isUnread(t.id)) &&
+        <span className="thread-dot" role="img" aria-label="Unread" />}</summary>
+      {archived.map(row)}
+    </details>}
+  </>;
+}
+
+function ThreadTitleForm({ kind, initial, busy, online, save }: {
+  kind: "create" | "rename"; initial: string; busy: boolean; online: boolean; save: (title: string) => void;
+}) {
+  const [title, setTitle] = useState(initial);
+  const create = kind === "create";
+  return <form className="thread-form" onSubmit={(e) => { e.preventDefault(); save(title); }}>
+    <h2 className="sheet-heading">{create ? "New thread" : "Rename thread"}</h2>
+    <label htmlFor="thread-title">{create ? "Title (optional)" : "Title"}</label>
+    <input id="thread-title" value={title} onChange={(e) => setTitle(e.target.value)}
+      maxLength={LIMITS.threadTitleChars} placeholder="New thread" autoFocus />
+    {!online && <p className="sheet-help">{create ? "This thread will sync when you reconnect." : "Reconnect to rename this thread."}</p>}
+    <button className="primary" disabled={busy || TITLE_CONTROL.test(title) || (!create && (!online || !title.trim()))}>
+      {create ? "Create thread" : "Save title"}
+    </button>
+  </form>;
+}
+
+function SheetItem(props: { icon: string; title: string; sub?: string; disabled?: boolean; onClick: () => void }) {
   return (
-    <button role="menuitem" className="sheet-item" onClick={props.onClick}>
+    <button className="sheet-item" disabled={props.disabled} onClick={props.onClick}>
       <span className="sheet-icon">
         <Icon d={props.icon} />
       </span>
       <span>
         <b>{props.title}</b>
-        <small>{props.sub}</small>
+        {props.sub && <small>{props.sub}</small>}
       </span>
     </button>
   );
@@ -271,18 +469,18 @@ function EventRow({ ev, store, last }: { ev: DurableEvent; store: Store; last: b
     const t = clock(ev.at);
     return (
       <div className="divider" role="separator">
-        <span>New thread{t && ` · ${t}`}</span>
+        <span>New context{t && ` · ${t}`}</span>
       </div>
     );
   }
   if (ev.event !== "message") return null; // settled only drives delivery state
-  if (ev.role === "notice") return <div className="notice">{ev.text}</div>;
+  if (ev.role === "notice") return <div className="notice" data-thread-title={suggestedTitle(ev.text)}>{ev.text}</div>;
   if (ev.role === "user") {
     const state = ev.key ? store.outbox.get(ev.key)?.state : undefined;
     return <UserBubble text={ev.text} state={state} at={ev.at} last={last} />;
   }
   return (
-    <div className="msg assistant">
+    <div className="msg assistant" data-thread-title={suggestedTitle(ev.text)}>
       <Streamdown>{ev.text}</Streamdown>
     </div>
   );
@@ -303,7 +501,7 @@ function UserBubble(props: { text: string; state?: OutgoingState; at?: string | 
   const d = state && DELIV[state];
   return (
     <div className="row user">
-      <div className="bubble">{props.text}</div>
+      <div className="bubble" data-thread-title={suggestedTitle(props.text)}>{props.text}</div>
       {show && d && (
         <span className="deliv" data-state={state}>
           {state === "admitted" || state === "answered" || state === "sent" ? clock(props.at) : d.label}

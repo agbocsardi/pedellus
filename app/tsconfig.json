@@ -13,5 +13,5 @@
     "skipLibCheck": true,
     "types": ["vite/client"]
   },
-  "include": ["src", "vite.config.ts", "../protocol/v1.ts"]
+  "include": ["src", "vite.config.ts", "../protocol/v2.ts"]
 }
