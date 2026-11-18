@@ -6,36 +6,41 @@
 
 /*
  * Palette. Light + dark via prefers-color-scheme; the tokens are also what
- * Streamdown's built-in chrome (code blocks, tables, links) reads.
+ * Streamdown's built-in chrome (code blocks, tables, links) reads. Streamdown
+ * uses `sidebar` for code-block surfaces and the copy/download toolbar; left
+ * undefined, that border falls back to currentColor (a white frame in dark).
  */
 @theme {
   --color-background: #f7f6f3;
-  --color-foreground: #24231f;
+  --color-foreground: #22211e;
   --color-card: #ffffff;
-  --color-card-foreground: #24231f;
-  --color-muted: #ebe9e2;
-  --color-muted-foreground: #7c7a72;
-  --color-border: #e2e0d8;
+  --color-card-foreground: #22211e;
+  --color-muted: #ecebe5;
+  --color-muted-foreground: #76746c;
+  --color-border: #e3e1d9;
+  --color-sidebar: #f2f1ec;
   --color-primary: #0e7a6a;
   --color-primary-foreground: #ffffff;
   --color-destructive: #b3403a;
   --font-sans:
-    ui-round, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
     "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
     --color-background: #171917;
-    --color-foreground: #e7e5df;
-    --color-card: #202321;
-    --color-card-foreground: #e7e5df;
-    --color-muted: #26292a;
-    --color-muted-foreground: #94928a;
-    --color-border: #2c2f2c;
+    --color-foreground: #eae8e2;
+    --color-card: #212422;
+    --color-card-foreground: #eae8e2;
+    --color-muted: #2a2d2b;
+    --color-muted-foreground: #9a988f;
+    --color-border: #2e322f;
+    --color-sidebar: #1d201e;
     --color-primary: #4fbfa9;
-    --color-primary-foreground: #10201c;
-    --color-destructive: #d97069;
+    --color-primary-foreground: #0f201b;
+    --color-destructive: #e0756e;
   }
 }
 
@@ -44,12 +49,34 @@
 :root {
   --accent: var(--color-primary);
   --danger: var(--color-destructive);
-  --amber: #c9a24b;
+  --amber: #b8892c;
   --line: var(--color-border);
   --ink: var(--color-foreground);
   --muted-ink: var(--color-muted-foreground);
+  --muted: var(--color-muted);
   --bg: var(--color-background);
   --card: var(--color-card);
+  --bubble: #0e7a6a;
+  --bubble-ink: #ffffff;
+  --shadow: 0 1px 2px rgb(30 25 15 / 0.05), 0 8px 28px rgb(30 25 15 / 0.08);
+  /* doodle robot materials */
+  --steel: #c3cfd4;
+  --steel-shine: #eef4f6;
+  --brass: #d3a54e;
+  --hat: #2c2d31;
+  --gutter: max(16px, env(safe-area-inset-left), env(safe-area-inset-right));
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --amber: #d9ad55;
+    --bubble: #2b7d6f;
+    --steel: #5b6c74;
+    --steel-shine: #8fa2aa;
+    --brass: #c7983f;
+    --hat: #101214;
+    --bubble-ink: #f1fbf8;
+    --shadow: 0 1px 2px rgb(0 0 0 / 0.3), 0 10px 30px rgb(0 0 0 / 0.35);
+  }
 }
 
 html,
@@ -63,6 +90,7 @@ body,
   color: var(--ink);
   font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
   overscroll-behavior: none;
 }
 
@@ -77,78 +105,293 @@ textarea:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
+svg {
+  display: block;
+}
 
 .screen {
   height: 100dvh;
   overflow-y: auto;
   display: grid;
   place-items: center;
-  padding: 24px;
+  padding: calc(env(safe-area-inset-top) + 24px) var(--gutter)
+    calc(env(safe-area-inset-bottom) + 24px);
 }
 .dim {
   color: var(--muted-ink);
 }
+/* SF Rounded on Apple platforms for the few display lines only */
+.who h1,
+.empty h2,
+.card h1 {
+  font-family: ui-rounded, var(--font-sans);
+}
 
-/* Logo mark: rounded square with three speech dots. */
-.mark {
-  --s: 48px;
-  width: var(--s);
-  height: var(--s);
-  border-radius: calc(var(--s) * 0.24);
-  background: var(--accent);
-  position: relative;
+/*
+ * Avatar: doodle robot (see Avatar.tsx). It fills whatever slot it is put
+ * in; layout only knows the slot. Two wobbly frames per pose: frame A holds
+ * still at rest, A/B alternate ("boil") while the agent is busy.
+ */
+.avatar-slot {
+  width: 44px;
+  height: 44px;
+  flex: none;
+}
+.avatar-slot.big {
+  width: 96px;
+  height: 96px;
   margin-inline: auto;
 }
-.mark::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  margin: auto;
-  width: calc(var(--s) * 0.14);
-  height: calc(var(--s) * 0.14);
-  border-radius: 50%;
-  background: #fff;
-  box-shadow:
-    calc(var(--s) * 0.28) 0 0 #fff,
-    calc(var(--s) * -0.28) 0 0 #fff;
+.avatar {
+  display: block;
+  width: 100%;
+  height: 100%;
+  color: var(--ink);
 }
-.mark.small {
-  --s: 26px;
-  margin: 0;
+.avatar[data-state="offline"] {
+  color: var(--muted-ink);
 }
+.avatar svg {
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+.avatar g,
+.avatar path {
+  transform-box: view-box;
+}
+.avatar path {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.avatar .thin {
+  stroke-width: 1.6;
+}
+.avatar .thick {
+  stroke-width: 2.8;
+}
+.avatar .body {
+  fill: var(--steel);
+}
+.avatar .prop {
+  fill: var(--card);
+}
+.avatar .shine {
+  stroke: var(--steel-shine);
+}
+.avatar .brass {
+  fill: var(--brass);
+}
+.avatar .glass {
+  fill: #172024;
+  stroke-width: 1.2;
+}
+.avatar .iris {
+  fill: var(--accent);
+  stroke: none;
+}
+.avatar .pupil {
+  fill: #0b1113;
+  stroke: none;
+}
+.avatar .glint {
+  fill: #f4fbf9;
+  stroke: none;
+}
+.avatar .mark {
+  stroke: #c8d4d6;
+  stroke-width: 1.8;
+}
+.avatar .hat {
+  fill: var(--hat);
+}
+.avatar .band {
+  stroke: var(--brass);
+  stroke-width: 1.8;
+}
+.avatar .fillink {
+  fill: currentColor;
+  stroke-width: 0.6;
+}
+.avatar .fillacc {
+  fill: var(--accent);
+  stroke-width: 0.8;
+}
+.avatar .fillcard {
+  fill: var(--card);
+  stroke: none;
+}
+.avatar .grip {
+  stroke: var(--accent);
+  stroke-width: 3.6;
+}
+.avatar .bad {
+  stroke: #f07a6e;
+  stroke-width: 2.4;
+}
+.avatar[data-state="offline"] {
+  --steel: var(--muted);
+  --brass: color-mix(in oklab, var(--muted-ink) 45%, var(--muted));
+}
+.avatar .wisp {
+  opacity: 0.5;
+}
+.avatar .fb {
+  visibility: hidden;
+}
+
+/* line boil while busy (~7 fps; faster when upset) */
+.avatar:is([data-state="queued"], [data-state="thinking"], [data-state="tool"]) .fa {
+  animation: boil-a 0.3s steps(1, end) infinite;
+}
+.avatar:is([data-state="queued"], [data-state="thinking"], [data-state="tool"]) .fb {
+  animation: boil-b 0.3s steps(1, end) infinite;
+}
+.avatar[data-state="error"] .fa {
+  animation: boil-a 0.24s steps(1, end) infinite;
+}
+.avatar[data-state="error"] .fb {
+  animation: boil-b 0.24s steps(1, end) infinite;
+}
+.avatar[data-state="queued"] .fa,
+.avatar[data-state="queued"] .fb {
+  animation-duration: 0.5s;
+}
+@keyframes boil-a {
+  0% {
+    visibility: visible;
+  }
+  50% {
+    visibility: hidden;
+  }
+}
+@keyframes boil-b {
+  0% {
+    visibility: hidden;
+  }
+  50% {
+    visibility: visible;
+  }
+}
+
+/* hover bob (not when switched off) */
+.avatar:not([data-state="offline"]) .bob {
+  animation: av-bob 2.8s ease-in-out infinite;
+}
+.avatar[data-state="offline"] .bob {
+  transform: translateY(3px);
+}
+@keyframes av-bob {
+  50% {
+    transform: translateY(-1.6px);
+  }
+}
+
+/* at rest: an occasional blink and, now and then, a small wave */
+.avatar[data-state="idle"] .eye {
+  transform-origin: 32px 29px;
+  animation: av-blink 5.5s infinite;
+}
+@keyframes av-blink {
+  0%,
+  94%,
+  100% {
+    transform: none;
+  }
+  97% {
+    transform: scaleY(0.12);
+  }
+}
+.avatar[data-state="idle"] .wave {
+  transform-origin: 46px 31px;
+  animation: av-wave 11s ease-in-out infinite 2s;
+}
+@keyframes av-wave {
+  0%,
+  80%,
+  100% {
+    transform: none;
+  }
+  84%,
+  92% {
+    transform: rotate(-125deg);
+  }
+  88%,
+  96% {
+    transform: rotate(-100deg);
+  }
+}
+.avatar[data-state="offline"] .zz {
+  animation: av-zz 3s ease-in-out infinite;
+}
+@keyframes av-zz {
+  50% {
+    opacity: 0.35;
+    transform: translate(1px, -1.5px);
+  }
+}
+.avatar[data-state="error"] .bob {
+  animation: av-shake 0.5s ease-in-out 1;
+}
+@keyframes av-shake {
+  20%,
+  60% {
+    transform: translateX(-1.5px);
+  }
+  40%,
+  80% {
+    transform: translateX(1.5px);
+  }
+}
+
+/* Pairing / update cards */
 
 .card {
   background: var(--card);
   border: 1px solid var(--line);
-  border-radius: 16px;
+  border-radius: 24px;
+  box-shadow: var(--shadow);
 }
 .pad {
-  padding: 28px;
+  padding: 28px 24px 24px;
   width: min(24rem, 100%);
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
 }
 .card h1 {
-  margin: 8px 0 4px;
-  font-size: 1.3rem;
+  margin: 14px 0 0;
+  font-size: 1.4rem;
+  font-weight: 650;
+  letter-spacing: -0.01em;
   text-align: center;
+}
+.card p {
+  margin: 0;
+}
+.lede {
+  text-align: center;
+  color: var(--muted-ink);
+  font-size: 0.92rem;
+  line-height: 1.45;
+  margin-bottom: 8px !important;
 }
 .hint {
   font-size: 0.85rem;
   line-height: 1.5;
-  color: var(--muted-ink);
+  color: var(--ink);
   background: color-mix(in oklab, var(--accent) 9%, transparent);
-  border: 1px solid color-mix(in oklab, var(--accent) 25%, transparent);
-  border-radius: 10px;
+  border-radius: 14px;
   padding: 10px 12px;
 }
 label {
-  font-size: 0.72rem;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+  font-size: 0.8rem;
+  font-weight: 600;
   color: var(--muted-ink);
-  margin-top: 8px;
+  margin: 8px 0 -2px 4px;
 }
 input {
   /* Inputs have a wide intrinsic size; without these the pairing card grows
@@ -158,26 +401,31 @@ input {
   border: 1px solid var(--line);
   background: var(--bg);
   color: var(--ink);
-  border-radius: 10px;
-  padding: 10px 12px;
+  border-radius: 14px;
+  padding: 12px 14px;
   font: inherit;
   font-size: 1rem;
 }
+input:focus {
+  border-color: var(--accent);
+  outline: none;
+}
 input#pair-code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 1.3rem;
-  letter-spacing: 0.25em;
+  font-family: var(--font-mono);
+  font-size: 1.35rem;
+  letter-spacing: 0.3em;
   text-align: center;
   text-transform: uppercase;
 }
 .primary {
-  margin-top: 14px;
+  margin-top: 16px;
   border: 0;
-  border-radius: 12px;
+  border-radius: 999px;
   background: var(--accent);
   color: var(--color-primary-foreground);
-  padding: 12px 16px;
+  padding: 14px 16px;
   font-weight: 600;
+  font-size: 1rem;
 }
 .primary:disabled {
   opacity: 0.6;
@@ -185,8 +433,9 @@ input#pair-code {
 }
 .error-text {
   color: var(--danger);
-  font-size: 0.82rem;
-  margin: 4px 0 0;
+  font-size: 0.85rem;
+  text-align: center;
+  margin: 6px 0 0 !important;
 }
 
 /* Chat screen */
@@ -200,118 +449,73 @@ input#pair-code {
 .top {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: calc(env(safe-area-inset-top) + 10px) 14px 10px;
-  border-bottom: 1px solid var(--line);
-  background: color-mix(in oklab, var(--bg) 88%, transparent);
-  backdrop-filter: blur(8px);
-  position: sticky;
-  top: 0;
+  gap: 12px;
+  padding: calc(env(safe-area-inset-top) + 8px) var(--gutter) 10px;
+  border-bottom: 1px solid color-mix(in oklab, var(--line) 70%, transparent);
+  background: color-mix(in oklab, var(--bg) 90%, transparent);
+  backdrop-filter: saturate(1.4) blur(12px);
+  -webkit-backdrop-filter: saturate(1.4) blur(12px);
   z-index: 4;
 }
 .who {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 11px;
   margin-right: auto;
+  min-width: 0;
+}
+.who-text {
   min-width: 0;
 }
 .who h1 {
   margin: 0;
-  font-size: 1.05rem;
+  font-size: 1.06rem;
   font-weight: 650;
+  line-height: 1.25;
+  letter-spacing: -0.01em;
 }
-
-.pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 0.74rem;
+.presence {
+  margin: 1px 0 0;
+  font-size: 0.78rem;
+  line-height: 1.25;
   color: var(--muted-ink);
-  border: 1px solid var(--line);
-  background: var(--card);
-  border-radius: 999px;
-  padding: 4px 10px;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
-.pill i {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--muted-ink);
+.presence[data-tone="run"] {
+  color: var(--accent);
 }
-.pill[data-kind="ok"] i {
-  background: var(--accent);
+.presence[data-tone="warn"] {
+  color: var(--amber);
 }
-.pill[data-kind="run"] i {
-  background: var(--accent);
-  animation: pulse 1.3s ease-in-out infinite;
-}
-.pill[data-kind="warn"] i {
-  background: var(--amber);
-}
-.pill[data-kind="bad"] i {
-  background: var(--danger);
-}
-@keyframes pulse {
-  50% {
-    opacity: 0.35;
-  }
+.presence[data-tone="bad"] {
+  color: var(--danger);
 }
 
-.menu {
-  position: relative;
-}
 .icon-btn {
-  width: 34px;
-  height: 34px;
+  width: 38px;
+  height: 38px;
+  flex: none;
   border-radius: 50%;
-  border: 1px solid var(--line);
-  background: var(--card);
-  color: var(--muted-ink);
+  border: 0;
+  background: var(--muted);
+  color: var(--ink);
   display: grid;
   place-items: center;
-  font-size: 1rem;
 }
-.menu-backdrop {
-  position: fixed;
-  inset: 0;
-  background: transparent;
-  border: 0;
-  z-index: 5;
-}
-.menu-pop {
-  position: absolute;
-  right: 0;
-  top: calc(100% + 8px);
-  z-index: 6;
-  background: var(--card);
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  box-shadow: 0 8px 24px rgb(0 0 0 / 0.12);
-  min-width: 180px;
-  overflow: hidden;
-}
-.menu-pop button {
-  display: block;
-  width: 100%;
-  text-align: left;
-  border: 0;
-  background: none;
-  color: var(--ink);
-  font-size: 0.9rem;
-  padding: 11px 14px;
-}
-.menu-pop button:hover {
-  background: var(--muted, var(--color-muted));
+.icon-btn svg {
+  width: 22px;
+  height: 22px;
 }
 
 .messages {
   flex: 1;
   overflow-y: auto;
   overflow-x: hidden;
+  overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
-  padding: 8px 14px 18px;
+  padding: 12px var(--gutter) 20px;
 }
 
 .msg {
@@ -319,14 +523,47 @@ input#pair-code {
   margin: 0 auto;
 }
 .msg.assistant {
-  padding: 8px 0;
-  font-size: 0.95rem;
-  line-height: 1.6;
+  padding: 6px 0 4px;
+  font-size: 1rem;
+  line-height: 1.58;
+  overflow-wrap: anywhere;
+}
+.msg.assistant > div > :first-child {
+  margin-top: 0;
+}
+.msg.assistant > div > :last-child {
+  margin-bottom: 0;
+}
+.msg.assistant :where(h1, h2, h3, h4) {
+  letter-spacing: -0.01em;
+}
+.msg.assistant a {
+  color: var(--accent);
+  text-underline-offset: 2px;
+}
+.msg.assistant [data-streamdown="inline-code"] {
+  font-family: var(--font-mono);
+  font-size: 0.86em;
+  background: var(--muted);
+  border-radius: 6px;
+  padding: 0.1em 0.38em;
+}
+.msg.assistant [data-streamdown="code-block"] {
+  border-radius: 16px;
+  border-color: var(--line);
+}
+.msg.assistant [data-streamdown="code-block-actions"] {
+  border-color: var(--line);
+}
+.msg.assistant pre,
+.msg.assistant code {
+  font-family: var(--font-mono);
 }
 /* Horizontal code scrolling is the iOS-safe default; Streamdown adds the
    copy button and block chrome on top. */
 .msg.assistant pre {
   overflow-x: auto;
+  font-size: 0.84rem;
 }
 .msg.assistant table {
   display: block;
@@ -337,25 +574,38 @@ input#pair-code {
   display: flex;
   flex-direction: column;
   align-items: flex-end;
-  margin: 12px 0;
+  margin: 18px auto 10px;
   max-width: 44rem;
-  margin-inline: auto;
 }
 .bubble {
-  background: var(--color-muted);
-  border-radius: 18px 18px 4px 18px;
+  background: var(--bubble);
+  color: var(--bubble-ink);
+  border-radius: 20px 20px 6px 20px;
   padding: 9px 14px;
-  max-width: min(85%, 36rem);
+  max-width: min(82%, 34rem);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  font-size: 0.95rem;
+  font-size: 1rem;
+  line-height: 1.4;
 }
 .deliv {
-  font-size: 0.68rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 0.7rem;
   color: var(--muted-ink);
-  margin: 3px 8px 0 0;
+  margin: 4px 4px 0 0;
+  font-variant-numeric: tabular-nums;
 }
-.deliv.bad {
+.deliv-icon svg {
+  width: 15px;
+  height: 15px;
+}
+.deliv[data-state="answered"] .deliv-icon {
+  color: var(--accent);
+}
+.deliv[data-state="failed"],
+.deliv[data-state="aborted"] {
   color: var(--danger);
 }
 
@@ -363,15 +613,16 @@ input#pair-code {
   text-align: center;
   color: var(--muted-ink);
   font-size: 0.8rem;
-  margin: 12px auto;
-  max-width: 44rem;
+  line-height: 1.4;
+  margin: 14px auto;
+  max-width: 30rem;
 }
 
 .divider {
   display: flex;
   align-items: center;
   gap: 10px;
-  margin: 22px auto;
+  margin: 26px auto;
   max-width: 44rem;
 }
 .divider::before,
@@ -382,41 +633,121 @@ input#pair-code {
   background: var(--line);
 }
 .divider span {
-  font-size: 0.68rem;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
+  font-size: 0.72rem;
+  font-weight: 600;
   color: var(--muted-ink);
+  background: var(--muted);
+  border-radius: 999px;
+  padding: 4px 10px;
+  white-space: nowrap;
 }
 
-.streaming .typing {
-  display: inline-block;
-  font-size: 1.1rem;
-  color: var(--muted-ink);
-  animation: pulse 1s ease-in-out infinite;
+/* Agent is working, nothing streamed yet */
+.typing {
+  display: flex;
+  gap: 5px;
+  width: max-content;
+  max-width: 44rem;
+  margin: 8px auto 4px 0;
+  padding: 13px 15px;
+  border-radius: 20px 20px 20px 6px;
+  background: var(--muted);
+}
+@media (min-width: 46rem) {
+  .typing {
+    margin-left: calc((100% - 44rem) / 2);
+  }
+}
+.typing i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted-ink);
+  animation: bounce 1.2s ease-in-out infinite;
+}
+.typing i:nth-child(2) {
+  animation-delay: 0.15s;
+}
+.typing i:nth-child(3) {
+  animation-delay: 0.3s;
+}
+@keyframes bounce {
+  0%,
+  60%,
+  100% {
+    transform: none;
+    opacity: 0.45;
+  }
+  30% {
+    transform: translateY(-4px);
+    opacity: 1;
+  }
 }
 
 .empty {
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
   text-align: center;
-  padding-top: 38vh;
-  font-size: 0.9rem;
+  gap: 4px;
+  padding-bottom: 6vh;
+}
+.empty h2 {
+  margin: 14px 0 0;
+  font-size: 1.3rem;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+.empty p {
+  margin: 0;
+  max-width: 17rem;
+  color: var(--muted-ink);
+  font-size: 0.92rem;
+  line-height: 1.45;
 }
 
+/* Floating capsule composer */
 .composer {
-  display: flex;
-  align-items: flex-end;
-  gap: 8px;
-  padding: 10px 12px calc(env(safe-area-inset-bottom) + var(--vkb, 0px) + 10px);
-  border-top: 1px solid var(--line);
+  position: relative;
+  padding: 6px var(--gutter) calc(env(safe-area-inset-bottom) + var(--vkb, 0px) + 10px);
   background: var(--bg);
 }
-.composer textarea {
+.composer::before {
+  /* fades the list into the composer instead of a hard rule */
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 100%;
+  height: 18px;
+  background: linear-gradient(transparent, var(--bg));
+  pointer-events: none;
+}
+.capsule {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  max-width: 44rem;
+  margin: 0 auto;
+  padding: 5px 5px 5px 18px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 26px;
+  box-shadow: var(--shadow);
+  transition: border-color 0.2s;
+}
+.capsule:focus-within {
+  border-color: color-mix(in oklab, var(--accent) 55%, var(--line));
+}
+.capsule textarea {
   flex: 1;
   resize: none;
-  border: 1px solid var(--line);
-  background: var(--card);
+  border: 0;
+  background: transparent;
   color: var(--ink);
-  border-radius: 20px;
-  padding: 10px 16px;
+  padding: 8px 0;
   font: inherit;
   /* 16px minimum: iOS zooms the page on focusing smaller text, leaving it
      zoomed and scrollable in both directions. */
@@ -424,25 +755,136 @@ input#pair-code {
   line-height: 1.4;
   max-height: 140px;
   min-width: 0;
-}
-.composer textarea:focus {
-  border-color: var(--accent);
   outline: none;
 }
+.capsule textarea::placeholder {
+  color: var(--muted-ink);
+}
 .send {
-  width: 40px;
-  height: 40px;
+  width: 36px;
+  height: 36px;
   border-radius: 50%;
   border: 0;
-  background: var(--accent);
-  color: var(--color-primary-foreground);
-  font-size: 0.95rem;
+  background: var(--muted);
+  color: var(--muted-ink);
   flex: none;
   display: grid;
   place-items: center;
+  transition:
+    background 0.2s,
+    color 0.2s,
+    transform 0.1s;
+}
+.send svg {
+  width: 20px;
+  height: 20px;
+}
+.send[data-ready] {
+  background: var(--accent);
+  color: var(--color-primary-foreground);
 }
 .send.stop {
-  background: var(--danger);
+  background: var(--ink);
+  color: var(--bg);
+}
+.send:active {
+  transform: scale(0.92);
+}
+
+/* Menu as a bottom sheet */
+.sheet-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+}
+.sheet-backdrop {
+  position: absolute;
+  inset: 0;
+  border: 0;
+  background: rgb(0 0 0 / 0.3);
+  animation: fade 0.2s ease-out;
+}
+.sheet {
+  position: absolute;
+  left: var(--gutter);
+  right: var(--gutter);
+  bottom: calc(env(safe-area-inset-bottom) + 10px);
+  max-width: 28rem;
+  margin: 0 auto;
+  padding: 6px 8px 8px;
+  background: var(--card);
+  border-radius: 26px;
+  box-shadow: var(--shadow);
+  animation: rise 0.26s cubic-bezier(0.2, 0.9, 0.3, 1.1);
+}
+.sheet-grip {
+  width: 36px;
+  height: 5px;
+  border-radius: 3px;
+  background: var(--line);
+  margin: 2px auto 6px;
+}
+.sheet-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  border: 0;
+  background: none;
+  text-align: left;
+  padding: 10px;
+  border-radius: 16px;
+}
+.sheet-item:active,
+.sheet-item:hover {
+  background: var(--muted);
+}
+.sheet-item b {
+  display: block;
+  font-weight: 600;
+  font-size: 1rem;
+}
+.sheet-item small {
+  display: block;
+  color: var(--muted-ink);
+  font-size: 0.8rem;
+  line-height: 1.35;
+}
+.sheet-icon {
+  width: 38px;
+  height: 38px;
+  flex: none;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: color-mix(in oklab, var(--accent) 13%, transparent);
+  color: var(--accent);
+}
+.sheet-icon svg {
+  width: 20px;
+  height: 20px;
+}
+.sheet-cancel {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+  border: 0;
+  border-radius: 16px;
+  background: var(--muted);
+  padding: 13px;
+  font-weight: 600;
+  font-size: 1rem;
+}
+@keyframes fade {
+  from {
+    opacity: 0;
+  }
+}
+@keyframes rise {
+  from {
+    transform: translateY(24px);
+    opacity: 0;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -451,6 +893,30 @@ input#pair-code {
   *::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  /* Poses stay legible without motion: frame A only, no boil or bob. */
+  .avatar * {
+    animation: none !important;
+  }
+  .avatar .fa {
+    visibility: visible !important;
+  }
+  .avatar .fb {
+    visibility: hidden !important;
+  }
+  .typing i {
+    animation: none !important;
+    opacity: 0.7;
   }
 }
 
+@media (max-width: 360px) {
+  .pad {
+    padding: 22px 18px 18px;
+  }
+  .card .avatar-slot.big {
+    width: 76px;
+    height: 76px;
+  }
+}
