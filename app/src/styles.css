@@ -62,6 +62,7 @@
   /* doodle robot materials */
   --steel: #c3cfd4;
   --steel-shine: #eef4f6;
+  --steel-shade: #9aafb9;
   --brass: #d3a54e;
   --hat: #2c2d31;
   --gutter: max(16px, env(safe-area-inset-left), env(safe-area-inset-right));
@@ -71,7 +72,8 @@
     --amber: #d9ad55;
     --bubble: #2b7d6f;
     --steel: #5b6c74;
-    --steel-shine: #8fa2aa;
+    --steel-shine: #9fb3bb;
+    --steel-shade: #43545e;
     --brass: #c7983f;
     --hat: #454a52;
     --bubble-ink: #f1fbf8;
@@ -127,11 +129,7 @@ svg {
   font-family: ui-rounded, var(--font-sans);
 }
 
-/*
- * Avatar: doodle robot (see Avatar.tsx). It fills whatever slot it is put
- * in; layout only knows the slot. Two wobbly frames per pose: frame A holds
- * still at rest, A/B alternate ("boil") while the agent is busy.
- */
+/* Agent avatar (see Avatar.tsx). The callers only provide a sized slot. */
 .avatar-slot {
   width: 44px;
   height: 44px;
@@ -148,204 +146,139 @@ svg {
   height: 100%;
   color: var(--ink);
 }
-.avatar[data-state="offline"] {
-  color: var(--muted-ink);
-}
 .avatar svg {
   width: 100%;
   height: 100%;
-  overflow: visible;
 }
-.avatar g,
-.avatar path {
-  transform-box: view-box;
-}
-.avatar path {
+.avatar :is(path, circle) {
   fill: none;
   stroke: currentColor;
-  stroke-width: 2.3;
+  stroke-width: 1.95;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
-.avatar .thin {
-  stroke-width: 1.6;
-}
-.avatar .thick {
-  stroke-width: 2.8;
-}
-.avatar .body {
+.avatar .shell {
   fill: var(--steel);
 }
-.avatar .prop {
-  fill: var(--card);
+.avatar .shade {
+  fill: var(--steel-shade);
+  stroke: none;
+}
+.avatar .fine {
+  stroke-width: 1.35;
 }
 .avatar .shine {
   stroke: var(--steel-shine);
+}
+.avatar .rivets {
+  stroke-width: 1.6;
+}
+.avatar .tube {
+  stroke-width: 4.7;
+}
+.avatar .tube-inset {
+  stroke: var(--steel);
+  stroke-width: 2.4;
+}
+.avatar .joint {
+  fill: var(--steel-shade);
+  stroke-width: 1.25;
 }
 .avatar .brass {
   fill: var(--brass);
 }
 .avatar .glass {
   fill: #172024;
-  stroke-width: 1.2;
+  stroke-width: 1.25;
+}
+.avatar .shutter {
+  fill: var(--steel-shade);
+  stroke-width: 1;
 }
 .avatar .iris {
   fill: var(--accent);
   stroke: none;
 }
-.avatar .pupil {
-  fill: #0b1113;
+.avatar .alarm {
+  fill: #fa8474;
   stroke: none;
 }
 .avatar .glint {
   fill: #f4fbf9;
   stroke: none;
 }
-.avatar .mark {
-  stroke: #c8d4d6;
-  stroke-width: 1.8;
-}
 .avatar .hat {
   fill: var(--hat);
 }
 .avatar .band {
   stroke: var(--brass);
-  stroke-width: 1.8;
+  stroke-width: 1.55;
 }
-.avatar .fillink {
-  fill: currentColor;
-  stroke-width: 0.6;
+.avatar .brim {
+  stroke-width: 2.65;
 }
-.avatar .fillacc {
-  fill: var(--accent);
-  stroke-width: 0.8;
+.avatar .paper {
+  fill: #f4ebd7;
 }
-.avatar .fillcard {
-  fill: var(--card);
-  stroke: none;
-}
-.avatar .grip {
-  stroke: var(--accent);
-  stroke-width: 3.6;
-}
-.avatar .bad {
-  stroke: #f07a6e;
-  stroke-width: 2.4;
+@media (prefers-color-scheme: dark) {
+  .avatar {
+    color: #b9c5c9;
+  }
+  .avatar :is(.glass, .shutter) {
+    stroke: #27343b;
+  }
+  .avatar .paper {
+    fill: #756b59;
+  }
 }
 .avatar[data-state="offline"] {
-  --steel: var(--muted);
-  --brass: color-mix(in oklab, var(--muted-ink) 45%, var(--muted));
+  --steel: color-mix(in oklab, var(--steel-shade), var(--muted) 45%);
+  --brass: var(--steel-shade);
 }
 .avatar .wisp {
-  opacity: 0.5;
+  opacity: 0.54;
 }
-.avatar .fb {
+.avatar .avatar-accent {
   visibility: hidden;
 }
 
-/* line boil while busy (~7 fps; faster when upset) */
-.avatar:is([data-state="queued"], [data-state="thinking"], [data-state="tool"]) .fa {
-  animation: boil-a 0.3s steps(1, end) infinite;
-}
-.avatar:is([data-state="queued"], [data-state="thinking"], [data-state="tool"]) .fb {
-  animation: boil-b 0.3s steps(1, end) infinite;
-}
-.avatar[data-state="error"] .fa {
-  animation: boil-a 0.24s steps(1, end) infinite;
-}
-.avatar[data-state="error"] .fb {
-  animation: boil-b 0.24s steps(1, end) infinite;
-}
-.avatar[data-state="queued"] .fa,
-.avatar[data-state="queued"] .fb {
-  animation-duration: 0.5s;
-}
-@keyframes boil-a {
-  0% {
-    visibility: visible;
+/* Switch whole drawings at the two keys. No JS ticks, tweening, or perpetual
+ * recoil/settle animation. Without motion the expressive hold is the default. */
+@media (prefers-reduced-motion: no-preference) {
+  .avatar .avatar-hold {
+    --hold: visible;
+    --accent-pose: hidden;
   }
-  50% {
-    visibility: hidden;
+  .avatar .avatar-accent {
+    --hold: hidden;
+    --accent-pose: visible;
   }
-}
-@keyframes boil-b {
-  0% {
-    visibility: hidden;
+  .avatar:is([data-state="idle"], [data-state="queued"]) svg > g {
+    animation: avatar-glance 6.8s step-end infinite;
   }
-  50% {
-    visibility: visible;
+  .avatar[data-state="queued"] svg > g {
+    animation-duration: 4.4s;
   }
-}
-
-/* hover bob (not when switched off) */
-.avatar:not([data-state="offline"]) {
-  /* On the HTML element, not inside the SVG, so the compositor animates it
-     without repainting the drawing every frame. */
-  animation: av-bob 2.8s ease-in-out infinite;
-}
-.avatar[data-state="offline"] .bob {
-  transform: translateY(3px);
-}
-@keyframes av-bob {
-  50% {
-    transform: translateY(-1.6px);
+  .avatar:is([data-state="thinking"], [data-state="tool"]) svg > g {
+    animation: avatar-effort 2.8s step-end infinite;
   }
-}
-
-/* at rest: an occasional blink and, now and then, a small wave */
-.avatar[data-state="idle"] .eye {
-  transform-origin: 32px 29px;
-  animation: av-blink 5.5s infinite;
-}
-@keyframes av-blink {
-  0%,
-  94%,
-  100% {
-    transform: none;
+  .avatar[data-state="tool"] svg > g {
+    animation-duration: 1.45s;
   }
-  97% {
-    transform: scaleY(0.12);
+  .avatar:is([data-state="error"], [data-state="offline"]) svg > g {
+    animation: avatar-settle 260ms step-end;
   }
-}
-.avatar[data-state="idle"] .wave {
-  transform-origin: 46px 31px;
-  animation: av-wave 11s ease-in-out infinite 2s;
-}
-@keyframes av-wave {
-  0%,
-  80%,
-  100% {
-    transform: none;
+  @keyframes avatar-glance {
+    0%, 100% { visibility: var(--hold); }
+    96% { visibility: var(--accent-pose); }
   }
-  84%,
-  92% {
-    transform: rotate(-125deg);
+  @keyframes avatar-effort {
+    0%, 100% { visibility: var(--hold); }
+    66% { visibility: var(--accent-pose); }
   }
-  88%,
-  96% {
-    transform: rotate(-100deg);
-  }
-}
-.avatar[data-state="offline"] .zz {
-  animation: av-zz 3s ease-in-out infinite;
-}
-@keyframes av-zz {
-  50% {
-    opacity: 0.35;
-    transform: translate(1px, -1.5px);
-  }
-}
-.avatar[data-state="error"] .bob {
-  animation: av-shake 0.5s ease-in-out 1;
-}
-@keyframes av-shake {
-  20%,
-  60% {
-    transform: translateX(-1.5px);
-  }
-  40%,
-  80% {
-    transform: translateX(1.5px);
+  @keyframes avatar-settle {
+    from { visibility: var(--accent-pose); }
+    to { visibility: var(--hold); }
   }
 }
 
@@ -896,16 +829,6 @@ input#pair-code {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
-  }
-  /* Poses stay legible without motion: frame A only, no boil or bob. */
-  .avatar * {
-    animation: none !important;
-  }
-  .avatar .fa {
-    visibility: visible !important;
-  }
-  .avatar .fb {
-    visibility: hidden !important;
   }
   .typing i {
     animation: none !important;
