@@ -63,7 +63,9 @@ an omitted label picks a free `device-<n>`. Revoke is exact-label.
 `POST /v1/pair` exchanges one console-created code for a device token. The code is 8 characters
 from `[A-Z2-9]` minus `I`/`O` (case-insensitive input), single-use, and expires after ten minutes.
 Only its hash is stored. The token is long and random, exists only in the `durable_device` cookie
-(`HttpOnly; Secure; SameSite=Strict; Path=/v1`) and only its SHA-256 hash with the label and
+(`HttpOnly; Secure; SameSite=Strict; Path=/v1; Max-Age=34560000`, the 400-day lifetime v1
+requires because iOS drops session cookies when a home-screen app closes) and only its SHA-256
+hash with the label and
 created time is stored durably in the app channel state — the same file-based trust boundary as the
 provider credential store. A console-created label must match at redemption when one was given.
 More than five pairing failures in one minute across all clients refuse the next attempt with
@@ -97,14 +99,18 @@ with one fixed notice, and its text is never stored.
 
 Requests are `{"type":"req","id","op",...}` with exactly one `{"type":"res","id","ok",...}` reply;
 fixed error codes only, never free text. Frames and request bodies are bounded at 262 144 bytes;
-`send.text` at 16 000 characters; ids and keys at 1–64 characters of `[A-Za-z0-9_-]`.
+`send.text` at 16 000 characters (an over-bound text is the fixed `too_large` error); ids and
+keys at 1–64 characters of `[A-Za-z0-9_-]`.
 
 Durable egress is the adapter's own cursor-numbered event log — `message` (roles `user`,
 `assistant`, `notice`), `settled`, `divider` — appended in one commit per delivery. `hello` replays
 events with `cursor > hello.cursor` (oldest first, at most 500 per batch; the app re-`hello`s for
 more), live sockets are pushed every event after their own position, and `ack` records each
-device's highest stored cursor. Replay is idempotent by cursor on the client, so delivery is
-at-least-once and the cursor is the dedupe identity. Retention trims events acknowledged by every
+device's highest stored cursor, clamped to the current head. Replay is idempotent by cursor on the
+client, so delivery is at-least-once and the cursor is the dedupe identity; a replay always ends
+with one `status` event (`idle` when nothing is known). Outbound `preview` frames are bounded to
+the same frame budget with a tail-safe prefix of the streamed text; the final message carries the
+whole answer. Retention trims events acknowledged by every
 active device, then a hard cap of 2 000 keeps the newest; a `hello` below the retention floor
 replays from the floor, so a device that acks never sees a gap, and one that returns after the cap
 was exceeded has an irreducible hole (the app refetches nothing; phase 2 push mitigates this).
@@ -115,8 +121,9 @@ sends have no idempotency key, so an ambiguous outcome is quarantined and never 
 idempotent — so no write-ahead intent or unknown-outcome quarantine exists, and none is needed.
 Everything else follows the Telegram adapter, the delivery-semantics reference: admission before
 submission with a stable request id (`app:send:<key>`), a repeated `send` key answered
-`duplicate: true` with nothing admitted (keys are remembered durably for at least seven days, at
-most 2 000 — see *Known gaps*), the shared-answer retirement of steered inputs, control records
+`duplicate: true` with nothing admitted (keys are remembered for seven days by time-based
+pruning, and a key whose echo is still in the event log stays a duplicate even then — no re-used
+key can ever leave a second echo), the shared-answer retirement of steered inputs, control records
 with held acknowledgements, gating, applied/refused/unconfirmed outcomes and unconfirmed reporting
 at reopen.
 
@@ -169,11 +176,6 @@ reason and a durable fault entry; no raw record contents are logged.
   revision must add one before this channel can carry URLs or questions.
 * **No uploads, media, history, tasks, cards or Web Push.** The protocol marks them *later*;
   `history` and `tasks` reply `unsupported`; a `send` with `attachments` replies `unsupported`.
-* **Send-key idempotency is bounded at 2 000 keys inside seven days.** The protocol promises
-  idempotency "for at least 7 days"; with more than 2 000 distinct keys in that window the oldest
-  is evicted early and a re-used key would be admitted again. The durable request id
-  (`app:send:<key>`) still fences the model turn, so the duplicate becomes an echo, not a second
-  answer.
 * **The event log is capped at 2 000.** Beyond it the oldest events are dropped even if
   unacknowledged; a returning device below the floor replays from the floor with a visible cursor
   gap.
@@ -184,8 +186,6 @@ reason and a durable fault entry; no raw record contents are logged.
 * **Oversize frames beyond eight times the frame bound** are aborted by the WebSocket layer with
   1009 (a network-class close for the app) rather than the gateway's `4400`; the bound itself is
   enforced with `4400` up to that backstop.
-* **The cookie has no `Max-Age`.** The protocol names exactly its four attributes, so the cookie
-  is session-scoped: a device that loses its cookie jar re-pairs with a new code.
 * **Not covered offline:** a real `tailscale serve` proxy, an installed PWA's cookie jar, iOS
   suspension and reconnect backoff, `sw.js` update semantics, and mid-turn process replacement
   (the listener closes all sockets with 1001; the app replays from its stored cursor after
@@ -204,9 +204,12 @@ a temporary store with a faux provider, the real listener on an ephemeral loopba
 synthetic WebSocket client and a controllable clock. It covers config strictness, static paths and
 types, pairing (good/bad/expired/reused codes, the rate limit and its rolling window, label
 uniqueness), the auth close codes (4401, 4409, 4400, 4426), bounded replay with later `hello`
-continuation and ack trimming, idempotent send, a full streaming turn (echo, preview, status,
-answer, settled), reconnect without loss, controls with their replay reporting, revocation,
-oversize frames and callback interception. No tailnet, device, credential or paid inference is
+continuation and ack trimming, idempotent send and the `too_large` text bound, a full streaming
+turn (echo, preview, status, answer, settled), a steered pair answered once with a settled per
+key, reconnect without loss, controls with their replay reporting, a seeded reopen (interrupted
+command reported, held acknowledgement released, a pre-restart turn still answered), a failed run
+(`settled{failed}` with the error presence state), revocation, oversize frames and callback
+interception. No tailnet, device, credential or paid inference is
 used. The `app pair`/`devices`/`revoke` local-socket dispatch is exercised through the same console
 host the running adapter exports; the thin socket layer itself follows the `cron` console's
 existing tests.

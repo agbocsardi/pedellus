@@ -34,12 +34,9 @@ export const APP_LIMITS = Object.freeze({
   maxEvents: 2_000,
   /** Inputs admitted but not yet settled; further input is refused, like the other channels. */
   maxPending: 500,
-  /** `send` keys remembered for idempotency. */
-  maxSendKeys: 2_000,
+  /** `send` keys are remembered for idempotency; pruning is by age only (keys are tiny). */
   sendKeyTtlMs: 7 * 24 * 60 * 60_000,
   maxUnresolvedControls: 64,
-  /** Live device sockets; a further stream for an authenticated device closes the older one. */
-  maxSockets: 16,
 } as const);
 
 /** `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`: 8 characters, no `I`/`O`, case-insensitive input. */

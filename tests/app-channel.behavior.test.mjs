@@ -16,6 +16,8 @@ import {
   appState,
   context,
   deviceClient,
+  fauxAssistantMessage,
+  fauxToolCall,
   openAppStore,
   parseConfig,
   postPair,
@@ -136,7 +138,7 @@ test('pairing creates one single-use code that redeems into a hashed device', { 
     // Input is case-insensitive; the cookie carries exactly the protocol's attributes.
     const exchange = await postPair(base, created.code.toLowerCase(), 'phone');
     assert.equal(exchange.status, 204);
-    assert.match(exchange.cookie, /HttpOnly; Secure; SameSite=Strict; Path=\/v1$/u);
+    assert.match(exchange.cookie, /HttpOnly; Secure; SameSite=Strict; Path=\/v1; Max-Age=34560000$/u);
 
     const devices = await store.gateway.appConsole.console().devices();
     assert.deepEqual(devices.map((device) => device.label), ['phone']);
@@ -309,13 +311,17 @@ test('send is idempotent by key: one echo, one turn, one settlement', { timeout:
     assert.deepEqual({ key: settled.key, outcome: settled.outcome }, { key: 'k1', outcome: 'answered' });
     assert.match(store.captured[0].messages.at(-1).content, /hello there/u);
 
-    // A malformed send is a fixed reply, never a turn.
+    // A malformed send is a fixed reply, never a turn; an over-bound text is `too_large`.
     device.send({ type: 'req', id: 's3', op: 'send', key: 'k2', text: '' });
     await device.wait(() => device.response('s3') !== undefined, 'empty send reply');
     assert.equal(device.response('s3').error, 'bad_request');
     device.send({ type: 'req', id: 's4', op: 'send', key: 'bad key!', text: 'x' });
     await device.wait(() => device.response('s4') !== undefined, 'bad key reply');
     assert.equal(device.response('s4').error, 'bad_request');
+    device.send({ type: 'req', id: 's5', op: 'send', key: 'k3', text: 'x'.repeat(16_001) });
+    await device.wait(() => device.response('s5') !== undefined, 'over-bound send reply');
+    assert.equal(device.response('s5').ok, false);
+    assert.equal(device.response('s5').error, 'too_large');
     await device.close();
   });
 });
@@ -336,7 +342,10 @@ test('a full turn echoes, previews, answers and settles in protocol order', { ti
       'preview and settlement');
 
     const order = device.frames.filter((frame) => frame.type === 'event').map((frame) => frame.event);
-    assert.equal(order[0], 'message', 'the admission echo comes first');
+    // The hello replay always ends with the current presence state; the echo comes after it.
+    assert.equal(order[0], 'status', 'hello ends with the presence state');
+    assert.equal(device.events('status')[0].state, 'idle', 'an unknown presence is idle');
+    assert.equal(order[1], 'message', 'the admission echo comes next');
     assert.ok(order.includes('preview'), 'a preview arrived while the turn ran');
     assert.ok(device.events('preview').every((event) => event.key === 'k1'));
     assert.ok(device.events('status').some((event) => event.state === 'thinking'),
@@ -517,6 +526,140 @@ test('a callback-shaped send is consumed before admission and never stored', { t
     const state = await appState(store.gateway);
     assert.equal(JSON.stringify(state).includes('secret-code'), false, 'the callback text is never stored');
     assert.equal(store.captured.length, 0);
+    await device.close();
+  });
+});
+
+test('a steering owner message joins the tool round and the pair is answered once', { timeout: 30_000 }, async () => {
+  await withChannel('steer', {
+    followUpMode: 'steer',
+    tools: ['read'],
+    files: { 'note.md': 'synthetic note\n' },
+    adapter: { followUpMode: 'steer' },
+  }, async ({ store, base }) => {
+    // The first response opens a tool round, so the steered sibling has a boundary to join — the
+    // same shape the Telegram and Discord steer checks use.
+    store.script([
+      () => fauxAssistantMessage(fauxToolCall('read', { path: 'note.md' }, { id: 'call-1' }), { stopReason: 'toolUse' }),
+      () => fauxAssistantMessage('SHARED-STEER-ANSWER'),
+    ]);
+    const cookie = await pairedDevice(store, base);
+    const device = deviceClient(base, cookie);
+    await device.open();
+    device.send({ type: 'req', id: 'h1', op: 'hello', v: 1, cursor: null });
+    await device.wait(() => device.response('h1') !== undefined, 'hello reply');
+
+    const entered = store.gate.hold();
+    device.send({ type: 'req', id: 's1', op: 'send', key: 'k1', text: 'the first steering message' });
+    await entered;
+    device.send({ type: 'req', id: 's2', op: 'send', key: 'k2', text: 'the second steering message' });
+    await device.wait(() => device.response('s2') !== undefined, 'the second send admitted');
+    assert.deepEqual(device.response('s2').duplicate, false);
+    store.gate.release();
+
+    // Both keys are consumed by one run: one assistant answer, one settled per key, no second turn.
+    await device.wait(() => device.events('settled').length === 2, 'both keys settled');
+    const answered = device.events('message').filter((event) => event.role === 'assistant');
+    assert.equal(answered.length, 1, 'the steered sibling must not answer again');
+    assert.equal(answered[0].text, 'SHARED-STEER-ANSWER');
+    assert.equal(answered[0].key, 'k1', 'the answer is attributed to the run\'s first input');
+    const settled = device.events('settled').map((event) => [event.key, event.outcome]);
+    assert.deepEqual(settled, [['k1', 'answered'], ['k2', 'answered']]);
+    const texts = store.captured.at(-1).messages.filter((message) => message.role === 'user').map((message) =>
+      typeof message.content === 'string' ? message.content
+        : message.content.filter((part) => part.type === 'text').map((part) => part.text).join(''));
+    assert.ok(texts.some((text) => text.includes('first steering message')));
+    assert.ok(texts.some((text) => text.includes('second steering message')), 'the steer joined the same run');
+    const state = await appState(store.gateway);
+    assert.equal(state.pending.length, 0, 'the shared answer retired both records');
+    await device.close();
+  });
+});
+
+test('a reopen reports interrupted controls, releases held acknowledgements and answers admitted work', { timeout: 30_000 }, async () => {
+  // Seed the channel exactly as a crash would have left it: one admitted-but-unconfirmed command
+  // with its held acknowledgement, one applied command whose acknowledgement never went out, and
+  // one turn admitted before the process died without ever being submitted.
+  const store = await openAppStore('recovery', {});
+  const { AppState } = await import(new URL('../dist/channels/app.js', import.meta.url).href);
+  const stateConversation = await store.gateway.conversationFor('app:channel-state', context);
+  await stateConversation.commit(async (tx) => {
+    const doc = await tx.doc(AppState, stateConversation.id);
+    doc.events.push({
+      event: 'message', cursor: 1, id: 'send:pre-restart', role: 'user',
+      text: 'answer me after the restart', at: new Date(0).toISOString(), key: 'pre-restart',
+    });
+    doc.nextCursor = 2;
+    doc.sendKeys = [{ key: 'pre-restart', atMs: Date.now() }];
+    doc.origin = { admittedAtMs: Date.now() };
+    doc.controls = [
+      { key: 'c:interrupted', command: 'new', status: 'admitted' },
+      { key: 'c:applied', command: 'new', status: 'applied' },
+    ];
+    doc.nextNoticeSeq = 3;
+    doc.pending = [
+      { key: 'c:interrupted', text: 'Context reset.', admittedAtMs: 1, notice: true, noticeSeq: 1, hold: true },
+      { key: 'c:applied', text: 'Context reset.', admittedAtMs: 2, notice: true, noticeSeq: 2, hold: true },
+      { key: 'pre-restart', text: 'answer me after the restart', admittedAtMs: 3 },
+    ];
+  }, context);
+  const app = startApp(store);
+  const base = `http://127.0.0.1:${await app.port}`;
+  try {
+    const cookie = await pairedDevice(store, base);
+    const device = deviceClient(base, cookie);
+    await device.open();
+    device.send({ type: 'req', id: 'h1', op: 'hello', v: 1, cursor: null });
+    await device.wait(() => device.response('h1') !== undefined, 'hello reply');
+
+    // The interrupted command is reported once, never replayed.
+    await device.wait(() => device.events('message').some((event) =>
+      event.role === 'notice' && /Command interrupted; outcome unknown/u.test(event.text)),
+      'the interrupted command is reported');
+    // The applied command's held acknowledgement is released with its original text.
+    await device.wait(() => device.events('message').filter((event) =>
+      event.role === 'notice' && event.text === 'Context reset.').length === 1,
+      'the applied acknowledgement is released');
+    // The turn admitted before the restart is submitted and answered after it.
+    await device.wait(() => device.events('settled').some((event) =>
+      event.key === 'pre-restart' && event.outcome === 'answered'), 'the pre-restart turn settled');
+    const answer = device.events('message').find((event) => event.role === 'assistant');
+    assert.ok(answer !== undefined);
+    assert.match(store.captured.at(-1).messages.at(-1).content, /answer me after the restart/u);
+
+    const state = await appState(store.gateway);
+    // The interrupted command's report was delivered, so its unconfirmed record is pruned — the
+    // same terminal-report rule the Telegram controls log keeps. The applied record stays.
+    assert.deepEqual(state.controls.map((entry) => [entry.key, entry.status]),
+      [['c:applied', 'applied']]);
+    assert.equal(state.pending.length, 0, 'nothing is left queued after recovery');
+    await device.close();
+  } finally {
+    await app.stop();
+    await store.close();
+  }
+});
+
+test('a failed run settles its key as failed and reports the error state', { timeout: 30_000 }, async () => {
+  await withChannel('failed-run', {}, async ({ store, base }) => {
+    store.script([() => { throw new Error('synthetic provider failure'); }]);
+    const cookie = await pairedDevice(store, base);
+    const device = deviceClient(base, cookie);
+    await device.open();
+    device.send({ type: 'req', id: 'h1', op: 'hello', v: 1, cursor: null });
+    await device.wait(() => device.response('h1') !== undefined, 'hello reply');
+    device.send({ type: 'req', id: 's1', op: 'send', key: 'k1', text: 'this run will fail' });
+    await device.wait(() => device.response('s1') !== undefined, 'send admitted');
+
+    await device.wait(() => device.events('settled').length === 1, 'the failed run settled');
+    const settled = device.events('settled')[0];
+    assert.deepEqual({ key: settled.key, outcome: settled.outcome }, { key: 'k1', outcome: 'failed' });
+    assert.ok(device.events('message').every((event) => event.role !== 'assistant'),
+      'a failed run answers with no assistant message');
+    assert.ok(device.events('status').some((event) => event.state === 'error'),
+      'the error presence state was reported');
+    const state = await appState(store.gateway);
+    assert.equal(state.pending.length, 0, 'the failed record was retired');
     await device.close();
   });
 });

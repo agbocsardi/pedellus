@@ -8,10 +8,10 @@
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { context, fauxModels } from './discord-harness.mjs';
-export { context };
+export { context, fauxAssistantMessage, fauxToolCall } from './discord-harness.mjs';
 
 const modules = join(new URL('../../', import.meta.url).pathname, 'node_modules/@earendil-works');
 export const { withCancel } = await import(`${modules}/chord/dist/context/index.js`);
@@ -50,6 +50,11 @@ export async function openAppStore(label, options = {}) {
     const workspace = join(directory, 'workspace');
     const staticRoot = options.staticRoot ?? await makeStaticRoot(directory);
     await mkdir(workspace, { recursive: true });
+    for (const [relativePath, content] of Object.entries(options.files ?? {})) {
+      const path = join(workspace, ...relativePath.split('/'));
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, content);
+    }
     const captured = [];
     const { models, gate } = fauxModels(captured, options);
     const model = { provider: 'fixture', modelId: 'alpha' };

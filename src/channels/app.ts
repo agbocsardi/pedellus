@@ -28,7 +28,7 @@
  * channel state is forbidden by the other channels' binding contract. A callback-shaped `send` is
  * consumed before admission and never stored.
  */
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { defineDoc, AssistantEntry, ConversationBusy, LiveDoc } from "@earendil-works/pi-durable";
 import type { Context, Draft } from "@earendil-works/chord";
 import { copyJson } from "@earendil-works/chord";
@@ -56,8 +56,9 @@ import {
   parseHelloCursor,
   validAppLabel,
   type AppControlRecord,
-  type AppDurableEvent,
   type AppDeviceRecord,
+  type AppDurableEvent,
+  type AppErrorCode,
   type AppPairingRecord,
   type AppPendingInput,
 } from "./app-protocol.js";
@@ -216,6 +217,13 @@ type AppEventInput =
 
 const sha256 = (value: string): string => createHash("sha256").update(value, "utf8").digest("hex");
 
+/** Constant-time comparison of one presented value against a stored hex digest. */
+function sameDigest(presented: string, storedHash: string): boolean {
+  const known = Buffer.from(storedHash, "hex");
+  const candidate = createHash("sha256").update(presented, "utf8").digest();
+  return known.length === candidate.length && timingSafeEqual(known, candidate);
+}
+
 function newDeviceToken(): string {
   return randomBytes(32).toString("base64url");
 }
@@ -257,13 +265,12 @@ function isConversationBusy(error: unknown): boolean {
   return error instanceof ConversationBusy || (error instanceof Error && error.name === "ConversationBusy");
 }
 
-/** `send` key idempotency window: entries live at least seven days, then the oldest is evicted. */
+/** `send` key idempotency window: entries are pruned by age only, so the window is really seven days. */
 function pruneSendKeys(
   keys: readonly { readonly key: string; readonly atMs: number }[],
   nowMs: number,
 ): { readonly key: string; readonly atMs: number }[] {
-  const fresh = keys.filter((entry) => nowMs - entry.atMs < APP_LIMITS.sendKeyTtlMs);
-  return fresh.length > APP_LIMITS.maxSendKeys ? fresh.slice(fresh.length - APP_LIMITS.maxSendKeys) : fresh;
+  return keys.filter((entry) => nowMs - entry.atMs < APP_LIMITS.sendKeyTtlMs);
 }
 
 /** Trim the durable event log: acknowledged events first, then the hard cap keeps the newest. */
@@ -457,9 +464,9 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   const wireEvent = (event: AppDurableEvent): string =>
     JSON.stringify({ type: "event", ...event } as Record<string, unknown>);
 
-  /** Push every durable event after one socket's position, in order. */
+  /** Push every durable event after one socket's position, in order; only hello'd sockets receive live events. */
   const pushEvents = (socket: LiveSocket): void => {
-    if (!socket.session.isOpen()) return;
+    if (!socket.hello || !socket.session.isOpen()) return;
     for (const event of state.events) {
       if (event.cursor <= socket.lastSent) continue;
       socket.session.send(wireEvent(event));
@@ -480,14 +487,6 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     for (const socket of sockets.values()) {
       if (socket.hello && socket.session.isOpen()) socket.session.send(frame);
     }
-  };
-
-  /** One commit appends a durable event and immediately pushes it to every live socket. */
-  const appendDurable = async (event: AppEventInput): Promise<void> => {
-    await mutateState((doc) => {
-      appendEvent(doc, event);
-    });
-    pushEventsToSockets();
   };
 
   // ── Sockets ───────────────────────────────────────────────────────────────
@@ -513,16 +512,6 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     });
   };
 
-  const reply = (socket: LiveSocket, id: string, body: Record<string, unknown>): void => {
-    if (!socket.session.isOpen()) return;
-    socket.session.send(JSON.stringify({ type: "res", id, ok: true, ...body }));
-  };
-
-  const replyError = (socket: LiveSocket, id: string, error: "bad_request" | "too_large" | "unsupported" | "not_ready" | "internal"): void => {
-    if (!socket.session.isOpen()) return;
-    socket.session.send(JSON.stringify({ type: "res", id, ok: false, error }));
-  };
-
   async function handleFrame(socket: LiveSocket, text: string): Promise<void> {
     let frame: Record<string, unknown>;
     try {
@@ -542,43 +531,70 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       socket.session.close(APP_CLOSE.protocol, "hello first");
       return;
     }
-    switch (frame.op) {
-      case "hello":
-        await handleHello(socket, id, frame);
-        return;
-      case "send":
-        await handleSendFrame(socket, id, frame);
-        return;
-      case "ack":
-        await handleAck(socket, id, frame);
-        return;
-      case "control":
-        await handleControlFrame(socket, id, frame);
-        return;
-      case "ping":
-        reply(socket, id, {});
-        return;
-      case "history":
-      case "tasks":
-        replyError(socket, id, "unsupported");
-        return;
-      default:
-        socket.session.close(APP_CLOSE.protocol, "unknown op");
+    // Exactly one reply per request, even on an unexpected failure: the helpers mark the request
+    // answered, so the catch below never leaves a request silent and never double-replies.
+    let answered = false;
+    const sendOk = (body: Record<string, unknown> = {}): void => {
+      answered = true;
+      if (socket.session.isOpen()) {
+        socket.session.send(JSON.stringify({ type: "res", id, ok: true, ...body }));
+      }
+    };
+    const sendError = (error: AppErrorCode): void => {
+      answered = true;
+      if (socket.session.isOpen()) {
+        socket.session.send(JSON.stringify({ type: "res", id, ok: false, error }));
+      }
+    };
+    try {
+      switch (frame.op) {
+        case "hello":
+          await handleHello(socket, frame, sendOk, sendError);
+          return;
+        case "send":
+          await handleSendFrame(socket, frame, sendOk, sendError);
+          return;
+        case "ack":
+          await handleAck(socket, frame, sendOk, sendError);
+          return;
+        case "control":
+          await handleControlFrame(socket, frame, sendOk, sendError);
+          return;
+        case "ping":
+          sendOk();
+          return;
+        case "history":
+        case "tasks":
+          sendError("unsupported");
+          return;
+        default:
+          socket.session.close(APP_CLOSE.protocol, "unknown op");
+      }
+    } catch (error) {
+      if (stopping || signal?.aborted) return;
+      // A request is never left unanswered: an unexpected failure is one fixed `internal` reply.
+      journalEvent("app.request.failed", { op: String(frame.op) }, error);
+      if (!answered) sendError("internal");
     }
   }
 
-  async function handleHello(socket: LiveSocket, id: string, frame: Record<string, unknown>): Promise<void> {
+  async function handleHello(
+    socket: LiveSocket,
+    frame: Record<string, unknown>,
+    sendOk: (body?: Record<string, unknown>) => void,
+    sendError: (error: AppErrorCode) => void,
+  ): Promise<void> {
     if (frame.v !== APP_PROTOCOL_VERSION) {
       socket.session.close(APP_CLOSE.version, "unsupported version");
       return;
     }
     const cursor = parseHelloCursor(frame.cursor);
     if (cursor === undefined) {
-      replyError(socket, id, "bad_request");
+      sendError("bad_request");
       return;
     }
     socket.hello = true;
-    reply(socket, id, { v: APP_PROTOCOL_VERSION, device: socket.session.label, head: headCursor() });
+    sendOk({ v: APP_PROTOCOL_VERSION, device: socket.session.label, head: headCursor() });
     // Replay from the acknowledged position (or the retention floor), oldest first, bounded.
     const head = headCursor();
     socket.lastSent = head === null ? state.floor : Math.min(Math.max(cursor ?? 0, state.floor), head);
@@ -591,40 +607,57 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       socket.lastSent = event.cursor;
       sent += 1;
     }
-    // After the replay the socket learns the current presence state.
-    if (lastStatus !== undefined && socket.session.isOpen()) {
-      socket.session.send(JSON.stringify({ type: "event", event: "status", state: lastStatus }));
+    // After the replay the socket always learns the current presence state; unknown means idle.
+    if (socket.session.isOpen()) {
+      socket.session.send(JSON.stringify({ type: "event", event: "status", state: lastStatus ?? "idle" }));
     }
   }
 
-  async function handleAck(socket: LiveSocket, id: string, frame: Record<string, unknown>): Promise<void> {
+  async function handleAck(
+    socket: LiveSocket,
+    frame: Record<string, unknown>,
+    sendOk: (body?: Record<string, unknown>) => void,
+    sendError: (error: AppErrorCode) => void,
+  ): Promise<void> {
     const cursor = parseHelloCursor(frame.cursor);
     if (cursor === null || cursor === undefined) {
-      replyError(socket, id, "bad_request");
+      sendError("bad_request");
       return;
     }
     const deviceId = socket.session.deviceId;
     await mutateState((doc) => {
+      // An ack never advances past what exists: clamping keeps the retention cursor honest.
+      const head = doc.events.length === 0 ? doc.floor : doc.events.at(-1)!.cursor;
+      const clamped = Math.min(cursor, head);
       const previous = doc.acks[deviceId];
-      if (previous !== undefined && Number.isSafeInteger(previous) && previous >= cursor) return;
-      doc.acks[deviceId] = cursor;
+      if (previous !== undefined && Number.isSafeInteger(previous) && previous >= clamped) return;
+      doc.acks[deviceId] = clamped;
       pruneEvents(doc);
     });
-    reply(socket, id, {});
+    sendOk();
   }
 
   // ── Ingress ───────────────────────────────────────────────────────────────
 
-  async function handleSendFrame(socket: LiveSocket, id: string, frame: Record<string, unknown>): Promise<void> {
+  async function handleSendFrame(
+    socket: LiveSocket,
+    frame: Record<string, unknown>,
+    sendOk: (body?: Record<string, unknown>) => void,
+    sendError: (error: AppErrorCode) => void,
+  ): Promise<void> {
     const key = frame.key;
     const text = frame.text;
     if (typeof key !== "string" || !APP_LIMITS.idPattern.test(key) ||
-        typeof text !== "string" || text.length === 0 || text.length > APP_LIMITS.sendTextChars) {
-      replyError(socket, id, "bad_request");
+        typeof text !== "string" || text.length === 0) {
+      sendError("bad_request");
+      return;
+    }
+    if (text.length > APP_LIMITS.sendTextChars) {
+      sendError("too_large");
       return;
     }
     if (frame.attachments !== undefined) {
-      replyError(socket, id, "unsupported");
+      sendError("unsupported");
       return;
     }
     // A callback-shaped body is consumed before admission; neither its text nor its values are stored.
@@ -641,7 +674,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         });
       });
       pushEventsToSockets();
-      reply(socket, id, { duplicate: false });
+      sendOk({ duplicate: false });
       return;
     }
     let duplicate = true;
@@ -649,6 +682,8 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       await mutateState((doc) => {
         if (doc.sendKeys.some((entry) => entry.key === key)) return;
         if (doc.pending.some((entry) => entry.key === key && entry.notice !== true)) return;
+        // A key whose echo is still in the log is a duplicate even if its window entry was pruned.
+        if (hasEventId(doc, `send:${key}`)) return;
         if (doc.pending.length >= APP_LIMITS.maxPending) throw new Error(QUEUE_FULL);
         duplicate = false;
         appendEvent(doc, {
@@ -672,15 +707,15 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       if (stopping || signal?.aborted) return;
       if (error instanceof Error && error.message === QUEUE_FULL) {
         journalEvent("app.send.refused", { reason: "queue-full" });
-        replyError(socket, id, "not_ready");
+        sendError("not_ready");
         return;
       }
       journalEvent("app.send.failed", {}, error);
-      replyError(socket, id, "internal");
+      sendError("internal");
       return;
     }
     pushEventsToSockets();
-    reply(socket, id, { duplicate });
+    sendOk({ duplicate });
     if (!duplicate) {
       journalEvent("app.admitted", { "send.key": key, "queue.depth": state.pending.length });
       void releaseWithheld();
@@ -789,7 +824,16 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     };
     const publishPreview = async (text: string): Promise<void> => {
       if (text.trim() === "" || signal?.aborted) return;
-      const frame = JSON.stringify({ type: "event", event: "preview", key: item.key, text });
+      // A preview must fit one frame; the final message carries the whole answer, so a cut is honest.
+      // Shrinking by the escaped-JSON overshoot keeps the tail-safe prefix inside the frame bound.
+      let shown = text;
+      let frame = JSON.stringify({ type: "event", event: "preview", key: item.key, text: shown });
+      while (frame.length > APP_LIMITS.frameBytes && shown.length > 0) {
+        const overshoot = frame.length - APP_LIMITS.frameBytes;
+        shown = shown.slice(0, Math.max(0, shown.length - Math.max(64, Math.ceil(overshoot * 1.2))));
+        if (shown.length > 0 && /[\uD800-\uDBFF]/u.test(shown.at(-1) ?? "")) shown = shown.slice(0, -1);
+        frame = JSON.stringify({ type: "event", event: "preview", key: item.key, text: shown });
+      }
       for (const socket of sockets.values()) {
         if (socket.hello && socket.session.isOpen()) socket.session.send(frame);
       }
@@ -990,27 +1034,39 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
 
   // ── Controls ──────────────────────────────────────────────────────────────
 
-  async function handleControlFrame(socket: LiveSocket, id: string, frame: Record<string, unknown>): Promise<void> {
+  async function handleControlFrame(
+    socket: LiveSocket,
+    frame: Record<string, unknown>,
+    sendOk: (body?: Record<string, unknown>) => void,
+    sendError: (error: AppErrorCode) => void,
+  ): Promise<void> {
     const command = frame.command;
     if (typeof command !== "string") {
-      replyError(socket, id, "bad_request");
+      sendError("bad_request");
       return;
     }
     if (APP_LATER_COMMANDS.includes(command)) {
-      replyError(socket, id, "unsupported");
+      sendError("unsupported");
       return;
     }
     if (command !== "new" && command !== "abort" && command !== "status") {
-      replyError(socket, id, "bad_request");
+      sendError("bad_request");
       return;
     }
-    const key = `c:${id}`;
+    const key = `c:${frame.id as string}`;
     const recorded = state.controls.find((entry) => entry.key === key);
     if (recorded !== undefined) {
+      // While the command is still applying its acknowledgement is still held: a reused request id
+      // is simply answered, and the notice the command itself releases remains the visible result.
+      // Marking it unconfirmed or releasing the ack here would misreport a live command.
+      if (state.pending.some((entry) => entry.key === key && entry.hold === true) || deferredControls.has(key)) {
+        sendOk();
+        return;
+      }
       // The command was durably admitted before its effect, so a replay reports it instead of rerunning.
       if (recorded.status === "admitted") await markControlUnconfirmed(key);
       await admitNotice(key, replayControlText(recorded));
-      reply(socket, id, {});
+      sendOk();
       drain();
       return;
     }
@@ -1020,7 +1076,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       } else {
         await admitNotice(key, await statusNotice());
       }
-      reply(socket, id, {});
+      sendOk();
       drain();
       return;
     }
@@ -1030,14 +1086,14 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     } catch (error) {
       if (stopping || signal?.aborted) return;
       if (error instanceof Error && error.message === QUEUE_FULL) {
-        replyError(socket, id, "not_ready");
+        sendError("not_ready");
         return;
       }
       journalEvent("app.control.failed", {}, error);
-      replyError(socket, id, "internal");
+      sendError("internal");
       return;
     }
-    reply(socket, id, {});
+    sendOk();
   }
 
   /** Queue one bounded host notice through the same durable pending queue every reply uses. */
@@ -1499,17 +1555,16 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       countPairingFailure();
       return { status: "bad-request" };
     }
-    const hash = sha256(code.toUpperCase());
     let token: string | undefined;
     await mutateState((doc) => {
       prunePairings(doc);
-      const pairing = doc.pairings.find((entry) => entry.codeHash === hash);
+      const pairing = doc.pairings.find((entry) => sameDigest(code.toUpperCase(), entry.codeHash));
       if (pairing === undefined) return;
       if (pairing.label !== undefined && pairing.label !== label) return;
       if (doc.devices.some((device) => device.revokedAtMs === undefined && device.label === label)) return;
       if (doc.devices.filter((device) => device.revokedAtMs === undefined).length >= APP_LIMITS.maxDevices) return;
       // Single use: the code is consumed exactly when the device record is created.
-      doc.pairings = doc.pairings.filter((entry) => entry.codeHash !== hash);
+      doc.pairings = doc.pairings.filter((entry) => !sameDigest(code.toUpperCase(), entry.codeHash));
       token = newDeviceToken();
       doc.devices.push({
         id: randomBytes(16).toString("hex"),
@@ -1528,8 +1583,8 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
 
   const authenticate = async (token: string): Promise<{ deviceId: string; label: string } | undefined> => {
     if (token.length === 0 || token.length > 256) return undefined;
-    const hash = sha256(token);
-    const device = state.devices.find((entry) => entry.tokenHash === hash && entry.revokedAtMs === undefined);
+    const device = state.devices.find((entry) =>
+      entry.revokedAtMs === undefined && sameDigest(token, entry.tokenHash));
     return device === undefined ? undefined : { deviceId: device.id, label: device.label };
   };
 
@@ -1581,22 +1636,19 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       return;
     }
     const id = `outbox:${record.id}`;
-    // A crash after the append but before the outbox update must not duplicate the event.
-    if (state.events.some((event) => event.event === "message" && event.id === id)) {
-      await updateScheduled(sessionKey, record.id, (entry) => {
-        entry.status = "delivered";
-        entry.settledAt = now();
-        delete entry.error;
-      }, cleanupContext);
-      return;
-    }
-    await appendDurable({
-      event: "message",
-      id,
-      role: isTurnInterruptionNotice(record) ? "notice" : "assistant",
-      text: record.text,
-      at: new Date(now()).toISOString(),
+    // The dedupe and the append share one commit, like the notice path: a crash between them can
+    // never duplicate the event, and a concurrent scan finds the id already in the log.
+    await mutateState((doc) => {
+      if (hasEventId(doc, id)) return;
+      appendEvent(doc, {
+        event: "message",
+        id,
+        role: isTurnInterruptionNotice(record) ? "notice" : "assistant",
+        text: record.text,
+        at: new Date(now()).toISOString(),
+      });
     });
+    pushEventsToSockets();
     await updateScheduled(sessionKey, record.id, (entry) => {
       entry.status = "delivered";
       entry.settledAt = now();

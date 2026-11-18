@@ -230,11 +230,12 @@ export async function startAppListener(options: {
       response.end(text);
       return;
     }
-    // Exactly the protocol's cookie attributes; no `Max-Age` is specified, so the cookie is
-    // session-scoped and a lost jar means re-pairing.
+    // Exactly the protocol's cookie attributes. `Max-Age=34560000` (400 days) is required by v1:
+    // iOS drops session cookies when a home-screen app closes, so without it every suspension
+    // would force a re-pairing.
     response.setHeader(
       "set-cookie",
-      `${APP_LIMITS.cookieName}=${result.token}; HttpOnly; Secure; SameSite=Strict; Path=/v1`,
+      `${APP_LIMITS.cookieName}=${result.token}; HttpOnly; Secure; SameSite=Strict; Path=/v1; Max-Age=34560000`,
     );
     response.writeHead(204);
     response.end();
