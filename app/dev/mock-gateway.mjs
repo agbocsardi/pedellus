@@ -11,6 +11,7 @@ const FRAME_BYTES = 262_144;
 const SEND_TEXT_CHARS = 16_000;
 const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const REPLAY_BATCH = 500;
+const IDLE_ARCHIVE_MS = Number(process.env.IDLE_ARCHIVE_MS ?? 14 * 24 * 60 * 60 * 1000);
 const LABEL_RE = /^[^\p{Cc}\u2028\u2029]{1,40}$/u;
 const TITLE_RE = /^[^\p{Cc}\u2028\u2029]{1,80}$/u;
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // [A-Z2-9] minus I, O
@@ -40,9 +41,9 @@ const rateFailures = [];
 
 const iso = () => new Date().toISOString();
 
-function addThread(id, title) {
+function addThread(id, title, origin) {
   const at = iso();
-  const thread = { info: { id, title, archived: false, createdAt: at, lastAt: at }, state: "idle", running: null, queue: [] };
+  const thread = { info: { id, title, archived: false, origin, createdAt: at, lastAt: at }, state: "idle", running: null, queue: [] };
   threads.set(id, thread);
   return thread;
 }
@@ -74,6 +75,17 @@ function threadChanged(thread) {
   // Keep a snapshot in replay, not a pointer to mutable metadata.
   broadcast({ type: "event", event: "thread", thread: { ...thread.info } });
 }
+
+function archiveIdle() {
+  for (const t of threads.values()) {
+    if (t === main || t.info.archived || t.running || t.queue.length) continue;
+    if (Date.now() - Date.parse(t.info.lastAt) < IDLE_ARCHIVE_MS) continue;
+    t.info.archived = true;
+    t.info.archivedReason = "idle";
+    threadChanged(t);
+  }
+}
+if (IDLE_ARCHIVE_MS > 0) setInterval(archiveIdle, Math.min(IDLE_ARCHIVE_MS, 1000)).unref();
 
 function notice(thread, text) {
   emit(thread, "message", { id: `n${cursor + 1}`, role: "notice", text, at: iso() });
@@ -297,24 +309,41 @@ function onStream(ws, token) {
         break;
       }
       case "threads": {
+        const { query } = frame;
+        if (query !== undefined && (typeof query !== "string" || !TITLE_RE.test(query))) return invalid();
+        const list = [...threads.values()].map((t) => t.info).sort((a, b) => b.lastAt.localeCompare(a.lastAt));
         let archived = 0;
-        const list = [...threads.values()].map((t) => t.info)
-          .sort((a, b) => b.lastAt.localeCompare(a.lastAt))
-          .filter((t) => !t.archived || archived++ < 200);
-        reply(ws, frame.id, true, { threads: list });
+        reply(ws, frame.id, true, { threads: query === undefined
+          ? list.filter((t) => !t.archived || archived++ < 200)
+          : list.filter((t) => t.title.toLowerCase().includes(query.toLowerCase())).slice(0, 200) });
         break;
       }
       case "thread.create": {
-        const { key, title = "New thread" } = frame;
+        const { key, title = "New thread", from } = frame;
         if (typeof key !== "string" || !ID_RE.test(key) || typeof title !== "string" || !TITLE_RE.test(title)) return invalid();
         const existing = created.get(key);
         if (existing) return reply(ws, frame.id, true, { thread: existing, duplicate: true });
         if (full()) return invalid();
+        let source = [];
+        let origin;
+        if (from !== undefined) {
+          if (!from || typeof from.messageId !== "string" || !threads.has(from.thread)) return invalid();
+          const messages = events.filter((e) => e.event === "message" && e.thread === from.thread && e.role !== "notice");
+          const anchor = messages.findIndex((e) => e.id === from.messageId);
+          if (anchor < 0) return invalid();
+          source = messages.slice(0, anchor + 1);
+          origin = { thread: from.thread, messageId: from.messageId };
+        }
         const id = `t_${randomBytes(12).toString("hex")}`;
-        const added = addThread(id, title);
+        const added = addThread(id, title, origin);
         created.set(key, id);
         reply(ws, frame.id, true, { thread: id, duplicate: false });
         threadChanged(added);
+        // Synthetic transcript: copy visible history with fresh identity and
+        // without send keys (inherited messages aren't admissions).
+        for (const { role, text, at } of source) {
+          broadcast({ type: "event", event: "message", thread: id, id: `f${cursor + 1}`, role, text, at });
+        }
         break;
       }
       case "thread.rename": {
@@ -332,6 +361,11 @@ function onStream(ws, token) {
           for (const key of thread.queue.splice(0)) emit(thread, "settled", { key, outcome: "aborted" });
         }
         thread.info.archived = archived;
+        if (archived) thread.info.archivedReason = "manual";
+        else {
+          delete thread.info.archivedReason;
+          thread.info.lastAt = iso();
+        }
         reply(ws, frame.id, true);
         threadChanged(thread);
         break;

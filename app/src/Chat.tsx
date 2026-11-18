@@ -2,14 +2,16 @@ import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type 
 import { Streamdown } from "streamdown";
 import type { Connection } from "./conn";
 import type { AgentStatus, Outgoing, OutgoingState, Store } from "./store";
-import { LIMITS, MAIN_THREAD, type DurableEvent, type ThreadInfo } from "./protocol";
+import { LIMITS, MAIN_THREAD, type DurableEvent, type ThreadInfo, type ThreadOrigin } from "./protocol";
 import { Avatar, type AvatarState } from "./Avatar";
 
 const FINE_POINTER = matchMedia("(pointer: fine)").matches;
 
 type Row = { kind: "ev"; ev: DurableEvent } | { kind: "pending"; m: Outgoing };
 type Tone = "ok" | "run" | "warn" | "bad";
-type Sheet = { kind: "list" | "menu" } | { kind: "create" | "rename" | "message"; title: string };
+type Sheet = { kind: "list" | "menu" } | { kind: "rename"; title: string }
+  | { kind: "create"; title: string; from?: ThreadOrigin }
+  | { kind: "message"; title: string; from: ThreadOrigin };
 const LIST_ICON = "M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01";
 const TITLE_CONTROL = /[\p{Cc}\u2028\u2029]/u;
 
@@ -18,9 +20,14 @@ function suggestedTitle(text: string) {
     .replace(/[\uD800-\uDBFF]$/u, "").trimEnd();
 }
 
-function messageTitle(target: EventTarget | null) {
+function forkAction(target: EventTarget | null, thread: string): Sheet | undefined {
   if (!(target instanceof Element) || target.closest("a, button, input, summary")) return;
-  return target.closest<HTMLElement>("[data-thread-title]")?.dataset.threadTitle;
+  const data = target.closest<HTMLElement>("[data-message-id]")?.dataset;
+  if (data?.messageId) return { kind: "message", title: data.threadTitle ?? "", from: { thread, messageId: data.messageId } };
+}
+
+function archivedLabel(t: ThreadInfo | undefined) {
+  return t?.archivedReason === "idle" ? "Archived · idle" : "Archived";
 }
 
 /** One place maps connection + agent status to the header line and avatar. */
@@ -81,6 +88,18 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   const preview = archived ? undefined : store.preview(thread);
   const p = presence(store);
   const latest = store.latestViewable(thread);
+  const source = store.threads.get(info?.origin?.thread ?? MAIN_THREAD);
+  const back = source ?? store.threads.get(MAIN_THREAD)!;
+  const forks = new Map<string, ThreadInfo[]>();
+  let hasOtherActivity = false;
+  for (const t of store.threads.values()) {
+    if (t.id !== thread && (store.isUnread(t.id) || isRunning(store.status(t.id).state))) hasOtherActivity = true;
+    if (t.origin?.thread === thread) {
+      const children = forks.get(t.origin.messageId) ?? [];
+      children.push(t);
+      forks.set(t.origin.messageId, children);
+    }
+  }
 
   const rows: Row[] = (store.events.get(thread) ?? []).map((ev) => ({ kind: "ev", ev }));
   for (const m of store.outbox.values()) {
@@ -192,7 +211,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
           setError("Archive a side thread before creating another.");
           return;
         }
-        const create = await store.queueCreate(name || undefined);
+        const create = await store.queueCreate(name || undefined, sheet?.kind === "create" ? sheet.from : undefined);
         setSheet({ kind: "list" });
         conn.sendCreate(create, online ? thread : undefined);
       }
@@ -223,21 +242,25 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   return (
     <div className="app">
       <header className="top">
+        {!main && <button className="thread-back" onClick={() => store.selectThread(back.id)}
+          aria-label={`Back to ${back.id === MAIN_THREAD ? "Main" : back.title}`}>
+          <span aria-hidden="true">‹</span><span>{back.id === MAIN_THREAD ? "Main" : back.title}</span>
+        </button>}
         <div className="who">
           <div className="avatar-slot">
             <Avatar state={p.avatar} />
           </div>
           <div className="who-text">
-            <h1>{title}</h1>
+            <h1><button className="thread-switch" aria-label={`${title}, open threads`} aria-haspopup="dialog"
+              aria-expanded={sheet?.kind === "list"} onClick={(e) => { e.currentTarget.focus(); show({ kind: "list" }); }}>
+              <span className="switch-title">{title}</span><span aria-hidden="true">▾</span>
+              {hasOtherActivity && <span className="thread-dot" role="img" aria-label="Activity in another thread" />}
+            </button></h1>
             <p className="presence" data-tone={p.tone} aria-live="polite">
               {p.text}
             </p>
           </div>
         </div>
-        <button className="icon-btn" aria-label="Open threads" aria-haspopup="dialog"
-          aria-expanded={sheet?.kind === "list"} onClick={(e) => { e.currentTarget.focus(); show({ kind: "list" }); }}>
-          <Icon d={LIST_ICON} bold />
-        </button>
         <button
           className="icon-btn"
           aria-label="Thread menu"
@@ -260,20 +283,20 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
           if (pinned.current) markAtBottom(el);
         }}
         onContextMenu={(e) => {
-          const title = messageTitle(e.target);
-          if (title === undefined) return;
+          const action = forkAction(e.target, thread);
+          if (!action) return;
           e.preventDefault();
           cancelPress();
-          show({ kind: "message", title });
+          show(action);
         }}
         onPointerDown={(e) => {
           cancelPress();
           if (e.button !== 0 || !e.isPrimary) return;
-          const title = messageTitle(e.target);
-          if (title === undefined) return;
+          const action = forkAction(e.target, thread);
+          if (!action) return;
           press.current = { x: e.clientX, y: e.clientY, timer: setTimeout(() => {
             press.current = null;
-            show({ kind: "message", title });
+            show(action);
           }, 550) };
         }}
         onPointerMove={(e) => {
@@ -292,12 +315,13 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
             <h2>{title}</h2>
             <p>{archived ? "No messages in this thread." : main
               ? "One ongoing thread with your agent. Ask anything to get started."
-              : "A fresh conversation with your agent."}</p>
+              : info?.origin ? "Forked from an earlier message." : "A fresh conversation with your agent."}</p>
           </div>
         )}
         {rows.map((r, i) =>
           r.kind === "ev" ? (
-            <EventRow key={`e${r.ev.cursor}`} ev={r.ev} store={store} last={i === lastUser} />
+            <EventRow key={`e${r.ev.cursor}`} ev={r.ev} store={store} last={i === lastUser}
+              forks={r.ev.event === "message" ? forks.get(r.ev.id) : undefined} />
           ) : (
             <UserBubble key={`p${r.m.key}`} text={r.m.text} state={r.m.state} at={r.m.at} last={i === lastUser} />
           ),
@@ -318,7 +342,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
       <footer className="composer">
         {!sheet && error && <p className="error-text" role="alert">{error}</p>}
         {archived ? (
-          <p className="archived-hint">Archived · {online
+          <p className="archived-hint">{archivedLabel(info)} · {online
             ? <button disabled={busy} onClick={() => void toggleArchive()}>Restore to reply</button>
             : "Reconnect to restore"}</p>
         ) : <div className="capsule">
@@ -356,7 +380,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
             sheet.kind === "rename" ? "Rename thread" : "New thread"}
           dismiss={() => { setError(""); setSheet(null); }}>
             <div className="sheet-grip" aria-hidden="true" />
-            {sheet.kind === "list" && <ThreadList store={store} onNew={() => show({ kind: "create", title: "" })}
+            {sheet.kind === "list" && <ThreadList store={store} conn={conn} online={online} onNew={() => show({ kind: "create", title: "" })}
               onSelect={(id) => { setSheet(null); store.selectThread(id); }} />}
             {sheet.kind === "menu" && <>
               {!archived && <>
@@ -375,8 +399,8 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
               {!online && <p className="sheet-help">Reconnect to use these controls.</p>}
             </>}
             {sheet.kind === "message" && <SheetItem icon={LIST_ICON} title="Start side thread from here"
-              sub="Use this message as the title; the new chat starts empty"
-              onClick={() => show({ kind: "create", title: sheet.title })} />}
+              sub="Fork the conversation at this message"
+              onClick={() => show({ kind: "create", title: sheet.title, from: sheet.from })} />}
             {(sheet.kind === "create" || sheet.kind === "rename") && (
               <ThreadTitleForm key={sheet.kind} kind={sheet.kind} initial={sheet.title} busy={busy} online={online} save={saveTitle} />
             )}
@@ -406,37 +430,63 @@ function Modal({ title, dismiss, children }: { title: string; dismiss: () => voi
   );
 }
 
-function ThreadList({ store, onNew, onSelect }: {
-  store: Store; onNew: () => void; onSelect: (thread: string) => void;
+function ThreadSignals({ store, thread }: { store: Store; thread: string }) {
+  const state = store.status(thread).state;
+  return <>
+    {state !== "idle" && <small className="thread-running">{state === "error" ? "Error" : "Running"}</small>}
+    {store.isUnread(thread) && <span className="thread-dot" role="img" aria-label="Unread" />}
+  </>;
+}
+
+function ThreadList({ store, conn, online, onNew, onSelect }: {
+  store: Store; conn: Connection; online: boolean; onNew: () => void; onSelect: (thread: string) => void;
 }) {
+  const [input, setInput] = useState("");
+  const query = input.trim();
+  useEffect(() => {
+    if (!query || !online || TITLE_CONTROL.test(query)) return;
+    const timer = setTimeout(() => conn.searchThreads(query), 250);
+    return () => clearTimeout(timer);
+  }, [conn, online, query]);
+
   const main = store.threads.get(MAIN_THREAD)!;
   const side = [...store.threads.values()].filter((t) => t.id !== MAIN_THREAD)
     .sort((a, b) => Date.parse(b.lastAt) - Date.parse(a.lastAt));
   const archived = side.filter((t) => t.archived);
-  const row = (t: ThreadInfo) => {
-    const unread = store.isUnread(t.id);
-    const active = store.status(t.id).state !== "idle";
-    return <button key={t.id} className="sheet-item thread-row" aria-current={store.openThread === t.id ? "true" : undefined}
+  const matches = query ? store.messageMatches(query.replace(/\s+/g, " ").toLowerCase()) : undefined;
+  const results = query ? [main, ...side].filter((t) => matches?.has(t.id) ||
+    (t.id === MAIN_THREAD ? `Main Durable ${t.title}` : t.title).toLowerCase().includes(query.toLowerCase())) : [];
+  const row = (t: ThreadInfo) => (
+    <button key={t.id} className="sheet-item thread-row" aria-current={store.openThread === t.id ? "true" : undefined}
       onClick={() => onSelect(t.id)}>
-      <span className="thread-name"><b>{t.id === MAIN_THREAD ? "Main" : t.title}</b></span>
-      {active && <small className="thread-running">{store.status(t.id).state === "error" ? "Error" : "Running"}</small>}
-      {unread && <span className="thread-dot" role="img" aria-label="Unread" />}
-    </button>;
-  };
+      <span className="thread-name">
+        <b>{t.id === MAIN_THREAD ? "Main" : t.title}</b>
+        {t.archived && <small>{archivedLabel(t)}</small>}
+        {matches?.has(t.id) && <small className="thread-snippet">{matches.get(t.id)}</small>}
+      </span>
+      <ThreadSignals store={store} thread={t.id} />
+    </button>
+  );
   return <>
     <h2 className="sheet-heading">Threads</h2>
+    <input className="thread-search" type="search" aria-label="Search threads" placeholder="Search titles and messages"
+      maxLength={LIMITS.threadTitleChars} value={input} onChange={(e) => setInput(e.target.value)} />
     {store.threadListUnavailable && <p className="sheet-help">Could not refresh the thread list. Showing known threads.</p>}
-    <SheetItem icon="M12 5v14M5 12h14" title="New thread" sub="Start a separate conversation" onClick={onNew} />
-    {[...store.creates.values()].map((c) => <p className="sheet-help" key={c.key}>
-      {c.title || "New thread"} · {c.failed ? "Could not create" : "Waits for connection"}
-    </p>)}
-    {row(main)}
-    {side.filter((t) => !t.archived).map(row)}
-    {archived.length > 0 && <details className="thread-archive">
-      <summary>Archived ({archived.length}){archived.some((t) => store.isUnread(t.id)) &&
-        <span className="thread-dot" role="img" aria-label="Unread" />}</summary>
-      {archived.map(row)}
-    </details>}
+    {query ? (
+      results.length ? results.map(row) : <p className="sheet-help">No matching threads.</p>
+    ) : <>
+      <SheetItem icon="M12 5v14M5 12h14" title="New thread" sub="Start an empty conversation" onClick={onNew} />
+      {[...store.creates.values()].map((c) => <p className="sheet-help" key={c.key}>
+        {c.title || "New thread"} · {c.failed ? "Could not create" : "Waits for connection"}
+      </p>)}
+      {row(main)}
+      {side.filter((t) => !t.archived).map(row)}
+      {archived.length > 0 && <details className="thread-archive">
+        <summary>Archived ({archived.length}){archived.some((t) => store.isUnread(t.id)) &&
+          <span className="thread-dot" role="img" aria-label="Unread" />}</summary>
+        {archived.map(row)}
+      </details>}
+    </>}
   </>;
 }
 
@@ -486,7 +536,7 @@ function Icon({ d, bold }: { d: string; bold?: boolean }) {
   );
 }
 
-function EventRow({ ev, store, last }: { ev: DurableEvent; store: Store; last: boolean }) {
+function EventRow({ ev, store, last, forks }: { ev: DurableEvent; store: Store; last: boolean; forks?: ThreadInfo[] }) {
   if (ev.event === "divider") {
     const t = clock(ev.at);
     return (
@@ -496,16 +546,22 @@ function EventRow({ ev, store, last }: { ev: DurableEvent; store: Store; last: b
     );
   }
   if (ev.event !== "message") return null; // settled only drives delivery state
-  if (ev.role === "notice") return <div className="notice" data-thread-title={suggestedTitle(ev.text)}>{ev.text}</div>;
-  if (ev.role === "user") {
-    const state = ev.key ? store.outgoing(ev.thread, ev.key)?.state : undefined;
-    return <UserBubble text={ev.text} state={state} at={ev.at} last={last} />;
-  }
-  return (
-    <div className="msg assistant" data-thread-title={suggestedTitle(ev.text)}>
-      <Streamdown>{ev.text}</Streamdown>
-    </div>
-  );
+  const state = ev.key ? store.outgoing(ev.thread, ev.key)?.state : undefined;
+  return <>
+    {ev.role === "notice" ? <div className="notice">{ev.text}</div> : ev.role === "user" ? (
+      <UserBubble text={ev.text} messageId={ev.id} state={state} at={ev.at} last={last} />
+    ) : (
+      <div className="msg assistant" data-message-id={ev.id} data-thread-title={suggestedTitle(ev.text)}>
+        <Streamdown>{ev.text}</Streamdown>
+      </div>
+    )}
+    {!!forks?.length && <div className="msg fork-links" data-role={ev.role}>
+      {forks.map((t) => <button key={t.id} className="fork-chip" onClick={() => store.selectThread(t.id)}>
+        <span aria-hidden="true">↳</span><span className="fork-title">{t.title}</span>
+        <ThreadSignals store={store} thread={t.id} />
+      </button>)}
+    </div>}
+  </>;
 }
 
 const DELIV: Record<OutgoingState, { label: string; icon: ReactNode }> = {
@@ -517,13 +573,14 @@ const DELIV: Record<OutgoingState, { label: string; icon: ReactNode }> = {
   aborted: { label: "Stopped", icon: <Icon d="M6 6l12 12M18 6 6 18" /> },
 };
 
-function UserBubble(props: { text: string; state?: OutgoingState; at?: string | number; last: boolean }) {
+function UserBubble(props: { text: string; messageId?: string; state?: OutgoingState; at?: string | number; last: boolean }) {
   const { state } = props;
   const show = state && (props.last || state === "queued" || state === "sent" || state === "failed");
   const d = state && DELIV[state];
   return (
     <div className="row user">
-      <div className="bubble" data-thread-title={suggestedTitle(props.text)}>{props.text}</div>
+      <div className="bubble" data-message-id={props.messageId}
+        data-thread-title={props.messageId ? suggestedTitle(props.text) : undefined}>{props.text}</div>
       {show && d && (
         <span className="deliv" data-state={state}>
           {state === "admitted" || state === "answered" || state === "sent" ? clock(props.at) : d.label}

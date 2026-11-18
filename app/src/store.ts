@@ -1,11 +1,11 @@
 import { openDB, type DBSchema, type IDBPDatabase } from "idb";
-import { MAIN_THREAD, type DurableEvent, type PreviewEvent, type StatusEvent, type ThreadId, type ThreadInfo } from "./protocol";
+import { MAIN_THREAD, type DurableEvent, type PreviewEvent, type StatusEvent, type ThreadId, type ThreadInfo, type ThreadOrigin } from "./protocol";
 
 export type ConnState = "offline" | "connecting" | "replaying" | "open";
 export type Mode = "boot" | "chat" | "pair" | "update";
 export type OutgoingState = "queued" | "sent" | "admitted" | "answered" | "failed" | "aborted";
 export type Outgoing = { key: string; thread: ThreadId; text: string; state: OutgoingState; at: number };
-export type ThreadCreate = { key: string; title?: string; failed?: boolean };
+export type ThreadCreate = { key: string; title?: string; from?: ThreadOrigin; failed?: boolean };
 export type AgentStatus = Pick<StatusEvent, "state" | "label">;
 type ChatEvent = Exclude<DurableEvent, { event: "thread" }>;
 
@@ -204,14 +204,34 @@ export class Store {
     this.changed();
   }
 
-  async replaceThreads(list: ThreadInfo[]) {
-    this.threadListUnavailable = false;
-    this.threads = new Map([[MAIN_THREAD, MAIN], ...list.map((t) => [t.id, t] as const)]);
-    if (!this.threads.has(this.openThread)) this.selectThread(MAIN_THREAD);
+  async mergeThreads(list: ThreadInfo[], refresh = false) {
+    if (refresh) this.threadListUnavailable = false;
+    // The gateway omits older archives from the default listing. Keep known
+    // metadata so cached messages and origin links stay navigable.
+    for (const t of list) this.threads.set(t.id, t);
     this.changed();
     if (!this.db) return;
     const tx = this.db.transaction("threads", "readwrite");
-    await Promise.all([tx.store.clear(), ...list.map((t) => tx.store.put(t)), tx.done]);
+    await Promise.all([...list.map((t) => tx.store.put(t)), tx.done]);
+  }
+
+  messageMatches(query: string): Map<ThreadId, string> {
+    const matches = new Map<ThreadId, string>();
+    // Search the in-memory projection of the durable IndexedDB message log.
+    for (const [thread, events] of this.events) {
+      for (let i = events.length - 1; i >= 0; i--) {
+        const ev = events[i];
+        if (ev.event !== "message") continue;
+        const text = ev.text.replace(/\s+/g, " ");
+        const at = text.toLowerCase().indexOf(query);
+        if (at < 0) continue;
+        const start = Math.max(0, at - 24);
+        const end = Math.min(text.length, at + query.length + 44);
+        matches.set(thread, (start ? "…" : "") + text.slice(start, end) + (end < text.length ? "…" : ""));
+        break;
+      }
+    }
+    return matches;
   }
 
   selectThread(thread: ThreadId) {
@@ -299,8 +319,8 @@ export class Store {
     await this.db?.put("outbox", next);
   }
 
-  async queueCreate(title?: string): Promise<ThreadCreate> {
-    const c = { key: newKey(), title };
+  async queueCreate(title?: string, from?: ThreadOrigin): Promise<ThreadCreate> {
+    const c = { key: newKey(), title, from };
     await this.db?.put("creates", c);
     this.creates.set(c.key, c);
     this.changed();

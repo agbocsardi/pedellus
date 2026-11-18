@@ -87,14 +87,21 @@ export class Connection {
     });
   }
 
-  sendCreate(c: ThreadCreate, from?: ThreadId) {
+  searchThreads(query: string) {
     if (this.store.connState !== "open") return;
-    this.request({ type: "req", id: this.id(), op: "thread.create", key: c.key, title: c.title }, async (res) => {
+    this.request({ type: "req", id: this.id(), op: "threads", query }, async (res) => {
+      if (res?.ok && res.threads) await this.store.mergeThreads(res.threads);
+    });
+  }
+
+  sendCreate(c: ThreadCreate, openFrom?: ThreadId) {
+    if (this.store.connState !== "open") return;
+    this.request({ type: "req", id: this.id(), op: "thread.create", key: c.key, title: c.title, from: c.from }, async (res) => {
       if (!res) return; // No reply: retry the same key after replay.
       await this.store.finishCreate(c, res.ok);
-      if (res.ok && res.thread && from === this.store.openThread) {
+      if (res.ok && res.thread && openFrom === this.store.openThread) {
         if (this.store.threads.has(res.thread)) this.store.selectThread(res.thread);
-        else this.selectCreated = { thread: res.thread, from };
+        else this.selectCreated = { thread: res.thread, from: openFrom };
       }
     });
   }
@@ -293,7 +300,7 @@ export class Connection {
   private refreshThreads(ws: WebSocket) {
     this.request({ type: "req", id: this.id(), op: "threads" }, async (res) => {
       if (!res) return;
-      if (res.ok && res.threads) await this.store.replaceThreads(res.threads).catch(console.error);
+      if (res.ok && res.threads) await this.store.mergeThreads(res.threads, true).catch(console.error);
       else this.store.setThreadListUnavailable();
       if (this.ws !== ws) return;
       this.attempt = 0;

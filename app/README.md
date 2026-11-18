@@ -21,7 +21,10 @@ npm run dev    # vite on http://localhost:5173, proxying /v1 (incl. ws) to it
 dev/mock-gateway.mjs MYC2DE23`). For a different mock port, set `PORT` on the
 mock and the same value as `MOCK_PORT` on Vite (dev or preview). Mock credentials,
 threads and cursors are in memory; after a mock restart use a fresh browser
-profile or clear site data before pairing again.
+profile or clear site data before pairing again. Set `IDLE_ARCHIVE_MS=3000`
+on the mock to try automatic archiving after three seconds of idleness.
+The mock shows fork history by copying messages through the selected message;
+it doesn't run a real agent.
 
 The production build, incl. the service worker and its precache manifest:
 

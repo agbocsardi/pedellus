@@ -24,7 +24,11 @@ export type ErrorCode = "bad_request" | "too_large" | "unsupported" | "not_ready
 export type ControlCommand = "new" | "abort" | "status";
 export const MAIN_THREAD = "main";
 export type ThreadId = string;
-export type ThreadInfo = { id: ThreadId; title: string; archived: boolean; createdAt: string; lastAt: string };
+export type ThreadOrigin = { thread: ThreadId; messageId: string };
+export type ThreadInfo = {
+  id: ThreadId; title: string; archived: boolean; archivedReason?: "manual" | "idle";
+  origin?: ThreadOrigin; createdAt: string; lastAt: string;
+};
 
 export type Request =
   | { type: "req"; id: string; op: "hello"; v: 2; cursor: number | null }
@@ -32,8 +36,8 @@ export type Request =
   | { type: "req"; id: string; op: "ack"; cursor: number }
   | { type: "req"; id: string; op: "control"; command: ControlCommand; thread?: ThreadId }
   | { type: "req"; id: string; op: "ping" }
-  | { type: "req"; id: string; op: "threads" }
-  | { type: "req"; id: string; op: "thread.create"; key: string; title?: string }
+  | { type: "req"; id: string; op: "threads"; query?: string }
+  | { type: "req"; id: string; op: "thread.create"; key: string; title?: string; from?: ThreadOrigin }
   | { type: "req"; id: string; op: "thread.rename"; thread: ThreadId; title: string }
   | { type: "req"; id: string; op: "thread.archive"; thread: ThreadId; archived: boolean };
 
