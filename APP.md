@@ -186,6 +186,8 @@ reason and a durable fault entry; no raw record contents are logged.
 * **Oversize frames beyond eight times the frame bound** are aborted by the WebSocket layer with
   1009 (a network-class close for the app) rather than the gateway's `4400`; the bound itself is
   enforced with `4400` up to that backstop.
+* **Very long final answers** are still sent as one durable message, which can exceed the frame
+  budget. Unlike previews, final answers must not be trimmed; they need lossless chunking.
 * **Not covered offline:** a real `tailscale serve` proxy, an installed PWA's cookie jar, iOS
   suspension and reconnect backoff, `sw.js` update semantics, and mid-turn process replacement
   (the listener closes all sockets with 1001; the app replays from its stored cursor after

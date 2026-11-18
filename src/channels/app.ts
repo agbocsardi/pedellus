@@ -825,12 +825,13 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     const publishPreview = async (text: string): Promise<void> => {
       if (text.trim() === "" || signal?.aborted) return;
       // A preview must fit one frame; the final message carries the whole answer, so a cut is honest.
-      // Shrinking by the escaped-JSON overshoot keeps the tail-safe prefix inside the frame bound.
       let shown = text;
       let frame = JSON.stringify({ type: "event", event: "preview", key: item.key, text: shown });
-      while (frame.length > APP_LIMITS.frameBytes && shown.length > 0) {
-        const overshoot = frame.length - APP_LIMITS.frameBytes;
-        shown = shown.slice(0, Math.max(0, shown.length - Math.max(64, Math.ceil(overshoot * 1.2))));
+      for (let bytes = Buffer.byteLength(frame); bytes > APP_LIMITS.frameBytes && shown.length > 0;
+        bytes = Buffer.byteLength(frame)) {
+        // Estimate the cut in code units, then recheck the serialized UTF-8 byte count.
+        const excessUnits = Math.ceil((bytes - APP_LIMITS.frameBytes) * shown.length / bytes);
+        shown = shown.slice(0, Math.max(0, shown.length - Math.max(64, excessUnits)));
         if (shown.length > 0 && /[\uD800-\uDBFF]/u.test(shown.at(-1) ?? "")) shown = shown.slice(0, -1);
         frame = JSON.stringify({ type: "event", event: "preview", key: item.key, text: shown });
       }
