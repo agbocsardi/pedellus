@@ -310,7 +310,7 @@ export class Connection {
         break;
       }
       case "preview":
-        this.store.setPreview(f);
+        // Show only the final answer. Live status frames drive the typing indicator.
         break;
       case "status":
         this.store.setStatus(f);

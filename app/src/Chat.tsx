@@ -89,7 +89,6 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   const setText = (value: string) => setDrafts((prev) => ({ ...prev, [thread]: value }));
   const online = store.connState === "open";
   const running = !archived && isRunning(store.status(thread).state);
-  const preview = archived ? undefined : store.preview(thread);
   const p = presence(store);
   const latest = store.latestViewable(thread);
   const origin = info?.origin;
@@ -356,7 +355,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
               {(sourceMessage?.text.length ?? 0) > 220 ? "…" : ""}</span>
           </button>
         </div>}
-        {!origin && empty && !running && !preview && (
+        {!origin && empty && !running && (
           <div className="empty">
             <div className="avatar-slot big">
               <Avatar state={p.avatar} />
@@ -381,17 +380,13 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
               onDiscard={!writable || r.m.state === "failed" ? () => void discardMessage(r.m.key) : undefined} />
           ),
         )}
-        {preview ? (
-          <div className="msg assistant streaming" aria-busy="true">
-            <Streamdown>{preview.text}</Streamdown>
-          </div>
-        ) : running ? (
+        {running && (
           <div className="typing" role="status" aria-label={p.text}>
             <i />
             <i />
             <i />
           </div>
-        ) : null}
+        )}
       </div>
 
       <footer className="composer">
@@ -628,7 +623,7 @@ function EventRow({ ev, store, last, forks, onActions, onRetry }: {
         onRetry={onRetry && outgoing?.state === "failed" ? () => onRetry(outgoing) : undefined} />
     ) : (
       <div className="msg assistant" {...anchor}>
-        <Streamdown>{ev.text}</Streamdown>
+        <Streamdown mode="static">{ev.text}</Streamdown>
       </div>
     )}
     {(anchor || !!forks?.length) && <div className="msg fork-links" data-role={ev.role}>

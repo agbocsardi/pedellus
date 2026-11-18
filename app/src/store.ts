@@ -1,5 +1,5 @@
 import { openDB, type DBSchema, type IDBPDatabase } from "idb";
-import { MAIN_THREAD, type DurableEvent, type PreviewEvent, type StatusEvent, type ThreadId, type ThreadInfo, type ThreadOrigin } from "./protocol";
+import { MAIN_THREAD, type DurableEvent, type StatusEvent, type ThreadId, type ThreadInfo, type ThreadOrigin } from "./protocol";
 
 export type ConnState = "offline" | "connecting" | "replaying" | "open";
 export type Mode = "boot" | "chat" | "pair" | "update";
@@ -46,8 +46,7 @@ export class Store {
   cursor: number | null = null;
   resumeCursor: number | null = null;
 
-  // Live frames are not durable; hello resends current statuses, not previews.
-  private previews = new Map<ThreadId, PreviewEvent>();
+  // Status is live; hello resends it rather than replaying it from storage.
   private statuses = new Map<ThreadId, AgentStatus>();
   private viewed = new Map<ThreadId, number>();
   private db: IDBPDatabase<Db> | null = null;
@@ -228,10 +227,9 @@ export class Store {
       if (m && (m.state === "queued" || m.state === "sent")) {
         return this.updateOutgoing(m, "admitted");
       }
-    } else if (ev.event === "settled" || (ev.event === "message" && ev.role === "assistant")) {
-      if (ev.key && this.previews.get(ev.thread)?.key === ev.key) this.previews.delete(ev.thread);
-      const m = ev.event === "settled" ? this.outgoing(ev.thread, ev.key) : undefined;
-      if (m && ev.event === "settled" && !terminal(m.state)) return this.updateOutgoing(m, ev.outcome);
+    } else if (ev.event === "settled") {
+      const m = this.outgoing(ev.thread, ev.key);
+      if (m && !terminal(m.state)) return this.updateOutgoing(m, ev.outcome);
     }
   }
 
@@ -362,13 +360,7 @@ export class Store {
     void this.db?.put("view", { thread, cursor }).catch(console.error);
   }
 
-  preview(thread: ThreadId) { return this.previews.get(thread); }
   status(thread: ThreadId) { return this.statuses.get(thread) ?? IDLE; }
-
-  setPreview(p: PreviewEvent) {
-    this.previews.set(p.thread, p);
-    this.changed();
-  }
 
   resetStatuses() {
     this.statuses.clear();
@@ -385,10 +377,7 @@ export class Store {
       this.connState = s;
       if (s === "connecting" || s === "replaying") this.replayReady = false;
       if (s === "open") this.replayReady = true;
-      if (s === "offline") {
-        this.previews.clear();
-        this.statuses.clear();
-      }
+      if (s === "offline") this.statuses.clear();
       this.changed();
     }
   }

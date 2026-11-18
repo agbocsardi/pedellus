@@ -1,7 +1,7 @@
 # Durable — app
 
 The installable web app (PWA) that is the chat channel of the Durable agent
-gateway. Vite + TypeScript + React 19, Streamdown for streaming markdown,
+gateway. Vite + TypeScript + React 19, Streamdown for rendering answer markdown,
 `vite-plugin-pwa` (injectManifest) for the service worker, `idb` for IndexedDB.
 The wire contract is [`../protocol/v2.md`](../protocol/v2.md); the app imports
 its types from [`../protocol/v2.ts`](../protocol/v2.ts). HTTP and WebSocket
