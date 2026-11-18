@@ -50,6 +50,7 @@ const D = {
   B: "A + snap window scroll back to 0",
   C: "B + focus without scroll on tap",
   D: "C + composer parked at top while keyboard opens",
+  F: "C + blur when the keyboard closes (fix for the 2nd tap)",
   E: "plain document, sticky header/composer",
 };
 document.getElementById("s").textContent = S + " — " + D[S];
@@ -65,12 +66,20 @@ function meter() {
   document.getElementById("m").textContent =
     `inner ${innerHeight} · vv ${Math.round(vv.height)} @${Math.round(vv.offsetTop)} · scrollY ${Math.round(scrollY)}`;
 }
+const kbOpen = () => vv.height < innerHeight - 80;
+let wasOpen = false;
 function apply() {
+  // F: on iPad, hiding the keyboard does not blur the field, so the next tap
+  // took the native (scrolling) focus path. Blur on close to reset it.
+  const open = kbOpen();
+  if (S === "F" && wasOpen && !open && document.activeElement === t) t.blur();
+  wasOpen = open;
   if (S !== "E") {
     root.style.setProperty("--h", vv.height + "px");
     root.style.setProperty("--y", vv.offsetTop + "px");
   }
   if (S !== "A" && S !== "E" && scrollY !== 0) scrollTo(0, 0);
+  if (S === "F" && !open && document.activeElement !== t) { root.style.setProperty("--y", "0px"); }
   if (S === "D" && vv.height < innerHeight - 80) footer.style.order = "";
   meter();
 }
@@ -78,9 +87,9 @@ vv.addEventListener("resize", apply);
 vv.addEventListener("scroll", apply);
 addEventListener("scroll", apply, { passive: true });
 
-if (S === "C" || S === "D") {
+if (S === "C" || S === "D" || S === "F") {
   t.addEventListener("touchend", (e) => {
-    if (document.activeElement === t) return;
+    if (S === "F" ? kbOpen() : document.activeElement === t) return;
     e.preventDefault();
     if (S === "D") footer.style.order = "-1"; // composer at the top: nothing to pan to
     t.focus({ preventScroll: true });
