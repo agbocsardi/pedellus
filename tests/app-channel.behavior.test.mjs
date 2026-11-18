@@ -489,13 +489,33 @@ test('hello lists the app command catalogue and control routes args to the owner
       return notices().at(-1);
     };
 
+    // The catalog is read from a mapped conversation (hello never creates one), so a re-hello after
+    // the first control lists the presets and the current one for main.
+    assert.deepEqual(device.response('h1').presets, []);
+    await lastNotice('s0', { command: 'status' }, 'status notice');
+    device.send({ type: 'req', id: 'h2', op: 'hello', v: 2, cursor: null });
+    await device.wait(() => device.response('h2') !== undefined, 'second hello reply');
+    assert.deepEqual(device.response('h2').presets, [
+      { name: 'fast', model: 'fixture/alpha', thinking: 'off' },
+      { name: 'deep', model: 'fixture/beta', thinking: 'high' },
+    ]);
+    await device.wait(() => device.events('model').length === 1, 'model event after replay');
+    assert.deepEqual(device.events('model')[0], { type: 'event', event: 'model', thread: 'main', preset: 'fast' });
+
     assert.match(await lastNotice('m1', { command: 'model' }, 'preset listing'),
       /\* fast — fixture alpha \[thinking: off\] \(default\)/u);
     assert.equal(await lastNotice('m2', { command: 'model', args: 'deep' }, 'preset applied'),
       'Model set to fixture/beta (thinking: high) for this thread.');
+    await device.wait(() => device.events('model').length === 2, 'model event after switch');
+    assert.equal(device.events('model')[1].preset, 'deep');
+    assert.equal((await appState(store.gateway)).events.some((event) => event.event === 'model'), false, 'model is never durable');
     const state = await appState(store.gateway);
     assert.deepEqual([state.controls.at(-1).command, state.controls.at(-1).option, state.controls.at(-1).status],
       ['model', 'deep', 'applied']);
+    device.send({ type: 'req', id: 'tc', op: 'thread.create', key: 'model-thread' });
+    await device.wait(() => device.events('model').length === 3, 'model event for the new thread');
+    assert.equal(device.events('model')[2].thread, device.response('tc').thread);
+    assert.notEqual(device.events('model')[2].preset, undefined);
     assert.match(await lastNotice('m3', { command: 'model', args: 'nope' }, 'unknown preset'),
       /^Unknown model preset nope: nothing was changed\./u);
 

@@ -66,6 +66,7 @@ import {
   APP_REQUEST_OPS,
   parseHelloCursor,
   validAppAgentName,
+  appPresetInfos,
   validAppLabel,
   validThreadTitle,
   parseThreadId,
@@ -781,6 +782,23 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     }
   };
 
+  /**
+   * Non-durable `model` events: each thread's current preset name (`null` outside the presets) to one
+   * socket or every hello'd one. Never stored in the outbox and never consumes a cursor.
+   */
+  async function pushModelEvents(threads: readonly string[], only?: LiveSocket): Promise<void> {
+    for (const thread of threads) {
+      const listing = await peekModelListing(thread);
+      // A thread without a mapped conversation yet runs the configured default preset.
+      const preset = listing === undefined ? catalog?.defaultPreset : matchingPresetName(listing);
+      if (listing === undefined && catalog === undefined) continue;
+      const frame = JSON.stringify({ type: "event", event: "model", thread, preset: preset ?? null });
+      for (const socket of only === undefined ? sockets.values() : [only]) {
+        if (socket.hello && socket.session.isOpen()) socket.session.send(frame);
+      }
+    }
+  }
+
   // ── Sockets ───────────────────────────────────────────────────────────────
 
   const onSocket = (session: AppDeviceSession, hooks: AppSessionHooks): void => {
@@ -909,9 +927,15 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       sendError("bad_request");
       return;
     }
+    for (const entry of [APP_MAIN_THREAD, ...(state.threads ?? []).filter((item) => !item.archived).map((item) => item.id)]) {
+      if (catalog !== undefined || await peekModelListing(entry) !== undefined) break;
+    }
+    const presets = appPresetInfos(catalog?.presets);
+    if (!socket.session.isOpen()) return;
     socket.hello = true;
     sendOk({
       v: APP_PROTOCOL_VERSION, device: socket.session.label, head: headCursor(), agent: agentName, commands: commandInfos,
+      presets,
     });
     // Replay from the acknowledged position (or the retention floor), oldest first, bounded.
     const head = headCursor();
@@ -930,6 +954,10 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       socket.session.send(statusFrame(APP_MAIN_THREAD, statuses.get(APP_MAIN_THREAD) ?? "idle"));
       for (const [thread, status] of statuses) {
         if (thread !== APP_MAIN_THREAD) socket.session.send(statusFrame(thread, status));
+      }
+      if (presets.length > 0) {
+        const open = (state.threads ?? []).filter((entry) => entry.id !== APP_MAIN_THREAD && !entry.archived);
+        await pushModelEvents([APP_MAIN_THREAD, ...open.map((entry) => entry.id)], socket);
       }
     }
   }
@@ -1020,6 +1048,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     }
     sendOk({ thread, duplicate: false });
     pushEventsToSockets();
+    await pushModelEvents([thread]);
   }
 
   async function renameThread(
@@ -1840,6 +1869,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       outcome = await applyModelPreset(record);
     }
     if (outcome.kind !== "applied") return outcome;
+    if (record.command === "model") await pushModelEvents([record.thread]);
     await mutateState((doc) => {
       const entry = doc.controls.find((item) => item.key === record.key);
       if (entry !== undefined) entry.status = "applied";
@@ -2030,6 +2060,20 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       id: conversation.id,
       commit: (change, context) => conversation.commit(change, context),
     }, adapterContext));
+  }
+
+  /** Last model catalog seen on a mapped thread; presets are config, so it holds for unmapped threads. */
+  let catalog: GatewayModelList | undefined;
+  /** Read-only listing: unlike `readModelListing` it never creates a mapping or takes a snapshot slot. */
+  async function peekModelListing(thread: string): Promise<GatewayModelList | undefined> {
+    if (gateway.listModels === undefined) return undefined;
+    try {
+      const listing = await gateway.listModels(sessionForThread(thread), adapterContext);
+      if (listing.presets !== undefined && listing.presets.length > 0) catalog = listing;
+      return listing.presets === undefined || listing.presets.length === 0 ? undefined : listing;
+    } catch {
+      return undefined;
+    }
   }
 
   /** The host model catalog is per-session, so this thread's mapped conversation must exist first. */
