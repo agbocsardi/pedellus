@@ -63,7 +63,11 @@ import {
   createDiscordHistoryTool,
   type DiscordHistoryRegistry,
 } from "./channels/discord-history.js";
-import { createAppConsoleRegistry, type AppConsoleRegistry } from "./channels/app.js";
+import {
+  APP_STATE_SESSION_KEY, AppState, appForkEntry, createAppConsoleRegistry, sessionForThread, threadInfo,
+  type AppConsoleRegistry, type AppGateway,
+} from "./channels/app.js";
+import { APP_MAIN_THREAD, parseThreadId } from "./channels/app-protocol.js";
 import type { CronOwner } from "./automation/cron.js";
 import {
   ASK_USER_TOOL_NAME,
@@ -451,6 +455,8 @@ export interface Gateway {
    * `app pair|devices|revoke` commands reach it over the private socket.
    */
   readonly appConsole?: AppConsoleRegistry;
+  readonly forkAppThread?: NonNullable<AppGateway["forkAppThread"]>;
+  readonly appThreadBusy?: NonNullable<AppGateway["appThreadBusy"]>;
   /**
    * MCP server connection state; absent when MCP is not configured and enabled. A failed server has
    * no tools; its status carries a fixed failure code, never a transport message or configured value.
@@ -1508,10 +1514,40 @@ export async function openGateway(config: PortConfig, context: Context, options:
     readonly jobId: string | null;
   }>();
   /** This host's scope record for one conversation: its class, never inferred from absence. */
-  const scopeRecordFor = async (tx: Tx, conversationId: ConversationId) => {
+  const scopeRecordFor = async (tx: Tx, conversationId: ConversationId, rootId: ConversationId) => {
     const record = await tx.conversation(conversationId);
     if (record === undefined) return undefined;
-    return automationConversations.has(conversationId) ? { ...record, automation: true } : record;
+    if (automationConversations.has(conversationId)) return { ...record, automation: true };
+    if (record.parent === undefined || record.owner !== undefined) return record;
+    const map = await tx.doc(SessionMap, rootId);
+    const stateId = map.sessions[encodedSessionKey(APP_STATE_SESSION_KEY)] as ConversationId | undefined;
+    if (stateId === undefined || stateId === rootId) return record;
+    const stateRecord = await tx.conversation(stateId);
+    if (stateRecord === undefined || stateRecord.owner !== undefined || stateRecord.parent !== undefined) return record;
+    const state = await tx.doc(AppState, stateId);
+    const seen = new Set<ConversationId>();
+    // Every hop has to be registered and match the native parent and the exact session mappings.
+    // An archived ancestor was open at creation; archiving it does not revoke a descendant.
+    let child = record;
+    while (child.parent !== undefined) {
+      if (seen.has(child.id) || child.owner !== undefined || child.id === rootId || automationConversations.has(child.id)) return record;
+      seen.add(child.id);
+      const binding = state.forks?.[`c${child.id}`];
+      const thread = parseThreadId(binding?.thread);
+      if (binding === undefined || thread === undefined || thread === APP_MAIN_THREAD ||
+          map.sessions[encodedSessionKey(sessionForThread(thread))] !== child.id ||
+          binding.at !== child.parent.at) return record;
+      const provenance = threadInfo(state, thread)?.origin;
+      const origin = parseThreadId(provenance?.thread);
+      if (origin === undefined || provenance?.messageId !== binding.messageId || threadInfo(state, origin) === undefined ||
+          map.sessions[encodedSessionKey(sessionForThread(origin))] !== child.parent.conversationId) return record;
+      const parent = await tx.conversation(child.parent.conversationId);
+      if (parent === undefined) return record;
+      child = parent;
+    }
+    if (child.id === rootId || child.owner !== undefined || automationConversations.has(child.id) ||
+        automationConversationOf(await tx.doc(CronConversationDoc, child.id)) !== undefined) return record;
+    return { ...record, appThreadFork: true as const };
   };
   /** Automation conversations in episode-catalog shape; never chat, so no session key is implied. */
   const automationSessions = (): HistoryChatSession[] => [...automationConversations.keys()]
@@ -1693,6 +1729,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
           if (job === null || !isChatSessionKey(job.owner.sessionKey)) return;
           if (!cronDeliveryPrefixes.some((prefix) => job.owner.sessionKey.startsWith(prefix))) return;
           let text: string;
+          let appAnswerEntry: EntryId | undefined;
           if (delivery.status === "error") {
             text = cronOutcomeNotice("failed", job.id, occurrence.scheduledAtMs);
           } else {
@@ -1708,6 +1745,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
             // so a run that produced no usable message is visible rather than silently dropped. A
             // failed run never reaches this branch and keeps its sanitized notice.
             if (job.silent === true) return;
+            if (job.owner.sessionKey.startsWith("app:") && answer?.conversationId === originConversationId &&
+                body !== "" && body !== "[SILENT]") appAnswerEntry = answer.id;
             text = body === "" || body === "[SILENT]"
               ? cronOutcomeNotice("empty", job.id, occurrence.scheduledAtMs)
               : body.length > CRON_DELIVERY_MAX_TEXT_CHARS
@@ -1726,6 +1765,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
               createdAtMs: now(),
               status: "pending",
               nextChunkIndex: 0,
+              ...(appAnswerEntry === undefined ? {} : { appAnswerEntry }),
             });
           } catch {
             admission = "invalid";
@@ -2244,7 +2284,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
           // Backstop: a job whose conversation is not chat scope never reaches a provider call. An
           // automation conversation and a summary task's own target are equally out of scope.
           scope: (tx: Tx, conversationId: ConversationId): Promise<ChatScopeExclusion | undefined> =>
-            readChatScope((id) => scopeRecordFor(tx, id), conversationId, root.id),
+            readChatScope((id) => scopeRecordFor(tx, id, root.id), conversationId, root.id),
           // Resolved lazily: the catalog is created after this object so its extension can be
           // installed in the initial registry.
           listEpisodes: (conversationId, query, ctx) =>
@@ -2446,17 +2486,15 @@ export async function openGateway(config: PortConfig, context: Context, options:
 
     // History scope: mapped chat sessions only. A channel's own state conversation, a scheduled run's
     // automation conversation and the root are not chat history, and the host has already
-    // authenticated the session key before naming it. A mapped chat session is also unforked: search,
-    // every entry/episode read and the background episode/summary work share that check, so a forged
-    // or stale map entry cannot expose or summarize an automation, task-owned or inherited
-    // transcript, a fork, or the root.
+    // authenticated the session key before naming it. Search, episode reads and summary work share
+    // the same checked scope, including the narrow exception for registered app thread forks.
     const assertMappedChatConversations = async (
       conversationIds: readonly ConversationId[],
       ctx: Context,
     ): Promise<void> => {
       await root.commit(async (tx) => {
         for (const conversationId of conversationIds) {
-          const reason = await readChatScope((id) => scopeRecordFor(tx, id), conversationId, root.id);
+          const reason = await readChatScope((id) => scopeRecordFor(tx, id, root.id), conversationId, root.id);
           if (reason !== undefined) throw new Error(chatScopeMessage(reason));
         }
       }, ctx);
@@ -2471,7 +2509,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       if (mapping === undefined) return [];
       const candidates = readChatSessions(mapping.sessions, root.id);
       return root.commit(async (tx) => {
-        const { chat } = await partitionChatScope((id) => scopeRecordFor(tx, id), candidates, root.id);
+        const { chat } = await partitionChatScope((id) => scopeRecordFor(tx, id, root.id), candidates, root.id);
         return chat;
       }, ctx);
     };
@@ -2929,14 +2967,14 @@ export async function openGateway(config: PortConfig, context: Context, options:
       const sessions = storedMappedSessions;
       // A stored key names a mapped session only while its conversation is still ordinary chat: the
       // class pass above removed this host's automation conversations, and the shared scope rule
-      // removes the root, a task-owned conversation and a fork, exactly as the channel ingress refuses
+      // removes the root, task-owned conversations and unregistered forks, as channel ingress refuses
       // that same key. Such a key therefore gains no cron owner, no unevictable snapshot slot and no
       // resume target here, and a forked id leaves this set so its snapshot stays evictable. A missing
       // conversation keeps its explicit failure below.
       const outOfScope = new Set<ConversationId>();
       await root.commit(async (tx) => {
         for (const { conversationId } of sessions) {
-          const reason = await readChatScope((id) => scopeRecordFor(tx, id), conversationId, root.id);
+          const reason = await readChatScope((id) => scopeRecordFor(tx, id, root.id), conversationId, root.id);
           if (reason === "automation" || reason === "root" || reason === "task-owned" || reason === "forked") {
             outOfScope.add(conversationId);
           }
@@ -3847,6 +3885,59 @@ export async function openGateway(config: PortConfig, context: Context, options:
     };
     const gateway: Gateway = {
       harness,
+      ...(config.app === undefined ? {} : {
+        async forkAppThread(stateId, thread, from, register, ctx) {
+          if (parseThreadId(thread) !== thread || thread === APP_MAIN_THREAD || parseThreadId(from.thread) !== from.thread) return false;
+          const stateKey = encodedSessionKey(APP_STATE_SESSION_KEY);
+          const sourceKey = encodedSessionKey(sessionForThread(from.thread));
+          const targetKey = encodedSessionKey(sessionForThread(thread));
+          const anchor = await root.commit(async (tx) => {
+            const map = await tx.doc(SessionMap, root.id);
+            const id = map.sessions[sourceKey] as ConversationId | undefined;
+            if (map.sessions[stateKey] !== stateId || id === undefined ||
+                await readChatScope((candidate) => scopeRecordFor(tx, candidate, root.id), id, root.id) !== undefined ||
+                automationConversationOf(await tx.doc(CronConversationDoc, id)) !== undefined) return undefined;
+            const state = await tx.doc(AppState, stateId);
+            if (threadInfo(state, from.thread)?.archived !== false) return undefined;
+            const at = await appForkEntry(tx, state, id, from);
+            if (at === undefined) return undefined;
+            return { id, at, policy: policyForState(await tx.doc(AgentDoc, id)) };
+          }, ctx);
+          if (anchor === undefined) return false;
+          const source = await harness!.conversation(anchor.id, ctx);
+          if (source === undefined) return false;
+          const fork = await source.fork(anchor.at, {
+            ownership: { kind: "ownerless" },
+            agent: anchor.policy,
+            async init(tx, child) {
+              const map = await tx.doc(SessionMap, root.id);
+              if (map.sessions[stateKey] !== stateId || map.sessions[sourceKey] !== anchor.id ||
+                  Object.hasOwn(map.sessions, targetKey)) throw new Error("App thread mapping changed");
+              if (options.contextSnapshotProvider && Object.keys(map.sessions).length >= CONTEXT_LIMITS.maxConversations) {
+                throw new Error(`Context snapshots support at most ${CONTEXT_LIMITS.maxConversations} mapped conversations`);
+              }
+              const state = await tx.doc(AppState, stateId);
+              register(state);
+              const origin = threadInfo(state, thread)?.origin;
+              if (origin?.thread !== from.thread || origin.messageId !== from.messageId) throw new Error("App fork registration is missing provenance");
+              const binding = { thread, at: anchor.at, messageId: from.messageId };
+              if (state.forks === undefined) state.forks = { [`c${child}`]: binding };
+              else state.forks[`c${child}`] = binding;
+              map.sessions[targetKey] = child;
+            },
+          }, ctx);
+          // Apply ordinary mapped-chat policy; native forks always start with denied tools.
+          await gateway.conversationFor(sessionForThread(thread), ctx);
+          await episodeSummaries?.initialize(harness!, fork.id, ctx).catch(() => undefined);
+          return true;
+        },
+        async appThreadBusy(tx, thread) {
+          const map = await tx.doc(SessionMap, root.id);
+          const id = map.sessions[encodedSessionKey(sessionForThread(thread))] as ConversationId | undefined;
+          if (id === undefined) return false;
+          return (await tx.doc(LiveDoc, id)).run !== undefined || (await tx.doc(InboxDoc, id)).items.length > 0;
+        },
+      }),
       memorySearch: (caller, query, ctx) => {
         const service = memoryServiceRef.current;
         if (!service) throw new Error("Memory recall is unavailable");
@@ -3923,7 +4014,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
         // older layout. A mapped session key may therefore name only an ordinary chat conversation;
         // anything else is refused here, before it can become a cron owner or receive chat policy.
         const scopeReason = await root.commit(
-          (tx) => readChatScope((id) => scopeRecordFor(tx, id), conversationId!, root.id), ctx,
+          (tx) => readChatScope((id) => scopeRecordFor(tx, id, root.id), conversationId!, root.id), ctx,
         );
         if (scopeReason !== undefined) throw new Error(chatScopeMessage(scopeReason));
         // A mapped session key is the cron owner; unmapped conversations (such as a scheduled run's

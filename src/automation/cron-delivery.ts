@@ -58,6 +58,8 @@ export type CronDeliveryRecord = {
   readonly createdAtMs: number;
   readonly status: CronDeliveryStatus;
   readonly nextChunkIndex: number;
+  /** App-only fork anchor, present only for a real answer committed in the origin chat. */
+  readonly appAnswerEntry?: number;
   /** Persisted Telegram chunk plan; absent with progress means the pre-rich legacy plan. */
   readonly telegramChunkPlan?: "rich-v1" | "legacy";
   readonly messageId?: number;

@@ -67,7 +67,10 @@ test('the app config block is opt-in, strict and loopback-only', { timeout: 10_0
     ...WORKSPACE_BASE,
     app: { port: 43190, staticRoot: '/tmp/synthetic-pwa' },
   }, '/tmp/synthetic');
-  assert.deepEqual(parsed.app, { port: 43190, staticRoot: '/tmp/synthetic-pwa' });
+  assert.deepEqual(parsed.app, { port: 43190, staticRoot: '/tmp/synthetic-pwa', autoArchiveDays: 14 });
+  for (const autoArchiveDays of [0, -1, 1.5, '14', null]) {
+    assert.throws(() => parseConfig({ ...WORKSPACE_BASE, app: { port: 43190, staticRoot: '/p', autoArchiveDays } }, '/tmp'), /app\.autoArchiveDays/u);
+  }
   // Absent stays absent: nothing about the app channel is configured or loaded.
   assert.equal(parseConfig({ ...WORKSPACE_BASE }, '/tmp/synthetic').app, undefined);
 
@@ -763,11 +766,17 @@ test('thread registry is durable, creation is idempotent, and only open side thr
     assert.equal((await request(device, 'archive-spare', 'thread.archive', { thread: replacement, archived: true })).ok, true);
     app.clock.now += 1_000;
     assert.equal((await request(device, 'restore', 'thread.archive', { thread: side, archived: false })).ok, true);
+    const matches = await request(device, 'search', 'threads', { query: 'sEaRc' });
+    assert.deepEqual(matches.threads.map(({ id }) => id), [side]);
+    for (const [i, query] of ['', 'x'.repeat(81), null].entries()) {
+      assert.equal((await request(device, `bad-search-${i}`, 'threads', { query })).error, 'bad_request');
+    }
     const { threads } = await request(device, 'list', 'threads');
     assert.equal(threads.length, 52);
     assert.equal(threads[0].id, side);
     assert.equal(threads.find((thread) => thread.id === 'main').archived, false);
-    assert.equal(threads.find((thread) => thread.id === replacement).archived, true);
+    assert.equal(threads.find((thread) => thread.id === replacement).archivedReason, 'manual');
+    assert.equal(threads.find((thread) => thread.id === side).archivedReason, undefined);
     assert.deepEqual(device.events('thread').filter((event) => event.thread.id === side)
       .map(({ thread }) => [thread.title, thread.archived]),
     [['New thread', false], ['Research', false], ['Research', true], ['Research', false]]);
@@ -791,7 +800,7 @@ test('threads lists only the 200 most recently active archives without deleting 
         ...Array.from({ length: 202 }, (_, i) => entry(`t_archive_${i}`, i + 1, true)),
         ...Array.from({ length: 49 }, (_, i) => entry(`t_open_${i}`, i + 1, false))];
     }, context);
-    const reopened = startApp(store);
+    const reopened = startApp(store, { now: 300_000 });
     try {
       const base = `http://127.0.0.1:${await reopened.port}`;
       const device = await connectV2(base, await pairedDevice(store, base));
@@ -801,6 +810,9 @@ test('threads lists only the 200 most recently active archives without deleting 
       assert.equal(list.threads.at(-1).id, 'main');
       assert.deepEqual(list.threads.filter((thread) => thread.archived).map((thread) => thread.id),
         Array.from({ length: 200 }, (_, i) => `t_archive_${201 - i}`));
+      const search = await request(device, 'search', 'threads', { query: '😀' });
+      assert.equal(search.threads.length, 200);
+      assert.equal(search.threads[0].id, 't_archive_201');
       assert.equal((await request(device, 'restore-old', 'thread.archive', { thread: 't_archive_0', archived: false })).ok, true);
       await device.close();
     } finally {
@@ -918,10 +930,123 @@ test('a cron job created by an app side turn delivers back to that thread', { ti
       () => fauxAssistantMessage('SIDE-CRON-RESULT'),
     ]);
     assert.equal((await request(device, 'add-job', 'send', { thread: side, key: 'add-job', text: 'Add a reminder' })).ok, true);
+    await device.wait(() => device.events('settled').some((event) => event.key === 'add-job'), 'cron tool turn settled');
+    assert.equal((await request(device, 'archive-cron', 'thread.archive', { thread: side, archived: true })).ok, true);
     await device.wait(() => device.events('message').some((event) => event.text === 'SIDE-CRON-RESULT'), 'scheduled result');
     const result = device.events('message').find((event) => event.text === 'SIDE-CRON-RESULT');
     assert.deepEqual([result.thread, result.role, result.key], [side, 'assistant', undefined]);
     assert.ok(result.id.startsWith('outbox:'));
+    const lifecycle = device.events('thread').filter((event) => event.thread.id === side);
+    assert.deepEqual(lifecycle.map((event) => event.thread.archived), [false, true, false]);
+    assert.ok(lifecycle[2].cursor < result.cursor);
+    assert.equal(lifecycle[2].thread.archivedReason, undefined);
+    await device.close();
+  });
+});
+
+test('a registered app fork inherits only the prefix through its anchor and reopens as chat', { timeout: 20_000 }, async () => {
+  const gatewayOptions = { contextSnapshotProvider: () => ({ identity: { source: 'synthetic', content: 'app context' } }) };
+  const original = await openAppStore('fork-side', { gatewayOptions, cron: true, keepDirectory: true });
+  const app = startApp(original);
+  let reopened;
+  let nextApp;
+  try {
+    const base = `http://127.0.0.1:${await app.port}`;
+    const cookie = await pairedDevice(original, base);
+    const device = await connectV2(base, cookie);
+    original.setAnswer('committed anchor answer');
+    const send = async (key, text) => {
+      assert.equal((await request(device, key, 'send', { key, text })).ok, true);
+      await device.wait(() => device.events('settled').some((event) => event.key === key), `${key} settled`);
+    };
+    await send('anchor', 'context before fork');
+    const answer = device.events('message').find((event) => event.role === 'assistant' && event.key === 'anchor');
+    await send('too-late', 'context after fork point');
+    const main = await original.gateway.conversationFor(APP_CHAT_SESSION_KEY, context);
+    const { defineDoc } = await import('@earendil-works/pi-durable');
+    const { encodedSessionKey } = await import('../dist/history/scope.js');
+    const mapToken = defineDoc({ kind: 'nanobot.session-map', version: 1, scope: 'conversation', history: 'latest', fork: 'initial', initial: () => ({ sessions: {} }), checkpointWhen: () => true });
+    const root = await original.gateway.harness.root(context);
+    const outside = await original.gateway.conversationFor('not-app', context);
+    const other = await outside.submit({ type: 'input', content: 'non-app chat' }, context);
+    const otherResult = await other.wait(context);
+    const nativeFork = await outside.fork(otherResult.answer, { ownership: { kind: 'ownerless' } }, context);
+    await root.commit(async (tx) => {
+      const map = await tx.doc(mapToken, root.id);
+      map.sessions[encodedSessionKey(`${APP_CHAT_SESSION_KEY}:t_unregistered`)] = nativeFork.id;
+    }, context);
+    await assert.rejects(original.gateway.conversationFor(`${APP_CHAT_SESSION_KEY}:t_unregistered`, context), /forked conversation/u);
+    assert.deepEqual((await nativeFork.agent(context)).tools, []);
+    const rawAppFork = await main.fork(Number(answer.id.split(':').at(-1)), { ownership: { kind: 'ownerless' } }, context);
+    await root.commit(async (tx) => {
+      const map = await tx.doc(mapToken, root.id);
+      map.sessions[encodedSessionKey(`${APP_CHAT_SESSION_KEY}:t_raw_app`)] = rawAppFork.id;
+    }, context);
+    await assert.rejects(original.gateway.conversationFor(`${APP_CHAT_SESSION_KEY}:t_raw_app`, context), /forked conversation/u);
+
+    for (const [i, from] of [null, { thread: 't_unknown', messageId: answer.id },
+      { thread: 'main', messageId: 'answer:12345' }, { thread: 'main', messageId: `answer:${otherResult.answer}` }].entries()) {
+      assert.equal((await request(device, `invalid-${i}`, 'thread.create', { key: 'invalid', from })).error, 'bad_request');
+    }
+    // Acknowledging and trimming the echo must not invalidate a committed app answer.
+    assert.equal((await request(device, 'ack', 'ack', { cursor: device.events('settled').at(-1).cursor })).ok, true);
+    const from = { thread: 'main', messageId: answer.id };
+    const result = await request(device, 'fork', 'thread.create', { key: 'fork', from, title: 'Branch' });
+    assert.equal(result.ok, true, JSON.stringify(result));
+    const child = result.thread;
+    const replay = await request(device, 'fork-again', 'thread.create', { key: 'fork', from });
+    assert.deepEqual([replay.thread, replay.duplicate], [child, true]);
+    assert.deepEqual((await request(device, 'list', 'threads')).threads.find((entry) => entry.id === child).origin, from);
+    await app.stop();
+    await original.close();
+    reopened = await openAppStore('fork-reopen', { directory: original.directory, cron: true, gatewayOptions });
+    nextApp = startApp(reopened);
+    const next = await connectV2(`http://127.0.0.1:${await nextApp.port}`, cookie);
+    assert.equal((await request(next, 'send-child', 'send', { thread: child, key: 'child', text: 'side continuation' })).ok, true);
+    await next.wait(() => next.events('settled').some((event) => event.key === 'child' && event.outcome === 'answered'), 'child answer');
+    const frame = reopened.captured[0];
+    assert.deepEqual(frame.messages.filter((message) => message.role === 'user').map((message) => message.content),
+      ['context before fork', 'side continuation']);
+    assert.ok(frame.messages.some((message) => message.role === 'assistant' && message.content.some((part) => part.text === 'committed anchor answer')));
+    const tools = async (key) => (await (await reopened.gateway.conversationFor(key, context)).agent(context)).tools.map((tool) => tool.name);
+    assert.deepEqual(await tools(`${APP_CHAT_SESSION_KEY}:${child}`), await tools(APP_CHAT_SESSION_KEY));
+    assert.ok((await tools(`${APP_CHAT_SESSION_KEY}:${child}`)).includes('cron'));
+    const nested = await request(next, 'fork-side', 'thread.create', { key: 'fork-side', from: { thread: child, messageId: 'send:child' } });
+    assert.equal(nested.ok, true);
+    await next.close();
+  } finally {
+    await nextApp?.stop();
+    await reopened?.close();
+    await app.stop();
+    await original.close();
+    await rm(original.directory, { recursive: true, force: true });
+  }
+});
+
+test('idle archive uses the configured clock and skips running and queued work', { timeout: 15_000 }, async () => {
+  await withChannel('idle-archive', { adapter: { autoArchiveDays: 1 } }, async ({ app, store, base }) => {
+    const device = await connectV2(base, await pairedDevice(store, base));
+    const idle = await createSide(device, 'will-expire');
+    const busy = await createSide(device, 'will-not-expire');
+    try {
+      const entered = store.gate.hold();
+      assert.equal((await request(device, 'busy', 'send', { thread: busy, key: 'busy', text: 'running' })).ok, true);
+      await entered;
+      assert.equal((await request(device, 'queued', 'send', { thread: busy, key: 'queued', text: 'queued' })).ok, true);
+      await untilAsync(async () => {
+        const chat = await store.gateway.conversationFor(`${APP_CHAT_SESSION_KEY}:${busy}`, context);
+        return (await chat.commit((tx) => tx.submissionByRequest(chat.id, 'app:send:queued'), context))?.status === 'queued';
+      }, 'native queued submission');
+      assert.equal((await request(device, 'fork-queued', 'thread.create', { key: 'not-placed', from: { thread: busy, messageId: 'send:queued' } })).error, 'bad_request');
+      app.clock.now += 86_400_001;
+      await device.wait(() => device.events('thread').some(({ thread }) => thread.id === idle && thread.archivedReason === 'idle'), 'idle archive scan');
+      const list = await request(device, 'list', 'threads');
+      assert.equal(list.threads.find((thread) => thread.id === busy).archived, false);
+      assert.equal(list.threads.find((thread) => thread.id === 'main').archived, false);
+    } finally {
+      store.gate.release();
+    }
+    await device.wait(() => device.events('settled').length === 2, 'busy and queued turns finish');
     await device.close();
   });
 });

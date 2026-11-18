@@ -427,6 +427,7 @@ export interface PortConfig {
   app?: {
     readonly port: number;
     readonly staticRoot: string;
+    readonly autoArchiveDays?: number;
   };
 }
 
@@ -1344,7 +1345,7 @@ function discordConfig(value: unknown): NonNullable<PortConfig["discord"]> {
 }
 
 /** Exactly the accepted `app` keys; an unknown key is a typo that must not silently widen access. */
-const APP_KEYS = ["port", "staticRoot"] as const;
+const APP_KEYS = ["port", "staticRoot", "autoArchiveDays"] as const;
 
 /** `app`: opt-in, loopback-only, with an explicit port and an absolute static root. */
 function appConfig(value: unknown): NonNullable<PortConfig["app"]> {
@@ -1356,7 +1357,11 @@ function appConfig(value: unknown): NonNullable<PortConfig["app"]> {
   if (typeof a.staticRoot !== "string" || a.staticRoot.trim() === "" || !a.staticRoot.startsWith("/")) {
     throw new Error("app.staticRoot must be an absolute directory path");
   }
-  return Object.freeze({ port: a.port, staticRoot: a.staticRoot });
+  const autoArchiveDays = a.autoArchiveDays === undefined ? 14 : a.autoArchiveDays;
+  if (typeof autoArchiveDays !== "number" || !Number.isSafeInteger(autoArchiveDays) || autoArchiveDays < 1) {
+    throw new Error("app.autoArchiveDays must be an integer of at least 1");
+  }
+  return Object.freeze({ port: a.port, staticRoot: a.staticRoot, autoArchiveDays });
 }
 
 /**

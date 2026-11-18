@@ -65,7 +65,11 @@ export const APP_REQUEST_OPS: readonly string[] = [
   "threads", "thread.create", "thread.rename", "thread.archive",
 ];
 
-export type AppThreadInfo = { id: string; title: string; archived: boolean; createdAt: string; lastAt: string };
+export type AppThreadOrigin = { thread: string; messageId: string };
+export type AppThreadInfo = {
+  id: string; title: string; archived: boolean; archivedReason?: "manual" | "idle";
+  origin?: AppThreadOrigin; createdAt: string; lastAt: string;
+};
 
 export function validThreadTitle(value: unknown): value is string {
   return typeof value === "string" && Array.from(value).length <= APP_LIMITS.threadTitleChars &&

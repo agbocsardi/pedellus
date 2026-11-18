@@ -28,6 +28,7 @@ listener is loaded.
 | --- | --- |
 | `port` | Required explicit integer 1–65535. The listener binds `127.0.0.1` only; no other bind is configurable, and `tailscale serve` is the only publisher. Never Funnel, port forwarding or a wildcard bind. |
 | `staticRoot` | Required absolute directory holding the built PWA. Files are served with safe path resolution (no traversal, no directory listing, encoded separators are not structure), correct MIME types and `index.html` for the root; `sw.js` is always served `no-store`. |
+| `autoArchiveDays` | Optional integer ≥1, default 14. Automatically archive inactive side threads, but never while they have running or queued work. |
 
 The block is strict: an unrecognized key is refused at startup instead of being ignored, like the
 Discord block. The listener ignores Tailscale identity headers by construction: any local process
@@ -83,17 +84,24 @@ replays again from its cursor — the app fetches the next 500-event batch that 
 ## Session and authority
 
 Every paired device shares the same threads. `main` keeps its `app:chat` session and history;
-retained v1 events and pending work without a thread belong to `main`. Side threads start empty,
-use host-assigned IDs and host-derived session keys, and are validated as separate ordinary
-mapped chats. There is no per-device conversation. The registry and log live in the
+retained v1 events and pending work without a thread belong to `main`. Side threads use host-assigned
+IDs and host-derived session keys. They start empty unless `thread.create {from: {thread, messageId}}`
+forks a validated open app chat at a committed message. The fork inherits only the context through
+that message, records `origin`, and receives the same ordinary chat policy at creation and reopen.
+A queued echo, host notice, or isolated cron reply has no entry in that chat and cannot be forked.
+No other kind of fork receives chat authority. There is no per-device conversation. The registry and log live in the
 `app:channel-state` conversation (`nanobot.app-state`), never in a plaintext sidecar.
 
 `threads` returns `main`, every open thread and the 200 most recently active archived threads,
-newest activity first. `thread.create` defaults to `New thread` and remembers its key for at least
-seven days; titles are 1–80 printable characters. `thread.archive` aborts that thread's turn,
-without deleting history or cancelling its schedules. An archived thread refuses `send` and
-`control` with `bad_request`; restoring it counts toward the 50-open-side-thread limit.
-`main` cannot be renamed or archived. Lifecycle changes append durable `thread` events.
+newest activity first. With `query` (1–80 characters), it returns up to 200 case-insensitive title
+substring matches, including older archives, newest first. `thread.create` defaults to `New thread`
+and remembers its key for at least seven days; titles are 1–80 printable characters.
+Manual archive aborts the thread's turn and records `archivedReason: "manual"`. The idle scan
+records `"idle"` without aborting work. Archive does not delete history, cancel schedules, or reset
+the episode; the separately configured idle rollover still runs under its own safeguards.
+An archived thread refuses `send` and `control` with `bad_request`. Restoring clears the reason
+and counts toward the 50-open-side-thread limit. `main` cannot be renamed or archived.
+Lifecycle changes append durable `thread` events.
 
 The adapter grants no tool: coding tools, MCP, web, cron, memory and worker authority are whatever
 the configuration already gives that mapped chat. The app chat is **not** an MCP login or
@@ -160,8 +168,10 @@ else is `bad_request`.
 ## Scheduled results and interruption notices
 
 The adapter consumes the channel-neutral durable outbox (`nanobot.cron.deliveries`) for each
-thread's own session, even after archive: a completed cron result is appended as `message{role:"assistant"}` and a
-host interruption notice as `message{role:"notice"}`, both cursor events, authorized by this
+thread's own session. A cron result restores its archived thread before appending the result as
+`message{role:"assistant"}`; both events commit together. At the 50-open-thread limit the result
+stays pending until a slot opens. A host interruption notice is appended as
+`message{role:"notice"}` without restoring the thread. Both are authorized by the
 thread's own durable admission evidence (created by the first authenticated input; a fresh
 admission restores it and releases withheld records). The outbox record is marked `delivered`
 after the append; a crash between the two is closed by the event's stable id (`outbox:<record
@@ -199,6 +209,8 @@ reason and a durable fault entry; no raw record contents are logged.
 * **Very long final answers** are still sent as one durable message, which can exceed the frame
   budget. Unlike previews, final answers must not be trimmed; they need lossless chunking.
 * **Archive keeps the mapping.** The gateway's existing mapped-conversation limits still apply.
+* **Legacy fork anchors.** For assistant replies written before fork support, the gateway needs the
+  retained app event to identify the native entry. New replies keep that link after replay trimming.
 * **Not covered offline:** a real `tailscale serve` proxy, an installed PWA's cookie jar, iOS
   suspension and reconnect backoff, `sw.js` update semantics, or native process replacement with
   a real device. Offline checks reopen a gateway mid-turn and verify side-thread recovery.
@@ -221,8 +233,8 @@ turn (echo, preview, status, answer, settled), a steered pair answered once with
 key, reconnect without loss, controls with their replay reporting, a seeded reopen (interrupted
 command reported, held acknowledgement released, a pre-restart turn still answered), a failed run
 (`settled{failed}` with the error presence state), revocation, oversize frames and callback
-interception. v2 coverage includes thread lifecycle and list limits, cross-thread replay and
-concurrent turns, side-thread interruption recovery, and a cron job delivered back to its side thread.
+interception. v2 coverage includes thread lifecycle, search and list limits, concurrent turns and
+replay, fork context and scope checks after reopen, idle archive, interruption recovery, and cron restore.
 No tailnet, device, credential or paid inference is
 used. The `app pair`/`devices`/`revoke` local-socket dispatch is exercised through the same console
 host the running adapter exports; the thin socket layer itself follows the `cron` console's

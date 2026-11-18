@@ -112,13 +112,14 @@ export async function makeStaticRoot(directory) {
 /** Start the real adapter over the real gateway with a controllable clock and ephemeral port. */
 export function startApp(store, options = {}) {
   const scope = withCancel(context);
-  const clock = { now: Date.now() };
+  const clock = { now: options.now ?? Date.now() };
   let portResolve;
   const port = new Promise((resolvePort) => { portResolve = resolvePort; });
   const adapter = runApp(store.gateway, {
     port: options.port ?? 0,
     staticRoot: options.staticRoot ?? store.staticRoot,
     ...(options.followUpMode === undefined ? {} : { followUpMode: options.followUpMode }),
+    autoArchiveDays: options.autoArchiveDays ?? store.config.app.autoArchiveDays,
     now: () => clock.now,
     onListening: (bound) => portResolve(bound),
   }, scope.context);

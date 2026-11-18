@@ -108,10 +108,15 @@ edits need restart only; unit edits additionally need daemon-reload.
   or exact MCP registration names can be selected. Integrations still require their
   own opt-ins; Telegram, Discord history, cron and recursive worker grants are forbidden.
   Only validated mapped chats receive foreground authority, and
-  every admitted Telegram or Discord user shares the configured workspace/tools. Raw, root,
-  forked and state conversations remain denied; a mapped session key naming
-  anything but an ordinary chat is refused at ingress, before it can become a
-  cron owner or receive chat policy. A scheduled run's automation
+  every admitted Telegram or Discord user shares the configured workspace/tools. Raw, root and
+  state conversations remain denied, as do forks except the following narrow case.
+  Only an ownerless fork created by the app channel's `thread.create {from}` from a validated,
+  open app chat at a committed app message may be admitted as an ordinary mapped chat.
+  Its durable thread registry, exact app session mappings and native parent cutoff must agree
+  at admission and reopen. It gets the source chat's ordinary policy, not inherited grants
+  or new authority. Every other fork remains denied. A mapped key naming anything but an
+  ordinary chat is refused at ingress, before it can become a cron owner or receive chat policy.
+  A scheduled run's automation
   conversation is a distinct class: ownerless, recorded by its origin's cron
   documents and by its own class marker, adopted only while that marker names
   the same origin and job and the conversation is still unforked, and restored
@@ -122,7 +127,7 @@ edits need restart only; unit edits additionally need daemon-reload.
   key naming an automation conversation in a store whose cron was since disabled is
   admitted as chat. Open installs no cron
   owner or context snapshot for a mapped key naming the root, a task-owned
-  conversation or a fork. Such a conversation is never a
+  conversation or a fork outside the registered app exception. Such a conversation is never a
   chat, an origin, a digest
   source, a worker, an MCP/Code Mode/compositor scope or a scheduling scope.
   Isolated cron runs capture an origin subset bounded by current config, prepare it
@@ -166,8 +171,10 @@ edits need restart only; unit edits additionally need daemon-reload.
   surface: one loopback-only HTTP+WebSocket listener (bind fixed to 127.0.0.1, published only with
   `tailscale serve`, Tailscale identity headers ignored), speaking the sibling `durable-app`
   repository's protocol v2 only. All devices share `main` (`app:chat`) and up to 50 open side
-  threads, each a separate host-derived ordinary mapped chat with the same policy. Archiving aborts
-  that chat's turn and refuses app send/control until restored; it is not deletion. Devices authenticate solely with a
+  threads with separate host-derived keys. Manual archive aborts that chat's turn; idle archive
+  (default 14 days) skips running and queued work. An archive refuses app send/control; it does
+  not reset or delete the chat. Cron delivery restores the original thread before appending its
+  result; if all slots are occupied, it waits in the outbox. Devices authenticate solely with a
   cookie token stored as a hash, created from a single-use ten-minute console code
   (`durable-nanobot app pair`, exact-label `revoke` over the private local socket). Egress is the
   adapter's one durable cursor-numbered event log across threads (at-least-once, deduplicated by cursor on the
@@ -234,7 +241,7 @@ edits need restart only; unit edits additionally need daemon-reload.
   native Code Mode `models.*` from an authenticated mapped chat or a live ordinary
   worker. The model identity is exact and checked at call time (a forged catalog
   object cannot substitute it), catalog discovery lists only that model and no
-  image models, and work, cron, digest, root, fork, raw, retired-worker and other
+  image models, and work, cron, digest, root, unregistered forks, raw, retired-worker and other
   task-owned scopes get no classifier. A worker capture stores the identity, so a
   removed or changed configuration prunes it permanently and a later re-enable
   cannot resurrect it. Image generation is not registered; the native
@@ -254,7 +261,7 @@ edits need restart only; unit edits additionally need daemon-reload.
   repolicied, and pinned background models remain allowed. A matching stored policy-revision
   commit publishes registry/defaults through synchronous native `observeCommits`, never beforehand.
 - `ask_user` is model-only, sole-tool-round delivery to the unique authenticated mapped-chat owner
-  surface (CLI or Telegram), never worker, isolated cron, digest, root, fork or state authority.
+  surface (CLI or Telegram), never worker, isolated cron, digest, root, unregistered fork or state authority.
   It ends the tool round without parking tasks; answers arrive as ordinary later inputs. Button claims
   and typed answers settle with admission in one commit; typed text answers the oldest delivered
   question for that exact session. `/new` cancels pending questions. Unknown external sends are
@@ -441,7 +448,7 @@ edits need restart only; unit edits additionally need daemon-reload.
   auto-enablement when that block is absent. Scripts compose only the current
   conversation's callable set through native `executeTool`/`ToolTask` hooks: no
   new authority, no recursion, no host-only owner commands, and no composition in
-  root, state, fork, raw/other task-owned or scheduled-run automation conversations. It may compose
+  root, state, unregistered fork, raw/other task-owned or scheduled-run automation conversations. It may compose
   the `worker` tool from a spawning mapped chat under that tool's own spawner and
   capture checks. A worker child also gets the compositor, but only over its
   captured coding, web, MCP and explicitly captured memory-recall tools over mapped
@@ -455,7 +462,7 @@ edits need restart only; unit edits additionally need daemon-reload.
   authenticated mapped chats, ordinary workers with captured grants, and live isolated scheduled
   runs with exact per-run captures receive MCP tools. Scheduled runs offer those tools directly,
   never through Code Mode; no MCP management or login is inherited. Code Mode follows its own
-  switch and excludes scheduled runs. Root, state, fork, raw/other task-owned, digest and idle
+  switch and excludes scheduled runs. Root, state, unregistered fork, raw/other task-owned, digest and idle
   scheduled-run automation conversations get none. A worker's worktree does
   not confine MCP: the server keeps its gateway-owned host cwd and authority. A configured stdio server is a native host
   process, not covered by `toolSandbox: "bwrap"`. Secrets are referenced by
@@ -463,7 +470,7 @@ edits need restart only; unit edits additionally need daemon-reload.
 - MCP management is direct and explicitly owner-authorized in an authenticated
   mapped ordinary chat, and it is the only path from a model to new MCP
   authority. The `mcp` model tool (`status`, `add`/`configure`, `login`,
-  `logout`, `remove`) is offered only there — never to a worker, fork, root,
+  `logout`, `remove`) is offered only there — never to a worker, unregistered fork, root,
   digest or scheduled-run target — and login requires a unique live owner surface for that
   exact session. There is no proposal document and no separate approval command.
   An `add` validates one entry with the start parser and writes

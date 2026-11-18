@@ -34,7 +34,7 @@ import { copyJson } from "@earendil-works/chord";
 import { withCancel, withoutAbortSignal, withTelemetry } from "@earendil-works/chord/context";
 import type { TelemetrySpan } from "@earendil-works/pi-telemetry";
 import { journalEvent, observeOperation } from "../observability.js";
-import type { Conversation, Submission, SubmissionId, SubmissionRecord } from "@earendil-works/pi-durable";
+import type { Conversation, ConversationId, EntryId, Submission, SubmissionId, SubmissionRecord, Tx } from "@earendil-works/pi-durable";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { FollowUpMode } from "../config.js";
 import type { CronDeliveryOutbox, CronDeliveryRecord } from "../automation/cron-delivery.js";
@@ -64,13 +64,14 @@ import {
   type AppPairingRecord,
   type AppPendingInput,
   type AppThreadInfo,
+  type AppThreadOrigin,
 } from "./app-protocol.js";
 import { startAppListener, type AppDeviceSession, type AppSessionHooks } from "./app-listener.js";
 
 /** Preserve the original mapped chat and its history. */
 export const APP_CHAT_SESSION_KEY = "app:chat";
-const APP_STATE_SESSION_KEY = `app${CHANNEL_STATE_SESSION_SUFFIX}`;
-const sessionForThread = (thread: string): string =>
+export const APP_STATE_SESSION_KEY = `app${CHANNEL_STATE_SESSION_SUFFIX}`;
+export const sessionForThread = (thread: string): string =>
   thread === APP_MAIN_THREAD ? APP_CHAT_SESSION_KEY : `${APP_CHAT_SESSION_KEY}:${thread}`;
 const threadOf = (record: { readonly thread?: string }): string => record.thread ?? APP_MAIN_THREAD;
 
@@ -81,6 +82,8 @@ const MAX_CONTROL_ATTEMPTS = 10;
 const SCHEDULED_SCAN_INTERVAL_MS = 2_000;
 const MAX_SCHEDULED_ACTIVE = 4;
 const MAX_NOTICE_CHARS = 1_500;
+const DAY_MS = 86_400_000;
+class ThreadCreateConflict extends Error {}
 const MAX_LATE_CONTROL_CHARS = 4_000;
 const QUEUE_FULL = "app durable output queue is full";
 
@@ -102,6 +105,10 @@ export type AppChannelState = {
   sendKeys: { readonly key: string; readonly atMs: number }[];
   // These fields are optional on stores written by v1. Existing records belong to main.
   threads?: AppThreadInfo[];
+  /** Internal authority evidence, bound to the native child and inclusive parent entry. */
+  forks?: Record<string, { thread: string; at: number; messageId: string }>;
+  /** Committed app-visible assistant messages, independent of cursor retention. */
+  answerAnchors?: Record<string, { thread: string; at: number }>;
   createKeys?: { readonly key: string; readonly atMs: number; readonly thread: string }[];
   /** Durable admission evidence, set by authenticated input to that exact thread. */
   origin?: { readonly admittedAtMs: number };
@@ -131,6 +138,12 @@ export const AppState = defineDoc<AppChannelState>({
 
 export interface AppGateway {
   conversationFor(sessionKey: string, context: Context): Promise<Conversation>;
+  forkAppThread?(
+    stateId: ConversationId, thread: string, from: AppThreadOrigin,
+    init: (doc: Draft<AppChannelState>) => void, context: Context,
+  ): Promise<boolean>;
+  /** Check native work in the same transaction as idle archive without creating a chat. */
+  appThreadBusy?(tx: Tx, thread: string): Promise<boolean>;
   /** Host-authenticated durable outbox for completed cron results and interruption notices. */
   cronOutbox?: CronDeliveryOutbox;
   /** Optional host model catalog for the `status` control's model line. */
@@ -192,6 +205,7 @@ export type AppOptions = {
   readonly port: number;
   /** Absolute directory holding the built PWA, served as static files. */
   readonly staticRoot: string;
+  readonly autoArchiveDays?: number;
   /** Configured owner busy-mode, written onto each admitted input. */
   readonly followUpMode?: FollowUpMode;
   /** Controlled clock for offline checks; absent keeps wall time. */
@@ -226,12 +240,53 @@ type SubmissionSlot = { readonly prior: Promise<void>; release(): void };
 type WithoutCursor<T> = T extends { cursor: number } ? Omit<T, "cursor"> : never;
 type AppEventInput = WithoutCursor<AppDurableEvent> & { thread: string | AppThreadInfo };
 
-function threadInfo(doc: AppChannelState, thread: string): AppThreadInfo | undefined {
+export function threadInfo(doc: AppChannelState, thread: string): AppThreadInfo | undefined {
   return doc.threads?.find((entry) => entry.id === thread);
 }
 
 function openThread(doc: AppChannelState, thread: string): boolean {
   return threadInfo(doc, thread)?.archived === false;
+}
+
+function canOpenSideThread(doc: AppChannelState): boolean {
+  return (doc.threads?.filter((entry) => entry.id !== APP_MAIN_THREAD && !entry.archived).length ?? 0) <
+    APP_LIMITS.maxOpenThreads;
+}
+
+function setArchived(doc: Draft<AppChannelState>, info: Draft<AppThreadInfo>, at: string, reason?: "manual" | "idle"): void {
+  info.archived = reason !== undefined;
+  if (reason === undefined) delete info.archivedReason;
+  else info.archivedReason = reason;
+  // Idle archive does not make an inactive thread more recent than an active one.
+  if (reason !== "idle" && info.lastAt < at) info.lastAt = at;
+  appendEvent(doc, { event: "thread", thread: { ...info } });
+}
+
+/** Resolve an app message, not an arbitrary entry ID. Legacy answers need a retained echo. */
+export async function appForkEntry(
+  tx: Tx, state: AppChannelState, source: ConversationId, from: AppThreadOrigin,
+): Promise<EntryId | undefined> {
+  const { thread, messageId } = from;
+  const userKey = messageId.startsWith("send:") ? messageId.slice(5) : undefined;
+  let at: number | undefined;
+  if (userKey !== undefined && APP_LIMITS.idPattern.test(userKey)) {
+    const submission = await tx.submissionByRequest(source, requestIdFor(userKey));
+    if (submission?.type === "input") at = submission.entry;
+  } else {
+    const anchor = state.answerAnchors?.[messageId];
+    if (anchor?.thread === thread) at = anchor.at;
+    else {
+      const legacy = state.events.find((event) => event.event === "message" && event.role === "assistant" &&
+        threadOf(event) === thread && event.id === messageId);
+      if (legacy?.event === "message" && legacy.key !== undefined) {
+        const submission = await tx.submissionByRequest(source, requestIdFor(legacy.key));
+        if (submission?.type === "input" && submission.status === "done") at = submission.answer;
+      }
+    }
+  }
+  if (at === undefined || !Number.isSafeInteger(at) || at <= 0) return undefined;
+  const entry = await tx.entry(at as EntryId);
+  return entry?.conversationId === source ? entry.id : undefined;
 }
 
 // ── Pure helpers ─────────────────────────────────────────────────────────────
@@ -320,6 +375,11 @@ function appendEvent(doc: Draft<AppChannelState>, event: AppEventInput): void {
 }
 
 /** Message events carry stable ids, so a replayed or crashed append can be recognized exactly. */
+function rememberAnswer(doc: Draft<AppChannelState>, id: string, thread: string, at: number): void {
+  if (doc.answerAnchors === undefined) doc.answerAnchors = { [id]: { thread, at } };
+  else doc.answerAnchors[id] = { thread, at };
+}
+
 function hasEventId(doc: Draft<AppChannelState>, id: string): boolean {
   return doc.events.some((event) => event.event === "message" && event.id === id);
 }
@@ -418,6 +478,9 @@ export function validateOptions(options: AppOptions): void {
   if (!options.staticRoot.startsWith("/")) {
     throw new Error("App staticRoot must be an absolute path");
   }
+  if (options.autoArchiveDays !== undefined && (!Number.isSafeInteger(options.autoArchiveDays) || options.autoArchiveDays < 1)) {
+    throw new Error("App autoArchiveDays must be an integer of at least 1");
+  }
 }
 
 // ── The adapter ──────────────────────────────────────────────────────────────
@@ -425,6 +488,7 @@ export function validateOptions(options: AppOptions): void {
 export async function runApp(gateway: AppGateway, options: AppOptions, context: Context): Promise<void> {
   validateOptions(options);
   const now = options.now ?? (() => Date.now());
+  const archiveAfterMs = (options.autoArchiveDays ?? 14) * DAY_MS;
   const scope = withCancel(context);
   const adapterContext = scope.context;
   const cleanupContext = withoutAbortSignal(adapterContext);
@@ -596,9 +660,15 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           await handleControlFrame(frame, sendOk, sendError);
           return;
         case "threads": {
+          const query = frame.query;
+          if (query !== undefined && (typeof query !== "string" || query.length === 0 ||
+              Array.from(query).length > APP_LIMITS.threadTitleChars)) return sendError("bad_request");
+          const sorted = [...(state.threads ?? [])].sort((a, b) => b.lastAt.localeCompare(a.lastAt));
           let archived = 0;
-          const threads = [...(state.threads ?? [])].sort((a, b) => b.lastAt.localeCompare(a.lastAt))
-            .filter((thread) => !thread.archived || archived++ < APP_LIMITS.maxListedArchivedThreads);
+          const needle = query?.toLowerCase();
+          const threads = needle === undefined
+            ? sorted.filter((thread) => !thread.archived || archived++ < APP_LIMITS.maxListedArchivedThreads)
+            : sorted.filter((thread) => thread.title.toLowerCase().includes(needle)).slice(0, APP_LIMITS.maxListedArchivedThreads);
           sendOk({ threads });
           return;
         }
@@ -703,27 +773,50 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     if (typeof key !== "string" || !APP_LIMITS.idPattern.test(key) || !validThreadTitle(title)) {
       return sendError("bad_request");
     }
-    let thread: string | undefined;
-    let duplicate = true;
-    await mutateState((doc) => {
-      thread = doc.createKeys?.find((entry) => entry.key === key)?.thread;
-      if (thread !== undefined) return;
-      const threads = doc.threads!;
-      if (threads.filter((entry) => entry.id !== APP_MAIN_THREAD && !entry.archived).length >=
-          APP_LIMITS.maxOpenThreads) return;
-      duplicate = false;
-      do {
-        thread = `t_${randomBytes(18).toString("base64url")}`;
-      } while (threads.some((entry) => entry.id === thread));
+    const raw = frame.from;
+    let from: AppThreadOrigin | undefined;
+    if (raw !== undefined) {
+      if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return sendError("bad_request");
+      const { thread, messageId } = raw as Record<string, unknown>;
+      const source = parseThreadId(thread);
+      if (source === undefined || typeof messageId !== "string" || messageId.length === 0 || messageId.length > 256) {
+        return sendError("bad_request");
+      }
+      from = { thread: source, messageId };
+    }
+    const prior = state.createKeys?.find((entry) => entry.key === key);
+    if (prior !== undefined) return sendOk({ thread: prior.thread, duplicate: true });
+    if (from !== undefined && (!openThread(state, from.thread) || archiving.has(from.thread))) return sendError("bad_request");
+    let thread: string;
+    do { thread = `t_${randomBytes(18).toString("base64url")}`; } while (threadInfo(state, thread) !== undefined);
+    const register = (doc: Draft<AppChannelState>) => {
+      if (doc.createKeys?.some((entry) => entry.key === key) || !canOpenSideThread(doc) ||
+          threadInfo(doc, thread) !== undefined ||
+          (from !== undefined && (!openThread(doc, from.thread) || archiving.has(from.thread)))) {
+        throw new ThreadCreateConflict();
+      }
       const atMs = now();
       const at = new Date(atMs).toISOString();
-      const info = { id: thread, title, archived: false, createdAt: at, lastAt: at };
-      threads.push(info);
+      const info = { id: thread, title, archived: false, createdAt: at, lastAt: at, ...(from === undefined ? {} : { origin: from }) };
+      doc.threads!.push(info);
       doc.createKeys = pruneKeys([...(doc.createKeys ?? []), { key, atMs, thread }], atMs);
       appendEvent(doc, { event: "thread", thread: { ...info } });
-    });
-    if (thread === undefined) return sendError("bad_request");
-    sendOk({ thread, duplicate });
+    };
+    try {
+      if (from === undefined) await mutateState(register);
+      else {
+        if (!await gateway.forkAppThread?.(stateConversation.id, thread, from, register, adapterContext)) {
+          return sendError("bad_request");
+        }
+        await mutateState(() => undefined);
+      }
+    } catch (error) {
+      if (!(error instanceof ThreadCreateConflict)) throw error;
+      const latest = await mutateState(() => undefined);
+      const existing = latest.createKeys?.find((entry) => entry.key === key);
+      return existing === undefined ? sendError("bad_request") : sendOk({ thread: existing.thread, duplicate: true });
+    }
+    sendOk({ thread, duplicate: false });
     pushEventsToSockets();
   }
 
@@ -776,8 +869,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         let changed = false;
         state = await stateConversation.commit(async (tx) => {
           const doc = await tx.doc(AppState, stateConversation.id);
-          if (!archived && doc.threads!.filter((entry) => entry.id !== APP_MAIN_THREAD && !entry.archived).length >=
-              APP_LIMITS.maxOpenThreads) return copyJson(doc) as unknown as AppChannelState;
+          if (!archived && !canOpenSideThread(doc)) return copyJson(doc) as unknown as AppChannelState;
           if (conversation !== undefined) {
             const retired = new Set<string>();
             for (const item of doc.pending) {
@@ -789,9 +881,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
             doc.pending = doc.pending.filter((item) => !retired.has(item.key));
           }
           const entry = threadInfo(doc, thread)!;
-          entry.archived = archived;
-          entry.lastAt = new Date(now()).toISOString();
-          appendEvent(doc, { event: "thread", thread: { ...entry } });
+          setArchived(doc, entry, new Date(now()).toISOString(), archived ? "manual" : undefined);
           changed = true;
           return copyJson(doc) as unknown as AppChannelState;
         }, adapterContext);
@@ -804,6 +894,25 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       archiving.delete(thread);
       drain();
     }
+  }
+
+  async function scanIdleThreads(): Promise<void> {
+    if (gateway.appThreadBusy === undefined) return;
+    const atMs = now();
+    const at = new Date(atMs).toISOString();
+    const expired = (info: AppThreadInfo) => info.id !== APP_MAIN_THREAD && !info.archived &&
+      atMs - Date.parse(info.lastAt) >= archiveAfterMs && !archiving.has(info.id) && !controlPendingSet.has(info.id);
+    if (!state.threads?.some(expired)) return;
+    state = await stateConversation.commit(async (tx) => {
+      const doc = await tx.doc(AppState, stateConversation.id);
+      for (const info of doc.threads ?? []) {
+        if (!expired(info) || doc.pending.some((item) => threadOf(item) === info.id) ||
+            await gateway.appThreadBusy!(tx, info.id)) continue;
+        setArchived(doc, info, at, "idle");
+      }
+      return copyJson(doc) as unknown as AppChannelState;
+    }, adapterContext);
+    pushEventsToSockets();
   }
 
   // ── Ingress ───────────────────────────────────────────────────────────────
@@ -1136,6 +1245,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       const retired = new Set(members.map((member) => member.key));
       const answerId = thread === APP_MAIN_THREAD ? `answer:${answerEntry}` : `answer:${thread}:${answerEntry}`;
       if (members.length > 0 && !hasEventId(doc, answerId)) {
+        rememberAnswer(doc, answerId, thread, answerEntry);
         appendEvent(doc, {
           event: "message",
           thread,
@@ -1826,17 +1936,27 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     const id = thread === APP_MAIN_THREAD ? `outbox:${record.id}` : `outbox:${thread}:${record.id}`;
     // The dedupe and the append share one commit, like the notice path: a crash between them can
     // never duplicate the event, and a concurrent scan finds the id already in the log.
+    let deferred = false;
     await mutateState((doc) => {
       if (hasEventId(doc, id)) return;
+      if (archiving.has(thread)) { deferred = true; return; }
+      const info = threadInfo(doc, thread)!;
+      const interruption = isTurnInterruptionNotice(record);
+      if (!interruption && info.archived) {
+        if (!canOpenSideThread(doc)) { deferred = true; return; }
+        setArchived(doc, info, new Date(now()).toISOString());
+      }
+      if (record.appAnswerEntry !== undefined) rememberAnswer(doc, id, thread, record.appAnswerEntry);
       appendEvent(doc, {
         event: "message",
         id,
         thread,
-        role: isTurnInterruptionNotice(record) ? "notice" : "assistant",
+        role: interruption ? "notice" : "assistant",
         text: record.text,
         at: new Date(now()).toISOString(),
       });
     });
+    if (deferred) return;
     pushEventsToSockets();
     await updateScheduled(sessionKey, record.id, (entry) => {
       entry.status = "delivered";
@@ -1900,7 +2020,13 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   const requestScheduledScan = (): void => {
     if (scheduledScanning || stopping || signal?.aborted) return;
     scheduledScanning = true;
-    void scanScheduled().catch(() => undefined).finally(() => { scheduledScanning = false; });
+    const task = scanIdleThreads().catch((error: unknown) => {
+      if (!signal?.aborted) journalEvent("app.auto_archive.failed", {}, error);
+    }).then(scanScheduled).catch(() => undefined).finally(() => {
+      scheduledScanning = false;
+      active.delete(task);
+    });
+    active.add(task);
   };
 
   /** A fresh authenticated admission restores the origin evidence, releasing withheld results. */

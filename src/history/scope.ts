@@ -85,8 +85,8 @@ export function readChatSessions(sessions: unknown, rootId: ConversationId): His
  * Why a mapped conversation is not chat history even though its session key looks like one.
  *
  * A session key is a host string: it can be forged, imported or left behind by an older layout, so
- * the key alone never decides scope. A chat conversation is ownerless, unforked and not the root; a
- * scheduled run's automation conversation, a history fork and the root are never a discussion a
+ * the key alone never decides scope. A chat is ownerless, not the root, and unforked unless the
+ * host validates an app thread fork. Automation, other forks and the root are never a discussion a
  * channel named. Automation conversations are ownerless by design — they outlive the run task that
  * created them — so their class is carried by the host, not inferred from `owner`.
  */
@@ -103,6 +103,8 @@ export interface ChatScopeRecord {
   readonly id: ConversationId;
   readonly owner?: unknown;
   readonly parent?: unknown;
+  /** Native parent, exact app mapping and durable registry provenance checked by the host. */
+  readonly appThreadFork?: true;
   /**
    * The host's durable classification of this conversation as a scheduled run's automation
    * conversation. It is stated explicitly because such a conversation is ownerless and unforked,
@@ -120,7 +122,7 @@ export function chatScopeExclusion(
   if (conversation.id === rootId) return "root";
   if (conversation.automation === true) return "automation";
   if (conversation.owner !== undefined) return "task-owned";
-  if (conversation.parent !== undefined) return "forked";
+  if (conversation.parent !== undefined && conversation.appThreadFork !== true) return "forked";
   return undefined;
 }
 
