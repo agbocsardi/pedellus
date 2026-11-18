@@ -84,7 +84,7 @@ $('test-push').addEventListener('click', async () => {
       set('push-status', `cannot send test push: ${res.status} ${body.error ?? ''}`);
       return;
     }
-    const sendAt = Date.now() + 10000;
+    const sendAt = Date.parse((await res.json()).sendAt);
     set('push-status', 'push scheduled \u2014 lock the phone now');
     clearInterval(pushTimer);
     pushTimer = setInterval(() => {

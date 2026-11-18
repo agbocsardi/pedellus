@@ -11,7 +11,7 @@ done.
 ```sh
 cd phase0
 npm install          # installs web-push@4.0.0 (pinned in package.json)
-node server.mjs       # 127.0.0.1:8787 by default; or: node server.mjs 9000 / PORT=9000
+node server.mjs       # 127.0.0.1:8790 by default; or: node server.mjs 9000 / PORT=9000
 ```
 
 The server generates a VAPID key pair into `phase0/.data/vapid.json` (mode
@@ -23,7 +23,7 @@ testing.
 Then publish it (you run this, not the agent):
 
 ```sh
-tailscale serve --bg 8787
+tailscale serve --bg 8790
 ```
 
 Open the `https://<machine>.<tailnet>.ts.net/` URL in Safari **on the phone**

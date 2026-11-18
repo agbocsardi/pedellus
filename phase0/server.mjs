@@ -18,7 +18,7 @@ function portFromArgs() {
     const n = Number.parseInt(v ?? '', 10);
     if (Number.isInteger(n) && n > 0 && n < 65536) return n;
   }
-  return 8787;
+  return 8790;
 }
 const port = portFromArgs();
 
@@ -26,14 +26,17 @@ mkdirSync(dataDir, { recursive: true, mode: 0o700 });
 
 // VAPID keys, generated on first run.
 let vapid;
-if (existsSync(vapidFile)) {
+try {
   vapid = JSON.parse(readFileSync(vapidFile, 'utf8'));
-} else {
+} catch {
+  // Missing or corrupt: make a new pair. Old subscriptions then need resubscribing.
   vapid = generateVAPIDKeys();
   writeFileSync(vapidFile, JSON.stringify(vapid, null, 2) + '\n', { mode: 0o600 });
   console.log(`generated VAPID key pair: ${vapidFile}`);
 }
 setVapidDetails('mailto:phase0-probe@localhost', vapid.publicKey, vapid.privateKey);
+
+let pendingPush = null;
 
 const STATIC = {
   '/': ['index.html', 'text/html; charset=utf-8'],
@@ -58,7 +61,6 @@ function readBody(req) {
       size += chunk.length;
       if (size > MAX_BODY) {
         reject(new Error('body too large'));
-        req.destroy();
         return;
       }
       parts.push(chunk);
@@ -142,7 +144,8 @@ const server = http.createServer(async (req, res) => {
     const delayMs = Math.min(Math.max(Number(body.delayMs ?? 0) | 0, 0), MAX_DELAY_MS);
     if (!loadSubscription()) return sendJSON(res, 409, { error: 'no stored subscription; enable notifications on the phone first' });
     const sendAt = new Date(Date.now() + delayMs);
-    setTimeout(sendPush, delayMs);
+    clearTimeout(pendingPush);
+    pendingPush = setTimeout(sendPush, delayMs);
     return sendJSON(res, 200, { ok: true, delayMs, sendAt: sendAt.toISOString() });
   }
 
