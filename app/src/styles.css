@@ -149,6 +149,7 @@ svg {
 .avatar svg {
   width: 100%;
   height: 100%;
+  overflow: visible; /* Leave room for claws and wrench tips at the edge of a pose. */
 }
 .avatar :is(path, circle) {
   fill: none;
