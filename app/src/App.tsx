@@ -14,14 +14,14 @@ export function App({ store }: { store: Store }) {
     // The store is the source of truth; the connection starts once it is
     // loaded so the hello cursor matches what is actually persisted.
     let alive = true;
-    store.init().then(
-      () => {
+    store
+      .init()
+      .catch((err) => console.error("store init failed; continuing with empty cache", err))
+      .finally(() => {
         if (!alive) return;
         connRef.current = new Connection(store);
         setConn(connRef.current);
-      },
-      (err) => console.error("store init failed; continuing with empty cache", err),
-    );
+      });
     return () => {
       alive = false;
     };
@@ -68,7 +68,13 @@ function UpdateScreen() {
         <p className="dim">
           The gateway speaks a newer protocol. Reload to pick up the new app.
         </p>
-        <button className="primary" onClick={() => location.reload()}>
+        <button className="primary" onClick={() =>
+            void navigator.serviceWorker
+              ?.getRegistration()
+              .then((r) => r?.update())
+              .catch(() => {})
+              .finally(() => location.reload())
+          }>
           Reload
         </button>
       </div>

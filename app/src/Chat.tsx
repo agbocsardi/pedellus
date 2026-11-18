@@ -3,7 +3,7 @@ import { useSyncExternalStore } from "react";
 import { Streamdown } from "streamdown";
 import type { Connection } from "./conn";
 import type { AgentStatus, Outgoing, OutgoingState, Store } from "./store";
-import type { DurableEvent } from "./protocol";
+import { LIMITS, type DurableEvent } from "./protocol";
 
 const DELIV: Record<OutgoingState, string> = {
   queued: "queued",
@@ -83,7 +83,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
       return;
     }
     const t = text.trim();
-    if (!t) return;
+    if (!t || t.length > LIMITS.sendTextChars) return;
     setText("");
     const m = await store.createOutgoing(t);
     conn.sendOutgoing(m);
@@ -182,6 +182,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
           ref={taRef}
           value={text}
           rows={1}
+          maxLength={LIMITS.sendTextChars}
           placeholder={running ? "The agent is working…" : "Message"}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={onKeyDown}

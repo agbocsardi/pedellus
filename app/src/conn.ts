@@ -31,6 +31,7 @@ export class Connection {
   /** 4401/4426: only revive() (pairing success) starts us again. */
   private dead = false;
   private ackCursor: number | null = null;
+  private ackFrozen = false;
   private ackTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(private store: Store) {
@@ -42,6 +43,9 @@ export class Connection {
       if (!document.hidden) {
         this.suppressed = false;
         this.kick();
+        // iOS kills sockets in standby without a close frame: probe now
+        // instead of waiting for the next 25 s tick.
+        this.pingTick();
       }
     });
     addEventListener("online", () => this.kick());
@@ -52,6 +56,7 @@ export class Connection {
   revive() {
     this.dead = false;
     this.suppressed = false;
+    this.attempt = 0;
     this.connect();
   }
 
@@ -206,11 +211,12 @@ export class Connection {
       case "message":
       case "settled":
       case "divider": {
-        const isNew = await this.store.applyDurable(ev);
-        if (isNew) {
-          this.replayCount++;
-          this.ack(ev.cursor);
-        }
+        const { isNew, stored } = await this.store.applyDurable(ev);
+        if (isNew) this.replayCount++;
+        // Ack drives gateway retention: only what IndexedDB really holds.
+        // Once a write fails, acks stop so the gateway keeps everything.
+        if (!stored) this.ackFrozen = true;
+        if (isNew && stored && !this.ackFrozen) this.ack(ev.cursor);
         break;
       }
       case "preview":

@@ -93,16 +93,21 @@ export class Store {
    * the promise resolves only once IndexedDB has the event, so acks sent by
    * the caller never get ahead of what is actually stored.
    */
-  async applyDurable(ev: DurableEvent): Promise<boolean> {
-    if (this.cursor !== null && ev.cursor <= this.cursor) return false;
+  async applyDurable(ev: DurableEvent): Promise<{ isNew: boolean; stored: boolean }> {
+    if (this.cursor !== null && ev.cursor <= this.cursor) return { isNew: false, stored: true };
     this.events.push(ev);
     this.cursor = ev.cursor;
     this.absorb(ev);
     this.changed();
     const db = this.db;
-    if (!db) return true;
-    await db.put("events", ev);
-    return true;
+    if (!db) return { isNew: true, stored: false };
+    try {
+      await db.put("events", ev);
+      return { isNew: true, stored: true };
+    } catch (err) {
+      console.error("event not persisted; acks stop", err);
+      return { isNew: true, stored: false };
+    }
   }
 
   /** Side effects of durable events on the outbox and live preview. */

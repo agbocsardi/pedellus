@@ -1,4 +1,5 @@
 /// <reference lib="webworker" />
+import { clientsClaim } from "workbox-core";
 import { cleanupOutdatedCaches, precacheAndRoute } from "workbox-precaching";
 
 declare const self: ServiceWorkerGlobalScope & {
@@ -7,6 +8,10 @@ declare const self: ServiceWorkerGlobalScope & {
 
 // Phase 1: precache the app shell only. The gateway serves dist/ statically,
 // so offline the shell opens and the connection simply shows Offline.
+// A new app version takes over at once (registerType "autoUpdate"), so a
+// reload after a 4426 never lands on the old precached shell again.
+self.skipWaiting();
+clientsClaim();
 precacheAndRoute(self.__WB_MANIFEST);
 cleanupOutdatedCaches();
 
