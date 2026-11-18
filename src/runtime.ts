@@ -69,6 +69,7 @@ import {
   ASK_USER_TOOL_NAME,
   AskQuestionsDoc,
   cancelPendingQuestions,
+  pendingQuestionViews,
   createAskSurfaceRegistry,
   createAskUserTool,
   type AskSurfaceRegistry,
@@ -112,6 +113,15 @@ import { ensureStoreIdentity, type StoreIdentity } from "./history/store-identit
 import { modelKey, parseToolTimeoutSeconds, type ModelReference, type PortConfig } from "./config.js";
 import { createVisionHandoffExtension } from "./media/vision-hook.js";
 import { VisionHandoff, type VisionHandoffStats } from "./media/vision.js";
+import {
+  IDLE_ROLLOVER_LIMITS,
+  IDLE_ROLLOVER_SYSTEM_PROMPT,
+  renderRolloverSource,
+  rolloverPrompt,
+  startIdleRollover,
+  type IdleRollover,
+} from "./history/idle-rollover.js";
+import { providerSummaryText } from "./history/summary-source.js";
 import { hasPersistedNanobotContext, preparedContextReplay, preparedTaskModel } from "./recovery/prepared.js";
 import {
   addInterruptedRunReport,
@@ -240,6 +250,15 @@ const ModelPolicyRevisionDoc = defineDoc<{ revision: string }>({
   kind: "nanobot.model-policy-revision", version: 1, scope: "session",
   initial: () => ({ revision: "" }), checkpointWhen: () => true,
 });
+
+/** An idle rollover's guarded reset: its handoff and the newest entry it summarized. */
+interface IdleRolloverReset {
+  readonly expectLatest: EntryId;
+  readonly handoff: string;
+}
+
+/** New activity, a run or a waiting question appeared after the handoff was written. */
+class IdleRolloverStale extends Error {}
 
 /** Whether one stored commit carried a specific model-policy revision document. */
 function publicationCarriesRevision(publication: CommitPublication, revision: string): boolean {
@@ -848,6 +867,19 @@ export async function openGateway(config: PortConfig, context: Context, options:
     digestChoice = {
       model: { provider: choice.native.provider, modelId: choice.native.modelId },
       thinkingLevel: choice.thinkingLevels.includes("off") ? "off" : choice.thinkingLevels[0]!,
+    };
+  }
+  // Idle rollover writes its handoff with one configured preset, never the foreground model.
+  let rolloverChoice: { readonly model: ModelReference; readonly thinkingLevel: ModelThinkingLevel } | undefined;
+  if (config.idleRollover !== undefined) {
+    const preset = presetCatalog.get(config.idleRollover.preset);
+    if (preset === undefined) {
+      throw new StartupDiagnosticError("configInvalid", { detail: "idleRollover.preset must name a configured model preset" });
+    }
+    const level = preset.thinkingLevel ?? "off";
+    rolloverChoice = {
+      model: preset.choice.native,
+      thinkingLevel: preset.choice.thinkingLevels.includes(level) ? level : preset.choice.thinkingLevels[0]!,
     };
   }
   // A worker's model comes from the spawning conversation's current selection at launch, unless config
@@ -2182,6 +2214,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
   let harness: HarnessType | undefined;
   let storage: Storage | undefined;
   let episodeCatalog: EpisodeCatalog | undefined;
+  let idleRollover: IdleRollover | undefined;
   let historyIndex: HistoryIndex | undefined;
   let episodeSummaries: EpisodeSummaries | undefined;
   let closed = false;
@@ -2693,11 +2726,25 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // session key.
     // The refresh registers in contextSnapshotLoads so an install for the same conversation cannot
     // build a competing snapshot; any failed commit restores the prior in-memory extension/table.
+    // The rollover reset carries its handoff and applies only while nothing was appended since the
+    // handoff was written and no question still waits for an answer; otherwise the chat is not idle.
+    const appendIdleRollover = async (tx: Tx, conversationId: ConversationId, reset: IdleRolloverReset): Promise<void> => {
+      if ((await tx.doc(LiveDoc, conversationId)).run !== undefined) throw new IdleRolloverStale();
+      if (await tx.latestEntryId(conversationId) !== reset.expectLatest) throw new IdleRolloverStale();
+      if (pendingQuestionViews(await tx.doc(AskQuestionsDoc, conversationId), now()).views.length > 0) {
+        throw new IdleRolloverStale();
+      }
+      await tx.appendEntry(conversationId, {
+        kind: ResetEntry.kind,
+        head: "self",
+        model: [{ role: "user", content: reset.handoff, timestamp: now() }],
+      });
+    };
     const refreshContextSnapshot = async (
       sessionKey: string,
       conversationId: ConversationId,
       ctx: Context,
-      reset = false,
+      reset: boolean | IdleRolloverReset = false,
     ): Promise<number> => {
       // Serialize with an in-flight install or a previous refresh for this conversation.
       for (;;) {
@@ -2740,7 +2787,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
             await configure(tx, conversationId, { ...extensionsPolicy(conversationId), ...toolFilter });
             // Idle-only reset and prompt replacement share one commit, including across multiple
             // CLI attachments. No submission can begin between the two effects.
-            if (reset) await tx.appendEntry(conversationId, { kind: ResetEntry.kind, head: "self" });
+            if (reset === true) await tx.appendEntry(conversationId, { kind: ResetEntry.kind, head: "self" });
+            else if (reset !== false) await appendIdleRollover(tx, conversationId, reset);
             return count;
           }, ctx);
         } catch (error) {
@@ -4134,6 +4182,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
         // An MCP login waiting for its browser callback is stopped first: it must not reach a closed
         // Harness, and it must not store a grant while this process is tearing down.
         await close(() => mcpAdminRef.current?.close());
+        await close(() => idleRollover?.close());
         // Stop derived background work before the session stops accepting commits.
         await close(() => episodeCatalog?.close());
         await close(() => harness!.close(cleanup));
@@ -4368,6 +4417,61 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // Scheduling begins only after registry and all persisted conversation policies are ready.
     memoryServiceRef.current = memoryService;
     harness.resume();
+    if (rolloverChoice !== undefined) {
+      const choice = rolloverChoice;
+      idleRollover = startIdleRollover({
+        afterMs: config.idleRollover!.afterMinutes * 60_000,
+        now,
+        context,
+        sessions: async (ctx) => (await mappedChatSessions(ctx))
+          .filter((session) => authorizedChatConversations.has(session.conversationId)),
+        quiet: async (ctx) => (await activeWorkFor(ctx)).interrupting === 0,
+        probe: async (conversationId, ctx) => {
+          if ((await harness!.snapshot(LiveDoc, conversationId, ctx))?.run !== undefined) return undefined;
+          const conversation = await harness!.conversation(conversationId, ctx);
+          if (conversation === undefined) return undefined;
+          const [latest] = (await conversation.entries({ order: "descending" }, 1, undefined, ctx)).items;
+          // Nothing since the last reset (a rollover or `/new`): nothing to roll over.
+          if (latest === undefined || latest.kind === ResetEntry.kind) return undefined;
+          return latest.id;
+        },
+        summarize: async (conversationId, signal) => {
+          const model = models.getModel(choice.model.provider, choice.model.modelId);
+          const conversation = await harness!.conversation(conversationId, context);
+          if (model === undefined || conversation === undefined) return undefined;
+          const source = renderRolloverSource((await conversation.context(context)).messages);
+          if (source.trim().length === 0) return undefined;
+          const message = await models.completeSimple(model, {
+            messages: [
+              { role: "system", content: IDLE_ROLLOVER_SYSTEM_PROMPT, timestamp: now() },
+              { role: "user", content: rolloverPrompt(source), timestamp: now() },
+            ],
+          }, {
+            maxTokens: Math.min(IDLE_ROLLOVER_LIMITS.maxTokens, model.maxTokens),
+            signal,
+            ...(choice.thinkingLevel === "off" ? {} : { reasoning: choice.thinkingLevel }),
+          });
+          return providerSummaryText(message);
+        },
+        rollover: async (session, expectLatest, handoff, ctx) => {
+          const reset: IdleRolloverReset = { expectLatest, handoff };
+          try {
+            if (options.contextSnapshotProvider) {
+              await refreshContextSnapshot(session.sessionKey, session.conversationId, ctx, reset);
+            } else {
+              const conversation = await harness!.conversation(session.conversationId, ctx);
+              if (conversation === undefined) return;
+              await conversation.commit((tx) => appendIdleRollover(tx, session.conversationId, reset), ctx);
+            }
+          } catch (error) {
+            // New activity won the race; the next idle period starts a fresh clock.
+            if (error instanceof IdleRolloverStale || error instanceof ConversationBusy) return;
+            throw error;
+          }
+        },
+        report: (error) => reportFailure(error, "gateway.idleRollover"),
+      });
+    }
     // A worker that finished while the process was gone already committed its outcome and retired its
     // authority, but may not have admitted the internal result event. Re-admitting is idempotent by the
     // conversation-scoped request ID, so a crash cannot lose a result or duplicate the parent's turn.
@@ -4402,6 +4506,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       try { await operation(); }
       catch (cleanupError) { reportFailure(cleanupError, "gateway.close.runtime"); }
     };
+    await close(() => idleRollover?.close());
     await close(() => episodeCatalog?.close());
     await close(() => memoryServiceRef.current?.close());
     memoryServiceRef.current = undefined;

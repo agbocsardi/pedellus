@@ -354,6 +354,10 @@ edits need restart only; unit edits additionally need daemon-reload.
   re-arm, run-now or bulk path.
 - Skill prompts carry names, descriptions and locators only; bodies load on
   demand through the read-only `skill` tool.
+- Idle rollover (`idleRollover`, default off) is a native `pi.reset` carrying a handoff written by
+  one configured preset, applied only to an authenticated mapped chat with no run, no pending
+  question, no interrupting gateway work and no entry appended since the handoff was written
+  (checked in the reset commit). It grants nothing, starts no turn and sends no channel message.
 - Markdown in the workspace is the memory source of truth. Durable owns the
   transcript, runtime state and compaction.
 - Memory digestion starts only on an explicit owner command or an explicit

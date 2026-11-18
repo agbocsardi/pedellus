@@ -103,6 +103,14 @@ set `episodeSummary.enabled` to `false` to disable summaries. Already-closed epi
 backfilled automatically. Short cache retention is requested, but cache reuse is not guaranteed;
 see [episode summaries](./HISTORY.md#episode-summaries).
 
+Idle rollover is off by default. With `"idleRollover": { "afterMinutes": 30, "preset": "small" }`,
+an authenticated mapped chat that stays fully idle that long (no run, no gateway work, no
+pending `ask_user` question) gets a short handoff note from the named preset, usually a cheap
+model, and starts a new episode exactly like `/new`, with the note as its first message. The note
+tells the agent the owner may or may not continue and points it at the memory tools for detail.
+The closed episode is digested and summarized like any other. It makes one provider call per
+rollover, sends no channel message, and the idle clock is in memory, so a restart restarts it.
+
 ## Busy owner messages
 
 `followUpMode` decides where an owner's CLI or Telegram message goes when that conversation is

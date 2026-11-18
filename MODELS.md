@@ -360,7 +360,7 @@ refused as unrelated instead of partially applied: tools, channels, workspace
 context, MCP, `providers`, classifier, digest/worker/summary configuration,
 vision-handoff configuration, storage paths and every other startup field need
 `/restart`. Named-preset entries still referenced by `digest.preset`,
-`workers.preset`, `episodeSummary.preset` or `visionHandoff.describerPreset` must
+`workers.preset`, `episodeSummary.preset`, `idleRollover.preset` or `visionHandoff.describerPreset` must
 stay identical; with vision handoff configured the whole preset catalog is pinned,
 and a model captured at open for digestion, workers or episode summaries may not
 leave the new finite allowlist. Background model captures resolved at open are not
