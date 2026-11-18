@@ -522,30 +522,41 @@ test('a callback-shaped send is consumed before admission and never stored', { t
 });
 
 test('scheduled results are delivered through the channel-neutral outbox as cursor events', { timeout: 20_000 }, async () => {
-  await withChannel('scheduled', {}, async ({ store, base }) => {
-    const cookie = await pairedDevice(store, base);
+  // The outbox record and this channel's admission evidence are seeded before the adapter starts,
+  // as an earlier session would have left them; the startup scan then delivers without a tick.
+  const store = await openAppStore('scheduled', {});
+  const { CronDeliveriesDoc } = await import(new URL('../dist/automation/cron-delivery.js', import.meta.url).href);
+  const { AppState } = await import(new URL('../dist/channels/app.js', import.meta.url).href);
+  const stateConversation = await store.gateway.conversationFor('app:channel-state', context);
+  await stateConversation.commit(async (tx) => {
+    const doc = await tx.doc(AppState, stateConversation.id);
+    doc.origin = { admittedAtMs: 1 };
+  }, context);
+  const conversation = await store.gateway.conversationFor(APP_CHAT_SESSION_KEY, context);
+  await conversation.commit(async (tx) => {
+    const doc = await tx.doc(CronDeliveriesDoc, conversation.id);
+    doc.deliveries.push({
+      id: 'cron:1:1000',
+      sessionKey: APP_CHAT_SESSION_KEY,
+      text: 'SCHEDULED-REMINDER',
+      createdAtMs: Date.now(),
+      status: 'pending',
+      nextChunkIndex: 0,
+    });
+  }, context);
+  const app = startApp(store);
+  const base = `http://127.0.0.1:${await app.port}`;
+  try {
+    const cookie = await (async () => {
+      const created = await store.gateway.appConsole.console().pair('phone');
+      const exchange = await postPair(base, created.code, 'phone');
+      assert.equal(exchange.status, 204);
+      return exchange.cookie.split(';')[0];
+    })();
     const device = deviceClient(base, cookie);
     await device.open();
-    // The chat needs admission evidence before a scheduled result is released to it.
     device.send({ type: 'req', id: 'h1', op: 'hello', v: 1, cursor: null });
     await device.wait(() => device.response('h1') !== undefined, 'hello reply');
-    device.send({ type: 'req', id: 's1', op: 'send', key: 'warmup', text: 'warm up the chat' });
-    await device.wait(() => device.events('settled').length === 1, 'the warmup turn settled');
-
-    const conversation = await store.gateway.conversationFor(APP_CHAT_SESSION_KEY, context);
-    const { CronDeliveriesDoc } = await import(new URL('../dist/automation/cron-delivery.js', import.meta.url).href);
-    await conversation.commit(async (tx) => {
-      const doc = await tx.doc(CronDeliveriesDoc, conversation.id);
-      doc.deliveries.push({
-        id: 'cron:1:1000',
-        sessionKey: APP_CHAT_SESSION_KEY,
-        text: 'SCHEDULED-REMINDER',
-        createdAtMs: Date.now(),
-        status: 'pending',
-        nextChunkIndex: 0,
-      });
-    }, context);
-
     await device.wait(() => device.events('message').some((event) => event.text === 'SCHEDULED-REMINDER'),
       'the scheduled result arrived');
     const scheduled = device.events('message').find((event) => event.text === 'SCHEDULED-REMINDER');
@@ -557,5 +568,8 @@ test('scheduled results are delivered through the channel-neutral outbox as curs
     }, context);
     assert.equal(records.find((record) => record.id === 'cron:1:1000').status, 'delivered');
     await device.close();
-  });
+  } finally {
+    await app.stop();
+    await store.close();
+  }
 });
