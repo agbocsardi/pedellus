@@ -82,7 +82,8 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   const thread = store.openThread;
   const main = thread === MAIN_THREAD;
   const info = store.threads.get(thread);
-  const title = main ? "Durable" : info?.title ?? "New thread";
+  const agentName = store.agentName;
+  const title = main ? agentName : info?.title ?? "New thread";
   const archived = !!info?.archived;
   const writable = store.canWrite(thread);
   const text = drafts[thread] ?? "";
@@ -401,7 +402,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
             value={text}
             rows={1}
             maxLength={LIMITS.sendTextChars}
-            placeholder={running ? "Durable is working…" : "Message Durable"}
+            placeholder={running ? `${agentName} is working…` : `Message ${agentName}`}
             aria-label="Message"
             onChange={(e) => setText(e.target.value)}
             onKeyDown={onKeyDown}

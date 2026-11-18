@@ -8,6 +8,7 @@ export type Outgoing = { key: string; thread: ThreadId; text: string; state: Out
 export type ThreadCreate = { key: string; title?: string; from?: ThreadOrigin; failed?: boolean };
 export type AgentStatus = Pick<StatusEvent, "state" | "label">;
 type ChatEvent = Exclude<DurableEvent, { event: "thread" }>;
+type Identity = { device: string; agent?: string };
 
 interface Db extends DBSchema {
   events: { key: number; value: DurableEvent };
@@ -15,7 +16,7 @@ interface Db extends DBSchema {
   threads: { key: string; value: ThreadInfo };
   creates: { key: string; value: ThreadCreate };
   view: { key: string; value: { thread: ThreadId; cursor: number } };
-  settings: { key: "openThread" | "resumeCursor"; value: ThreadId | number };
+  settings: { key: "openThread" | "resumeCursor" | "identity"; value: ThreadId | number | Identity };
 }
 
 const IDLE: AgentStatus = { state: "idle" };
@@ -39,7 +40,7 @@ export class Store {
   openThread: ThreadId = MAIN_THREAD;
   connState: ConnState = "offline";
   mode: Mode = "boot";
-  device: string | null = null;
+  private identity?: Identity;
   storageBlocked = false;
   replayReady = false;
   /** Max seen can be ahead of a replay gap; only resumeCursor is safe for hello. */
@@ -70,6 +71,8 @@ export class Store {
     for (const fn of this.listeners) fn();
   }
 
+  get agentName() { return this.identity?.agent ?? "Durable"; }
+
   async init() {
     const db = await openDB<Db>("durable-app", 2, {
       blocked: () => {
@@ -96,10 +99,11 @@ export class Store {
     this.storageBlocked = false;
     // Load the replay checkpoint and everything it covers from one snapshot.
     const tx = db.transaction(["events", "outbox", "threads", "creates", "view", "settings"], "readonly");
-    const [events, outbox, threads, creates, viewed, open, resume] = await Promise.all([
+    const [events, outbox, threads, creates, viewed, open, resume, identity] = await Promise.all([
       tx.objectStore("events").getAll(), tx.objectStore("outbox").getAll(),
       tx.objectStore("threads").getAll(), tx.objectStore("creates").getAll(), tx.objectStore("view").getAll(),
-      tx.objectStore("settings").get("openThread"), tx.objectStore("settings").get("resumeCursor"), tx.done,
+      tx.objectStore("settings").get("openThread"), tx.objectStore("settings").get("resumeCursor"),
+      tx.objectStore("settings").get("identity"), tx.done,
     ]).catch((err) => { db.close(); throw err; });
     if (!closed) this.db = db;
     const cachedThreads = new Set(threads.map((t) => t.id));
@@ -131,6 +135,7 @@ export class Store {
       this.openThread = open;
     }
     if (typeof resume === "number") this.resumeCursor = resume;
+    if (typeof identity === "object" && identity) this.identity = identity;
     this.changed();
   }
 
@@ -322,7 +327,7 @@ export class Store {
         snippet = (start ? "…" : "") + entry.text.slice(start, end) + (end < entry.text.length ? "…" : "");
         break;
       }
-      const title = t.id === MAIN_THREAD ? `Main Durable ${t.title}` : t.title;
+      const title = t.id === MAIN_THREAD ? `Main ${this.agentName} ${t.title}` : t.title;
       if (snippet !== undefined || title.toLowerCase().includes(titleQuery) || remote?.has(t.id)) {
         results.push({ thread: t, snippet });
       }
@@ -389,11 +394,12 @@ export class Store {
     }
   }
 
-  setDevice(d: string) {
-    if (this.device !== d) {
-      this.device = d;
-      this.changed();
-    }
+  setIdentity(device: string, agent = this.identity?.agent) {
+    if (this.identity?.device === device && this.identity.agent === agent) return;
+    this.identity = { device, agent };
+    this.searchCache = undefined;
+    this.changed();
+    void this.db?.put("settings", this.identity, "identity").catch(console.error);
   }
 
   async createOutgoing(thread: ThreadId, text: string, retryKey?: string): Promise<Outgoing> {

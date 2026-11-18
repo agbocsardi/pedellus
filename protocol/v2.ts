@@ -41,7 +41,7 @@ export type Request =
   | { type: "req"; id: string; op: "thread.rename"; thread: ThreadId; title: string }
   | { type: "req"; id: string; op: "thread.archive"; thread: ThreadId; archived: boolean };
 
-export type HelloResult = { v: 2; device: string; head: number | null };
+export type HelloResult = { v: 2; device: string; head: number | null; agent: string };
 export type SendResult = { duplicate: boolean };
 export type ThreadsResult = { threads: ThreadInfo[] };
 export type ThreadCreateResult = { thread: ThreadId; duplicate: boolean };

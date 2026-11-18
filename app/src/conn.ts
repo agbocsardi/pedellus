@@ -347,7 +347,10 @@ export class Connection {
       this.replayCursor = cursor;
       this.replayHead = res.head ?? null;
       this.store.resetStatuses();
-      if (typeof res.device === "string") this.store.setDevice(res.device);
+      if (typeof res.device === "string") {
+        const name = typeof res.agent === "string" ? res.agent.trim() : "";
+        this.store.setIdentity(res.device, name && [...name].length <= 40 ? name : undefined);
+      }
       this.store.setMode("chat");
     });
   }
