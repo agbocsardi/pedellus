@@ -2736,6 +2736,13 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       authenticate: (token) => authenticate(token),
       onSocket: (session, hooks) => onSocket(session, hooks),
       upload: (device, request) => files.upload({ deviceId: device.deviceId, ...request }),
+      // Any paired device may fetch a file once a durable message references it; nothing else.
+      download: async (_device, id) => {
+        const file = await files.download(id);
+        return file === undefined
+          ? undefined
+          : { absolutePath: file.absolutePath, bytes: file.bytes, mimeType: file.mimeType, name: file.name };
+      },
     },
     // A listener that dies takes the channel with it: the supervisor reports gateway.app and the
     // host shuts down, instead of a half-open listener nobody is serving.

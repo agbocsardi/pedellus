@@ -197,9 +197,10 @@ export function createAppFiles(options: {
   const windows = new Map<string, number[]>();
   let lastPrunedAtMs = Number.NEGATIVE_INFINITY;
 
-  const read = async (): Promise<AppFilesChannelState> => copyJson(
-    await conversation.commit((tx) => tx.doc(AppFilesState, conversation.id), context),
-  ) as unknown as AppFilesChannelState;
+  const read = async (): Promise<AppFilesChannelState> => conversation.commit(
+    async (tx) => copyJson(await tx.doc(AppFilesState, conversation.id)) as unknown as AppFilesChannelState,
+    context,
+  );
 
   const rateLimited = (deviceId: string, atMs: number): boolean => {
     const recent = (windows.get(deviceId) ?? []).filter((stamp) => atMs - stamp < APP_FILE_LIMITS.rateWindowMs);

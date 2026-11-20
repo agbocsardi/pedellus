@@ -11,6 +11,7 @@
  * cookie is the only authentication.
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { createReadStream } from "node:fs";
 import { realpath, stat, open } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import { WebSocketServer, WebSocket, type WebSocket as WebSocketType } from "ws";
@@ -29,6 +30,12 @@ const PAIR_ERRORS: Readonly<Record<string, [number, string]>> = Object.freeze({
   "bad-request": [400, JSON.stringify({ error: "bad_request" })],
   invalid: [401, JSON.stringify({ error: "invalid_code" })],
   "rate-limited": [429, JSON.stringify({ error: "rate_limited" })],
+});
+/** A downloaded original's immutable, non-executable headers (protocol v2, Files). */
+const FILE_HEADERS = Object.freeze({
+  "x-content-type-options": "nosniff",
+  "content-security-policy": "sandbox",
+  "cache-control": "private, max-age=31536000, immutable",
 });
 /** Fixed upload replies; `201` carries only the new id. */
 const UPLOAD_ERRORS: Readonly<Record<Exclude<AppUploadOutcome["status"], "created">, [number, string]>> = Object.freeze({
@@ -65,10 +72,20 @@ export interface AppListenerHost {
   onSocket(session: AppDeviceSession, hooks: AppSessionHooks): void;
   /** Admit one uploaded original; transport bounds stay here, every policy decision there. */
   upload(device: AppUploadDevice, request: AppUploadStream): Promise<AppUploadOutcome>;
+  /** Resolve one file a durable message references, for `GET /v1/files/<id>`. */
+  download(device: AppUploadDevice, id: string): Promise<AppDownloadTarget | undefined>;
 }
 
 /** The authenticated device an upload or download is attributed to. */
 export type AppUploadDevice = { readonly deviceId: string; readonly label: string };
+
+/** One downloadable original, already resolved inside the host's media root. */
+export type AppDownloadTarget = {
+  readonly absolutePath: string;
+  readonly bytes: number;
+  readonly mimeType: string;
+  readonly name: string;
+};
 
 /** One upload body as the listener hands it over: already hard-capped, lazily consumed. */
 export type AppUploadStream = {
@@ -214,6 +231,10 @@ export async function startAppListener(options: {
       response.end(JSON.stringify({ error: "method_not_allowed" }));
       return;
     }
+    if (path.startsWith("/v1/files/")) {
+      await fileEndpoint(request, response, path.slice("/v1/files/".length));
+      return;
+    }
     if (path === "/v1/stream") {
       // A stream without an upgrade is not a usable endpoint; the static root is not searched.
       response.writeHead(400, { "content-type": "application/json" });
@@ -324,6 +345,46 @@ export async function startAppListener(options: {
     refuseUpload(request, response, ...UPLOAD_ERRORS[outcome.status], outcome.status !== "too-large");
   }
 
+  /** One file a durable message references; every other id is a plain 404. */
+  async function fileEndpoint(request: IncomingMessage, response: ServerResponse, rawId: string): Promise<void> {
+    const token = deviceCookie(request.headers.cookie);
+    const device = token === undefined ? undefined : await options.host.authenticate(token);
+    if (device === undefined) {
+      response.writeHead(401, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: "unauthorized" }));
+      return;
+    }
+    let id: string | undefined;
+    try {
+      id = decodeURIComponent(rawId);
+    } catch {
+      id = undefined;
+    }
+    // The shape is checked before any state is read, so a malformed id is never looked up.
+    const file = id === undefined || rawId.includes("/") || !APP_LIMITS.uploadIdPattern.test(id)
+      ? undefined
+      : await options.host.download(device, id);
+    if (file === undefined) {
+      response.writeHead(404, { "content-type": "application/json" });
+      response.end(NOT_FOUND_BODY);
+      return;
+    }
+    response.writeHead(200, {
+      ...FILE_HEADERS,
+      "content-type": file.mimeType,
+      "content-length": file.bytes,
+      "content-disposition": fileDisposition(file.mimeType, file.name),
+    });
+    if (request.method === "HEAD") {
+      response.end();
+      return;
+    }
+    // The host's store resolved this path inside the media root and refused symlinks; read only.
+    const stream = createReadStream(file.absolutePath);
+    stream.on("error", () => response.destroy());
+    stream.pipe(response);
+  }
+
   async function pairEndpoint(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const chunks: Buffer[] = [];
     let total = 0;
@@ -368,6 +429,17 @@ export async function startAppListener(options: {
     );
     response.writeHead(204);
     response.end();
+  }
+
+  /**
+   * `inline` only for the media types a browser renders safely under the sandbox policy; every
+   * other stored type downloads, with an RFC 5987 `filename*` instead of a raw header value.
+   */
+  function fileDisposition(mimeType: string, name: string): string {
+    if (mimeType.startsWith("image/") || mimeType.startsWith("audio/")) return "inline";
+    const encoded = encodeURIComponent(name).replace(/['()*]/gu,
+      (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+    return `attachment; filename*=UTF-8''${encoded}`;
   }
 
   async function serveStatic(request: IncomingMessage, response: ServerResponse): Promise<void> {
