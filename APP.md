@@ -513,10 +513,6 @@ with a fixed reason and a durable fault entry; no raw record contents are logged
   multipart uploads and no per-file deletion.
 * **The upload rate window is in-memory.** A restart clears it, like the pairing window; the durable
   per-device and total record bounds still apply.
-* **No MCP login surface.** A mapped app chat cannot start an MCP login (no owner surface is
-  registered, so the login is refused before delivery). Protocol v2 defines no owner-only
-  non-durable event; a later protocol revision must add one before this channel can carry URLs.
-  `ask_user` questions are supported through their own durable event (see *Owner questions*).
 * **Web Push is offline-verified only.** No real push service, browser subscription or service
   worker has been exercised; a failed (non-404/410) send is only retried by the next message, as
   specified. The app side (permission, service worker, badge) lives in `pwa/app`.
