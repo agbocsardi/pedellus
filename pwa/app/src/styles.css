@@ -892,10 +892,16 @@ input#pair-code {
   line-height: 1.4;
   max-height: 140px;
   min-width: 0;
+  /* A long value scrolls inside the field instead of widening the capsule. */
+  text-overflow: ellipsis;
   outline: none;
 }
 .capsule textarea::placeholder {
   color: var(--muted-ink);
+  /* One line, ellipsized: the field is too narrow at 320px to wrap it. */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .capsule:has(.wrench) {
   padding-left: 5px;
@@ -969,6 +975,7 @@ input#pair-code {
   margin: 4px 10px 0;
 }
 .send {
+  position: relative;
   width: 36px;
   height: 36px;
   border-radius: 50%;
@@ -986,6 +993,13 @@ input#pair-code {
 .send svg {
   width: 20px;
   height: 20px;
+}
+/* The idle send slot is the mic: a 36px circle with a real 44px tap target. */
+.send.mic::after {
+  content: "";
+  position: absolute;
+  inset: -4px;
+  border-radius: 50%;
 }
 .send[data-ready] {
   background: var(--accent);
@@ -1577,13 +1591,7 @@ input#pair-code {
   pointer-events: none;
 }
 
-/* Composer: the mic, the recording row and a short, non-error hint. */
-/* A real 44px tap target that keeps the 36px slot it looks like. */
-.wrench.mic {
-  width: 44px;
-  height: 44px;
-  margin: -4px -2px;
-}
+/* Composer: the recording row and a short, non-error hint. */
 .capsule.recording {
   align-items: center;
   justify-content: space-between;

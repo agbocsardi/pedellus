@@ -1133,10 +1133,6 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
               onClick={() => fileRef.current?.click()}>
               <Icon d={ATTACH_ICON} bold />
             </button>}
-            {canVoice && <button className="wrench mic" aria-label="Record a voice note"
-              onClick={() => void startVoice()}>
-              <Icon d={MIC_ICON} />
-            </button>}
             <input ref={fileRef} type="file" multiple hidden tabIndex={-1}
               onChange={(e) => {
                 const chosen = [...(e.currentTarget.files ?? [])];
@@ -1155,21 +1151,30 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
               onKeyDown={onKeyDown}
               enterKeyHint={FINE_POINTER ? "send" : "enter"}
             />
-            <button
-              className={running ? "send stop" : "send"}
-              aria-label={running ? "Stop" : "Send"}
-              data-ready={running || (slash ? !!picked && canRun(picked, cmdState) && !argsTooLong
-                : canSendFiles && (text.trim() !== "" || files.length > 0)) ? "" : undefined}
-              onClick={() => void submit()}
-            >
-              {running ? (
-                <svg viewBox="0 0 24 24" aria-hidden="true">
-                  <rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor" />
-                </svg>
-              ) : (
-                <Icon d="M12 19V5M5.5 11.5 12 5l6.5 6.5" bold />
-              )}
-            </button>
+            {!running && canVoice && text.trim() === "" && files.length === 0 ? (
+              /* Nothing to send yet, so the send slot is the mic: the 320px
+                 composer stays at two icons on the left. */
+              <button className="send mic" aria-label="Record a voice note"
+                onClick={(e) => { e.currentTarget.blur(); void startVoice(); }}>
+                <Icon d={MIC_ICON} />
+              </button>
+            ) : (
+              <button
+                className={running ? "send stop" : "send"}
+                aria-label={running ? "Stop" : "Send"}
+                data-ready={running || (slash ? !!picked && canRun(picked, cmdState) && !argsTooLong
+                  : canSendFiles && (text.trim() !== "" || files.length > 0)) ? "" : undefined}
+                onClick={() => void submit()}
+              >
+                {running ? (
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor" />
+                  </svg>
+                ) : (
+                  <Icon d="M12 19V5M5.5 11.5 12 5l6.5 6.5" bold />
+                )}
+              </button>
+            )}
           </div>
           )}
         </>}
