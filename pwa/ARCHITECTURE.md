@@ -55,14 +55,14 @@ An opt-in `app` config block starts one HTTP server on an explicit loopback
 port. `tailscale serve` terminates TLS with the node's `*.ts.net` certificate
 (HTTPS is required for service workers and push) and proxies to it.
 
-| Path | Purpose |
+| Path or stream op | Purpose |
 |---|---|
 | `/` | The built PWA (static files from a configured absolute directory) |
 | `GET /v1/stream` (WebSocket) | Events down, requests up |
 | `POST /v1/pair` | One-time pairing exchange |
 | `POST /v1/uploads` | Attachment upload, bounded size, stored under `media/app/` |
 | `GET /v1/media/<id>` | Download of a file the agent sent to this chat |
-| `POST /v1/push/subscription` | Store or replace this device's Web Push subscription |
+| `push.key` / `push.subscribe` / `push.unsubscribe` (stream requests) | Web Push enrolment: the gateway's VAPID public key, then store or drop this device's subscription |
 
 Same origin for app and API: no CORS, and the device credential can be an
 `HttpOnly; Secure; SameSite=Strict` cookie that the WebSocket handshake carries.
