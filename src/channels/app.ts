@@ -3109,12 +3109,10 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           refused = "pairing-limit";
           return;
         }
-        let chosen = trimmed;
-        if (chosen === undefined) {
-          let index = 1;
-          while (labelInUse(doc, `device-${index}`)) index += 1;
-          chosen = `device-${index}`;
-        } else if (labelInUse(doc, chosen)) {
+        // Without a console label the device names itself at redemption (any valid label not
+        // already used by an active device); with one, the device must send exactly that label.
+        const chosen = trimmed;
+        if (chosen !== undefined && labelInUse(doc, chosen)) {
           refused = "label-in-use";
           return;
         }
@@ -3124,11 +3122,11 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           if (doc.pairings.some((pairing) => pairing.codeHash === hash)) continue;
           doc.pairings.push({
             codeHash: hash,
-            label: chosen,
+            ...(chosen === undefined ? {} : { label: chosen }),
             createdAtMs: now(),
             expiresAtMs: now() + APP_LIMITS.pairTtlMs,
           });
-          chosenLabel = chosen;
+          chosenLabel = chosen ?? "";
           created = { code, expiresAtMs: now() + APP_LIMITS.pairTtlMs };
           return;
         }

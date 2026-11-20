@@ -181,7 +181,7 @@ test('malformed bodies and bad codes are refused with fixed errors', { timeout: 
     assert.equal((await postPair(base, 'ABCD234', 'phone')).status, 400);
     assert.equal((await postPair(base, 'ABCD23I5', 'phone')).status, 400, 'the alphabet excludes I');
     assert.equal((await postPair(base, 'ABCD23O5', 'phone')).status, 400, 'the alphabet excludes O');
-    assert.equal((await postPair(base, 'ABCD2345', 'not a label')).status, 400);
+    assert.equal((await postPair(base, 'ABCD2345', ' phone')).status, 400, 'a label never starts or ends with a space');
     assert.equal((await postPair(base, 'ABCD2345', 'phone')).status, 401);
     const invalid = await postPair(base, 'ABCD2345', 'phone');
     assert.deepEqual(invalid.body, { error: 'invalid_code' });
@@ -618,15 +618,19 @@ test('the console refuses duplicate labels, lists devices and revokes exactly by
     assert.deepEqual(reused, { refused: 'label-in-use' });
 
     const unnamed = await console.pair();
-    assert.equal('refused' in unnamed, false, 'an omitted label picks a free default');
+    assert.equal('refused' in unnamed, false, 'an omitted label lets the device name itself');
     const base = `http://127.0.0.1:${await app.port}`;
-    assert.equal((await postPair(base, unnamed.code, 'device-1')).status, 204);
+    assert.equal((await postPair(base, unnamed.code, 'My iPhone')).status, 204,
+      'an unlabelled code accepts whatever valid label the device sends');
 
     const devices = await console.devices();
     assert.equal(devices.length, 1);
-    assert.equal(devices[0].label, 'device-1');
+    assert.equal(devices[0].label, 'My iPhone');
+    const second = await console.pair();
+    assert.equal((await postPair(base, second.code, 'My iPhone')).status, 401,
+      'a label an active device already uses is still refused at redemption');
     assert.equal(await console.revoke('no-such-device'), 'missing');
-    assert.equal(await console.revoke('device-1'), 'revoked');
+    assert.equal(await console.revoke('My iPhone'), 'revoked');
     assert.deepEqual((await console.devices()).map((device) => device.revokedAtMs === undefined ? 'active' : 'revoked'),
       ['revoked']);
   });

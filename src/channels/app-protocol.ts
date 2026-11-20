@@ -98,7 +98,9 @@ export function parseThreadId(value: unknown): string | undefined {
 export function validAppLabel(value: unknown): value is string {
   if (typeof value !== "string") return false;
   if (value.length < APP_LIMITS.labelMinChars || value.length > APP_LIMITS.labelMaxChars) return false;
-  return /^[\x21-\x7e\u00a0-\uffff]+$/u.test(value) && !/[\u202a-\u202e\u2066-\u2069]/u.test(value);
+  // Spaces are fine inside a label ("Gergo's iPhone"), never at either end.
+  if (value.trim() !== value) return false;
+  return /^[\x20-\x7e\u00a0-\uffff]+$/u.test(value) && !/[\u202a-\u202e\u2066-\u2069]/u.test(value);
 }
 
 /** The hello reply's agent display name: 1–40 printable characters (spaces allowed). */

@@ -95,7 +95,8 @@ These commands attach to the running gateway over the private local socket, like
 console: the running adapter owns every decision (label uniqueness, device limit, revocation), and
 this process only parses flags and prints the bounded answer. A label is printable 1–40
 characters; `pair` refuses a label already in use by an active device or an outstanding code, and
-an omitted label picks a free `device-<n>`. Revoke is exact-label.
+without a label the code accepts whatever label the device sends at pairing (one not already used
+by an active device), while with one the device must send exactly that label. Revoke is exact-label.
 
 ## Pairing and devices
 
