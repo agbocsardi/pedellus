@@ -471,3 +471,38 @@ test('a replayed storage adopts its existing copy instead of deleting bytes a re
   }
 });
 
+test('an admitted app side-thread fork is offered the app tool and can send', { timeout: 30_000 }, async () => {
+  await withApp('agent-fork', {
+    files: { 'notes/report.txt': 'REPORT-BYTES' },
+    script: [
+      () => fauxAssistantMessage('committed anchor answer'),
+      () => fauxAssistantMessage([
+        fauxToolCall('app', { action: 'send', path: 'notes/report.txt', caption: 'Fork file' },
+          { id: 'fork-send' }),
+      ], { stopReason: 'toolUse' }),
+      () => fauxAssistantMessage('FORK-SENT'),
+    ],
+  }, async ({ store, device, request, send }) => {
+    await send('anchor', 'context before fork');
+    const answer = device.events('message').find((event) => event.role === 'assistant' && event.key === 'anchor');
+    const created = await request('thread.create', {
+      key: 'fork', from: { thread: 'main', messageId: answer.id }, title: 'Branch',
+    });
+    assert.equal(created.ok, true, JSON.stringify(created));
+    const child = await store.gateway.conversationFor(`${APP_CHAT_SESSION_KEY}:${created.thread}`, context);
+    assert.ok(toolNames(await child.agent(context)).includes('app'),
+      'the admitted fork is offered the app tool');
+
+    const reply = await request('send', { thread: created.thread, key: 'child', text: 'send it here' });
+    assert.equal(reply.ok, true, JSON.stringify(reply));
+    await device.wait(() => device.events('settled').some((event) => event.key === 'child'
+      && event.outcome === 'answered'), 'fork answer');
+    const receipt = await toolResults(child, 'fork-send');
+    assert.equal(receipt.isError, false, receipt.text);
+    assert.match(receipt.text, /Delivered the workspace file notes\/report\.txt as one attachment \(12 bytes\)/u);
+
+    const messages = agentFileMessages(await appState(store.gateway));
+    assert.equal(messages.length, 1);
+    assert.equal(messages[0].thread, created.thread, 'the file lands in the fork thread');
+  });
+});
