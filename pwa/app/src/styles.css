@@ -1,3 +1,17 @@
+/* Top inset. Installed iOS 26+ web apps get a Liquid Glass edge blur drawn ~40pt below the status
+   bar, over the page; content there (the header's avatar and name) is blurred. In installed
+   portrait iOS everything at the top clears that zone, and an opaque band (index.html) covers it. */
+:root {
+  --inset-top: env(safe-area-inset-top, 0px);
+}
+@supports (-webkit-touch-callout: none) {
+  @media (display-mode: standalone) and (orientation: portrait) {
+    :root {
+      --inset-top: calc(env(safe-area-inset-top, 0px) + 2.5rem);
+    }
+  }
+}
+
 @import "tailwindcss";
 @import "streamdown/styles.css";
 /* Streamdown's chrome is Tailwind-classed, and Tailwind skips node_modules
@@ -116,7 +130,7 @@ svg {
   overflow-y: auto;
   display: grid;
   place-items: center;
-  padding: calc(env(safe-area-inset-top) + 24px) var(--gutter)
+  padding: calc(var(--inset-top) + 24px) var(--gutter)
     calc(env(safe-area-inset-bottom) + 24px);
 }
 .dim {
@@ -398,7 +412,7 @@ input#pair-code {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: calc(env(safe-area-inset-top) + 8px) var(--gutter) 10px;
+  padding: calc(var(--inset-top) + 8px) var(--gutter) 10px;
   border-bottom: 1px solid color-mix(in oklab, var(--line) 70%, transparent);
   /* Solid, no backdrop-filter: nothing scrolls under the header, and in the installed iOS app a
      backdrop-filtered header inside the transformed shell rasterized blurry (avatar and title). */
@@ -1269,7 +1283,7 @@ input#pair-code {
   left: var(--gutter);
   right: var(--gutter);
   bottom: calc(env(safe-area-inset-bottom) + 10px);
-  max-height: calc(100% - env(safe-area-inset-top) - env(safe-area-inset-bottom) - 20px);
+  max-height: calc(100% - var(--inset-top) - env(safe-area-inset-bottom) - 20px);
   overflow: auto;
   overscroll-behavior: contain;
   max-width: 28rem;
@@ -1643,7 +1657,7 @@ input#pair-code {
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  padding-top: env(safe-area-inset-top);
+  padding-top: var(--inset-top);
   border-inline-end: 1px solid var(--line);
   background: color-mix(in oklab, var(--muted) 40%, var(--bg));
 }
@@ -2267,7 +2281,7 @@ input#pair-code {
   align-items: center;
   gap: 8px;
   flex: none;
-  padding: calc(env(safe-area-inset-top) + 8px) calc(env(safe-area-inset-right) + 12px) 8px
+  padding: calc(var(--inset-top) + 8px) calc(env(safe-area-inset-right) + 12px) 8px
     calc(env(safe-area-inset-left) + 8px);
   border-bottom: 1px solid var(--line);
   background: var(--card);

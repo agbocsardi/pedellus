@@ -30,7 +30,8 @@
             top: 0;
             left: 0;
             right: 0;
-            height: max(6px, env(safe-area-inset-top));
+            /* Covers the status bar and the blur zone below it (--inset-top, styles.css). */
+            height: max(6px, var(--inset-top, env(safe-area-inset-top)));
             background: #f7f6f3;
             pointer-events: none;
             z-index: 1000;
