@@ -1575,8 +1575,9 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     let blocked: AppErrorCode | undefined;
     try {
       await mutateState((doc) => {
-        // Rechecked inside the commit: archive may have landed while this request waited.
-        if (!openThread(doc, thread)) { blocked = "bad_request"; return; }
+        // Rechecked inside the commit exactly as a send does: an archive may have landed, or be in
+        // flight, while this request waited for its own commit.
+        if (!openThread(doc, thread) || archiving.has(thread)) { blocked = "bad_request"; return; }
         const target = findDurableMessage(doc, thread, message);
         if (target === undefined) { blocked = "bad_request"; return; }
         const previous = latestReaction(doc, thread, message)?.emoji ?? null;

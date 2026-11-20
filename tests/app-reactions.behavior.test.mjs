@@ -7,11 +7,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { appState, deviceClient, openAppStore, postPair, startApp, userTexts } from './fixtures/app-harness.mjs';
+import {
+  APP_CHAT_SESSION_KEY, appState, deviceClient, openAppStore, postPair, startApp, userTexts,
+} from './fixtures/app-harness.mjs';
 
-async function withChannel(label, body) {
+async function withChannel(label, body, setup) {
   const store = await openAppStore(label);
-  const app = startApp(store, {});
+  const app = startApp(store, setup === undefined ? {} : setup(store));
   const port = await app.port;
   const base = `http://127.0.0.1:${port}`;
   try {
@@ -106,6 +108,59 @@ test('a reaction is durable, starts no turn and is carried once by the next send
     assert.match(bullets[0], /old ❤️; new 🎉; added 🎉; removed ❤️/u, 'the change is named explicitly');
     await device.close();
   });
+});
+
+test('a reaction is refused while its thread is being archived', { timeout: 30_000 }, async () => {
+  // The archive's own commit is held open, so the thread is provably mid-archive when the reaction
+  // arrives; it must be refused rather than appended to a thread that is going away.
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const gate = { armed: false, key: '', armedCheck: false };
+  await withChannel('reaction-archive-race', async ({ store, base }) => {
+    const device = await connectV2(base, await pairedDevice(store, base));
+    const side = await request(device, 'create-side', 'thread.create', { key: 'side', title: 'Side' });
+    assert.equal(side.ok, true);
+    await sendAndSettle(device, 'ks', 'side message', side.thread);
+
+    // The archive only reaches its conversation while `archiving` already holds the thread.
+    gate.key = `${APP_CHAT_SESSION_KEY}:${side.thread}`;
+    gate.armed = true;
+    device.send({ type: 'req', id: 'archive-side', op: 'thread.archive', thread: side.thread, archived: true });
+    await entered.promise;
+    assert.equal(
+      (await request(device, 'react-mid-archive', 'react', { thread: side.thread, message: 'send:ks', emoji: '👍' })).error,
+      'bad_request',
+    );
+    release.resolve();
+    await device.wait(() => device.response('archive-side')?.ok === true, 'archive completes');
+
+    // Archived afterwards: still no target, and no reaction event was ever appended.
+    assert.equal(
+      (await request(device, 'react-archived', 'react', { thread: side.thread, message: 'send:ks', emoji: '👍' })).error,
+      'bad_request',
+    );
+    assert.equal(device.events('reaction').length, 0);
+    assert.equal((await appState(store.gateway)).reactions?.side, undefined);
+    await device.close();
+  }, (store) => {
+    const gateway = store.gateway;
+    return {
+      gateway: {
+        ...gateway,
+        async conversationFor(key, ctx) {
+          const chat = await gateway.conversationFor(key, ctx);
+          if (!gate.armed || key !== gate.key) return chat;
+          gate.armed = false;
+          gate.armedCheck = true;
+          entered.resolve();
+          await release.promise;
+          return chat;
+        },
+      },
+    };
+  });
+  assert.equal(gate.armedCheck, true, 'the archive reached the gated point');
+  release.resolve();
 });
 
 test('reaction context is bounded, ages out, and refuses bad or archived targets', { timeout: 60_000 }, async () => {
