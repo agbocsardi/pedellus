@@ -45,6 +45,9 @@ export const LIMITS = {
   questionIdPattern: /^[0-9a-f]{10}$/,
   /** Tasks view: entries per reply, title and detail length. */
   maxListedTasks: 50,
+  /** Shortcuts `POST /v1/ask`: how long it waits for the answer, and its per-token rate. */
+  askWaitMs: 25_000,
+  asksPerMinute: 10,
   /** Activity: tool steps kept per turn, tool name length. */
   maxActivitySteps: 50,
   activityToolChars: 64,
@@ -173,6 +176,12 @@ export type ServerFrame = Response | Event;
 export type AttachmentInfo = { id: string; name: string; type: string; size: number; kind: "image" | "audio" | "file" | "artifact" };
 export type UploadResult = { id: string };
 export type UploadError = "bad_request" | "unsupported" | "unauthorized" | "too_large" | "rate_limited";
+
+export type AskRequest = { text: string; thread?: ThreadId; key?: string };
+export type AskResult =
+  | { outcome: "answered"; text: string }
+  | { outcome: "failed" | "aborted" }
+  | { outcome: "pending"; key: string };
 
 export type PairRequest = { code: string; label: string };
 export type PairError = "bad_request" | "invalid_code" | "rate_limited";
