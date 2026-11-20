@@ -95,8 +95,8 @@ function messageViews(list: MessageEvent["attachments"]): AttachmentView[] {
     .map((file) => ({ ...file, url: fileUrl(file.id) }));
 }
 
-function AttachmentList({ files, onOpenArtifact }: {
-  files: AttachmentView[]; onOpenArtifact?: (file: AttachmentView) => void;
+function AttachmentList({ files, onOpenArtifact, openArtifactId }: {
+  files: AttachmentView[]; onOpenArtifact?: (file: AttachmentView) => void; openArtifactId?: string;
 }) {
   if (!files.length) return null;
   return (
@@ -112,7 +112,8 @@ function AttachmentList({ files, onOpenArtifact }: {
         // An artifact is agent-made HTML/SVG; it is only ever rendered through
         // `?view=artifact` inside the sandboxed frame (protocol v2).
         if (file.kind === "artifact" && onOpenArtifact) {
-          return <ArtifactCard key={key} file={file} onOpen={() => onOpenArtifact(file)} />;
+          return <ArtifactCard key={key} file={file} inViewer={file.id === openArtifactId}
+            onOpen={() => onOpenArtifact(file)} />;
         }
         return <FileChip key={key} file={file} />;
       })}
@@ -122,32 +123,36 @@ function AttachmentList({ files, onOpenArtifact }: {
 
 /**
  * An artifact in the chat: a still preview (never interactive — the frame takes no
- * pointer input) and the two real actions, Open and Download. The preview mounts
- * only once the card is near the viewport; until then a placeholder holds its height.
+ * pointer input) and the two real actions, Open and Download. The preview exists only
+ * while this card is near the viewport, so an artifact scrolled past keeps no live
+ * script context, and it is off entirely while this artifact's own viewer is open.
  */
-function ArtifactCard({ file, onOpen }: { file: AttachmentView; onOpen: () => void }) {
+function ArtifactCard({ file, onOpen, inViewer }: {
+  file: AttachmentView; onOpen: () => void; inViewer?: boolean;
+}) {
   const [near, setNear] = useState(false);
   const box = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const el = box.current;
-    if (!el || near) return;
+    if (!el) return;
     if (typeof IntersectionObserver !== "function") {
       setNear(true);
       return;
     }
+    // Two-way, not a latch. The margin is the same on entry and exit, and the frame's
+    // height is fixed, so mounting it again never pushes the card out of the margin.
     const io = new IntersectionObserver((entries) => {
-      if (entries.some((e) => e.isIntersecting)) {
-        setNear(true);
-        io.disconnect();
-      }
+      const last = entries[entries.length - 1];
+      if (last) setNear(last.isIntersecting);
     }, { rootMargin: "240px" });
     io.observe(el);
     return () => io.disconnect();
-  }, [near]);
+  }, []);
+  const preview = near && !inViewer;
   return (
     <div className="artifact-card">
       <div className="artifact-frame" ref={box}>
-        {near ? <iframe className="artifact-preview" title={`${file.name} preview`}
+        {preview ? <iframe className="artifact-preview" title={`${file.name} preview`}
           src={artifactUrl(file.id)} sandbox="allow-scripts" referrerPolicy="no-referrer" allow=""
           loading="lazy" tabIndex={-1} />
           : <span className="artifact-placeholder" aria-hidden="true">
@@ -994,7 +999,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
               forks={r.ev.event === "message" ? forks.get(r.ev.id) : undefined}
               onActions={(ev, button) => show({ kind: "message", title: suggestedTitle(ev.text),
                 from: { thread: ev.thread, messageId: ev.id } }, button)}
-              onOpenArtifact={setArtifact}
+              onOpenArtifact={setArtifact} openArtifactId={artifact?.id}
               onRetry={canRetry ? (m) => void queueMessage(m.text, m.key) : undefined} />
           ) : (
             <UserBubble key={`p${r.m.key}`} text={r.m.text} state={r.m.state} at={r.m.at} last={i === lastUser}
@@ -1488,12 +1493,13 @@ function Icon({ d, bold }: { d: string; bold?: boolean }) {
   );
 }
 
-function EventRow({ ev, text, partial, store, conn, thread, last, forks, onActions, onRetry, onOpenArtifact }: {
+function EventRow({ ev, text, partial, store, conn, thread, last, forks, onActions, onRetry, onOpenArtifact, openArtifactId }: {
   ev: DurableEvent; text?: string; partial?: boolean; store: Store; conn: Connection; thread: string;
   last: boolean; forks?: ThreadInfo[];
   onActions: (ev: MessageEvent, button: HTMLButtonElement) => void;
   onRetry?: (m: Outgoing) => void;
   onOpenArtifact: (file: AttachmentView) => void;
+  openArtifactId?: string;
 }) {
   if (ev.event === "divider") {
     const t = clock(ev.at);
@@ -1524,7 +1530,8 @@ function EventRow({ ev, text, partial, store, conn, thread, last, forks, onActio
       <div className="msg assistant" {...anchor}>
         <Streamdown mode="static">{body}</Streamdown>
         {steps.length > 0 && <ActivitySteps steps={steps} omitted={typeof ev.omitted === "number" ? ev.omitted : undefined} />}
-        <AttachmentList files={messageViews(ev.attachments)} onOpenArtifact={onOpenArtifact} />
+        <AttachmentList files={messageViews(ev.attachments)} onOpenArtifact={onOpenArtifact}
+          openArtifactId={openArtifactId} />
         {incomplete}
       </div>
     )}
