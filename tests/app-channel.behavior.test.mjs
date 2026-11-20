@@ -1978,3 +1978,22 @@ test('archiving a thread cancels a quarantined question whose live open card the
       await device.close();
     });
   });
+
+test('the idle archive cancels a quarantined question whose live open card the repair would reopen',
+  { timeout: 30_000 }, async () => {
+    await withChannel('idle-unknown-question', { adapter: { autoArchiveDays: 1, scanIntervalMs: 50 } },
+      async ({ app, store, base }) => {
+        const device = await questionDevice(store, base);
+        const side = await createSide(device, 'idle-quarantined');
+        const record = await seedQuarantinedQuestion(store, side, 'aaaabbbb08', app.clock.now + 10 * 86_400_000);
+
+        app.clock.now += 86_400_001;
+        await device.wait(() => device.events('thread').some((event) => event.thread.id === side &&
+          event.thread.archivedReason === 'idle'), 'the idle archive scan');
+        await device.wait(() => device.events('question').some((event) => event.id === record.id && event.state === 'cancelled'),
+          'the cancelled card published with the idle archive');
+        assert.equal(await storedQuestionStatus(store, `app:chat:${side}`, record.id), 'cancelled',
+          'the idle archive cancelled the repaired record, not the quarantine');
+        await device.close();
+      });
+  });

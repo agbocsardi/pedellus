@@ -1396,11 +1396,25 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     const expired = (info: AppThreadInfo) => info.id !== APP_MAIN_THREAD && !info.archived &&
       atMs - Date.parse(info.lastAt) >= archiveAfterMs && !archiving.has(info.id) && !controlPendingSet.has(info.id);
     if (!state.threads?.some(expired)) return;
+    // The idle archive cancels a thread's questions exactly like a manual archive, so it needs the
+    // same repair. A question document is addressed by its conversation id, which a session key
+    // cannot be resolved to inside the commit: resolve the candidate threads' conversations first,
+    // and leave any thread that only became eligible since then to the next scan.
+    const conversations = new Map<string, Conversation>();
+    for (const info of state.threads ?? []) {
+      if (!expired(info) || state.pending.some((item) => threadOf(item) === info.id)) continue;
+      conversations.set(info.id, await gateway.conversationFor(sessionForThread(info.id), adapterContext));
+    }
     state = await stateConversation.commit(async (tx) => {
       const doc = await tx.doc(AppState, stateConversation.id);
       for (const info of doc.threads ?? []) {
-        if (!expired(info) || doc.pending.some((item) => threadOf(item) === info.id) ||
+        const conversation = conversations.get(info.id);
+        if (!expired(info) || conversation === undefined || doc.pending.some((item) => threadOf(item) === info.id) ||
             await gateway.appThreadBusy!(tx, info.id)) continue;
+        const questions = await tx.doc(AskQuestionsDoc, conversation.id);
+        publishQuestionEvents(doc, questions, info.id, atMs);
+        cancelPendingQuestions(questions);
+        publishQuestionEvents(doc, questions, info.id, atMs);
         setArchived(doc, info, at, "idle");
       }
       return copyJson(doc) as unknown as AppChannelState;

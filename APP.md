@@ -284,7 +284,8 @@ host paired reset repairs first, commits the reset, and commits the cancellation
 Archiving a thread cancels its open questions in the archive's own commit, after the same repair,
 so the archived thread and the `cancelled` card arrive together and restoring the thread does not
 reopen them; an open question would otherwise leave a card that can never be answered and a record
-that blocks every later ask. `abort` and a restart cancel nothing.
+that blocks every later ask. The idle auto-archive performs the same repair, cancellation and
+`cancelled` append in its own archive commit. `abort` and a restart cancel nothing.
 
 ## Notifications (Web Push)
 
