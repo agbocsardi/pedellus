@@ -7,6 +7,7 @@ import { disablePush, enablePush, hasPushSubscription, pushPermission, requestPu
 import { Avatar, type AvatarState } from "./Avatar";
 import { attachmentKind, fileUrl, formatBytes, uploadErrorText, uploadFile } from "./uploads";
 import { ActivitySteps } from "./ActivitySteps";
+import { TasksSheet } from "./TasksSheet";
 
 const FINE_POINTER = matchMedia("(pointer: fine)").matches;
 /** From here the thread list is a sidebar and the chat sits beside it. */
@@ -21,12 +22,13 @@ type Pick = {
   id: string; file: File; name: string; type: string; size: number;
   state: "waiting" | "uploading" | "done" | "failed"; uploadId?: string; note?: string; preview?: string;
 };
-type Sheet = { kind: "list" | "menu" | "tools" | "confirm-new" | "model" } | { kind: "rename"; title: string }
+type Sheet = { kind: "list" | "menu" | "tools" | "tasks" | "confirm-new" | "model" } | { kind: "rename"; title: string }
   | { kind: "create"; title: string; from?: ThreadOrigin }
   | { kind: "message"; title: string; from: ThreadOrigin };
 const LIST_ICON = "M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01";
 const TITLE_CONTROL = /[\p{Cc}\u2028\u2029]/u;
 const BELL_ICON = "M18 14v-3.5a6 6 0 1 0-12 0V14l-2 3.5h16L18 14M10 21h4";
+const TASKS_ICON = "M4 6h3l1.5 3L12 5M4 14h3l1.5 3L12 13M16 7h4M16 15h4";
 const WRENCH_ICON = "M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.8-3.8a6 6 0 0 1-7.9 7.9l-6.9 6.9a2.1 2.1 0 0 1-3-3l6.9-6.9a6 6 0 0 1 7.9-7.9l-3.8 3.8Z";
 /** A DOM `MessageEvent`; the protocol's `MessageEvent` shadows the global in this file. */
 type SwMessage = Event & { origin: string; source: MessageEventSource | null; data?: unknown };
@@ -1000,7 +1002,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
 
       {sheet && (
         <Modal opener={opener.current} panel={sheet.kind} title={sheet.kind === "list" ? "Threads" :
-          sheet.kind === "menu" ? "Thread menu" : sheet.kind === "message" ? "Message actions" :
+          sheet.kind === "menu" ? "Thread menu" : sheet.kind === "tasks" ? "Tasks" : sheet.kind === "message" ? "Message actions" :
             sheet.kind === "tools" ? "Commands" : sheet.kind === "model" ? "Model" : sheet.kind === "confirm-new" ? "New context" :
             sheet.kind === "rename" ? "Rename thread" : "New thread"}
           dismiss={() => { setError(""); setSheet(null); }}>
@@ -1015,6 +1017,8 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
                   sub="Ask the agent what it is doing" disabled={!online} onClick={() => command("status")} />}
               </>}
               <NotificationsItem store={store} conn={conn} online={online} />
+              <SheetItem icon={TASKS_ICON} title="Tasks" sub="Workers and scheduled jobs in this thread"
+                disabled={!online} onClick={() => show({ kind: "tasks" })} />
               {!main && (writable || archived) && <>
                 <SheetItem icon="M4 20h4L20 8l-4-4L4 16v4Z" title="Rename thread" disabled={!online || busy}
                   onClick={() => show({ kind: "rename", title })} />
@@ -1025,6 +1029,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
               {!online && <p className="sheet-help">Reconnect to use these controls.</p>}
               {!writable && !archived && <p className="sheet-help">Thread details are not available.</p>}
             </>}
+            {sheet.kind === "tasks" && <TasksSheet store={store} conn={conn} thread={thread} online={online} archived={archived} />}
             {sheet.kind === "tools" && <>
               <h2 className="sheet-heading">Commands</h2>
               {commands.map((c) => <CommandItem key={c.name} c={c} state={cmdState} onClick={() => runCommand(c)} />)}
@@ -1065,7 +1070,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
             )}
             {(error || forkError) && <p className="error-text" role="alert">{error || forkError}</p>}
             <button className="sheet-cancel" onClick={() => { setError(""); setSheet(null); }}>
-              {sheet.kind === "list" ? "Done" : "Cancel"}
+              {sheet.kind === "list" || sheet.kind === "tasks" ? "Done" : "Cancel"}
             </button>
         </Modal>
       )}

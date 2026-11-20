@@ -69,7 +69,16 @@ import {
   type AppConsoleRegistry, type AppGateway,
 } from "./channels/app.js";
 import { APP_MAIN_THREAD, parseThreadId } from "./channels/app-protocol.js";
-import type { CronOwner } from "./automation/cron.js";
+import {
+  cronTask,
+  cronTaskId,
+  selectTasks,
+  workerTask,
+  workerTaskId,
+  type AppTaskCancelResult,
+  type AppTaskList,
+} from "./channels/app-tasks.js";
+import type { CronFoundation, CronOwner } from "./automation/cron.js";
 import {
   ASK_USER_TOOL_NAME,
   AskQuestionsDoc,
@@ -467,6 +476,19 @@ export interface Gateway {
   readonly appSnapshotRoom?: NonNullable<AppGateway["appSnapshotRoom"]>;
   readonly createAppThread?: NonNullable<AppGateway["createAppThread"]>;
   readonly reserveAppThread?: NonNullable<AppGateway["reserveAppThread"]>;
+  /**
+   * The app channel's bounded Tasks view for one already-mapped thread. Read-only: it lists that
+   * thread's own workers and scheduled jobs through the same owner-scoped readers the model tools
+   * use, bounds the result to `LIMITS.maxListedTasks`, and maps it display-only. Nothing else is
+   * read, started, retried or cancelled; an unmapped session key reads nothing.
+   */
+  readonly appTasks?: NonNullable<AppGateway["appTasks"]>;
+  /**
+   * Cancels or removes one task of that thread, and only one it owns: an id from another thread
+   * reports `unknown` and changes nothing. A worker uses the existing durable worker cancel; a
+   * scheduled job uses the existing owner-scoped cron cancel, including its already-terminal case.
+   */
+  readonly appTaskCancel?: NonNullable<AppGateway["appTaskCancel"]>;
   /**
    * MCP server connection state; absent when MCP is not configured and enabled. A failed server has
    * no tools; its status carries a fixed failure code, never a transport message or configured value.
@@ -4204,6 +4226,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
       },
       backgroundStatus: (sessionKey, ctx) => backgroundStatusFor(sessionKey, ctx),
       activeWork: (ctx) => activeWorkFor(ctx),
+      appTasks: (sessionKey, ctx) => appTasksFor(sessionKey, ctx),
+      appTaskCancel: (sessionKey, task, ctx) => appTaskCancelFor(sessionKey, task, ctx),
       ...(config.app === undefined ? {} : {
         async createAppThread(stateId, thread, register, ctx) {
           await root.commit(async (tx) => {
@@ -4647,6 +4671,80 @@ export async function openGateway(config: PortConfig, context: Context, options:
         digest: { live: digestLive, parked: digestParked },
         active,
       };
+    }
+    /**
+     * The Tasks view of one mapped thread. The owner-scoped list functions decide what exists; this
+     * function only reads them, once each, and never creates, retries or changes anything. An
+     * unmapped session key has no conversation to read, so it answers an empty list rather than
+     * mapping (and thereby creating) one.
+     */
+    async function appTasksFor(sessionKey: string, ctx: Context): Promise<AppTaskList> {
+      const conversationId = await mappedConversationId(sessionKey, ctx);
+      if (conversationId === undefined) return { tasks: [] };
+      // Only an authenticated mapped chat has tasks to show or cancel (as backgroundStatusFor checks).
+      if (!authorizedChatConversations.has(conversationId)) return { tasks: [] };
+      const workers = workerFoundation !== undefined && workerSpawners.has(conversationId)
+        ? await workerFoundation.list(harness!, conversationId, ctx)
+        : [];
+      const cronOwner = cronOwners.get(conversationId);
+      const jobs = cronFoundation !== undefined && cronOwner !== undefined
+        ? await cronFoundation.list(harness!, conversationId, { owner: cronOwner }, ctx)
+        : [];
+      return { tasks: selectTasks(workers, jobs) };
+    }
+    /**
+     * Cancels one task of one mapped thread. The task is resolved through this thread's own owner-
+     * scoped list first, so an id from another conversation is never passed to either foundation:
+     * it reports `unknown` and nothing is touched. A worker uses the ordinary durable cancel; a job
+     * uses the cron cancel, where a recorded cancellation whose cleanup threw is still `cancelled`,
+     * exactly as the model-facing tool reports it.
+     */
+    async function appTaskCancelFor(
+      sessionKey: string, task: string, ctx: Context,
+    ): Promise<AppTaskCancelResult> {
+      const conversationId = await mappedConversationId(sessionKey, ctx);
+      if (conversationId === undefined) return { outcome: "unknown" };
+      // Only an authenticated mapped chat has tasks to show or cancel (as backgroundStatusFor checks).
+      if (!authorizedChatConversations.has(conversationId)) return { outcome: "unknown" };
+      if (workerFoundation !== undefined && workerSpawners.has(conversationId)) {
+        const worker = (await workerFoundation.list(harness!, conversationId, ctx))
+          .find((view) => workerTaskId(view.taskId) === task);
+        if (worker !== undefined) {
+          const title = workerTask(worker).title;
+          // A thrown cancel is reported as a failure, like the worker tool: the abort either
+          // committed or it did not, and claiming an outcome here would be a guess.
+          const result = await workerFoundation.cancel(harness!, conversationId, worker.taskId, ctx);
+          const outcome = result === "marked" ? "cancelled" : result === "terminal" ? "finished" : "unknown";
+          return { outcome, title };
+        }
+      }
+      const cronOwner = cronOwners.get(conversationId);
+      if (cronFoundation !== undefined && cronOwner !== undefined) {
+        const job = (await cronFoundation.list(harness!, conversationId, { owner: cronOwner }, ctx))
+          .find((view) => cronTaskId(view.job.id) === task);
+        if (job !== undefined) {
+          const title = cronTask(job).title;
+          let result: Awaited<ReturnType<CronFoundation["cancel"]>>;
+          try {
+            result = await cronFoundation.cancel(harness!, conversationId, job.job.id, { owner: cronOwner }, ctx);
+          } catch (error) {
+            // A throw may still have committed the cancellation before cleanup failed; re-read the
+            // job and report the recorded truth instead of inviting a retry.
+            let after: Awaited<ReturnType<CronFoundation["inspect"]>>;
+            try {
+              after = await cronFoundation.inspect(harness!, conversationId, job.job.id, { owner: cronOwner }, ctx);
+            } catch {
+              after = undefined;
+            }
+            if (after === undefined || after.job.cancelledAtMs === null) throw error;
+            return { outcome: "cancelled", title };
+          }
+          if (result.status === "cancelled") return { outcome: "cancelled", title };
+          if (result.status === "already_terminal") return { outcome: "finished", title };
+          return { outcome: "unknown" };
+        }
+      }
+      return { outcome: "unknown" };
     }
     /**
      * One read of the native task inspection. Sleeping is an armed timer and blocked is parked work,

@@ -50,6 +50,8 @@ export const APP_LIMITS = Object.freeze({
   /** `send` keys are remembered for idempotency; pruning is by age only (keys are tiny). */
   sendKeyTtlMs: 7 * 24 * 60 * 60_000,
   maxUnresolvedControls: 64,
+  /** `task.cancel.task`: one namespaced task id (`w:` worker, `c:` scheduled job). */
+  taskIdPattern: /^[wc]:[A-Za-z0-9_-]{1,80}$/,
 } as const);
 
 /** Fixed WebSocket close codes; the upgrade is always completed first. */
@@ -61,9 +63,9 @@ export type AppErrorCode = ErrorCode;
 export type AppCommandInfo = CommandInfo;
 /** One `hello.presets` entry; `model` is `provider/model`. */
 export type AppPresetInfo = PresetInfo;
-/** Accepted ops; `history`/`tasks` are declared in v2.md as later work. */
+/** Accepted ops; `history` is declared in v2.md as later work. */
 export const APP_REQUEST_OPS: readonly string[] = [
-  "hello", "send", "ack", "control", "ping", "history", "tasks",
+  "hello", "send", "ack", "control", "ping", "history", "tasks", "task.cancel",
   "threads", "thread.create", "thread.rename", "thread.archive",
   "push.key", "push.subscribe", "push.unsubscribe",
 ];

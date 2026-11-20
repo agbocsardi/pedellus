@@ -108,6 +108,19 @@ export class Connection {
     return this.mutate({ type: "req", id: this.id(), op: "push.key" });
   }
 
+  /** One thread's own background work; the reply carries `tasks` (protocol v2, Tasks). */
+  tasks(thread: ThreadId) {
+    return this.mutate({ type: "req", id: this.id(), op: "tasks", thread });
+  }
+
+  /**
+   * Cancel one task of this thread. The gateway never asks first, so the sheet confirms before
+   * calling this; the outcome (`cancelled`/`finished`/`unknown`) is reported as it comes back.
+   */
+  cancelTask(thread: ThreadId, task: string) {
+    return this.mutate({ type: "req", id: this.id(), op: "task.cancel", thread, task });
+  }
+
   pushSubscribe(subscription: PushSubscriptionInfo) {
     return this.mutate({ type: "req", id: this.id(), op: "push.subscribe", subscription });
   }

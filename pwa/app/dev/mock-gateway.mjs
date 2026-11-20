@@ -99,9 +99,46 @@ const iso = () => new Date().toISOString();
 
 function addThread(id, title, origin) {
   const at = iso();
-  const thread = { info: { id, title, archived: false, origin, createdAt: at, lastAt: at }, state: "idle", running: null, queue: [], preset: DEFAULT_PRESET };
+  const thread = {
+    info: { id, title, archived: false, origin, createdAt: at, lastAt: at },
+    state: "idle", running: null, queue: [], preset: DEFAULT_PRESET, tasks: [],
+  };
   threads.set(id, thread);
   return thread;
+}
+
+/** Fake background work for the Tasks view; no task event stream, the app refetches. */
+let fakeTaskId = 0;
+const TASK_ID_RE = /^[wc]:[A-Za-z0-9_-]{1,80}$/;
+const TASK_ACTIVE = new Set(["running", "queued", "scheduled"]);
+
+function addFakeTasks(thread) {
+  const now = Date.now();
+  thread.tasks.push({
+    id: `w:${++fakeTaskId}`,
+    kind: "worker",
+    title: "Check the deploy log for failed jobs",
+    state: "running",
+    createdAt: iso(),
+    detail: "shared workspace",
+  });
+  thread.tasks.push({
+    id: `c:cron-${randomBytes(8).toString("hex")}`,
+    kind: "cron",
+    title: "Standup reminder",
+    state: "scheduled",
+    createdAt: new Date(now + 60_000).toISOString(),
+    nextAt: new Date(now + 3_600_000).toISOString(),
+    detail: "every hour",
+  });
+}
+
+/** This thread's own tasks, newest first; never another thread's. */
+function tasksFor(thread) {
+  if (!thread) return [];
+  return [...thread.tasks]
+    .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt))
+    .slice(0, 50);
 }
 const main = addThread("main", "Main");
 const full = () => [...threads.values()].filter((t) => t !== main && !t.info.archived).length >= MAX_OPEN_THREADS;
@@ -726,6 +763,9 @@ function onStream(ws, token) {
         }
         admitted.set(key, { text, attachments: info ?? [] });
         reply(ws, frame.id, true, { duplicate: false });
+        // Dev affordance: a message asking to start work seeds the Tasks sheet with one worker and
+        // one scheduled job in this thread.
+        if (/start task/i.test(text) && thread.tasks.length === 0) addFakeTasks(thread);
         emit(thread, "message", {
           id: `u-${key}`, role: "user", text, at: iso(), key,
           ...(info?.length ? { attachments: info } : {}),
@@ -811,8 +851,32 @@ function onStream(ws, token) {
         reply(ws, frame.id, true);
         break;
       }
-      case "history":
       case "tasks": {
+        if (frame.thread !== undefined && typeof frame.thread !== "string") return invalid();
+        reply(ws, frame.id, true, { tasks: tasksFor(thread) });
+        break;
+      }
+      case "task.cancel": {
+        const id = frame.task;
+        if (typeof id !== "string" || !TASK_ID_RE.test(id)) return invalid();
+        const task = thread?.tasks.find((entry) => entry.id === id);
+        if (!task) {
+          reply(ws, frame.id, true, { outcome: "unknown" });
+          if (thread) notice(thread, "No such task in this thread; nothing was changed.");
+          break;
+        }
+        if (!TASK_ACTIVE.has(task.state)) {
+          reply(ws, frame.id, true, { outcome: "finished" });
+          notice(thread, `Task "${task.title}" had already finished; nothing was cancelled.`);
+          break;
+        }
+        task.state = "cancelled";
+        task.lastAt = iso();
+        reply(ws, frame.id, true, { outcome: "cancelled" });
+        notice(thread, `Cancelled task "${task.title}".`);
+        break;
+      }
+      case "history": {
         reply(ws, frame.id, false, { error: "unsupported" });
         break;
       }
