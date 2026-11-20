@@ -794,16 +794,18 @@ function NotificationsItem({ store, conn, online }: { store: Store; conn: Connec
         return;
       }
       if (!res.key) return;
+      // Padding is optional in base64url; comparing one form keeps this honest.
+      const gatewayKey = res.key.replace(/=+$/, "");
       // Compare against the key the store last saw before overwriting it.
-      const rotated = store.push.key !== undefined && store.push.key !== res.key;
-      await store.setPush({ gatewayUnsupported: false, key: res.key });
+      const rotated = store.push.key !== undefined && store.push.key !== gatewayKey;
+      await store.setPush({ gatewayUnsupported: false, key: gatewayKey });
       if (!store.push.endpoint) return;
-      if (!rotated && await subscribedServerKey() === res.key) return;
+      if (!rotated && await subscribedServerKey() === gatewayKey) return;
       // The gateway's key changed under a live subscription: rebuild it on the
       // new key rather than leaving pushes the gateway cannot address.
       setBusy(true);
       try {
-        const renewed = await subscribe(store, conn, res.key);
+        const renewed = await subscribe(store, conn, gatewayKey);
         setPermission(renewed.permission);
         if (renewed.note) {
           // The old subscription is gone; say so instead of claiming "on".
