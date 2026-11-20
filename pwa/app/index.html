@@ -15,8 +15,35 @@
     <meta name="apple-mobile-web-app-title" content="Durable" />
     <link rel="apple-touch-icon" href="/icons/apple-touch-icon-180.png" />
     <link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png" />
+    <style>
+      /* iOS 26+ draws an installed PWA underneath the status bar, and iOS 27 blurs
+         that top band; theme-color and the status-bar-style meta are ignored. A
+         fixed, opaque strip at the very top (at least 6px tall, full width, within
+         4px of the top edge) is the only thing that makes iOS paint a solid bar.
+         Same fix as the Python web UI. */
+      .pwa-status-bar-backdrop { display: none; }
+      @supports (-webkit-touch-callout: none) {
+        @media (display-mode: standalone) {
+          .pwa-status-bar-backdrop {
+            display: block;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: max(6px, env(safe-area-inset-top));
+            background: #f7f6f3;
+            pointer-events: none;
+            z-index: 1000;
+          }
+          @media (prefers-color-scheme: dark) {
+            .pwa-status-bar-backdrop { background: #171917; }
+          }
+        }
+      }
+    </style>
   </head>
   <body>
+    <div class="pwa-status-bar-backdrop" aria-hidden="true"></div>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

@@ -1079,7 +1079,8 @@ input#pair-code {
 /* Floating capsule composer */
 .composer {
   position: relative;
-  padding: 6px var(--gutter) calc(env(safe-area-inset-bottom) + 10px);
+  /* The home indicator's inset already leaves room; sit just above it, not a full inset higher. */
+  padding: 6px var(--gutter) max(10px, calc(env(safe-area-inset-bottom) - 12px));
   background: var(--bg);
 }
 .composer::before {
