@@ -1576,3 +1576,188 @@ test('a split message straddles a hello replay batch boundary', { timeout: 60_00
     await store.close();
   }
 });
+
+// ── Owner questions (ASK_USER.md, protocol v2 "Owner questions") ─────────────
+
+const { AskQuestionsDoc } = await import(new URL('../dist/questions/index.js', import.meta.url).href);
+
+/** One hello'd paired device for a question test. */
+async function questionDevice(store, base) {
+  const device = deviceClient(base, await pairedDevice(store, base));
+  await device.open();
+  device.send({ type: 'req', id: 'h1', op: 'hello', v: 2, cursor: null });
+  await device.wait(() => device.response('h1') !== undefined, 'hello reply');
+  return device;
+}
+
+/** Script one asking turn, then the follow-up turn the owner's answer starts. */
+function scriptAsk(store, followUp) {
+  store.script([
+    () => fauxAssistantMessage(fauxToolCall('ask_user', {
+      questions: [{
+        question: 'Deploy now?',
+        options: [{ label: 'Yes', description: 'publish the current build' }, { label: 'No' }],
+      }],
+    }, { id: 'ask-1' }), { stopReason: 'toolUse' }),
+    () => fauxAssistantMessage(followUp),
+  ]);
+}
+
+/** Seed one already-expired pending record and the open card an earlier process delivered. */
+async function seedExpiredQuestion(store, thread, id) {
+  const record = {
+    id,
+    taskId: 1,
+    sessionKey: thread === 'main' ? 'app:chat' : `app:chat:${thread}`,
+    question: 'Still want the old deploy?',
+    options: [{ id: 'a', label: 'Yes' }, { id: 'b', label: 'No' }],
+    createdAtMs: Date.now() - 120_000,
+    expiresAtMs: Date.now() - 60_000,
+    delivery: 'delivered',
+    status: 'pending',
+  };
+  const conversation = await store.gateway.conversationFor(record.sessionKey, context);
+  await conversation.commit(async (tx) => {
+    const doc = await tx.doc(AskQuestionsDoc, conversation.id);
+    doc.questions.push(record);
+  }, context);
+  const stateConversation = await store.gateway.conversationFor('app:channel-state', context);
+  const { AppState } = await import(new URL('../dist/channels/app.js', import.meta.url).href);
+  await stateConversation.commit(async (tx) => {
+    const doc = await tx.doc(AppState, stateConversation.id);
+    const cursor = doc.nextCursor;
+    doc.nextCursor = cursor + 1;
+    doc.events.push({
+      event: 'question', cursor, thread, id, prompt: record.question,
+      options: record.options, expiresAt: new Date(record.expiresAtMs).toISOString(), state: 'open',
+    });
+  }, context);
+  return record;
+}
+
+test('ask_user delivers a durable question and one tap admits exactly one follow-up turn', { timeout: 30_000 }, async () => {
+  await withChannel('questions', {}, async ({ store, base }) => {
+    const device = await questionDevice(store, base);
+    scriptAsk(store, 'SYNTHETIC-DEPLOY-ANSWER');
+    device.send({ type: 'req', id: 's1', op: 'send', key: 'k1', text: 'ask me about the deploy' });
+    await device.wait(() => device.events('question').some((event) => event.state === 'open'), 'the open question');
+    const open = device.events('question').find((event) => event.state === 'open');
+    assert.equal(open.thread, 'main');
+    assert.match(open.id, /^[0-9a-f]{10}$/u);
+    assert.equal(open.prompt, 'Deploy now?');
+    assert.deepEqual(open.options.map((option) => [option.id, option.label]), [['a', 'Yes'], ['b', 'No']]);
+    assert.equal(open.options[0].description, 'publish the current build');
+    assert.equal(Number.isNaN(Date.parse(open.expiresAt)), false, 'expiresAt is an ISO timestamp');
+    // Asking ends the run: no assistant reply is fabricated for that turn.
+    await device.wait(() => device.events('settled').some((event) => event.key === 'k1'), 'the asking turn settled');
+
+    device.send({ type: 'req', id: 'a1', op: 'answer', thread: 'main', question: open.id, option: 'a' });
+    await device.wait(() => device.response('a1') !== undefined, 'answer reply');
+    assert.equal(device.response('a1').accepted, true);
+    await device.wait(() => device.events('question').some((event) => event.id === open.id && event.state === 'answered'),
+      'the answered question event');
+    const answered = device.events('question').filter((event) => event.id === open.id).at(-1);
+    assert.equal(answered.answer, 'a');
+    // Only the stored record's label reaches the model, as one ordinary follow-up turn.
+    await device.wait(() => store.captured.some((entry) => entry.messages.at(-1)?.content ===
+      `Answered question ${open.id}: Yes`), 'the follow-up input');
+    await device.wait(() => device.events('message').some((event) => event.role === 'assistant' &&
+      event.text === 'SYNTHETIC-DEPLOY-ANSWER'), 'the follow-up answer');
+    assert.equal(store.captured.filter((entry) => JSON.stringify(entry.messages).includes(`Answered question ${open.id}`)).length, 1,
+      'exactly one follow-up turn was admitted');
+
+    // A stale tap for the now-answered question is refused with the fixed notice and admits nothing.
+    device.send({ type: 'req', id: 'a2', op: 'answer', thread: 'main', question: open.id, option: 'b' });
+    await device.wait(() => device.response('a2') !== undefined, 'duplicate reply');
+    assert.equal(device.response('a2').accepted, false);
+    await device.wait(() => device.events('message').some((event) => event.role === 'notice' &&
+      event.text === 'Already answered.'), 'the replay notice');
+    assert.equal(store.captured.filter((entry) => JSON.stringify(entry.messages).includes(`Answered question ${open.id}`)).length, 1);
+
+    // An unknown id and a malformed option never reach the model either.
+    device.send({ type: 'req', id: 'a3', op: 'answer', thread: 'main', question: 'ffffffffff', option: 'a' });
+    await device.wait(() => device.response('a3') !== undefined, 'stale reply');
+    assert.equal(device.response('a3').accepted, false);
+    await device.wait(() => device.events('message').some((event) => event.role === 'notice' &&
+      event.text === 'This question is no longer open.'), 'the stale notice');
+    device.send({ type: 'req', id: 'a4', op: 'answer', thread: 'main', question: open.id, option: 'z' });
+    await device.wait(() => device.response('a4') !== undefined, 'malformed reply');
+    assert.equal(device.response('a4').ok, false, 'a malformed option is a bad request');
+    assert.equal(device.response('a4').error, 'bad_request');
+    assert.equal(store.captured.filter((entry) => JSON.stringify(entry.messages).includes(`Answered question ${open.id}`)).length, 1);
+    await device.close();
+  });
+});
+
+test('an expired question is refused on claim, published as expired and admits nothing', { timeout: 30_000 }, async () => {
+  await withChannel('expired-question', {}, async ({ store, base }) => {
+    const device = await questionDevice(store, base);
+    const record = await seedExpiredQuestion(store, 'main', 'abcdef1234');
+    device.send({ type: 'req', id: 'a1', op: 'answer', thread: 'main', question: record.id, option: 'a' });
+    await device.wait(() => device.response('a1') !== undefined, 'expired answer reply');
+    assert.equal(device.response('a1').accepted, false);
+    await device.wait(() => device.events('question').some((event) => event.id === record.id && event.state === 'expired'),
+      'the expired event');
+    await device.wait(() => device.events('message').some((event) => event.role === 'notice' &&
+      event.text === 'This question expired without an answer.'), 'the expired notice');
+    assert.equal(store.captured.length, 0, 'an expired answer starts no turn');
+    await device.close();
+  });
+});
+
+test('a typed ordinary message settles the oldest open question in the same admission', { timeout: 30_000 }, async () => {
+  await withChannel('typed-question', {}, async ({ store, base }) => {
+    const device = await questionDevice(store, base);
+    scriptAsk(store, 'SYNTHETIC-TYPED-ANSWER');
+    device.send({ type: 'req', id: 's1', op: 'send', key: 'k1', text: 'ask me about the deploy' });
+    await device.wait(() => device.events('question').some((event) => event.state === 'open'), 'the open question');
+    const open = device.events('question').find((event) => event.state === 'open');
+    await device.wait(() => device.events('settled').some((event) => event.key === 'k1'), 'the asking turn settled');
+
+    device.send({ type: 'req', id: 's2', op: 'send', key: 'k2', text: 'Yes, go ahead' });
+    await device.wait(() => device.response('s2') !== undefined, 'typed reply admitted');
+    assert.equal(device.response('s2').duplicate, false);
+    await device.wait(() => device.events('question').some((event) => event.id === open.id && event.state === 'answered'),
+      'the typed answer settled the question');
+    const answered = device.events('question').filter((event) => event.id === open.id).at(-1);
+    assert.equal(answered.answer, undefined, 'a typed answer carries no option id');
+    await device.wait(() => store.captured.some((entry) => entry.messages.at(-1)?.content === 'Yes, go ahead'),
+      'the typed input reached the model');
+    await device.wait(() => device.events('message').some((event) => event.role === 'assistant' &&
+      event.text === 'SYNTHETIC-TYPED-ANSWER'), 'the typed answer turn');
+    assert.equal(store.captured.filter((entry) => entry.messages.at(-1)?.content === 'Yes, go ahead').length, 1,
+      'the typed answer is admitted once');
+
+    // A later tap for that already-answered question is a replay, never a second turn.
+    device.send({ type: 'req', id: 'a1', op: 'answer', thread: 'main', question: open.id, option: 'b' });
+    await device.wait(() => device.response('a1') !== undefined, 'replay reply');
+    assert.equal(device.response('a1').accepted, false);
+    assert.equal(store.captured.filter((entry) => entry.messages.at(-1)?.content === `Answered question ${open.id}: No`).length, 0);
+    await device.close();
+  });
+});
+
+test('/new cancels the open question and a later tap is refused', { timeout: 30_000 }, async () => {
+  await withChannel('cancelled-question', {}, async ({ store, base }) => {
+    const device = await questionDevice(store, base);
+    scriptAsk(store, 'must not answer a cancelled question');
+    device.send({ type: 'req', id: 's1', op: 'send', key: 'k1', text: 'ask me about the deploy' });
+    await device.wait(() => device.events('question').some((event) => event.state === 'open'), 'the open question');
+    const open = device.events('question').find((event) => event.state === 'open');
+    await device.wait(() => device.events('settled').some((event) => event.key === 'k1'), 'the asking turn settled');
+
+    device.send({ type: 'req', id: 'c1', op: 'control', command: 'new' });
+    await device.wait(() => device.response('c1') !== undefined, 'new acknowledged');
+    await device.wait(() => device.events('question').some((event) => event.id === open.id && event.state === 'cancelled'),
+      'the cancelled question event');
+    await device.wait(() => device.events('divider').length === 1, 'the new-context divider');
+
+    device.send({ type: 'req', id: 'a1', op: 'answer', thread: 'main', question: open.id, option: 'a' });
+    await device.wait(() => device.response('a1') !== undefined, 'cancelled answer reply');
+    assert.equal(device.response('a1').accepted, false);
+    await device.wait(() => device.events('message').some((event) => event.role === 'notice' &&
+      event.text === 'This question was cancelled.'), 'the cancelled notice');
+    assert.equal(store.captured.some((entry) => entry.messages.at(-1)?.content === `Answered question ${open.id}: Yes`), false);
+    await device.close();
+  });
+});

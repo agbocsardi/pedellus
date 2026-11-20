@@ -55,7 +55,7 @@ import {
   offeredConversationCommands,
 } from "../help/commands.js";
 import { renderMemoryDigestStart, renderMemoryDigestStatus } from "../history/memory-digest.js";
-import { AskQuestionsDoc, type AskSurfaceRegistry } from "../questions/index.js";
+import { AskQuestionsDoc, cancelPendingQuestions, claimOutcomeText, claimQuestionAnswer, claimTypedQuestionAnswer, type AskSurfaceRegistry } from "../questions/index.js";
 import { openQuestionEvent, reconcileQuestionEvents } from "./app-questions.js";
 import { RESTART_BUSY_MESSAGE, RestartBusyError } from "../restart.js";
 import type { GatewayMemoryDigest, GatewayModelList, GatewayModelPresets, GatewayModelSelection } from "../runtime.js";
@@ -65,8 +65,10 @@ import {
   APP_MAIN_THREAD,
   APP_PAIR_ALPHABET,
   APP_PROTOCOL_VERSION,
+  APP_QUESTION_OPTION_IDS,
   APP_REQUEST_OPS,
   parseHelloCursor,
+  parseQuestionId,
   validAppAgentName,
   validVapidPrivateKey,
   validVapidPublicKey,
@@ -1040,6 +1042,9 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         case "control":
           await handleControlFrame(frame, sendOk, sendError);
           return;
+        case "answer":
+          await handleAnswerFrame(frame, sendOk, sendError);
+          return;
         case "threads": {
           const query = frame.query;
           if (query !== undefined && (typeof query !== "string" || query.length === 0 ||
@@ -1366,6 +1371,80 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
 
   // ── Ingress ───────────────────────────────────────────────────────────────
 
+  /**
+   * One tapped option becomes one ordinary follow-up turn only after the durable record accepts it.
+   * The claim and the admission share one commit, so a duplicate, stale, expired, cancelled or
+   * replayed tap can never admit a second turn; the gateway replies and then publishes the change.
+   */
+  async function handleAnswerFrame(
+    frame: Record<string, unknown>,
+    sendOk: (body?: Record<string, unknown>) => void,
+    sendError: (error: AppErrorCode) => void,
+  ): Promise<void> {
+    const thread = parseThreadId(frame.thread === undefined ? APP_MAIN_THREAD : frame.thread);
+    if (thread === undefined || !openThread(state, thread)) return sendError("bad_request");
+    if (archiving.has(thread)) return sendError("not_ready");
+    const questionId = parseQuestionId(frame.question);
+    const option = frame.option;
+    if (questionId === undefined || typeof option !== "string" || !APP_QUESTION_OPTION_IDS.includes(option)) {
+      return sendError("bad_request");
+    }
+    const sessionKey = sessionForThread(thread);
+    let accepted = false;
+    let blocked: AppErrorCode | undefined;
+    try {
+      const conversation = await gateway.conversationFor(sessionKey, adapterContext);
+      await mutateState(async (doc, tx) => {
+        if (!openThread(doc, thread)) { blocked = "bad_request"; return; }
+        if (archiving.has(thread)) { blocked = "not_ready"; return; }
+        const questions = await tx.doc(AskQuestionsDoc, conversation.id);
+        const claim = claimQuestionAnswer(questions, {
+          questionId, optionId: option, sessionKey, nowMs: now(),
+        });
+        // Expiry, and every other settled record, becomes durable before this reply leaves.
+        for (const event of reconcileQuestionEvents(questions, doc.events, thread, now())) {
+          appendEvent(doc, event);
+        }
+        if (claim.result.status !== "accepted") {
+          // Nothing is admitted. A retried request id explains once; a fresh tap explains again.
+          const noticeId = `notice:answer:${questionId}:${frame.id as string}`;
+          if (!hasEventId(doc, noticeId)) {
+            appendMessage(doc, {
+              event: "message", thread, id: noticeId, role: "notice",
+              text: claimOutcomeText(claim.result), at: new Date(now()).toISOString(),
+            });
+          }
+          return;
+        }
+        if (doc.pending.length >= APP_LIMITS.maxPending) throw new Error(QUEUE_FULL);
+        // Only the stored record's own label is admitted, never a client-supplied payload.
+        doc.pending.push({
+          key: `answer:${questionId}`,
+          thread,
+          text: claim.result.text,
+          admittedAtMs: now(),
+          ...(admittedWhenBusy === undefined ? {} : { whenBusy: admittedWhenBusy }),
+        });
+        accepted = true;
+      });
+    } catch (error) {
+      if (stopping || signal?.aborted) return;
+      if (error instanceof Error && error.message === QUEUE_FULL) return sendError("not_ready");
+      journalEvent("app.answer.failed", {}, error);
+      sendError("internal");
+      return;
+    }
+    if (blocked !== undefined) return sendError(blocked);
+    // The reply precedes the state event; the app still treats the card as answered only once the
+    // `question` event arrives (protocol v2, "Owner questions").
+    sendOk({ accepted });
+    pushEventsToSockets();
+    if (accepted) {
+      journalEvent("app.answered", { "send.key": `answer:${questionId}` });
+      drain();
+    }
+  }
+
   async function handleSendFrame(
     frame: Record<string, unknown>,
     sendOk: (body?: Record<string, unknown>) => void,
@@ -1415,10 +1494,19 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     }
     // Never store callback text. A refused callback still has an idempotent key.
     const callback = looksLikeOAuthCallback(text);
+    // A typed ordinary message settles the oldest delivered question in this thread in the same
+    // commit as its admission, as Telegram and the terminal do; commands and callback text never
+    // count, and an attachment-only send has no text to count with.
+    const answerConversation = callback || gateway.askSurfaces === undefined
+      ? undefined
+      : await gateway.conversationFor(sessionForThread(thread), adapterContext).catch((error: unknown) => {
+          if (!stopping && !signal?.aborted) journalEvent("app.send.failed", {}, error);
+          return undefined;
+        });
     let duplicate = true;
     let blocked: AppErrorCode | undefined;
     try {
-      await mutateState((doc) => {
+      await mutateState(async (doc, tx) => {
         if (!openThread(doc, thread)) { blocked = "bad_request"; return; }
         if (archiving.has(thread)) { blocked = "not_ready"; return; }
         if (doc.sendKeys.some((entry) => entry.key === key)) return;
@@ -1444,6 +1532,13 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         if (thread === APP_MAIN_THREAD) doc.origin = { admittedAtMs: atMs };
         else if (doc.sideOrigins === undefined) doc.sideOrigins = { [thread]: { admittedAtMs: atMs } };
         else doc.sideOrigins[thread] = { admittedAtMs: atMs };
+        if (answerConversation !== undefined) {
+          const questions = await tx.doc(AskQuestionsDoc, answerConversation.id);
+          claimTypedQuestionAnswer(questions, sessionForThread(thread), text, atMs);
+          for (const event of reconcileQuestionEvents(questions, doc.events, thread, atMs)) {
+            appendEvent(doc, event);
+          }
+        }
       });
     } catch (error) {
       if (stopping || signal?.aborted) return;
@@ -2118,11 +2213,22 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     if (resetSession === undefined) {
       const conversation = await gateway.conversationFor(sessionForThread(thread), adapterContext);
       await conversation.reset(undefined, adapterContext);
+      // A context boundary retires questions the new context can no longer answer.
+      if (gateway.askSurfaces !== undefined) {
+        await conversation.commit(async (tx) => {
+          cancelPendingQuestions(await tx.doc(AskQuestionsDoc, conversation.id));
+        }, adapterContext);
+        await reconcileThreadQuestions(thread);
+      }
       return { kind: "applied" };
     }
     try {
       const result = await resetSession(sessionForThread(thread), adapterContext);
       if (result.status === "busy") return { kind: "refused", text: RESET_BUSY };
+      // The host reset cancels pending questions in its own commit; publish their final state so an
+      // already-rendered card can no longer be answered. This read is also where a crash between
+      // admitting a question and delivering it is quarantined honestly.
+      if (gateway.askSurfaces !== undefined) await reconcileThreadQuestions(thread);
       return { kind: "applied" };
     } catch (error) {
       if (isConversationBusy(error)) return { kind: "refused", text: RESET_BUSY };

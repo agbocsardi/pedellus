@@ -137,12 +137,12 @@ and counts toward the 50-open-side-thread limit. `main` cannot be renamed or arc
 Lifecycle changes append durable `thread` events.
 
 The adapter grants no tool: coding tools, MCP, web, cron, memory and worker authority are whatever
-the configuration already gives that mapped chat. The app chat is **not** an MCP login or
-`ask_user` owner surface in this phase: protocol v2 has no event that could carry a one-time
-authorization URL or an owner question without persisting it in the durable event log, and
-persisting such a URL in channel state is forbidden by the channels' binding contract (see
-*Known gaps*). A callback-shaped `send` is still intercepted before transcript admission, refused
-with one fixed notice, and its text is never stored.
+the configuration already gives that mapped chat. The app chat is **not** an MCP login surface:
+protocol v2 has no event that could carry a one-time authorization URL without persisting it in
+channel state, which the channels' binding contract forbids (see *Known gaps*). It **is** an
+owner-question surface for the model's `ask_user` capability, because a question has a durable
+event of its own (see *Owner questions*). A callback-shaped `send` is still intercepted before
+transcript admission, refused with one fixed notice, and its text is never stored.
 
 ## Fork admission
 
@@ -166,7 +166,7 @@ fixed error codes only, never free text. Frames and request bodies are bounded a
 keys at 1–64 characters of `[A-Za-z0-9_-]`.
 
 Durable egress is one adapter-wide cursor log — `message` (roles `user`, `assistant`, `notice`),
-`settled`, `divider` and `thread` — across all threads. Each event names its thread; lifecycle
+`settled`, `divider`, `thread` and `question` — across all threads. Each event names its thread; lifecycle
 events carry its full metadata. `hello` replies with the protocol version, the device label, the
 durable head cursor, the configured agent display name (`app.agentName`, default `Durable`) and
 `commands` (the shared catalogue's `app` surface this host implements, in catalogue order), and replays
@@ -246,6 +246,33 @@ unprintable, contains whitespace or is too long is dropped) and a `model` event 
 listed preset, otherwise `null`. Known gap: a CLI `/reload` that changes presets or resets
 selections is not pushed to connected apps; they see it on their next `hello`.
 
+## Owner questions
+
+A running adapter attaches one owner-question surface for its mapped, open thread sessions, so the
+model's `ask_user` capability (ASK_USER.md) works in a mapped app chat. Delivery is the channel's
+own durable log: the adapter appends a `question` event with `state: "open"` and the record's
+`expiresAt` in one commit, which is a definite delivery — no external send exists to be fenced. A
+session with no live adapter (gateway stopped, thread archived) has no surface, and the tool
+refuses without admitting anything.
+
+Every later change is another `question` event for the same `id`, and the app keeps the latest one:
+`answered` (with the chosen option id for a tapped answer; a typed answer carries none), `expired`,
+`cancelled` by `/new`, and `unknown` for a delivery interrupted in a way the gateway cannot prove.
+A live `open` event itself proves the append happened, so a delivery mark lost in a crash is
+repaired on the next read instead of being quarantined. Expiry and quarantine are enforced when a
+question is read or claimed — on `answer`, a typed message, `/new`, or adapter start — never by an
+adapter timer, so an open card can outlive its answer window until one of those reads.
+
+`answer {thread, question, option}` claims the durable record against that exact thread session and
+admits the follow-up input in one commit. Only the stored record's own label is admitted
+(`Answered question <id>: <label>`), never a client string. The reply is `accepted: true` and the
+`question` `answered` event follows it; a duplicate, stale, expired, cancelled or foreign question
+replies `accepted: false`, appends one fixed `notice` message (once per request id) and admits
+nothing. A typed ordinary `send` settles the oldest delivered question in that thread atomically
+with its own admission — commands, callback-shaped text and attachment-only sends never count — so
+the answer is that message and the record stores no duplicate text. `/new` cancels every pending
+question in the thread in the same operation as the reset; `abort` and a restart do not.
+
 ## Notifications (Web Push)
 
 Optional and off unless `app.push` is configured and its private key variable is set. The wire
@@ -299,10 +326,10 @@ with a fixed reason and a durable fault entry; no raw record contents are logged
 
 ## Known gaps (phase 1)
 
-* **No MCP login or `ask_user` surface.** A mapped app chat cannot start an MCP login (no owner
-  surface is registered, so the login is refused before delivery) and cannot receive an
-  `ask_user` question. Protocol v2 defines no owner-only non-durable event; a later protocol
-  revision must add one before this channel can carry URLs or questions.
+* **No MCP login surface.** A mapped app chat cannot start an MCP login (no owner surface is
+  registered, so the login is refused before delivery). Protocol v2 defines no owner-only
+  non-durable event; a later protocol revision must add one before this channel can carry URLs.
+  `ask_user` questions are supported through their own durable event (see *Owner questions*).
 * **No uploads, media, history, tasks or cards.** The protocol marks them *later*; `history` and
   `tasks` reply `unsupported`; a `send` with `attachments` replies `unsupported`.
 * **Web Push is offline-verified only.** No real push service, browser subscription or service

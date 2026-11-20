@@ -9,8 +9,8 @@ crash can never leave a model coroutine or a task waiting for an answer.
 ## Scope
 
 - Offered only in an authenticated mapped ordinary chat: the local CLI attach
-  (`cli:*`), a mapped Telegram private chat, or another mapped chat that attaches
-  an owner surface. Root, channel-state, fork, worker, digest and scheduled-run
+  (`cli:*`), a mapped Telegram private chat, or a mapped app thread whose adapter
+  is running. Root, channel-state, fork, worker, digest and scheduled-run
   automation conversations never receive the extension.
 - It is not a `toolAllowlist` name and grants no coding, filesystem, network,
   channel-send, worker or scheduling authority. `toolAllowlist` neither enables nor
@@ -33,7 +33,8 @@ is cancelled; the tool reports that fixed reason.
 The tool admits each question in the conversation's own durable document
 (`nanobot.ask-questions`, version 1, conversation scope, latest history, initial
 fork), marks it `sending`, delivers it to the live surface, then marks it
-`delivered`. It returns a bounded receipt naming the question ids, sets
+`delivered`. For the app channel the delivery itself is a durable append, so a
+completed append is proof of delivery even when the tool's own mark was lost. It returns a bounded receipt naming the question ids, sets
 `control.terminate`, and the run ends at that tool round: no further model request
 is made and no answer is claimed in the tool result. Asking alongside another tool is refused
 before delivery: the model must finish other work, then issue `ask_user` alone, because native
@@ -59,6 +60,17 @@ follow-up inputs over time, never a combined fabricated answer).
   (`nanobot.ask-answer`) with fixed text `Answered question <id>: <label>`, so the
   existing delivery path sends the run's reply. The keyboard is removed best effort
   after any terminal outcome; a later press is still refused by the durable record.
+- **App** (protocol v2, `question` event) appends one durable event with
+  `state: "open"` in the thread's log; every later change (`answered`, `expired`,
+  `cancelled`, `unknown`) is another event for the same id and the app keeps the
+  latest. Tapping sends `answer {thread, question, option}`; the gateway claims
+  the record against that exact thread session and admits the stored label
+  (`Answered question <id>: <label>`) as the follow-up turn in one commit, replies
+  `accepted: true`, then publishes the `answered` event. A refused tap replies
+  `accepted: false`, appends one fixed notice and admits nothing. A typed ordinary
+  message settles the oldest delivered question in that thread in the same commit
+  as its admission, exactly like Telegram and the CLI, and `/new` cancels pending
+  questions with the reset.
 - **Local terminal** has no button protocol: the question is printed with numbered
   options and the owner types an answer as an ordinary message. Attaching prints
   questions that are still open in that conversation, so a gateway restart does not
@@ -70,9 +82,9 @@ follow-up inputs over time, never a combined fabricated answer).
 Only the option label from the stored record is admitted, never the callback payload,
 so a forged or stale payload cannot inject text. The callback id, chat id, sender and
 answer are validated in that order. A reply the owner types instead of pressing a
-button is an ordinary message: Telegram and CLI atomically settle the oldest delivered question
-when admitting it. Commands, empty text and attachment-only inputs do not count as typed answers.
-A later button for that answered question is refused as a replay.
+button is an ordinary message: Telegram, the CLI and the app atomically settle the oldest delivered
+question when admitting it. Commands, empty text and attachment-only inputs do not count as typed
+answers. A later button for that answered question is refused as a replay.
 
 ## Expiry and cancellation
 
