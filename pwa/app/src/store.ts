@@ -1,5 +1,5 @@
 import { openDB, type DBSchema, type IDBPDatabase } from "idb";
-import { MAIN_THREAD, type ActivityEvent, type CommandInfo, type DurableEvent, type ModelEvent, type PresetInfo, type StatusEvent, type ThreadId, type ThreadInfo, type ThreadOrigin } from "./protocol";
+import { MAIN_THREAD, type ActivityEvent, type CommandInfo, type DurableEvent, type ModelEvent, type PresetInfo, type Reaction, type StatusEvent, type ThreadId, type ThreadInfo, type ThreadOrigin } from "./protocol";
 
 export type ConnState = "offline" | "connecting" | "replaying" | "open";
 export type Mode = "boot" | "chat" | "pair" | "update";
@@ -95,6 +95,11 @@ export class Store {
   private seenCursors = new Set<number>();
   private threadCursors = new Map<ThreadId, number>();
   private echoedKeys = new Map<ThreadId, Set<string>>();
+  /**
+   * The latest durable reaction per (thread, message), by cursor, so a badge is one lookup per
+   * render instead of a scan of the thread's whole event log.
+   */
+  private reactions = new Map<ThreadId, Map<string, { emoji: Reaction | null; cursor: number }>>();
   private searchText = new Map<number, { text: string; lower: string }>();
   private searchCache?: { query: string; remote: ReadonlySet<string> | undefined; results: { thread: ThreadInfo; snippet?: string }[] };
   private listeners = new Set<() => void>();
@@ -269,6 +274,14 @@ export class Store {
 
   private absorbChat(ev: ChatEvent): Outgoing | undefined {
     this.ensureThread(ev.thread);
+    if (ev.event === "reaction") {
+      // Latest by cursor wins, so a clear is never shadowed by an earlier reaction, and a replay
+      // that arrives out of order cannot move a badge backwards.
+      let seen = this.reactions.get(ev.thread);
+      if (!seen) this.reactions.set(ev.thread, seen = new Map());
+      const previous = seen.get(ev.message);
+      if (previous === undefined || ev.cursor > previous.cursor) seen.set(ev.message, { emoji: ev.emoji, cursor: ev.cursor });
+    }
     if (ev.event === "message") {
       const text = normalize(ev.text);
       this.searchText.set(ev.cursor, { text, lower: text.toLowerCase() });
@@ -434,7 +447,8 @@ export class Store {
   latestViewable(thread: ThreadId): number {
     const events = this.events.get(thread) ?? [];
     for (let i = events.length - 1; i >= 0; i--) {
-      if (events[i].event !== "settled") return events[i].cursor;
+      // A reaction or a settlement changes a message's state, not the thread's read state.
+      if (events[i].event !== "settled" && events[i].event !== "reaction") return events[i].cursor;
     }
     return 0;
   }
@@ -451,6 +465,15 @@ export class Store {
   }
 
   status(thread: ThreadId): AgentStatus { return this.statuses.get(thread) ?? IDLE; }
+
+  /**
+   * The owner's durable reaction on one message: an emoji, `null` when it was cleared, or
+   * `undefined` when this device has seen no reaction event for it. Only the latest event per
+   * (`message`, `by`) counts, so a clear is not shadowed by an earlier reaction.
+   */
+  reaction(thread: ThreadId, messageId: string): Reaction | null | undefined {
+    return this.reactions.get(thread)?.get(messageId)?.emoji;
+  }
 
   resetStatuses() {
     this.statuses.clear();

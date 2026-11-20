@@ -19,6 +19,7 @@ import {
   type AttachmentInfo,
   type ErrorCode,
   type PresetInfo,
+  type Reaction,
   type ThreadInfo,
   type ThreadOrigin,
 } from "./generated/protocol-v2.js";
@@ -67,7 +68,7 @@ export type AppPresetInfo = PresetInfo;
 export const APP_REQUEST_OPS: readonly string[] = [
   "hello", "send", "ack", "control", "ping", "history", "tasks", "task.cancel",
   "threads", "thread.create", "thread.rename", "thread.archive",
-  "push.key", "push.subscribe", "push.unsubscribe",
+  "push.key", "push.subscribe", "push.unsubscribe", "react",
 ];
 
 export type AppThreadOrigin = ThreadOrigin;
@@ -167,6 +168,17 @@ export type AppDurableEvent =
     part?: { i: number; n: number };
   }
   | { event: "settled"; cursor: number; thread?: string; key: string; outcome: "answered" | "failed" | "aborted" }
+  | {
+    event: "reaction";
+    cursor: number;
+    thread?: string;
+    /** The durable `message` id this reaction is on. */
+    message: string;
+    /** Protocol v2 defines exactly one reacting party for now. */
+    by: "owner";
+    /** The reaction, or `null` when the owner cleared it. */
+    emoji: Reaction | null;
+  }
   | { event: "divider"; cursor: number; thread?: string; at: string; reason: "new" }
   | { event: "thread"; cursor: number; thread: AppThreadInfo };
 

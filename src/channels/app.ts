@@ -92,6 +92,13 @@ import { createAppPushDispatcher, pushPayload, type AppPushDispatcher, type AppP
 import { absorbActivity, activityForWire, emptyActivity, type ActivityTally } from "./app-activity.js";
 import { startAppListener, type AppDeviceSession, type AppSessionHooks } from "./app-listener.js";
 import { AppFileRejected, createAppFiles, type AppMediaOptions } from "./app-files.js";
+import {
+  isReaction,
+  reactionChangeSummary,
+  retainReactionNote,
+  takeReactionContextText,
+  type AppReactionNote,
+} from "./app-reactions.js";
 
 /** Preserve the original mapped chat and its history. */
 export const APP_CHAT_SESSION_KEY = "app:chat";
@@ -146,6 +153,11 @@ export type AppChannelState = {
   sideOrigins?: Record<string, { readonly admittedAtMs: number }>;
   /** Threads owed a confirmation once the process that recorded an applied `restart` is replaced. */
   restart?: string[];
+  /**
+   * Passive reaction notes per thread: bounded, replaced per message, and consumed by that
+   * thread's next ordinary owner message in the same commit that admits it.
+   */
+  reactions?: Record<string, AppReactionNote[]>;
 };
 
 export const AppState = defineDoc<AppChannelState>({
@@ -555,6 +567,28 @@ function rememberAnswer(doc: Draft<AppChannelState>, id: string, thread: string,
 
 function hasEventId(doc: Draft<AppChannelState>, id: string): boolean {
   return doc.events.some((event) => event.event === "message" && event.id === id);
+}
+
+type DurableMessageEvent = Extract<AppDurableEvent, { event: "message" }>;
+type DurableReactionEvent = Extract<AppDurableEvent, { event: "reaction" }>;
+
+/** The durable `message` a reaction may target: in this thread, and its first part when split. */
+function findDurableMessage(
+  doc: AppChannelState, thread: string, id: string,
+): DurableMessageEvent | undefined {
+  return doc.events.find((event): event is DurableMessageEvent => event.event === "message" &&
+    threadOf(event) === thread && event.id === id && (event.part === undefined || event.part.i === 0));
+}
+
+/** The thread's latest reaction event for one message; the log is ascending, so the last wins. */
+function latestReaction(
+  doc: AppChannelState, thread: string, message: string,
+): DurableReactionEvent | undefined {
+  let found: DurableReactionEvent | undefined;
+  for (const event of doc.events) {
+    if (event.event === "reaction" && threadOf(event) === thread && event.message === message) found = event;
+  }
+  return found;
 }
 
 /**
@@ -1129,6 +1163,9 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           return await handlePushSubscribe(socket, frame, sendOk, sendError);
         case "push.unsubscribe":
           return await handlePushUnsubscribe(socket, sendOk, sendError);
+        case "react":
+          await handleReactFrame(frame, sendOk, sendError);
+          return;
         case "ping":
           sendOk();
           return;
@@ -1550,8 +1587,18 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           event: "message", thread, id: eventId, role: "user", text, at, key,
           ...(claimed === undefined || claimed.length === 0 ? {} : { attachments: files.infos(claimed) }),
         });
+        // This thread's retained reaction notes are passive context for the model-facing input only:
+        // the echo above keeps the owner's exact text, and the notes are cleared in this same commit
+        // so a replay cannot attach them twice.
+        const retained = doc.reactions?.[thread];
+        let notes: string | undefined;
+        if (retained !== undefined) {
+          notes = takeReactionContextText(retained, atMs);
+          // Written back even when empty: the consumption is the commit's own record of it.
+          doc.reactions![thread] = retained;
+        }
         doc.pending.push({
-          key, thread, text, admittedAtMs: atMs,
+          key, thread, text: notes === undefined ? text : `${notes}\n${text}`, admittedAtMs: atMs,
           ...(claimed === undefined ? {} : { attachments: claimed }),
           ...(admittedWhenBusy === undefined ? {} : { whenBusy: admittedWhenBusy }),
         });
@@ -1580,6 +1627,60 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       void releaseWithheld(thread);
       drain();
     }
+  }
+
+  // ── Reactions ──────────────────────────────────────────────────────────
+
+  /**
+   * `react`: one owner reaction (or its clear) on a durable message of an open thread. It appends
+   * the durable `reaction` event every device renders and retains a bounded passive note for the
+   * thread's next ordinary owner message; it never admits input and never starts a turn.
+   */
+  async function handleReactFrame(
+    frame: Record<string, unknown>,
+    sendOk: (body?: Record<string, unknown>) => void,
+    sendError: (error: AppErrorCode) => void,
+  ): Promise<void> {
+    const thread = parseThreadId(frame.thread === undefined ? APP_MAIN_THREAD : frame.thread);
+    const message = frame.message;
+    const emoji = frame.emoji;
+    if (thread === undefined || !openThread(state, thread) || archiving.has(thread)) return sendError("bad_request");
+    if (typeof message !== "string" || message.length === 0 || message.length > 256) return sendError("bad_request");
+    if (emoji !== null && !isReaction(emoji)) return sendError("bad_request");
+    let blocked: AppErrorCode | undefined;
+    try {
+      await mutateState((doc) => {
+        // Rechecked inside the commit exactly as a send does: an archive may have landed, or be in
+        // flight, while this request waited for its own commit.
+        if (!openThread(doc, thread) || archiving.has(thread)) { blocked = "bad_request"; return; }
+        const target = findDurableMessage(doc, thread, message);
+        // A gateway `notice` is neither the owner's nor the agent's message. Summarising it would
+        // attribute the gateway's own text to the owner, so it is not a target at all.
+        if (target === undefined || target.role === "notice") { blocked = "bad_request"; return; }
+        const previous = latestReaction(doc, thread, message)?.emoji ?? null;
+        const atMs = now();
+        if (doc.reactions === undefined) doc.reactions = {};
+        // Build the next list before assigning it: a draft stores the assigned value, so an array
+        // created by a property write is not the one the commit keeps.
+        const notes = [...(doc.reactions[thread] ?? [])];
+        retainReactionNote(notes, {
+          messageId: message,
+          emoji,
+          text: reactionChangeSummary({ messageId: message, role: target.role, text: target.text, previous, emoji }),
+          observedAtMs: atMs,
+        });
+        doc.reactions[thread] = notes;
+        appendEvent(doc, { event: "reaction", thread, message, by: "owner", emoji });
+      });
+    } catch (error) {
+      if (stopping || signal?.aborted) return;
+      journalEvent("app.react.failed", {}, error);
+      sendError("internal");
+      return;
+    }
+    if (blocked !== undefined) return sendError(blocked);
+    sendOk();
+    pushEventsToSockets();
   }
 
   // ── Delivery of admitted work ─────────────────────────────────────────────
