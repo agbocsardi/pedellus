@@ -129,6 +129,8 @@ export type AppDurableEvent =
     text: string;
     at: string;
     key?: string;
+    /** Present only on a split message: part `i` (from 0) of `n`; see v2.md, Long messages. */
+    part?: { i: number; n: number };
   }
   | { event: "settled"; cursor: number; thread?: string; key: string; outcome: "answered" | "failed" | "aborted" }
   | { event: "divider"; cursor: number; thread?: string; at: string; reason: "new" }

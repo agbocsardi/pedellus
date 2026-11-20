@@ -166,6 +166,8 @@ export function deviceClient(base, cookie) {
     ? new WebSocket(`${base.replace(/^http/, 'ws')}/v1/stream`)
     : new WebSocket(`${base.replace(/^http/, 'ws')}/v1/stream`, { headers: { cookie } });
   const frames = [];
+  // Raw frame sizes, parallel to `frames`: the wire limit applies to the bytes on the socket.
+  const bytes = [];
   const closed = { code: undefined, reason: undefined };
   const waiters = [];
   const collect = () => {
@@ -176,6 +178,7 @@ export function deviceClient(base, cookie) {
     }
   };
   socket.on('message', (data) => {
+    bytes.push(Buffer.byteLength(data));
     frames.push(JSON.parse(data.toString()));
     collect();
   });
@@ -188,6 +191,7 @@ export function deviceClient(base, cookie) {
   return {
     socket,
     frames,
+    bytes,
     closed,
     send(value) {
       socket.send(typeof value === 'string' ? value : JSON.stringify(value));

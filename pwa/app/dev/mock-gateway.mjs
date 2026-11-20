@@ -13,6 +13,7 @@ const FRAME_BYTES = 262_144;
 const SEND_TEXT_CHARS = 16_000;
 const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const REPLAY_BATCH = 500;
+const MAX_MESSAGE_PARTS = 64;
 const IDLE_ARCHIVE_MS = Number(process.env.IDLE_ARCHIVE_MS ?? 14 * 24 * 60 * 60 * 1000);
 const LABEL_RE = /^[^\p{Cc}\u2028\u2029]{1,40}$/u;
 const TITLE_RE = /^[^\p{Cc}\u2028\u2029]{1,80}$/u;
@@ -110,10 +111,47 @@ function notice(thread, text) {
   emit(thread, "message", { id: `n${cursor + 1}`, role: "notice", text, at: iso() });
 }
 
+/** Six escaped bytes per UTF-16 unit is the worst case, so this keeps every part frame small. */
+const PART_CHARS = 24_000;
+
+/** Split one long text into parts, never between the halves of a surrogate pair (v2.md). */
+function splitText(text) {
+  const parts = [];
+  let index = 0;
+  while (index < text.length && parts.length < MAX_MESSAGE_PARTS) {
+    let end = Math.min(text.length, index + PART_CHARS);
+    const last = text.charCodeAt(end - 1);
+    if (end < text.length && last >= 0xd800 && last <= 0xdbff) end -= 1;
+    parts.push(text.slice(index, end));
+    index = end;
+  }
+  return parts;
+}
+
+/** Emit one durable `message`, as its parts when it is too long for a single frame. */
+function emitMessage(thread, { text, ...fields }) {
+  const parts = splitText(text);
+  if (parts.length < 2) {
+    emit(thread, "message", { ...fields, text });
+    return;
+  }
+  parts.forEach((part, i) => emit(thread, "message", { ...fields, text: part, part: { i, n: parts.length } }));
+}
+
 // -- fake agent turns -------------------------------------------------------
+
+/** A long answer for the mock: multi-byte text and emoji, several parts big. */
+function longAnswer(asked) {
+  const unit = 'Absatz mit Grüßen, 🙂👋🏽 Emoji, "Zitat" und Umlauten — 日本語.';
+  const rows = [`A deliberately long answer to **${asked.slice(0, 40)}**, sent as parts.`, ""];
+  while (rows.join("\n").length < 160_000) rows.push(`${rows.length}. ${unit}`);
+  return rows.join("\n");
+}
 
 function answerFor(key) {
   const asked = admitted.get(key) ?? "…";
+  // Ask for "a long answer" to exercise a split durable message.
+  if (/long answer/i.test(asked)) return longAnswer(asked);
   const short = asked.length > 60 ? asked.slice(0, 60) + "…" : asked;
   return [
     `Sure — here is a mock answer to **${short}**.`,
@@ -140,17 +178,19 @@ function startTurn(thread) {
   const key = thread.queue.shift();
   if (!key) return;
   const text = answerFor(key);
-  const words = text.split(/(?<=\s)/); // keep separators
+  // Stream a bounded number of preview ticks, whatever the answer's length.
+  const width = Math.max(1, Math.ceil(text.length / 40));
+  const chunks = text.match(new RegExp(`[\\s\\S]{1,${width}}`, "g")) ?? [""];
   const turn = thread.running = { key, timers: [] };
   const at = (ms, fn) => turn.timers.push(setTimeout(fn, ms));
 
   emit(thread, "status", { state: "queued" });
   at(300, () => emit(thread, "status", { state: "thinking" }));
-  for (let n = 1; n <= words.length; n++) {
-    at(600 + n * 90, () => emit(thread, "preview", { key, text: words.slice(0, n).join("") }));
+  for (let n = 1; n <= chunks.length; n++) {
+    at(600 + n * 90, () => emit(thread, "preview", { key, text: chunks.slice(0, n).join("") }));
   }
-  at(600 + words.length * 90 + 200, () => {
-    emit(thread, "message", { id: `a-${key}`, role: "assistant", text, at: iso(), key });
+  at(600 + chunks.length * 90 + 200, () => {
+    emitMessage(thread, { id: `a-${key}`, role: "assistant", text, at: iso(), key });
     emit(thread, "settled", { key, outcome: "answered" });
     emit(thread, "status", { state: "idle" });
     thread.running = null;

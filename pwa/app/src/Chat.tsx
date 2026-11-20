@@ -7,7 +7,7 @@ import { Avatar, type AvatarState } from "./Avatar";
 
 const FINE_POINTER = matchMedia("(pointer: fine)").matches;
 
-type Row = { kind: "ev"; ev: DurableEvent } | { kind: "pending"; m: Outgoing };
+type Row = { kind: "ev"; ev: DurableEvent; text?: string; partial?: boolean } | { kind: "pending"; m: Outgoing };
 type Tone = "ok" | "run" | "warn" | "bad";
 type Sheet = { kind: "list" | "menu" | "tools" | "confirm-new" | "model" } | { kind: "rename"; title: string }
   | { kind: "create"; title: string; from?: ThreadOrigin }
@@ -160,7 +160,20 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     }
   }
 
-  const rows: Row[] = (store.events.get(thread) ?? []).map((ev) => ({ kind: "ev", ev }));
+  // A split message is one row: its parts are joined in `i` order here, and a message whose other
+  // parts have not arrived yet is marked incomplete.
+  const rows: Row[] = [];
+  const splitSeen = new Set<string>();
+  for (const ev of store.events.get(thread) ?? []) {
+    if (ev.event === "message" && ev.part !== undefined) {
+      if (splitSeen.has(ev.id)) continue;
+      splitSeen.add(ev.id);
+      const split = store.splitMessage(thread, ev.id);
+      rows.push({ kind: "ev", ev, text: split?.text, partial: !split?.complete });
+      continue;
+    }
+    rows.push({ kind: "ev", ev });
+  }
   for (const m of store.outbox.values()) {
     if (m.thread === thread && (m.state === "queued" || m.state === "sent" || m.state === "failed") && !store.hasEcho(thread, m.key)) {
       rows.push({ kind: "pending", m });
@@ -493,7 +506,8 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
         )}
         {rows.map((r, i) =>
           r.kind === "ev" ? (
-            <EventRow key={`e${r.ev.cursor}`} ev={r.ev} store={store} last={i === lastUser}
+            <EventRow key={`e${r.ev.cursor}`} ev={r.ev} text={r.text} partial={r.partial}
+              store={store} last={i === lastUser}
               forks={r.ev.event === "message" ? forks.get(r.ev.id) : undefined}
               onActions={(ev, button) => show({ kind: "message", title: suggestedTitle(ev.text),
                 from: { thread: ev.thread, messageId: ev.id } }, button)}
@@ -785,8 +799,8 @@ function Icon({ d, bold }: { d: string; bold?: boolean }) {
   );
 }
 
-function EventRow({ ev, store, last, forks, onActions, onRetry }: {
-  ev: DurableEvent; store: Store; last: boolean; forks?: ThreadInfo[];
+function EventRow({ ev, text, partial, store, last, forks, onActions, onRetry }: {
+  ev: DurableEvent; text?: string; partial?: boolean; store: Store; last: boolean; forks?: ThreadInfo[];
   onActions: (ev: MessageEvent, button: HTMLButtonElement) => void;
   onRetry?: (m: Outgoing) => void;
 }) {
@@ -799,17 +813,20 @@ function EventRow({ ev, store, last, forks, onActions, onRetry }: {
     );
   }
   if (ev.event !== "message") return null; // settled only drives delivery state
+  const body = text ?? ev.text;
+  const incomplete = partial ? <span className="msg-partial" role="status">Incomplete</span> : null;
   const outgoing = ev.key ? store.outgoing(ev.thread, ev.key) : undefined;
   const anchor = Number.isSafeInteger(ev.cursor) && ev.cursor > 0 && ev.role !== "notice"
     ? { "data-message-id": ev.id, "data-message-cursor": ev.cursor, "data-thread-title": suggestedTitle(ev.text), tabIndex: -1 }
     : undefined;
   return <>
-    {ev.role === "notice" ? <div className="notice">{ev.text}</div> : ev.role === "user" ? (
-      <UserBubble text={ev.text} anchor={anchor} state={outgoing?.state} at={ev.at} last={last}
+    {ev.role === "notice" ? <div className="notice">{body}{incomplete}</div> : ev.role === "user" ? (
+      <UserBubble text={body} partial={partial} anchor={anchor} state={outgoing?.state} at={ev.at} last={last}
         onRetry={onRetry && outgoing?.state === "failed" ? () => onRetry(outgoing) : undefined} />
     ) : (
       <div className="msg assistant" {...anchor}>
-        <Streamdown mode="static">{ev.text}</Streamdown>
+        <Streamdown mode="static">{body}</Streamdown>
+        {incomplete}
       </div>
     )}
     {(anchor || !!forks?.length) && <div className="msg fork-links" data-role={ev.role}>
@@ -833,15 +850,18 @@ const DELIV: Record<OutgoingState, { label: string; icon: ReactNode }> = {
 };
 
 function UserBubble(props: {
-  text: string; anchor?: React.HTMLAttributes<HTMLDivElement>; state?: OutgoingState; at?: string | number;
-  last: boolean; onRetry?: () => void; onDiscard?: () => void; held?: string;
+  text: string; partial?: boolean; anchor?: React.HTMLAttributes<HTMLDivElement>; state?: OutgoingState;
+  at?: string | number; last: boolean; onRetry?: () => void; onDiscard?: () => void; held?: string;
 }) {
   const { state } = props;
   const show = state && (props.last || state === "queued" || state === "sent" || state === "failed");
   const d = state && DELIV[state];
   return (
     <div className="row user">
-      <div className="bubble" {...props.anchor}>{props.text}</div>
+      <div className="bubble" {...props.anchor}>
+        {props.text}
+        {props.partial && <span className="msg-partial" role="status">Incomplete</span>}
+      </div>
       {show && d && (
         <span className="deliv" data-state={state}>
           {props.held && (state === "queued" || state === "sent") ? props.held

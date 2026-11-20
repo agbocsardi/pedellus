@@ -284,6 +284,8 @@ type SubmissionSlot = { readonly prior: Promise<void>; release(): void };
 /** One durable event without its cursor, distributive over the union. */
 type WithoutCursor<T> = T extends { cursor: number } ? Omit<T, "cursor"> : never;
 type AppEventInput = WithoutCursor<AppDurableEvent> & { thread: string | AppThreadInfo };
+/** A durable `message` as callers hand it over, before `appendMessage` sizes its frame. */
+type AppMessageInput = Omit<Extract<AppEventInput, { event: "message" }>, "part">;
 
 export function threadInfo(doc: AppChannelState, thread: string): AppThreadInfo | undefined {
   return doc.threads?.find((entry) => entry.id === thread);
@@ -423,6 +425,91 @@ function appendEvent(doc: Draft<AppChannelState>, event: AppEventInput): void {
   }
   doc.events.push({ ...event, cursor });
   pruneEvents(doc);
+}
+
+/**
+ * Bytes of one code point as `JSON.stringify` writes it inside a string literal: `"` and `\\` take
+ * two, most control characters six, and a lone surrogate is escaped as `\uXXXX`. Counting the
+ * escaped size is what keeps a split part's whole frame inside `frameBytes`.
+ */
+function escapedCodePointBytes(codePoint: number): number {
+  if (codePoint === 0x22 || codePoint === 0x5c) return 2;
+  if (codePoint < 0x20) {
+    return codePoint === 0x08 || codePoint === 0x09 || codePoint === 0x0a || codePoint === 0x0c ||
+      codePoint === 0x0d ? 2 : 6;
+  }
+  if (codePoint < 0x80) return 1;
+  if (codePoint < 0x800) return 2;
+  if (codePoint >= 0xd800 && codePoint <= 0xdfff) return 6;
+  if (codePoint < 0x10000) return 3;
+  return 4;
+}
+
+/** Escaped bytes of a whole string, as the wire's JSON writes it. */
+function escapedTextBytes(text: string): number {
+  return Buffer.byteLength(JSON.stringify(text)) - 2;
+}
+
+/** The longest prefix of `text`, in whole code points, whose escaped bytes fit `budget`. */
+function fittingPrefix(text: string, budget: number): number {
+  let used = 0;
+  let end = 0;
+  while (end < text.length) {
+    const codePoint = text.codePointAt(end)!;
+    used += escapedCodePointBytes(codePoint);
+    if (used > budget) break;
+    end += codePoint > 0xffff ? 2 : 1;
+  }
+  return end;
+}
+
+/** `[truncated]` ends a message that needed more parts than the protocol allows. */
+const MESSAGE_TRUNCATED = "\n\n[truncated]";
+/** The widest `{i, n}` value the splitter can emit, as all nines of `maxMessageParts`'s width. */
+const PART_MARKER_BOUND = Number("9".repeat(String(APP_LIMITS.maxMessageParts).length));
+
+/** One message frame's exact size in bytes, in the shape `wireEvent` emits. */
+function messageFrameBytes(
+  event: AppMessageInput, cursor: number, part?: { i: number; n: number },
+): number {
+  return Buffer.byteLength(JSON.stringify({
+    type: "event", ...event, thread: event.thread ?? APP_MAIN_THREAD, cursor,
+    ...(part === undefined ? {} : { part }),
+  }));
+}
+
+/**
+ * Append one durable `message`, split into wire-sized parts when its frame would exceed the frame
+ * limit (protocol v2, "Long messages"): same id, thread, role, at and key, one cursor per part,
+ * `part: {i, n}`, and every part's frame inside the limit. Parts never cut a UTF-16 surrogate pair;
+ * a text needing more than `maxMessageParts` keeps its leading parts and truncates the last, which
+ * is marked and reported (APP.md, known bounds). Callers keep their `settled` after this call.
+ */
+function appendMessage(doc: Draft<AppChannelState>, event: AppMessageInput): void {
+  const first = doc.nextCursor;
+  if (messageFrameBytes(event, first) <= APP_LIMITS.frameBytes) {
+    appendEvent(doc, event);
+    return;
+  }
+  // `n` is unknown until the text is split, so every budget assumes the widest `{i, n}`; the
+  // cursor is exact per part because each append takes the next one.
+  const budget = (index: number): number => APP_LIMITS.frameBytes - messageFrameBytes(
+    { ...event, text: "" }, first + index, { i: PART_MARKER_BOUND, n: PART_MARKER_BOUND });
+  const texts: string[] = [];
+  let rest = event.text;
+  while (rest !== "" && texts.length < APP_LIMITS.maxMessageParts) {
+    // A budget below one code point is unreachable at the protocol's limits; still never cut a pair.
+    const take = fittingPrefix(rest, budget(texts.length)) || (rest.codePointAt(0)! > 0xffff ? 2 : 1);
+    texts.push(rest.slice(0, take));
+    rest = rest.slice(take);
+  }
+  if (rest !== "") {
+    const last = texts.length - 1;
+    const room = Math.max(1, budget(last) - escapedTextBytes(MESSAGE_TRUNCATED));
+    texts[last] = texts[last]!.slice(0, fittingPrefix(texts[last]! + rest, room)) + MESSAGE_TRUNCATED;
+    console.warn(`App message ${event.id} exceeds ${APP_LIMITS.maxMessageParts} parts and was truncated.`);
+  }
+  texts.forEach((text, i) => appendEvent(doc, { ...event, text, part: { i, n: texts.length } }));
 }
 
 /** Message events carry stable ids, so a replayed or crashed append can be recognized exactly. */
@@ -1240,10 +1327,10 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         const at = new Date(atMs).toISOString();
         doc.sendKeys = pruneKeys([...doc.sendKeys, { key, atMs }], atMs);
         if (callback) {
-          appendEvent(doc, { event: "message", thread, id: callbackId, role: "notice", text: CALLBACK_REFUSED_TEXT, at });
+          appendMessage(doc, { event: "message", thread, id: callbackId, role: "notice", text: CALLBACK_REFUSED_TEXT, at });
           return;
         }
-        appendEvent(doc, { event: "message", thread, id: eventId, role: "user", text, at, key });
+        appendMessage(doc, { event: "message", thread, id: eventId, role: "user", text, at, key });
         doc.pending.push({
           key, thread, text, admittedAtMs: atMs,
           ...(admittedWhenBusy === undefined ? {} : { whenBusy: admittedWhenBusy }),
@@ -1335,7 +1422,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       const id = `notice:${item.key}#${item.noticeSeq ?? item.admittedAtMs}`;
       await mutateState((doc) => {
         if (hasEventId(doc, id)) return;
-        appendEvent(doc, {
+        appendMessage(doc, {
           event: "message",
           thread,
           id,
@@ -1535,7 +1622,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       const answerId = thread === APP_MAIN_THREAD ? `answer:${answerEntry}` : `answer:${thread}:${answerEntry}`;
       if (members.length > 0 && !hasEventId(doc, answerId)) {
         rememberAnswer(doc, answerId, thread, answerEntry);
-        appendEvent(doc, {
+        appendMessage(doc, {
           event: "message",
           thread,
           id: answerId,
@@ -2408,7 +2495,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           restored = true;
         }
         if (entry.appAnswerEntry !== undefined) rememberAnswer(doc, id, thread, entry.appAnswerEntry);
-        appendEvent(doc, {
+        appendMessage(doc, {
           event: "message", id, thread, role: interruption ? "notice" : "assistant",
           text: entry.text, at: new Date(now()).toISOString(),
         });

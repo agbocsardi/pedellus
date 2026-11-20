@@ -154,6 +154,16 @@ active device, then a hard cap of 2 000 keeps the newest; a `hello` below the re
 replays from the floor, so a device that acks never sees a gap, and one that returns after the cap
 was exceeded has an irreducible hole (the app refetches nothing; phase 2 push mitigates this).
 
+A durable `message` whose frame would exceed 262 144 bytes is stored as up to 64 parts sharing one
+id, thread, role, `at` and `key`, each with its own cursor and `part: {i, n}` (protocol v2, *Long
+messages*). The split measures each part's escaped JSON bytes, never cuts a UTF-16 surrogate pair,
+and keeps every frame inside the limit; the app joins the parts in `i` order and `settled` follows
+the last one. Parts are ordinary cursor events, so a replay batch may end mid-message and the app
+shows what it has until the next batch. *Known bound:* a text that would need more than 64 parts
+(about 16 MB escaped) keeps its leading parts and truncates the last, marked `[truncated]` and
+reported once with a `console.warn` naming the event id; the full text is still in the transcript. Parts are ordinary events for retention, so trimming at the ack floor or the event cap can drop
+the leading parts of a message a device never stored; that device then shows the rest as incomplete.
+
 This is the app-channel reconciliation of Telegram's held-unknown boundary: Telegram's external
 sends have no idempotency key, so an ambiguous outcome is quarantined and never resent. The app's
 "send" is a durable local commit, and its retransmission path is cursor replay, which is exactly
@@ -248,8 +258,10 @@ with a fixed reason and a durable fault entry; no raw record contents are logged
 * **Oversize frames beyond eight times the frame bound** are aborted by the WebSocket layer with
   1009 (a network-class close for the app) rather than the gateway's `4400`; the bound itself is
   enforced with `4400` up to that backstop.
-* **Very long final answers** are still sent as one durable message, which can exceed the frame
-  budget. Unlike previews, final answers must not be trimmed; they need lossless chunking.
+* **Very long final answers are split, with one bound.** An answer over the frame budget becomes up
+to `maxMessageParts` (64) durable parts, losslessly; a text needing more than that (about 16 MB of
+escaped text) has its last part truncated and marked `[truncated]`, and is reported once by a
+`console.warn` naming the event id. The transcript keeps the whole text.
 * **Archive keeps the mapping.** Idle archived snapshots are evictable and rebuilt on restore.
   The gateway reserves snapshot capacity before acknowledging a new thread or send.
 * **Legacy fork anchors.** For assistant replies written before fork support, the gateway needs the

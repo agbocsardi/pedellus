@@ -23,7 +23,9 @@ mock and the same value as `MOCK_PORT` on Vite (dev or preview). Set
 `AGENT_NAME` on the mock to override the default display name, “Durable”.
 Mock credentials, threads and cursors are in memory; after a mock restart use a fresh browser
 profile or clear site data before pairing again. Set `IDLE_ARCHIVE_MS=3000`
-on the mock to try automatic archiving after three seconds of idleness.
+on the mock to try automatic archiving after three seconds of idleness. Ask for
+`a long answer` to get a durable message split into `part: {i, n}` frames
+(protocol v2, *Long messages*), including while it is only partly received.
 The mock records and validates fork origins without copying messages into
 the new thread. It doesn't run a real agent.
 
