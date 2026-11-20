@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+// NOTE: the shipped icons in public/icons are now the robot avatar (src/Avatar.tsx, idle pose) rendered
+// on the dark background; running this script would replace them with the old speech-bubble mark.
 // Generates the app icons as PNGs with zero dependencies: a small PNG writer
 // (zlib is in the stdlib) plus a supersampled rasterizer for the "speech
 // bubble" mark. Deterministic, re-run any time with `npm run icons`.
