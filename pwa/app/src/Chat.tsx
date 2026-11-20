@@ -7,6 +7,7 @@ import { disablePush, enablePush, hasPushSubscription, pushPermission, requestPu
 import { Avatar, type AvatarState } from "./Avatar";
 import { Reactions } from "./Reactions";
 import { attachmentKind, fileUrl, formatBytes, uploadErrorText, uploadFile } from "./uploads";
+import { canRecord, startVoiceNote, VOICE_MAX_MS, type Recording, type VoiceStop } from "./recorder";
 import { ActivitySteps } from "./ActivitySteps";
 import { TasksSheet } from "./TasksSheet";
 import { QuestionCard } from "./Question";
@@ -23,6 +24,8 @@ type AttachmentView = { id: string; name: string; type: string; size: number; ki
 type Pick = {
   id: string; file: File; name: string; type: string; size: number;
   state: "waiting" | "uploading" | "done" | "failed"; uploadId?: string; note?: string; preview?: string;
+  /** Seconds, for a pick that came from the recorder: its chip names it by length, not by file. */
+  voice?: number;
 };
 type Sheet = { kind: "list" | "menu" | "tools" | "tasks" | "confirm-new" | "model" } | { kind: "rename"; title: string }
   | { kind: "create"; title: string; from?: ThreadOrigin }
@@ -38,6 +41,15 @@ const ATTACH_ICON = "M12 5v14M5 12h14";
 const REMOVE_ICON = "M6 6l12 12M18 6 6 18";
 const FILE_ICON = "M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5ZM14 3v5h5";
 const IMAGE_ICON = "M4 5h16v14H4zM4 16l4-4 3 3 3-3 6 6M15 10h.01";
+const AUDIO_ICON = "M4 12h2M8 8v8M12 5v14M16 8v8M20 12h2";
+const MIC_ICON = "M12 4a3 3 0 0 0-3 3v5a3 3 0 0 0 6 0V7a3 3 0 0 0-3-3M5 11a7 7 0 0 0 14 0M12 18v3";
+const PLAY_ICON = "M8 5.5v13l11-6.5-11-6.5Z";
+const PAUSE_ICON = "M9.5 5.5v13M14.5 5.5v13";
+/** A voice note's length, `m:ss`. */
+const lengthText = (secs: number) => `${Math.floor(secs / 60)}:${String(Math.floor(secs % 60)).padStart(2, "0")}`;
+/** A name the recorder made (`Voice note 14:32.m4a`): the label is the kind, not the timestamp. */
+const VOICE_NAME = /^Voice note \d{2}:\d{2}(\.[a-z0-9]+)?$/i;
+const noteLabel = (name: string) => (VOICE_NAME.test(name) ? "Voice note" : name);
 
 type CommandState = { online: boolean; writable: boolean; running: boolean };
 const ready = (s: CommandState) => s.online && s.writable;
@@ -102,10 +114,7 @@ function AttachmentList({ files }: { files: AttachmentView[] }) {
         const key = `${file.id}-${file.name}`;
         if (!file.url) return <FileChip key={key} file={file} />;
         if (file.kind === "image") return <ImageAttachment key={key} file={file} url={file.url} />;
-        if (file.kind === "audio") {
-          return <audio key={key} className="attachment-audio" controls preload="none"
-            src={file.url} aria-label={file.name} />;
-        }
+        if (file.kind === "audio") return <VoiceAttachment key={key} file={file} url={file.url} />;
         return <FileChip key={key} file={file} />;
       })}
     </div>
@@ -125,13 +134,56 @@ function ImageAttachment({ file, url }: { file: AttachmentView; url: string }) {
   );
 }
 
+/**
+ * A recorded voice note: one compact row, with the browser's own `<audio>`
+ * element underneath as the player. The row says what it is and how long it
+ * runs; the recorder's timestamped file name stays on the download.
+ */
+function VoiceAttachment({ file, url }: { file: AttachmentView; url: string }) {
+  const audio = useRef<HTMLAudioElement>(null);
+  const [duration, setDuration] = useState<number | null>(null);
+  const [playing, setPlaying] = useState(false);
+  const [unsupported, setUnsupported] = useState(false);
+  if (unsupported) {
+    // Not decodable here: fall back to the plain player instead of a dead button.
+    return <audio className="attachment-audio" controls preload="none" src={url} aria-label={file.name} />;
+  }
+  const toggle = () => {
+    const el = audio.current;
+    if (!el) return;
+    if (el.paused) void el.play().catch(() => setUnsupported(true));
+    else el.pause();
+  };
+  return (
+    <div className="voice-note">
+      <button className="voice-toggle" aria-label={playing ? "Pause voice note" : "Play voice note"}
+        aria-pressed={playing} onClick={toggle}>
+        <Icon d={playing ? PAUSE_ICON : PLAY_ICON} bold={!playing} />
+      </button>
+      <span className="voice-text">
+        <b>{noteLabel(file.name)}</b>
+        {/* Empty until the container reports a length: guessing one would be a lie. */}
+        <small>{duration === null ? "" : lengthText(duration)}</small>
+      </span>
+      <audio ref={audio} className="voice-audio" src={url} preload="metadata" tabIndex={-1} aria-hidden="true"
+        onLoadedMetadata={(e) => {
+          const d = e.currentTarget.duration;
+          if (Number.isFinite(d) && d > 0) setDuration(d);
+        }}
+        onPlay={() => setPlaying(true)}
+        onPause={() => setPlaying(false)}
+        onEnded={() => setPlaying(false)} />
+    </div>
+  );
+}
+
 function FileChip({ file }: { file: AttachmentView }) {
   const body = <>
     <span className="file-chip-icon" aria-hidden="true">
-      <Icon d={file.kind === "image" ? IMAGE_ICON : FILE_ICON} />
+      <Icon d={file.kind === "image" ? IMAGE_ICON : file.kind === "audio" ? AUDIO_ICON : FILE_ICON} />
     </span>
     <span className="file-chip-text">
-      <b>{file.name}</b>
+      <b>{noteLabel(file.name)}</b>
       <small>{formatBytes(file.size)}</small>
     </span>
   </>;
@@ -214,6 +266,11 @@ function clock(at: string | number | undefined): string {
 export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [picks, setPicks] = useState<Record<string, Pick[]>>({});
+  /** A voice note being recorded, and the thread it belongs to. */
+  const [voice, setVoice] = useState<{ startedAt: number; thread: string } | null>(null);
+  const [voiceSecs, setVoiceSecs] = useState(0);
+  /** A short, non-error explanation (a recording that stopped on its own). */
+  const [hint, setHint] = useState("");
   const [sheet, setSheet] = useState<Sheet | null>(null);
   const wide = useWideLayout();
   const [error, setError] = useState("");
@@ -232,6 +289,11 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   const layoutWidth = useRef(0);
   const reflowedAt = useRef(0);
   const fileRef = useRef<HTMLInputElement>(null);
+  const voiceRef = useRef<{ recording: Recording; cap: ReturnType<typeof setTimeout>; startedAt: number } | null>(null);
+  /** Set before the permission prompt resolves, so a second tap cannot start a second stream. */
+  const startingVoice = useRef(false);
+  /** False once this screen has gone; a late permission answer must not arm a recording. */
+  const mounted = useRef(true);
   const uploading = useRef(new Set<string>());
   const previews = useRef(new Set<string>());
   const press = useRef<{ x: number; y: number; timer: ReturnType<typeof setTimeout> } | null>(null);
@@ -249,6 +311,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   const running = !archived && isRunning(store.status(thread).state);
   const files = picks[thread] ?? [];
   const canSendFiles = files.every((f) => f.state !== "failed");
+  const canVoice = store.uploads && canRecord();
   const liveActivity = store.activity(thread);
   const p = presence(store);
   const latest = store.latestViewable(thread);
@@ -365,6 +428,44 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   useEffect(() => () => {
     for (const url of previews.current) URL.revokeObjectURL(url);
     previews.current.clear();
+  }, []);
+  // The elapsed time of a running recording; the five-minute cap is its own timer.
+  useEffect(() => {
+    if (!voice) return;
+    const tick = () => setVoiceSecs(Math.floor((Date.now() - voice.startedAt) / 1000));
+    tick();
+    const timer = setInterval(tick, 500);
+    return () => clearInterval(timer);
+  }, [voice]);
+  // iOS suspends media in a backgrounded app, and a recorder that no longer
+  // records is a lie: end the note honestly and keep what it captured.
+  const endVoice = useEffectEvent((threadId: string, why: string) => { void keepVoice(threadId, why); });
+  useEffect(() => {
+    const onHide = () => {
+      if (document.hidden && voice) endVoice(voice.thread, "Recording stopped when the app went to the background.");
+    };
+    document.addEventListener("visibilitychange", onHide);
+    return () => document.removeEventListener("visibilitychange", onHide);
+  }, [voice]);
+  // A thread that turns read-only mid-recording takes the recording row with
+  // it, so end the note here with the same honest "keep" path as the rest.
+  useEffect(() => {
+    if (voice && voice.thread === thread && !writable) endVoice(voice.thread, "Recording stopped when the thread became read-only.");
+  }, [voice, thread, writable]);
+  // The recording row belongs to the thread it was started in.
+  useEffect(() => {
+    if (voice && voice.thread !== thread) endVoice(voice.thread, "Recording stopped when you left the thread.");
+  }, [voice, thread]);
+  // Leaving this screen ends the note and lets the microphone go; a permission
+  // prompt still open must not be answered with a recording nobody can see.
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      startingVoice.current = false;
+      voiceRef.current?.recording.cancel();
+      voiceRef.current = null;
+    };
   }, []);
   // Files picked while offline (or paused by a rate limit) upload once the
   // stream comes back. Only a transition retries them: reacting to each pick
@@ -538,13 +639,11 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     }
   }
 
-  /** Picker callback: limit checks first, then upload what the gateway will take. */
-  function addFiles(list: FileList | null) {
-    const chosen = [...(list ?? [])];
-    if (fileRef.current) fileRef.current.value = "";
+  /** Picked or recorded files: limit checks first, then upload what the gateway will take. */
+  function addFiles(chosen: File[], threadId: string = thread, voiceSecs?: number) {
     if (!chosen.length) return;
     const problems: string[] = [];
-    const room = Math.max(0, LIMITS.maxAttachments - files.length);
+    const room = Math.max(0, LIMITS.maxAttachments - (picks[threadId] ?? []).length);
     const added: Pick[] = [];
     for (const file of chosen) {
       if (file.size > LIMITS.uploadBytes) {
@@ -565,12 +664,13 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
         id: crypto.randomUUID().replaceAll("-", ""), file, name: file.name,
         type: file.type || "application/octet-stream", size: file.size,
         state: online && store.uploads ? "uploading" : "waiting", preview,
+        ...(voiceSecs === undefined ? {} : { voice: voiceSecs }),
       });
     }
     setError(problems.join(" "));
     if (!added.length) return;
-    setPicks((prev) => ({ ...prev, [thread]: [...(prev[thread] ?? []), ...added] }));
-    for (const pick of added) if (pick.state === "uploading") void runUpload(thread, pick);
+    setPicks((prev) => ({ ...prev, [threadId]: [...(prev[threadId] ?? []), ...added] }));
+    for (const pick of added) if (pick.state === "uploading") void runUpload(threadId, pick);
   }
 
   function removePick(threadId: string, id: string) {
@@ -587,6 +687,105 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
       ...prev,
       [threadId]: (prev[threadId] ?? []).filter((pick) => !sent.some((s) => s.id === pick.id)),
     }));
+  }
+
+  /** Mic tap: the permission prompt happens here, never at load. */
+  async function startVoice() {
+    // Synchronous guards only: iOS needs `getUserMedia` called in the tap
+    // handler itself, and two taps must never open two streams.
+    if (startingVoice.current || voiceRef.current || !store.canWrite(thread)) return;
+    startingVoice.current = true;
+    setError("");
+    setHint("");
+    let recording: Recording;
+    try {
+      recording = await startVoiceNote();
+    } catch (err) {
+      startingVoice.current = false;
+      setError(err instanceof DOMException && (err.name === "NotAllowedError" || err.name === "SecurityError")
+        ? "Microphone access was denied. Allow it for this app to record a voice note."
+        : "Could not start recording on this device.");
+      return;
+    }
+    // The screen, the thread or its write access may have gone behind the
+    // permission prompt: nobody could stop this recording, so let it go now.
+    if (!mounted.current || store.openThread !== thread || !store.canWrite(thread)) {
+      startingVoice.current = false;
+      recording.cancel();
+      return;
+    }
+    startingVoice.current = false;
+    const startedAt = Date.now();
+    const cap = setTimeout(() => void sendVoice(true), VOICE_MAX_MS);
+    voiceRef.current = { recording, cap, startedAt };
+    setVoice({ startedAt, thread });
+    setVoiceSecs(0);
+  }
+
+  /** Take the recorder down once; the caller decides what becomes of the audio. */
+  async function takeVoice() {
+    const current = voiceRef.current;
+    if (!current) return undefined;
+    voiceRef.current = null;
+    clearTimeout(current.cap);
+    setVoice(null);
+    return current.recording.finish();
+  }
+
+  /** Stop and send: one file, through the same upload and queue as a picked attachment. */
+  async function sendVoice(fromCap = false) {
+    if (!voiceRef.current) return;
+    // Taking the recorder destroys its audio, so refuse before that when the
+    // send could only be dropped; the row keeps the recording instead.
+    if (savingMessage.current || !store.canWrite(thread)) {
+      if (!fromCap) {
+        setHint("Couldn’t send the voice note; it is still recording.");
+        return;
+      }
+      // The five-minute cap fired: stop here and keep the audio, never record
+      // past the cap because a send was refused.
+      void keepVoice(thread, "Recording stopped at 5 minutes and was kept.");
+      return;
+    }
+    const result = await takeVoice();
+    if (!result) {
+      setHint("Nothing was recorded.");
+      return;
+    }
+    if (result.stopped === "size") {
+      setHint(`Recording stopped at ${formatBytes(LIMITS.uploadBytes)} and was discarded.`);
+      return;
+    }
+    const pick: Pick = {
+      id: crypto.randomUUID().replaceAll("-", ""), file: result.file, name: result.file.name,
+      type: result.file.type, size: result.file.size, state: "done",
+    };
+    await queueMessage("", undefined, [pick]);
+    if (result.stopped === "cap") setHint("Recording stopped at 5 minutes and was sent.");
+  }
+
+  async function cancelVoice() {
+    const current = voiceRef.current;
+    if (!current) return;
+    voiceRef.current = null;
+    clearTimeout(current.cap);
+    setVoice(null);
+    current.recording.cancel();
+  }
+
+  /** The composer can no longer show this recording: stop it and keep what it captured. */
+  async function keepVoice(threadId: string, why: string) {
+    // Read the clock before `takeVoice` drops the ref: the chip shows this length.
+    const started = voiceRef.current?.startedAt;
+    const secs = started === undefined ? undefined : Math.round((Date.now() - started) / 1000);
+    const result = await takeVoice();
+    if (!result) return;
+    if (result.stopped === "size") {
+      setHint(`Recording stopped at ${formatBytes(LIMITS.uploadBytes)} and was discarded.`);
+      return;
+    }
+    setHint(why);
+    addFiles([result.file], threadId, secs);
   }
 
   async function discardMessage(key: string) {
@@ -931,6 +1130,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
 
       <footer className="composer">
         {!sheet && (error || forkError) && <p className="error-text" role="alert">{error || forkError}</p>}
+        {!sheet && !error && !forkError && hint && <p className="composer-hint" role="status">{hint}</p>}
         {slashOpen && <div className="slash-list" aria-label="Commands" role="group">
           {matches.map((c) => <CommandItem key={c.name} c={c} state={cmdState} active={c === picked}
             onClick={() => runCommand(c, args)} keepFocus />)}
@@ -945,18 +1145,23 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
             : "Reconnect to restore"}</p>
         ) : !writable ? <p className="archived-hint">Read-only until thread details are available.</p> : <>
           {files.length > 0 && <ul className="picks" aria-label={`${files.length} ${files.length === 1 ? "file" : "files"} to send`}>
-            {files.map((pick) => (
+            {files.map((pick) => {
+            const voice = pick.voice !== undefined;
+            return (
               <li key={pick.id} className="pick" data-state={pick.state}>
                 {pick.preview ? (
                   <img className="pick-thumb" src={pick.preview} alt="" />
                 ) : (
                   <span className="pick-icon" aria-hidden="true">
-                    <Icon d={attachmentKind(pick.type) === "image" ? IMAGE_ICON : FILE_ICON} />
+                    <Icon d={attachmentKind(pick.type) === "image" ? IMAGE_ICON
+                      : attachmentKind(pick.type) === "audio" ? AUDIO_ICON : FILE_ICON} />
                   </span>
                 )}
                 <span className="pick-text">
-                  <b>{pick.name}</b>
-                  <small title={pick.note}>{pickLabel(pick)} · {formatBytes(pick.size)}</small>
+                  <b>{voice ? "Voice note" : pick.name}</b>
+                  <small title={pick.note}>{voice
+                    ? (pick.state === "done" ? lengthText(pick.voice!) : pickLabel(pick))
+                    : `${pickLabel(pick)} · ${formatBytes(pick.size)}`}</small>
                 </span>
                 {(pick.state === "waiting" || pick.state === "failed") &&
                   <button className="pick-action" onClick={() => void runUpload(thread, pick)}>Retry</button>}
@@ -965,8 +1170,25 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
                 </button>
                 {pick.state === "uploading" && <span className="pick-progress" aria-hidden="true" />}
               </li>
-            ))}
+            );
+          })}
           </ul>}
+          {voice ? (
+            <div className="capsule recording" role="group" aria-label="Voice note recording">
+              <button className="wrench voice-cancel" aria-label="Cancel recording" onClick={() => void cancelVoice()}>
+                <Icon d={REMOVE_ICON} />
+              </button>
+              <span className="voice-status">
+                <i className="voice-dot" aria-hidden="true" />
+                <b role="timer">{lengthText(voiceSecs)}</b>
+                <small>Recording</small>
+              </span>
+              <button className="send voice-send" aria-label="Send voice note" data-ready=""
+                onClick={() => void sendVoice()}>
+                <Icon d="M12 19V5M5.5 11.5 12 5l6.5 6.5" bold />
+              </button>
+            </div>
+          ) : (
           <div className="capsule">
             <button ref={wrenchRef} className="wrench" aria-label="Commands" aria-haspopup="dialog"
               aria-expanded={sheet?.kind === "tools"}
@@ -978,7 +1200,12 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
               <Icon d={ATTACH_ICON} bold />
             </button>}
             <input ref={fileRef} type="file" multiple hidden tabIndex={-1}
-              onChange={(e) => addFiles(e.target.files)} />
+              onChange={(e) => {
+                const chosen = [...(e.currentTarget.files ?? [])];
+                e.currentTarget.value = "";
+                setHint("");
+                addFiles(chosen);
+              }} />
             <textarea
               ref={taRef}
               value={text}
@@ -990,22 +1217,32 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
               onKeyDown={onKeyDown}
               enterKeyHint={FINE_POINTER ? "send" : "enter"}
             />
-            <button
-              className={running ? "send stop" : "send"}
-              aria-label={running ? "Stop" : "Send"}
-              data-ready={running || (slash ? !!picked && canRun(picked, cmdState) && !argsTooLong
-                : canSendFiles && (text.trim() !== "" || files.length > 0)) ? "" : undefined}
-              onClick={() => void submit()}
-            >
-              {running ? (
-                <svg viewBox="0 0 24 24" aria-hidden="true">
-                  <rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor" />
-                </svg>
-              ) : (
-                <Icon d="M12 19V5M5.5 11.5 12 5l6.5 6.5" bold />
-              )}
-            </button>
+            {!running && canVoice && text.trim() === "" && files.length === 0 ? (
+              /* Nothing to send yet, so the send slot is the mic: the 320px
+                 composer stays at two icons on the left. */
+              <button className="send mic" aria-label="Record a voice note"
+                onClick={(e) => { e.currentTarget.blur(); void startVoice(); }}>
+                <Icon d={MIC_ICON} />
+              </button>
+            ) : (
+              <button
+                className={running ? "send stop" : "send"}
+                aria-label={running ? "Stop" : "Send"}
+                data-ready={running || (slash ? !!picked && canRun(picked, cmdState) && !argsTooLong
+                  : canSendFiles && (text.trim() !== "" || files.length > 0)) ? "" : undefined}
+                onClick={() => void submit()}
+              >
+                {running ? (
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor" />
+                  </svg>
+                ) : (
+                  <Icon d="M12 19V5M5.5 11.5 12 5l6.5 6.5" bold />
+                )}
+              </button>
+            )}
           </div>
+          )}
         </>}
       </footer>
 

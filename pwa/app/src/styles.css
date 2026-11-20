@@ -1076,10 +1076,16 @@ input#pair-code {
   line-height: 1.4;
   max-height: 140px;
   min-width: 0;
+  /* A long value scrolls inside the field instead of widening the capsule. */
+  text-overflow: ellipsis;
   outline: none;
 }
 .capsule textarea::placeholder {
   color: var(--muted-ink);
+  /* One line, ellipsized: the field is too narrow at 320px to wrap it. */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .capsule:has(.wrench) {
   padding-left: 5px;
@@ -1153,6 +1159,7 @@ input#pair-code {
   margin: 4px 10px 0;
 }
 .send {
+  position: relative;
   width: 36px;
   height: 36px;
   border-radius: 50%;
@@ -1170,6 +1177,13 @@ input#pair-code {
 .send svg {
   width: 20px;
   height: 20px;
+}
+/* The idle send slot is the mic: a 36px circle with a real 44px tap target. */
+.send.mic::after {
+  content: "";
+  position: absolute;
+  inset: -4px;
+  border-radius: 50%;
 }
 .send[data-ready] {
   background: var(--accent);
@@ -1829,6 +1843,120 @@ input#pair-code {
 }
 .bubble .attachment-audio {
   flex-basis: 100%;
+}
+/* A recorded voice note: one compact row, 44px controls, tap to play. */
+.voice-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  min-height: 44px;
+  padding: 4px 14px 4px 4px;
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  background: var(--card);
+  color: var(--ink);
+}
+.bubble .voice-note {
+  border-color: color-mix(in oklab, var(--bubble-ink) 28%, transparent);
+  background: color-mix(in oklab, var(--bubble-ink) 14%, transparent);
+  color: var(--bubble-ink);
+}
+.voice-toggle {
+  flex: none;
+  width: 44px;
+  height: 44px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--color-primary-foreground);
+}
+.voice-toggle svg {
+  width: 20px;
+  height: 20px;
+}
+.bubble .voice-toggle {
+  background: color-mix(in oklab, var(--bubble-ink) 22%, transparent);
+  color: var(--bubble-ink);
+}
+.voice-text {
+  display: grid;
+  min-width: 0;
+}
+.voice-text b {
+  font-size: 0.85rem;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.voice-text small {
+  color: var(--muted-ink);
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+}
+.bubble .voice-text small {
+  color: color-mix(in oklab, var(--bubble-ink) 88%, transparent);
+}
+/* The element is the player; the row above is its only visible control. */
+.voice-audio {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* Composer: the recording row and a short, non-error hint. */
+.capsule.recording {
+  align-items: center;
+  justify-content: space-between;
+  padding: 5px;
+}
+.voice-cancel,
+.voice-send {
+  width: 44px;
+  height: 44px;
+}
+.voice-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 0 6px;
+  color: var(--ink);
+}
+.voice-status b {
+  font-size: 1rem;
+  font-variant-numeric: tabular-nums;
+}
+.voice-status small {
+  color: var(--muted-ink);
+  font-size: 0.82rem;
+}
+.voice-dot {
+  width: 9px;
+  height: 9px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--danger);
+  animation: voice-pulse 2.6s ease-in-out infinite;
+}
+@keyframes voice-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .voice-dot { animation: none; }
+}
+.composer-hint {
+  max-width: 44rem;
+  margin: 0 auto 6px;
+  color: var(--muted-ink);
+  font-size: 0.8rem;
+  text-align: center;
 }
 /* ── Activity: a turn's tool steps (protocol v2, "Activity") ──────────────── */
 
