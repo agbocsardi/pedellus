@@ -27,11 +27,16 @@ function extension(type: string): string {
   return "audio";
 }
 
-const NOTE_TIME = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", hour12: false });
+/** Local wall-clock `HH:MM`, always ASCII: a locale that writes other digits would
+ *  stop the app's own `Voice note` label recognition from matching the name. */
+function noteTime(at: number): string {
+  const d = new Date(at);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
 
 /** `Voice note 14:32.m4a`: bounded like any upload name, and metadata only, never a path. */
 export function voiceNoteName(type: string, at: number): string {
-  return `Voice note ${NOTE_TIME.format(at)}.${extension(type)}`.slice(0, LIMITS.uploadNameChars);
+  return `Voice note ${noteTime(at)}.${extension(type)}`.slice(0, LIMITS.uploadNameChars);
 }
 
 /** Why a recording ended on its own, if it did. */
@@ -84,7 +89,15 @@ export async function startVoiceNote(): Promise<Recording> {
   };
   rec.onstop = end;
   rec.onerror = end;
-  rec.start();
+  try {
+    // A timeslice is what lets the byte cap above act mid-recording: without
+    // it every chunk arrives at the end, and an oversized note is only seen
+    // after the whole file exists.
+    rec.start(1000);
+  } catch (err) {
+    for (const track of stream.getTracks()) track.stop();
+    throw err;
+  }
   return {
     async finish() {
       if (rec.state !== "inactive") {
