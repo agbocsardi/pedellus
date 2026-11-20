@@ -322,7 +322,10 @@ function longAnswer(asked) {
 }
 
 function answerFor(key) {
-  const asked = admitted.get(key)?.text ?? "…";
+  const sent = admitted.get(key);
+  const asked = sent?.text ?? "…";
+  // A voice note on its own: the mock cannot transcribe it, so say it was heard.
+  if (!asked.trim() && sent?.attachments?.some((f) => f.kind === "audio")) return "(heard a voice note)";
   // Ask for "use tools" to get three activity steps before the answer.
   if (/use tools/i.test(asked)) return "Used three mock tools, and one of them failed.";
   // Ask for "a long answer" to exercise a split durable message.
