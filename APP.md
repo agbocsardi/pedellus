@@ -238,7 +238,7 @@ upload is the fixed `400 unsupported`, and a send naming ids (which cannot exist
   a durable message references. Headers are fixed: the stored type,
   `X-Content-Type-Options: nosniff`, `Content-Security-Policy: sandbox`,
   `Cache-Control: private, max-age=31536000, immutable`, and `Content-Disposition: inline` for
-  `image/*` and `audio/*`, `attachment; filename*=UTF-8''…` otherwise. Every other id — pending,
+  `image/*` (except `image/svg+xml`) and `audio/*`, `attachment; filename*=UTF-8''…` otherwise. Every other id — pending,
   pruned, foreign-shaped or malformed — is `404`, and the id shape is checked before any state is
   read. The served path is the one the store resolved inside its media root; it is never built from
   request input. `HEAD` answers the same headers without the body.
@@ -302,7 +302,9 @@ with a fixed reason and a durable fault entry; no raw record contents are logged
 * Upload records are bounded (200 unreferenced per device, 4 000 total) and uploads are rate limited
   per device and minute; a refused upload stores no bytes. Referenced originals are never deleted by
   the adapter and there is no total-disk cap — keeping the workspace media directory bounded is the
-  operator's job, exactly as for Telegram.
+  operator's job, exactly as for Telegram. A hard crash between storing an upload and committing its
+  record can leave an unnamed original that the 24 h discard never sees. A refused upload body is
+  read at most 64 KiB before the connection is dropped.
 
 ## Known gaps (phase 1)
 

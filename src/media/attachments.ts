@@ -151,7 +151,7 @@ function validateChildDirectory(value: unknown): string {
  */
 export function sanitizeOriginalName(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
-  const cleaned = value.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/[\\/]/g, "_").trim();
+  const cleaned = value.replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, " ").replace(/[\\/]/g, "_").trim();
   if (cleaned === "") return undefined;
   const bound = MEDIA_LIMITS.maxOriginalNameChars;
   if (cleaned.length <= bound) return cleaned;

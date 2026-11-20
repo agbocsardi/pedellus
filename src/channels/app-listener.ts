@@ -23,6 +23,9 @@ import {
   staticMimeType,
 } from "./app-protocol.js";
 
+/** A refused upload body is read at most this far before the connection is dropped. */
+const REFUSED_BODY_DRAIN_BYTES = 64 * 1024;
+
 const HOST = "127.0.0.1";
 const NOT_FOUND_BODY = JSON.stringify({ error: "not_found" });
 const PAIR_ERRORS: Readonly<Record<string, [number, string]>> = Object.freeze({
@@ -288,8 +291,15 @@ export async function startAppListener(options: {
   ): void {
     response.writeHead(status, { "content-type": "application/json" });
     response.end(body);
-    if (drain) request.resume();
-    else response.once("finish", () => request.destroy());
+    if (drain) {
+      // Read a little so the client sees the answer, but never an unbounded refused body.
+      let drained = 0;
+      request.on("data", (chunk: Buffer) => {
+        drained += chunk.length;
+        if (drained > REFUSED_BODY_DRAIN_BYTES) request.destroy();
+      });
+      request.resume();
+    } else response.once("finish", () => request.destroy());
   }
 
   async function uploadEndpoint(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -448,7 +458,8 @@ export async function startAppListener(options: {
    * other stored type downloads, with an RFC 5987 `filename*` instead of a raw header value.
    */
   function fileDisposition(mimeType: string, name: string): string {
-    if (mimeType.startsWith("image/") || mimeType.startsWith("audio/")) return "inline";
+    // SVG is markup, not a picture: it always downloads, whatever the sandbox policy does.
+    if (mimeType !== "image/svg+xml" && (mimeType.startsWith("image/") || mimeType.startsWith("audio/"))) return "inline";
     const encoded = encodeURIComponent(name).replace(/['()*]/gu,
       (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
     return `attachment; filename*=UTF-8''${encoded}`;
