@@ -76,7 +76,11 @@ export function FirstRun({ store, conn }: { store: Store; conn: Connection }) {
 
   return (
     <div className="screen center">
-      <form className="card pad pair" onSubmit={pair}>
+      <form className="card pad pair" onSubmit={pair} onFocus={(e) => {
+        // Once the keyboard has resized the screen, bring the focused field into view.
+        const field = e.target;
+        if (field instanceof HTMLInputElement) setTimeout(() => field.scrollIntoView({ block: "center" }), 350);
+      }}>
         <div className="avatar-slot big">
           <Avatar state={busy ? "thinking" : "idle"} />
         </div>

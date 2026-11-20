@@ -131,12 +131,19 @@ svg {
 }
 
 .screen {
-  height: 100dvh;
+  /* Follows the visual viewport like the chat shell (App.tsx keyboard handling), so an open
+     keyboard shrinks the screen instead of covering it, and the screen scrolls inside itself. */
+  position: fixed;
+  top: 0;
+  inset-inline: 0;
+  height: var(--app-h, 100dvh);
+  transform: translateY(var(--vv-top, 0px));
   overflow-y: auto;
+  overscroll-behavior: contain;
   display: grid;
-  place-items: center;
+  place-items: safe center;
   padding: calc(var(--inset-top) + 24px) var(--gutter)
-    calc(env(safe-area-inset-bottom) + 24px);
+    calc(var(--inset-bottom) + 24px);
 }
 .dim {
   color: var(--muted-ink);
