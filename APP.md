@@ -161,7 +161,8 @@ and keeps every frame inside the limit; the app joins the parts in `i` order and
 the last one. Parts are ordinary cursor events, so a replay batch may end mid-message and the app
 shows what it has until the next batch. *Known bound:* a text that would need more than 64 parts
 (about 16 MB escaped) keeps its leading parts and truncates the last, marked `[truncated]` and
-reported once with a `console.warn` naming the event id; the full text is still in the transcript.
+reported once with a `console.warn` naming the event id; the full text is still in the transcript. Parts are ordinary events for retention, so trimming at the ack floor or the event cap can drop
+the leading parts of a message a device never stored; that device then shows the rest as incomplete.
 
 This is the app-channel reconciliation of Telegram's held-unknown boundary: Telegram's external
 sends have no idempotency key, so an ambiguous outcome is quarantined and never resent. The app's

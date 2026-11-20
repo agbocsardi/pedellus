@@ -465,8 +465,8 @@ function fittingPrefix(text: string, budget: number): number {
 
 /** `[truncated]` ends a message that needed more parts than the protocol allows. */
 const MESSAGE_TRUNCATED = "\n\n[truncated]";
-/** The widest `{i, n}` the real splitter can emit: `maxMessageParts` is 64, so never three digits. */
-const PART_MARKER_BOUND = 99;
+/** The widest `{i, n}` value the splitter can emit, as all nines of `maxMessageParts`'s width. */
+const PART_MARKER_BOUND = Number("9".repeat(String(APP_LIMITS.maxMessageParts).length));
 
 /** One message frame's exact size in bytes, in the shape `wireEvent` emits. */
 function messageFrameBytes(
@@ -494,11 +494,12 @@ function appendMessage(doc: Draft<AppChannelState>, event: AppMessageInput): voi
   // `n` is unknown until the text is split, so every budget assumes the widest `{i, n}`; the
   // cursor is exact per part because each append takes the next one.
   const budget = (index: number): number => APP_LIMITS.frameBytes - messageFrameBytes(
-    { ...event, text: "" }, first + index, { i: PART_MARKER_BOUND, n: PART_MARKER_BOUND }) + 2;
+    { ...event, text: "" }, first + index, { i: PART_MARKER_BOUND, n: PART_MARKER_BOUND });
   const texts: string[] = [];
   let rest = event.text;
   while (rest !== "" && texts.length < APP_LIMITS.maxMessageParts) {
-    const take = Math.max(1, fittingPrefix(rest, budget(texts.length)));
+    // A budget below one code point is unreachable at the protocol's limits; still never cut a pair.
+    const take = fittingPrefix(rest, budget(texts.length)) || (rest.codePointAt(0)! > 0xffff ? 2 : 1);
     texts.push(rest.slice(0, take));
     rest = rest.slice(take);
   }

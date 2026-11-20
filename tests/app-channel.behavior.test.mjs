@@ -1476,8 +1476,8 @@ const escapedBytes = (text) => Buffer.byteLength(JSON.stringify(text)) - 2;
 /** A repeatable unit of multi-byte text, emoji surrogate pairs and JSON-escaped characters. */
 const SPLIT_UNIT = 'Grüße 🙂👋🏽 \\ "\u0001\u001f;';
 
-/** An answer whose escaped size needs several frames, ending on another emoji pair. */
-function longAnswer(bytes = 330_000) {
+/** An answer whose escaped size needs at least ten frames (two-digit part markers), ending on an emoji pair. */
+function longAnswer(bytes = 3_000_000) {
   return SPLIT_UNIT.repeat(Math.ceil(bytes / escapedBytes(SPLIT_UNIT))) + '🙂';
 }
 
@@ -1502,7 +1502,7 @@ test('an answer over the frame limit arrives as wire-sized parts that join back 
     const echo = messages.find((event) => event.role === 'user');
     assert.equal(echo.part, undefined, 'a message that fits carries no part marker');
     const parts = messages.filter((event) => event.role === 'assistant');
-    assert.ok(parts.length >= 2, `the answer was split into ${parts.length} parts`);
+    assert.ok(parts.length >= 10, `two-digit part markers are exercised (${parts.length} parts)`);
 
     // Every frame on the socket is inside the limit, previews included.
     assert.deepEqual(device.bytes.filter((size) => size > APP_LIMITS.frameBytes), [],
