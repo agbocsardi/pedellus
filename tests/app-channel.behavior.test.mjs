@@ -1467,3 +1467,112 @@ test('idle archive uses the configured clock and skips running and queued work',
     await device.close();
   });
 });
+
+// ── Long messages: wire-sized parts (protocol v2, "Long messages") ─────────────
+
+/** Escaped bytes of `text` as the wire's JSON writes it; the frame limit counts these. */
+const escapedBytes = (text) => Buffer.byteLength(JSON.stringify(text)) - 2;
+
+/** A repeatable unit of multi-byte text, emoji surrogate pairs and JSON-escaped characters. */
+const SPLIT_UNIT = 'Grüße 🙂👋🏽 \\ "\u0001\u001f;';
+
+/** An answer whose escaped size needs several frames, ending on another emoji pair. */
+function longAnswer(bytes = 330_000) {
+  return SPLIT_UNIT.repeat(Math.ceil(bytes / escapedBytes(SPLIT_UNIT))) + '🙂';
+}
+
+/** Every part of one split message, ascending by `i`. */
+function messageParts(device, id) {
+  return device.events('message').filter((event) => event.id === id && event.part !== undefined)
+    .sort((left, right) => left.part.i - right.part.i);
+}
+
+test('an answer over the frame limit arrives as wire-sized parts that join back losslessly', { timeout: 60_000 }, async () => {
+  await withChannel('long-answer', {}, async ({ store, base }) => {
+    const answer = longAnswer();
+    store.setAnswer(answer);
+    const device = deviceClient(base, await pairedDevice(store, base));
+    await device.open();
+    device.send({ type: 'req', id: 'h1', op: 'hello', v: 2, cursor: null });
+    await device.wait(() => device.response('h1') !== undefined, 'hello reply');
+    device.send({ type: 'req', id: 's1', op: 'send', key: 'k1', text: 'give me the long answer' });
+    await device.wait(() => device.events('settled').length === 1, 'the long turn settled', 60_000);
+
+    const messages = device.events('message');
+    const echo = messages.find((event) => event.role === 'user');
+    assert.equal(echo.part, undefined, 'a message that fits carries no part marker');
+    const parts = messages.filter((event) => event.role === 'assistant');
+    assert.ok(parts.length >= 2, `the answer was split into ${parts.length} parts`);
+
+    // Every frame on the socket is inside the limit, previews included.
+    assert.deepEqual(device.bytes.filter((size) => size > APP_LIMITS.frameBytes), [],
+      'no frame exceeds LIMITS.frameBytes');
+
+    const { id, thread, at, key } = parts[0];
+    const n = parts[0].part.n;
+    assert.equal(n, parts.length, 'the parts agree on n');
+    for (const [index, part] of parts.entries()) {
+      assert.deepEqual(part.part, { i: index, n }, 'parts arrive in order, numbered from 0');
+      assert.deepEqual({ id: part.id, thread: part.thread, at: part.at, key: part.key }, { id, thread, at, key },
+        'every part keeps the id, thread, at and key');
+      // A part never ends or starts inside a UTF-16 surrogate pair.
+      assert.doesNotMatch(part.text, /[\uD800-\uDBFF]$/u, 'a part does not end mid surrogate pair');
+      assert.doesNotMatch(part.text, /^[\uDC00-\uDFFF]/u, 'a part does not start mid surrogate pair');
+    }
+
+    assert.equal(parts.map((part) => part.text).join(''), answer, 'the parts join back to the original');
+    const settled = device.events('settled')[0];
+    assert.deepEqual({ key: settled.key, outcome: settled.outcome }, { key: 'k1', outcome: 'answered' });
+    assert.equal(settled.cursor, parts.at(-1).cursor + 1, 'settled follows the last part');
+
+    // The durable log holds the parts, not the whole frame: the state still knows every cursor.
+    const state = await appState(store.gateway);
+    assert.equal(state.events.filter((event) => event.event === 'message' && event.id === id).length, n);
+    await device.close();
+  });
+});
+
+test('a split message straddles a hello replay batch boundary', { timeout: 60_000 }, async () => {
+  const store = await openAppStore('split-replay', {});
+  // Leave the log two events short of one batch, so the echo and the first part of the answer
+  // straddle the boundary and no later part fits in it.
+  await seedEvents(store.gateway, APP_LIMITS.replayBatch - 2);
+  const app = startApp(store);
+  const base = `http://127.0.0.1:${await app.port}`;
+  try {
+    const answer = longAnswer();
+    store.setAnswer(answer);
+    // The reader pairs before the turn, so its ack cannot trim what the replay still needs.
+    const reader = await pairedDevice(store, base, 'reader');
+    const device = deviceClient(base, await pairedDevice(store, base));
+    await device.open();
+    device.send({ type: 'req', id: 'h1', op: 'hello', v: 2, cursor: null });
+    await device.wait(() => device.response('h1') !== undefined, 'hello reply');
+    device.send({ type: 'req', id: 's1', op: 'send', key: 'k1', text: 'give me the long answer' });
+    await device.wait(() => device.events('settled').length === 1, 'the long turn settled', 60_000);
+    await device.close();
+
+    const resumed = deviceClient(base, reader);
+    await resumed.open();
+    resumed.send({ type: 'req', id: 'r1', op: 'hello', v: 2, cursor: null });
+    await resumed.wait(() => resumed.events('message').length >= APP_LIMITS.replayBatch, 'the first batch');
+    const first = resumed.events('message');
+    assert.equal(first.length, APP_LIMITS.replayBatch, 'the batch is bounded');
+    const splitId = first.at(-1).id;
+    assert.equal(first.at(-1).part.i, 0, 'the batch ends inside the split message');
+    assert.deepEqual(messageParts(resumed, splitId).map((part) => part.part.i), [0],
+      'only the first part arrived in the first batch');
+
+    resumed.send({ type: 'req', id: 'r2', op: 'hello', v: 2, cursor: first.at(-1).cursor });
+    await resumed.wait(() => resumed.events('settled').length === 1, 'the rest of the split replayed');
+    const parts = messageParts(resumed, splitId);
+    assert.ok(parts.length >= 2);
+    assert.deepEqual(parts.map((part) => part.part.i), parts.map((_, index) => index), 'the parts continue in order');
+    assert.equal(parts.map((part) => part.text).join(''), answer, 'the straddled parts join back to the original');
+    assert.ok(resumed.bytes.every((size) => size <= APP_LIMITS.frameBytes), 'every replayed frame is inside the limit');
+    await resumed.close();
+  } finally {
+    await app.stop();
+    await store.close();
+  }
+});
