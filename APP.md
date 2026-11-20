@@ -453,7 +453,8 @@ file authority.
 - Admission is the **same commit** a device `send` uses: the same idempotency by `key`, the same
   durable `message{role:"user"}` echo and pending record, the same typed-answer settlement of an
   open question. Every paired device therefore sees the message and its answer in that thread. The
-  journal never records the shortcut token, simply its label on create/revoke.
+  journal records creation and revocation events without the token (its projection carries no
+  labels either).
 - After admission the endpoint waits up to `LIMITS.askWaitMs` (25 s) for that key's durable
   `settled`, event-driven rather than polled: `200 {"outcome":"answered","text":"<final answer>"}`
   (a split answer is joined by part), `200 {"outcome":"failed"}` or `{"outcome":"aborted"}`, or

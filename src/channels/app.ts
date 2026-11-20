@@ -3094,8 +3094,8 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         created = { label: trimmed, token, createdAtMs };
       });
       if (refused !== undefined) return { refused };
-      // The label is not a credential; the token is never journalled.
-      journalEvent("app.shortcut.created", { "shortcut.label": trimmed });
+      // The token is never journalled; the journal's projection does not carry labels either.
+      journalEvent("app.shortcut.created");
       return created!;
     },
     async shortcuts() {
@@ -3117,7 +3117,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         revoked = true;
       });
       if (!revoked) return "missing";
-      journalEvent("app.shortcut.revoked", { "shortcut.label": label });
+      journalEvent("app.shortcut.revoked");
       return "revoked";
     },
   };
