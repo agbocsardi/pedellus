@@ -630,6 +630,7 @@ export class Store {
     await Promise.all([tx.store.put(next), tx.done]);
     this.outbox.set(key, next);
     this.changed();
+    this.queueChanges?.postMessage(null);
     return next;
   }
 
@@ -649,6 +650,7 @@ export class Store {
     await Promise.all([tx.store.put(next), tx.done]);
     this.outbox.set(key, next);
     this.changed();
+    this.queueChanges?.postMessage(null);
     return next;
   }
 

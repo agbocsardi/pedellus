@@ -83,7 +83,9 @@ function pendingViews(m: Outgoing): AttachmentView[] {
 }
 
 function messageViews(list: MessageEvent["attachments"]): AttachmentView[] {
-  return (list ?? []).map((file) => ({ ...file, url: fileUrl(file.id) }));
+  // Ids come from the gateway; only the protocol's shape ever becomes a URL.
+  return (list ?? []).filter((file) => LIMITS.uploadIdPattern.test(file.id))
+    .map((file) => ({ ...file, url: fileUrl(file.id) }));
 }
 
 function AttachmentList({ files }: { files: AttachmentView[] }) {
@@ -474,8 +476,10 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
       if (attach?.length) dropPicks(thread, attach);
       pinned.current = true;
       conn.sendOutgoing(m);
-    } catch {
-      setError("Can’t save offline on this device.");
+    } catch (err) {
+      setError(err instanceof DOMException && err.name === "QuotaExceededError"
+        ? "Not enough storage on this device for these files."
+        : "Can’t save offline on this device.");
     } finally {
       savingMessage.current = false;
     }
@@ -664,8 +668,10 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
         setSheet(wide ? null : { kind: "list" });
         conn.sendCreate(create, online ? thread : undefined);
       }
-    } catch {
-      setError("Can’t save offline on this device.");
+    } catch (err) {
+      setError(err instanceof DOMException && err.name === "QuotaExceededError"
+        ? "Not enough storage on this device for these files."
+        : "Can’t save offline on this device.");
     } finally {
       setBusy(false);
     }
@@ -1386,6 +1392,7 @@ function EventRow({ ev, text, partial, store, last, forks, onActions, onRetry }:
   const body = text ?? ev.text;
   const incomplete = partial ? <span className="msg-partial">Incomplete</span> : null;
   const outgoing = ev.key ? store.outgoing(ev.thread, ev.key) : undefined;
+  const spentFiles = outgoing?.state === "failed" && !!outgoing.attachments?.length && store.hasEcho(ev.thread, ev.key!);
   const anchor = Number.isSafeInteger(ev.cursor) && ev.cursor > 0 && ev.role !== "notice"
     ? { "data-message-id": ev.id, "data-message-cursor": ev.cursor, "data-thread-title": suggestedTitle(ev.text), tabIndex: -1 }
     : undefined;
@@ -1393,7 +1400,9 @@ function EventRow({ ev, text, partial, store, last, forks, onActions, onRetry }:
     {ev.role === "notice" ? <div className="notice">{body}{incomplete}</div> : ev.role === "user" ? (
       <UserBubble text={body} partial={partial} anchor={anchor} state={outgoing?.state} at={ev.at} last={last}
         files={messageViews(ev.attachments)}
-        onRetry={onRetry && outgoing?.state === "failed" ? () => onRetry(outgoing) : undefined} />
+        // Uploads are consumed by an admitted send, so a failed turn with files cannot be retried as is.
+        note={spentFiles ? "Files are sent once. Attach them again to retry" : undefined}
+        onRetry={onRetry && outgoing?.state === "failed" && !spentFiles ? () => onRetry(outgoing) : undefined} />
     ) : (
       <div className="msg assistant" {...anchor}>
         <Streamdown mode="static">{body}</Streamdown>
