@@ -81,7 +81,7 @@ port. `tailscale serve` terminates TLS with the node's `*.ts.net` certificate
 | `POST /v1/pair` | One-time pairing code → `204` + `durable_device` cookie |
 | `POST /v1/upload` | Attachment upload (raw body, bounded), stored under `media/app/` |
 | `GET\|HEAD /v1/files/<id>` | One file a durable message references; `?view=artifact` serves an agent artifact inline under the sandbox CSP |
-| `POST /v1/ask` | iOS Shortcuts ask (**in review**, already specified in `protocol/v2.md`) |
+| `POST /v1/ask` | iOS Shortcuts ask with a shortcut token (see APP.md, *Shortcuts*) |
 
 Same origin for app and API: no CORS, and the device credential is a
 `durable_device` cookie (`HttpOnly; Secure; SameSite=Strict; Path=/v1`) that
@@ -343,8 +343,6 @@ separate cookie jar.
 
 ## In review / known gaps
 
-- **Shortcuts `POST /v1/ask` (gateway, in review).** Specified in protocol v2
-  (token-based, waits for the turn to settle); not on `main` yet.
 - **No agent-side reactions**: v2 marks them *later*; owner reactions only.
 - **`card` events**: *later*. No buttons or quick replies on agent messages.
 - **`history`**: `unsupported`.

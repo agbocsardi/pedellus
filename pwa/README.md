@@ -18,7 +18,7 @@ worker notifications, badge, thread deep links, VAPID key rotation); the wide
 layout with keyboard shortcuts; MCP login cards; agent-sent files and the
 sandboxed artifact viewer.
 
-In review, not on `main`: the gateway's Shortcuts `POST /v1/ask` endpoint.
+The gateway also serves `POST /v1/ask` for iOS Shortcuts (APP.md, *Shortcuts*).
 
 - [protocol/v2.md](./protocol/v2.md) — the normative wire contract.
 - [ARCHITECTURE.md](./ARCHITECTURE.md) — components, data flow, every op and

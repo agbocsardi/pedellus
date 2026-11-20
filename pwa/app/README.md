@@ -114,4 +114,4 @@ one origin and one cookie jar.
 - **Artifacts** (`ArtifactCard`/`ArtifactViewer` in `src/Chat.tsx`): a card with a
   lazily mounted, pointer-inert preview and a full-screen viewer, both an
   iframe with `sandbox="allow-scripts"` only, loaded from `?view=artifact`.
-- In review, not on `main`: the gateway's Shortcuts `POST /v1/ask` endpoint.
+- The gateway's Shortcuts `POST /v1/ask` endpoint has no app UI; see APP.md, *Shortcuts*.
