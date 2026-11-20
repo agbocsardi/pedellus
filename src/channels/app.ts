@@ -3171,7 +3171,10 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         const file = await files.download(id);
         return file === undefined
           ? undefined
-          : { absolutePath: file.absolutePath, bytes: file.bytes, mimeType: file.mimeType, name: file.name };
+          : {
+              absolutePath: file.absolutePath, bytes: file.bytes, mimeType: file.mimeType,
+              name: file.name, kind: file.kind,
+            };
       },
     },
     // A listener that dies takes the channel with it: the supervisor reports gateway.app and the
