@@ -188,13 +188,16 @@ function ArtifactViewer({ file, onClose }: { file: AttachmentView; onClose: () =
       if (opener.current?.isConnected) opener.current.focus({ preventScroll: true });
     };
   }, []);
-  // Escape is the dialog's own cancel event, so it closes here too.
+  // Focus opens on Close, never in the frame: once the artifact has focus, its own
+  // document owns the keyboard (protocol v2), so this button is the guaranteed way out
+  // and it stays above the frame. Escape is the dialog's own cancel event.
   useLayoutEffect(() => { close.current?.focus({ preventScroll: true }); }, []);
   return (
     <dialog ref={ref} className="artifact-layer" aria-label={`${file.name} artifact`}
       onCancel={(e) => { e.preventDefault(); onClose(); }}>
       <div className="artifact-view">
         <header className="artifact-view-head">
+          {/* First focusable in the dialog, and above the frame in paint order. */}
           <button ref={close} className="artifact-close" onClick={onClose} aria-label="Close artifact">
             <Icon d="M6 6l12 12M18 6 6 18" />
           </button>
