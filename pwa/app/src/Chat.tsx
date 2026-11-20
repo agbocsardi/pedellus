@@ -90,8 +90,30 @@ function AttachmentList({ files }: { files: AttachmentView[] }) {
   if (!files.length) return null;
   return (
     <div className="attachments">
-      {files.map((file) => <FileChip key={`${file.id}-${file.name}`} file={file} />)}
+      {files.map((file) => {
+        const key = `${file.id}-${file.name}`;
+        if (!file.url) return <FileChip key={key} file={file} />;
+        if (file.kind === "image") return <ImageAttachment key={key} file={file} url={file.url} />;
+        if (file.kind === "audio") {
+          return <audio key={key} className="attachment-audio" controls preload="none"
+            src={file.url} aria-label={file.name} />;
+        }
+        return <FileChip key={key} file={file} />;
+      })}
     </div>
+  );
+}
+
+/** Inline thumbnail; the tap opens the file itself (same-origin, cookie-authed). */
+function ImageAttachment({ file, url }: { file: AttachmentView; url: string }) {
+  const [broken, setBroken] = useState(false);
+  if (broken) return <FileChip file={file} />;
+  return (
+    <a className="attachment-image" href={url} target="_blank" rel="noreferrer"
+      aria-label={`Open ${file.name}`}>
+      <img src={url} alt={file.name} loading="lazy" decoding="async" width={148} height={111}
+        onError={() => setBroken(true)} />
+    </a>
   );
 }
 
