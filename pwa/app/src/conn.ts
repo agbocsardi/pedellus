@@ -13,6 +13,7 @@ import {
   type ThreadId,
 } from "./protocol";
 import type { Outgoing, Store, ThreadCreate } from "./store";
+import { uploadErrorText, uploadFile } from "./uploads";
 
 const BASE_DELAY_MS = 1_000;
 const MAX_DELAY_MS = 30_000;
@@ -29,6 +30,10 @@ export class Connection {
   private attempt = 0;
   private sending = new Set<string>();
   private creating = new Set<string>();
+  /** Send keys whose files are uploading; one upload pass per key at a time. */
+  private uploading = new Set<string>();
+  private uploadRetryAt = new Map<string, number>();
+  private uploadTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private pingTimer: ReturnType<typeof setInterval> | undefined;
   private pingWatch: ReturnType<typeof setTimeout> | undefined;
@@ -145,11 +150,21 @@ export class Connection {
    * Send an outgoing message. Queued (stays "queued") unless the stream is
    * live; everything queued/sent is flushed after each replay finishes.
    */
-  sendOutgoing(m: Outgoing, retriedRace = false) {
-    const current = this.store.outgoing(m.thread, m.key);
-    if (this.store.connState !== "open" || !this.store.canWrite(m.thread) || this.sending.has(m.key) ||
+  sendOutgoing(entry: Outgoing, retriedRace = false) {
+    const current = this.store.outgoing(entry.thread, entry.key);
+    if (this.store.connState !== "open" || !this.store.canWrite(entry.thread) || this.sending.has(entry.key) ||
         (current?.state !== "queued" && current?.state !== "sent")) return;
-    const frame = { type: "req", id: this.id(), op: "send", key: m.key, text: m.text, thread: m.thread } as const;
+    // Files upload over HTTP first, and a key's attachments never change, so a
+    // send waits until every queued file has an upload id (v2.md, Files).
+    if (!current.attachments?.length && current.pending?.length) {
+      void this.uploadPending(current);
+      return;
+    }
+    const m = current;
+    const frame = {
+      type: "req", id: this.id(), op: "send", key: m.key, text: m.text, thread: m.thread,
+      ...(m.attachments?.length ? { attachments: m.attachments } : {}),
+    } as const;
     if (this.request(frame, async (res) => {
       const cur = this.store.outgoing(m.thread, m.key);
       this.sending.delete(m.key);
@@ -188,6 +203,55 @@ export class Connection {
       else this.sendOutgoing(cur, true);
     })) return;
     this.sending.delete(m.key);
+  }
+
+  /** Upload a queued send's files, freeze their ids on the entry, then send it. */
+  private async uploadPending(m: Outgoing) {
+    if (this.store.connState !== "open" || this.uploading.has(m.key)) return;
+    const due = this.uploadRetryAt.get(m.key) ?? 0;
+    if (Date.now() < due) {
+      this.scheduleUpload(m, due - Date.now());
+      return;
+    }
+    this.uploading.add(m.key);
+    try {
+      for (const file of m.pending ?? []) {
+        if (file.uploadId) continue;
+        const blob = await this.store.fileBlob(file.id);
+        if (!blob) {
+          await this.store.setOutgoingState(m.key, "failed", "The file is no longer on this device.");
+          return;
+        }
+        const outcome = await uploadFile(blob, file.name, file.type);
+        if (!outcome.ok) {
+          if (outcome.retry) {
+            const delay = outcome.error === "rate_limited" ? 10_000 : 20_000;
+            this.uploadRetryAt.set(m.key, Date.now() + delay);
+            this.scheduleUpload(m, delay);
+            return;
+          }
+          await this.store.setOutgoingState(m.key, "failed", uploadErrorText(outcome.error, file.name));
+          return;
+        }
+        if (!await this.store.setPendingUploadId(m.key, file.id, outcome.id)) return;
+      }
+      const promoted = await this.store.promotePending(m.key);
+      if (promoted) this.sendOutgoing(promoted);
+    } catch (err) {
+      console.error("a file upload did not finish", err);
+    } finally {
+      this.uploading.delete(m.key);
+    }
+  }
+
+  private scheduleUpload(m: Outgoing, delay: number) {
+    if (this.uploadTimers.has(m.key)) return;
+    this.uploadTimers.set(m.key, setTimeout(() => {
+      this.uploadTimers.delete(m.key);
+      this.uploadRetryAt.delete(m.key);
+      const again = this.store.outgoing(m.thread, m.key);
+      if (again) void this.uploadPending(again);
+    }, Math.max(delay, 250)));
   }
 
   private flushOutgoing(thread?: ThreadId) {
@@ -380,7 +444,7 @@ export class Connection {
       const device = typeof res.device === "string" ? res.device : undefined;
       const name = typeof res.agent === "string" ? res.agent.trim() : "";
       this.store.setIdentity(device, name && [...name].length <= 40 ? name : undefined, commandList(res.commands),
-        presetList(res.presets));
+        presetList(res.presets), typeof res.uploads === "boolean" ? res.uploads : false);
       this.store.setMode("chat");
     });
   }

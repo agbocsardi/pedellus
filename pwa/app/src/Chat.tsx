@@ -1,10 +1,11 @@
 import { useEffect, useEffectEvent, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { Streamdown } from "streamdown";
 import type { Connection } from "./conn";
-import type { AgentStatus, Outgoing, OutgoingState, Store } from "./store";
+import type { AgentStatus, NewAttachment, Outgoing, OutgoingState, Store } from "./store";
 import { LIMITS, MAIN_THREAD, type CommandInfo, type DurableEvent, type MessageEvent, type PresetInfo, type ThreadInfo, type ThreadOrigin } from "./protocol";
 import { disablePush, enablePush, hasPushSubscription, pushPermission, requestPushPermission, pushSupported, subscribedServerKey, clearAppBadge, type PushPermission } from "./push";
 import { Avatar, type AvatarState } from "./Avatar";
+import { attachmentKind, fileUrl, formatBytes, uploadErrorText, uploadFile } from "./uploads";
 
 const FINE_POINTER = matchMedia("(pointer: fine)").matches;
 /** From here the thread list is a sidebar and the chat sits beside it. */
@@ -12,6 +13,13 @@ const WIDE = "(min-width: 900px)";
 
 type Row = { kind: "ev"; ev: DurableEvent; text?: string; partial?: boolean } | { kind: "pending"; m: Outgoing };
 type Tone = "ok" | "run" | "warn" | "bad";
+/** What a bubble or chip row shows; `url` is absent while a file has no id yet. */
+type AttachmentView = { id: string; name: string; type: string; size: number; kind: "image" | "audio" | "file"; url?: string };
+/** A file picked in the composer and not yet sent. */
+type Pick = {
+  id: string; file: File; name: string; type: string; size: number;
+  state: "waiting" | "uploading" | "done" | "failed"; uploadId?: string; note?: string; preview?: string;
+};
 type Sheet = { kind: "list" | "menu" | "tools" | "confirm-new" | "model" } | { kind: "rename"; title: string }
   | { kind: "create"; title: string; from?: ThreadOrigin }
   | { kind: "message"; title: string; from: ThreadOrigin };
@@ -21,6 +29,10 @@ const BELL_ICON = "M18 14v-3.5a6 6 0 1 0-12 0V14l-2 3.5h16L18 14M10 21h4";
 const WRENCH_ICON = "M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.8-3.8a6 6 0 0 1-7.9 7.9l-6.9 6.9a2.1 2.1 0 0 1-3-3l6.9-6.9a6 6 0 0 1 7.9-7.9l-3.8 3.8Z";
 /** A DOM `MessageEvent`; the protocol's `MessageEvent` shadows the global in this file. */
 type SwMessage = Event & { origin: string; source: MessageEventSource | null; data?: unknown };
+const ATTACH_ICON = "M12 5v14M5 12h14";
+const REMOVE_ICON = "M6 6l12 12M18 6 6 18";
+const FILE_ICON = "M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5ZM14 3v5h5";
+const IMAGE_ICON = "M4 5h16v14H4zM4 16l4-4 3 3 3-3 6 6M15 10h.01";
 
 type CommandState = { online: boolean; writable: boolean; running: boolean };
 const ready = (s: CommandState) => s.online && s.writable;
@@ -50,6 +62,53 @@ const ARGS_MAX = 1000;
 const MODEL_PENDING_MS = 15_000;
 /** `/name` or `/name args` in the composer is a command, never a message. */
 const SLASH = /^\/([a-z0-9_-]*)(?:\s([\s\S]*))?$/i;
+
+const toNewAttachment = (pick: Pick): NewAttachment => ({
+  id: pick.id, name: pick.name, type: pick.type, size: pick.size, blob: pick.file,
+  ...(pick.uploadId ? { uploadId: pick.uploadId } : {}),
+});
+
+function pickLabel(pick: Pick) {
+  switch (pick.state) {
+    case "uploading": return "Uploading…";
+    case "waiting": return pick.note ?? "Waiting for connection";
+    case "failed": return "Upload failed";
+    default: return "Ready";
+  }
+}
+
+/** Files on a message, or on a send that is still queued (no id yet). */
+function pendingViews(m: Outgoing): AttachmentView[] {
+  return (m.pending ?? []).map((file) => ({ ...file, kind: attachmentKind(file.type) }));
+}
+
+function messageViews(list: MessageEvent["attachments"]): AttachmentView[] {
+  return (list ?? []).map((file) => ({ ...file, url: fileUrl(file.id) }));
+}
+
+function AttachmentList({ files }: { files: AttachmentView[] }) {
+  if (!files.length) return null;
+  return (
+    <div className="attachments">
+      {files.map((file) => <FileChip key={`${file.id}-${file.name}`} file={file} />)}
+    </div>
+  );
+}
+
+function FileChip({ file }: { file: AttachmentView }) {
+  const body = <>
+    <span className="file-chip-icon" aria-hidden="true">
+      <Icon d={file.kind === "image" ? IMAGE_ICON : FILE_ICON} />
+    </span>
+    <span className="file-chip-text">
+      <b>{file.name}</b>
+      <small>{formatBytes(file.size)}</small>
+    </span>
+  </>;
+  return file.url
+    ? <a className="file-chip" href={file.url} download={file.name}>{body}</a>
+    : <span className="file-chip" data-pending="">{body}</span>;
+}
 
 function suggestedTitle(text: string) {
   return text.replace(/[\p{Cc}\s]+/gu, " ").trim().slice(0, LIMITS.threadTitleChars)
@@ -124,6 +183,7 @@ function clock(at: string | number | undefined): string {
 
 export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [picks, setPicks] = useState<Record<string, Pick[]>>({});
   const [sheet, setSheet] = useState<Sheet | null>(null);
   const wide = useWideLayout();
   const [error, setError] = useState("");
@@ -141,6 +201,9 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   const anchor = useRef<{ cursor: string; offset: number; width: number } | null>(null);
   const layoutWidth = useRef(0);
   const reflowedAt = useRef(0);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const uploading = useRef(new Set<string>());
+  const previews = useRef(new Set<string>());
   const press = useRef<{ x: number; y: number; timer: ReturnType<typeof setTimeout> } | null>(null);
 
   const thread = store.openThread;
@@ -154,6 +217,8 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   const setText = (value: string) => setDrafts((prev) => ({ ...prev, [thread]: value }));
   const online = store.connState === "open";
   const running = !archived && isRunning(store.status(thread).state);
+  const files = picks[thread] ?? [];
+  const canSendFiles = files.every((f) => f.state !== "failed");
   const p = presence(store);
   const latest = store.latestViewable(thread);
   const origin = info?.origin;
@@ -259,6 +324,24 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
 
   useLayoutEffect(() => { pinned.current = true; anchor.current = null; }, [thread]);
   useEffect(() => cancelPress, []);
+  // Composer previews are object URLs; release every one the app still holds.
+  useEffect(() => () => {
+    for (const url of previews.current) URL.revokeObjectURL(url);
+    previews.current.clear();
+  }, []);
+  // Files picked while offline (or paused by a rate limit) upload once the
+  // stream comes back. Only a transition retries them: reacting to each pick
+  // update would loop while an upload keeps failing.
+  const uploadWindow = useRef({ online, thread });
+  const resumeUploads = useEffectEvent(() => {
+    if (!online || !store.uploads) return;
+    for (const pick of picks[thread] ?? []) if (pick.state === "waiting") void runUpload(thread, pick);
+  });
+  useEffect(() => {
+    const prev = uploadWindow.current;
+    uploadWindow.current = { online, thread };
+    if (online && (!prev.online || prev.thread !== thread)) resumeUploads();
+  }, [online, thread]);
   // Clear an unconfirmed pick after a while; a `model` event clears it sooner.
   useEffect(() => {
     if (!pendingModel) return;
@@ -350,17 +433,23 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
       return;
     }
     const t = text.trim();
-    if (!t || t.length > LIMITS.sendTextChars) return;
-    await queueMessage(t);
+    if ((!t && !files.length) || t.length > LIMITS.sendTextChars) return;
+    if (!canSendFiles) {
+      setError("Remove the files that could not be uploaded, then send.");
+      return;
+    }
+    await queueMessage(t, undefined, files);
   }
 
-  async function queueMessage(value: string, retryKey?: string) {
+  async function queueMessage(value: string, retryKey?: string, attach?: Pick[]) {
     if (savingMessage.current || !store.canWrite(thread)) return;
     savingMessage.current = true;
     setError("");
     try {
-      const m = await store.createOutgoing(thread, value, retryKey);
+      const m = await store.createOutgoing(thread, value, retryKey, attach?.map(toNewAttachment));
       if (!retryKey) setDrafts((prev) => prev[thread] === text ? { ...prev, [thread]: "" } : prev);
+      // The files now live in the outbox (blob and ids), so the composer row goes.
+      if (attach?.length) dropPicks(thread, attach);
       pinned.current = true;
       conn.sendOutgoing(m);
     } catch {
@@ -368,6 +457,97 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     } finally {
       savingMessage.current = false;
     }
+  }
+
+  function releasePreviews(list: Pick[]) {
+    for (const pick of list) {
+      if (!pick.preview) continue;
+      URL.revokeObjectURL(pick.preview);
+      previews.current.delete(pick.preview);
+    }
+  }
+
+  function updatePick(threadId: string, id: string, patch: Partial<Pick>) {
+    setPicks((prev) => {
+      const list = prev[threadId];
+      if (!list) return prev;
+      return { ...prev, [threadId]: list.map((pick) => pick.id === id ? { ...pick, ...patch } : pick) };
+    });
+  }
+
+  /** Upload one picked file; the queue retries waiting/failed ones on reconnect. */
+  async function runUpload(threadId: string, pick: Pick) {
+    if (uploading.current.has(pick.id) || !store.uploads) return;
+    uploading.current.add(pick.id);
+    try {
+      updatePick(threadId, pick.id, { state: "uploading", note: undefined });
+      const res = await uploadFile(pick.file, pick.name, pick.type);
+      if (res.ok) {
+        updatePick(threadId, pick.id, { state: "done", uploadId: res.id, note: undefined });
+      } else if (res.retry) {
+        updatePick(threadId, pick.id, {
+          state: "waiting",
+          note: res.error === "rate_limited" ? "Too many uploads; tap Retry" : "Waiting for connection",
+        });
+      } else {
+        const note = uploadErrorText(res.error, pick.name);
+        updatePick(threadId, pick.id, { state: "failed", note });
+        setError(note);
+      }
+    } finally {
+      uploading.current.delete(pick.id);
+    }
+  }
+
+  /** Picker callback: limit checks first, then upload what the gateway will take. */
+  function addFiles(list: FileList | null) {
+    const chosen = [...(list ?? [])];
+    if (fileRef.current) fileRef.current.value = "";
+    if (!chosen.length) return;
+    const problems: string[] = [];
+    const room = Math.max(0, LIMITS.maxAttachments - files.length);
+    const added: Pick[] = [];
+    for (const file of chosen) {
+      if (file.size > LIMITS.uploadBytes) {
+        problems.push(`${file.name} is larger than ${formatBytes(LIMITS.uploadBytes)}.`);
+        continue;
+      }
+      if ([...file.name].length > LIMITS.uploadNameChars) {
+        problems.push(`${file.name.slice(0, 36)}… is longer than ${LIMITS.uploadNameChars} characters.`);
+        continue;
+      }
+      if (added.length >= room) {
+        problems.push(`Up to ${LIMITS.maxAttachments} files per message.`);
+        break;
+      }
+      const preview = file.type.startsWith("image/") ? URL.createObjectURL(file) : undefined;
+      if (preview) previews.current.add(preview);
+      added.push({
+        id: crypto.randomUUID().replaceAll("-", ""), file, name: file.name,
+        type: file.type || "application/octet-stream", size: file.size,
+        state: online && store.uploads ? "uploading" : "waiting", preview,
+      });
+    }
+    setError(problems.join(" "));
+    if (!added.length) return;
+    setPicks((prev) => ({ ...prev, [thread]: [...(prev[thread] ?? []), ...added] }));
+    for (const pick of added) if (pick.state === "uploading") void runUpload(thread, pick);
+  }
+
+  function removePick(threadId: string, id: string) {
+    releasePreviews((picks[threadId] ?? []).filter((pick) => pick.id === id));
+    setPicks((prev) => ({
+      ...prev,
+      [threadId]: (prev[threadId] ?? []).filter((pick) => pick.id !== id),
+    }));
+  }
+
+  function dropPicks(threadId: string, sent: Pick[]) {
+    releasePreviews(sent);
+    setPicks((prev) => ({
+      ...prev,
+      [threadId]: (prev[threadId] ?? []).filter((pick) => !sent.some((s) => s.id === pick.id)),
+    }));
   }
 
   async function discardMessage(key: string) {
@@ -689,6 +869,8 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
             <UserBubble key={`p${r.m.key}`} text={r.m.text} state={r.m.state} at={r.m.at} last={i === lastUser}
               onRetry={canRetry && r.m.state === "failed" ? () => void queueMessage(r.m.text, r.m.key) : undefined}
               held={!writable ? archived ? "Held until restored" : "Thread unavailable" : undefined}
+              files={pendingViews(r.m)}
+              note={r.m.note}
               onDiscard={!writable || r.m.state === "failed" ? () => void discardMessage(r.m.key) : undefined} />
           ),
         )}
@@ -715,38 +897,70 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
           <p className="archived-hint">{archivedLabel(info)} · {online
             ? <button disabled={busy} onClick={() => void toggleArchive()}>Restore to reply</button>
             : "Reconnect to restore"}</p>
-        ) : !writable ? <p className="archived-hint">Read-only until thread details are available.</p> : <div className="capsule">
-          <button ref={wrenchRef} className="wrench" aria-label="Commands" aria-haspopup="dialog"
-            aria-expanded={sheet?.kind === "tools"}
-            onClick={(e) => show({ kind: "tools" }, e.currentTarget)}>
-            <Icon d={WRENCH_ICON} />
-          </button>
-          <textarea
-            ref={taRef}
-            value={text}
-            rows={1}
-            maxLength={LIMITS.sendTextChars}
-            placeholder={running ? `${agentName} is working…` : `Message ${agentName}`}
-            aria-label="Message"
-            onChange={(e) => { setText(e.target.value); setSlashPick(0); setSlashHidden(false); }}
-            onKeyDown={onKeyDown}
-            enterKeyHint={FINE_POINTER ? "send" : "enter"}
-          />
-          <button
-            className={running ? "send stop" : "send"}
-            aria-label={running ? "Stop" : "Send"}
-            data-ready={running || (slash ? !!picked && canRun(picked, cmdState) && !argsTooLong : text.trim() !== "") ? "" : undefined}
-            onClick={() => void submit()}
-          >
-            {running ? (
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor" />
-              </svg>
-            ) : (
-              <Icon d="M12 19V5M5.5 11.5 12 5l6.5 6.5" bold />
-            )}
-          </button>
-        </div>}
+        ) : !writable ? <p className="archived-hint">Read-only until thread details are available.</p> : <>
+          {files.length > 0 && <ul className="picks" aria-label={`${files.length} ${files.length === 1 ? "file" : "files"} to send`}>
+            {files.map((pick) => (
+              <li key={pick.id} className="pick" data-state={pick.state}>
+                {pick.preview ? (
+                  <img className="pick-thumb" src={pick.preview} alt="" />
+                ) : (
+                  <span className="pick-icon" aria-hidden="true">
+                    <Icon d={attachmentKind(pick.type) === "image" ? IMAGE_ICON : FILE_ICON} />
+                  </span>
+                )}
+                <span className="pick-text">
+                  <b>{pick.name}</b>
+                  <small title={pick.note}>{pickLabel(pick)} · {formatBytes(pick.size)}</small>
+                </span>
+                {(pick.state === "waiting" || pick.state === "failed") &&
+                  <button className="pick-action" onClick={() => void runUpload(thread, pick)}>Retry</button>}
+                <button className="pick-remove" aria-label={`Remove ${pick.name}`} onClick={() => removePick(thread, pick.id)}>
+                  <Icon d={REMOVE_ICON} />
+                </button>
+                {pick.state === "uploading" && <span className="pick-progress" aria-hidden="true" />}
+              </li>
+            ))}
+          </ul>}
+          <div className="capsule">
+            <button ref={wrenchRef} className="wrench" aria-label="Commands" aria-haspopup="dialog"
+              aria-expanded={sheet?.kind === "tools"}
+              onClick={(e) => show({ kind: "tools" }, e.currentTarget)}>
+              <Icon d={WRENCH_ICON} />
+            </button>
+            {store.uploads && <button className="wrench attach" aria-label="Attach files"
+              onClick={() => fileRef.current?.click()}>
+              <Icon d={ATTACH_ICON} bold />
+            </button>}
+            <input ref={fileRef} type="file" multiple hidden tabIndex={-1}
+              onChange={(e) => addFiles(e.target.files)} />
+            <textarea
+              ref={taRef}
+              value={text}
+              rows={1}
+              maxLength={LIMITS.sendTextChars}
+              placeholder={running ? `${agentName} is working…` : `Message ${agentName}`}
+              aria-label="Message"
+              onChange={(e) => { setText(e.target.value); setSlashPick(0); setSlashHidden(false); }}
+              onKeyDown={onKeyDown}
+              enterKeyHint={FINE_POINTER ? "send" : "enter"}
+            />
+            <button
+              className={running ? "send stop" : "send"}
+              aria-label={running ? "Stop" : "Send"}
+              data-ready={running || (slash ? !!picked && canRun(picked, cmdState) && !argsTooLong
+                : canSendFiles && (text.trim() !== "" || files.length > 0)) ? "" : undefined}
+              onClick={() => void submit()}
+            >
+              {running ? (
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor" />
+                </svg>
+              ) : (
+                <Icon d="M12 19V5M5.5 11.5 12 5l6.5 6.5" bold />
+              )}
+            </button>
+          </div>
+        </>}
       </footer>
 
       {sheet && (
@@ -1156,6 +1370,7 @@ function EventRow({ ev, text, partial, store, last, forks, onActions, onRetry }:
   return <>
     {ev.role === "notice" ? <div className="notice">{body}{incomplete}</div> : ev.role === "user" ? (
       <UserBubble text={body} partial={partial} anchor={anchor} state={outgoing?.state} at={ev.at} last={last}
+        files={messageViews(ev.attachments)}
         onRetry={onRetry && outgoing?.state === "failed" ? () => onRetry(outgoing) : undefined} />
     ) : (
       <div className="msg assistant" {...anchor}>
@@ -1186,20 +1401,23 @@ const DELIV: Record<OutgoingState, { label: string; icon: ReactNode }> = {
 function UserBubble(props: {
   text: string; partial?: boolean; anchor?: React.HTMLAttributes<HTMLDivElement>; state?: OutgoingState;
   at?: string | number; last: boolean; onRetry?: () => void; onDiscard?: () => void; held?: string;
+  files?: AttachmentView[]; note?: string;
 }) {
   const { state } = props;
   const show = state && (props.last || state === "queued" || state === "sent" || state === "failed");
   const d = state && DELIV[state];
   return (
     <div className="row user">
-      <div className="bubble" {...props.anchor}>
-        {props.text}
+      <div className="bubble" data-files={props.files?.length ? "" : undefined} {...props.anchor}>
+        {props.files && <AttachmentList files={props.files} />}
+        {props.text && <span className="bubble-text">{props.text}</span>}
         {props.partial && <span className="msg-partial">Incomplete</span>}
       </div>
       {show && d && (
         <span className="deliv" data-state={state}>
           {props.held && (state === "queued" || state === "sent") ? props.held
             : state === "admitted" || state === "answered" || state === "sent" ? clock(props.at) : d.label}
+          {props.note && state === "failed" && <span className="deliv-note"> · {props.note}</span>}
           {props.onRetry && <button className="retry-message" onClick={props.onRetry}>Retry</button>}
           {props.onDiscard && <button className="retry-message" onClick={props.onDiscard}>Discard</button>}
           <span className="deliv-icon" role="img" aria-label={d.label}>
