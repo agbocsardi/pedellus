@@ -12,7 +12,8 @@ shared limits, close codes and hello/thread shapes from `src/channels/generated/
 `src/channels/app-listener.ts` owns transport mechanics (sockets, bodies, cookies, MIME types,
 path safety); `src/channels/app.ts` owns admission, the durable event log, controls, pairing and
 the operator console; `src/channels/app-files.ts` owns uploads, their durable records, attachment
-context and the download lookup.
+context and the download lookup; `src/channels/app-tool.ts` is the model-facing `app` file tool,
+whose live host the adapter attaches.
 
 Status: offline-verified only. No tailnet, `tailscale serve`, real device, installed PWA or live
 pairing has been exercised in this repository. The first deployment is a supervised trial.
@@ -142,7 +143,9 @@ and counts toward the 50-open-side-thread limit. `main` cannot be renamed or arc
 Lifecycle changes append durable `thread` events.
 
 The adapter grants no tool: coding tools, MCP, web, cron, memory and worker authority are whatever
-the configuration already gives that mapped chat. The app chat is **not** an MCP login or
+the configuration already gives that mapped chat. Its one model-facing tool is the `app` file
+capability above (*Files*), which grants no coding authority, returns no file content to the
+model, and reaches only the thread the model is already answering. The app chat is **not** an MCP login or
 `ask_user` owner surface in this phase: protocol v2 has no event that could carry a one-time
 authorization URL or an owner question without persisting it in the durable event log, and
 persisting such a URL in channel state is forbidden by the channels' binding contract (see
@@ -284,7 +287,27 @@ upload is the fixed `400 unsupported`, and a send naming ids (which cannot exist
   `image/*` (except `image/svg+xml`) and `audio/*`, `attachment; filename*=UTF-8''…` otherwise. Every other id — pending,
   pruned, foreign-shaped or malformed — is `404`, and the id shape is checked before any state is
   read. The served path is the one the store resolved inside its media root; it is never built from
-  request input. `HEAD` answers the same headers without the body.
+  request input. `HEAD` answers the same headers without the body. `?view=artifact` on an `artifact`
+  record instead serves it inline with `Content-Disposition: inline` and the preview policy protocol
+  v2 states exactly: `Content-Security-Policy: sandbox allow-scripts; default-src 'none'; script-src
+  'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src
+  'none'; frame-ancestors 'self'`, plus `nosniff`. Without `?view=artifact`, or on any other record,
+  the file keeps the normal headers and downloads as an attachment.
+- **Agent files and artifacts.** With the top-level `media` block configured, a mapped app chat
+  conversation also holds the model-facing `app` tool (TOOLS.md), the counterpart of Telegram's
+  `send`. `send {path, caption?}` copies one existing regular workspace file (any type, at most
+  `LIMITS.uploadBytes`) into app file storage and appends one durable assistant `message` whose
+  text is the caption (possibly empty) and whose `attachments` carry its `AttachmentInfo` with
+  `kind: "file"`. `artifact {path, title?}` does the same for one `.html`, `.htm` or `.svg` file (at
+  most `LIMITS.artifactBytes`) with `kind: "artifact"` and the exact stored type (`text/html` or
+  `image/svg+xml`); the title is the message text. The path is resolved exactly as the Telegram
+  send resolves it — workspace-relative, no traversal, no symlink escape, one stable bounded read —
+  and nothing else about the file is read back to the model. The referenced record and the message
+  commit together, so a message that shows a file always has it downloadable (and vice versa), and a
+  repeated execution appends nothing twice. The tool exists only in a mapped app chat (an admitted
+  app side-thread fork included) while the adapter is running; it is never offered to the channel
+  state conversation, the root, a worker, a scheduled run or any other fork, and the model cannot
+  choose a thread or a device. The receipt is bounded and names only the workspace-relative path.
 
 ## Controls
 
@@ -412,9 +435,8 @@ with a fixed reason and a durable fault entry; no raw record contents are logged
   revision must add one before this channel can carry URLs or questions.
 * **No history or cards.** The protocol marks them *later*; `history` still replies
   `unsupported`. The Tasks view is implemented (see *Tasks*). Files are implemented (see *Files*),
-  but with no thumbnails, resumable or multipart uploads, per-file deletion, or a
-  `message.attachments` entry for files the agent sends back to the app: outbound files are only
-  the workspace locator in the answer text.
+  including agent-sent files and sandboxed artifacts, but with no thumbnails, resumable or
+  multipart uploads and no per-file deletion.
 * **The upload rate window is in-memory.** A restart clears it, like the pairing window; the durable
   per-device and total record bounds still apply.
 * **Web Push is offline-verified only.** No real push service, browser subscription or service
@@ -482,6 +504,15 @@ No tailnet, device, credential or paid inference is
 used. The `app pair`/`devices`/`revoke` local-socket dispatch is exercised through the same console
 host the running adapter exports; the thin socket layer itself follows the `cron` console's
 existing tests.
+
+`tests/app-agent-files.behavior.test.mjs` covers agent file delivery offline: `send` appends one
+durable assistant message with an attachment record in one commit and the file downloads unchanged
+with the fixed headers; `artifact` stores `kind: "artifact"` with `text/html`/`image/svg+xml`, and
+`?view=artifact` serves exactly the preview CSP and `nosniff` inline while the plain download stays
+an attachment; traversal, absolute, symlink-escaping, oversize and wrong-extension paths are refused
+with no message and no record, and the receipt carries no host path or file content; and the tool is
+absent from the channel state conversation, the terminal chat, the root, an ownerless raw
+conversation, a worker child and a scheduled run's automation conversation.
 
 `tests/app-tasks.behavior.test.mjs` covers the Tasks view offline: the list is scoped to one
 thread's own worker and scheduled job (another thread and the unmapped `main` thread list nothing),
