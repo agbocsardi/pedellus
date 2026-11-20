@@ -80,6 +80,13 @@ npm run build    # also runs tsc --noEmit for app and sw
 npm run preview  # serves dist/ on http://localhost:4173, same /v1 proxy
 ```
 
+The split-message "Incomplete" marker has a browser regression check. After
+`npm run build`, `node dev/long-answer-partial.mjs [runs]` starts the mock and a
+preview server on free ports, pairs a headless Chromium, asks for a long answer
+on fresh threads, and fails if any `.msg-partial` is still in the DOM 800 ms
+after the turn is idle (or if a message id has duplicate rows or a truncated
+answer). Default is 10 runs.
+
 ## Build output
 
 `vite build` writes the complete app to `app/dist/` — `index.html`,
