@@ -276,9 +276,11 @@ replies `accepted: false`, appends one fixed `notice` message (once per request 
 nothing. A typed ordinary `send` settles the oldest delivered question in that thread atomically
 with its own admission — commands, callback-shaped text and attachment-only sends never count — so
 the answer is that message and the record stores no duplicate text. `/new` cancels every pending
-question in the thread: the plain native reset commits the reset and the cancellation together,
-while the host paired reset commits the reset first and the cancellation immediately after (two
-commits, and the `cancelled` card is published right after them) — a refused reset cancels nothing.
+question in the thread after repairing a delivery mark lost in a crash in the same commit, so a
+quarantined question whose card is still live is cancelled too instead of being reopened by that
+repair: the plain native reset repairs and cancels in one commit right after the reset, while the
+host paired reset repairs first, commits the reset, and commits the cancellation immediately after
+(so the `cancelled` card is published right after them) — a refused reset cancels nothing.
 Archiving a thread cancels its open questions in the archive's own commit, so the archived thread
 and the `cancelled` card arrive together and restoring the thread does not reopen them; an open
 question would otherwise leave a card that can never be answered and a record that blocks every

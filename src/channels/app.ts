@@ -2252,16 +2252,30 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     if (resetSession === undefined) {
       const conversation = await gateway.conversationFor(sessionForThread(thread), adapterContext);
       await conversation.reset(undefined, adapterContext);
-      // A context boundary retires questions the new context can no longer answer.
+      // A context boundary retires questions the new context can no longer answer. Repair a delivery
+      // mark lost in a crash first, in this same commit: a quarantined question whose card is still
+      // live must be cancelled by the reset, not reopened by a repair that runs after it.
       if (gateway.askSurfaces !== undefined) {
-        await conversation.commit(async (tx) => {
-          cancelPendingQuestions(await tx.doc(AskQuestionsDoc, conversation.id));
-        }, adapterContext);
-        await reconcileThreadQuestions(thread);
+        let changed = false;
+        await mutateState(async (doc, tx) => {
+          const questions = await tx.doc(AskQuestionsDoc, conversation.id);
+          changed = publishQuestionEvents(doc, questions, thread, now());
+          cancelPendingQuestions(questions);
+          changed = publishQuestionEvents(doc, questions, thread, now()) || changed;
+        });
+        if (changed) pushEventsToSockets();
       }
       return { kind: "applied" };
     }
     try {
+      // The host's reset cancels pending questions in its own commit, so repair a quarantined question
+      // whose card is still live before that commit reads the record. Otherwise the repair below would
+      // reopen a question the reset had already skipped, and a tap could answer into the new context.
+      if (gateway.askSurfaces !== undefined) {
+        await reconcileThreadQuestions(thread).catch((error: unknown) => {
+          if (!signal?.aborted) journalEvent("app.question.reconcile_failed", {}, error);
+        });
+      }
       const result = await resetSession(sessionForThread(thread), adapterContext);
       if (result.status === "busy") return { kind: "refused", text: RESET_BUSY };
       // The host reset cancels pending questions in its own commit; publish their final state so an

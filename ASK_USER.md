@@ -95,9 +95,11 @@ Expiry is enforced when a question is read or claimed, not by a timer. An overdu
 `pending` question becomes `expired`; a foreign session, unknown id or superseded
 record answers `stale`; an already-answered one answers `replay`. `/new` (a context
 reset) cancels every pending question in that conversation, because an answer would
-otherwise start a turn whose context no longer contains the question. The plain
+otherwise start a turn whose context no longer contains the question. A delivery mark lost
+in a crash is repaired before that cancellation, so a quarantined question whose `open`
+event is still in the log is cancelled by the reset rather than reopened by the repair. The plain
 native reset commits the reset and the cancellation together; when the host owns the
-reset as a paired operation, the reset commits first and the cancellation
+reset as a paired operation, the repair runs first, the reset commits, and the cancellation
 immediately after, so a rendered card is retracted a moment later rather than
 atomically. `/abort` and a host restart do not cancel questions: the answer is still a
 meaningful next turn, and an expired or cancelled button is refused with fixed text.

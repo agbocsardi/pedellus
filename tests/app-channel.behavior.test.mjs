@@ -1892,3 +1892,66 @@ test('a quarantined question is repaired by its live open event; one without sta
     await device.close();
   });
 });
+
+/** A record quarantined by a lost delivery mark, whose open card an earlier process had delivered. */
+async function seedQuarantinedQuestion(store, thread, id, expiresAtMs = Date.now() + 600_000) {
+  return seedQuestion(store, thread, {
+    id,
+    taskId: 1,
+    sessionKey: thread === 'main' ? 'app:chat' : `app:chat:${thread}`,
+    question: 'Still want the deploy?',
+    options: [{ id: 'a', label: 'Yes' }, { id: 'b', label: 'No' }],
+    createdAtMs: expiresAtMs - 60_000,
+    expiresAtMs,
+    delivery: 'unknown',
+    status: 'unknown',
+  }, { open: true });
+}
+
+async function storedQuestionStatus(store, sessionKey, id) {
+  const conversation = await store.gateway.conversationFor(sessionKey, context);
+  return conversation.commit(async (tx) => {
+    const doc = await tx.doc(AskQuestionsDoc, conversation.id);
+    return doc.questions.find((record) => record.id === id)?.status;
+  }, context);
+}
+
+/** Both reset paths must cancel a repaired quarantined question and refuse the stale card. */
+async function assertResetCancelsQuarantined(store, device, record) {
+  assert.equal((await request(device, 'c1', 'control', { command: 'new' })).ok, true);
+  await device.wait(() => device.events('question').some((event) => event.id === record.id && event.state === 'cancelled'),
+    'the quarantined question cancelled by the reset');
+  assert.equal(await storedQuestionStatus(store, 'app:chat', record.id), 'cancelled',
+    'the reset cancelled the repaired record, not the quarantine');
+
+  assert.equal((await request(device, 'a1', 'answer', { thread: 'main', question: record.id, option: 'a' })).accepted, false);
+  await device.wait(() => device.events('message').some((event) => event.role === 'notice' &&
+    event.text === 'This question was cancelled.'), 'the cancelled notice');
+  assert.equal(store.captured.length, 0, 'the stale card admitted no turn into the new context');
+}
+
+test('/new cancels a quarantined question whose live open card the repair would reopen (host reset)',
+  { timeout: 30_000 }, async () => {
+    await withChannel('new-unknown-question', {}, async ({ store, base }) => {
+      const device = await questionDevice(store, base);
+      const record = await seedQuarantinedQuestion(store, 'main', 'aaaabbbb05');
+      await assertResetCancelsQuarantined(store, device, record);
+      await device.close();
+    });
+  });
+
+test('/new cancels a quarantined question whose live open card the repair would reopen (plain reset)',
+  { timeout: 30_000 }, async () => {
+    const store = await openAppStore('new-unknown-question-plain');
+    const app = startApp(store, { gateway: { ...store.gateway, resetSession: undefined } });
+    const base = `http://127.0.0.1:${await app.port}`;
+    try {
+      const device = await questionDevice(store, base);
+      const record = await seedQuarantinedQuestion(store, 'main', 'aaaabbbb06');
+      await assertResetCancelsQuarantined(store, device, record);
+      await device.close();
+    } finally {
+      await app.stop();
+      await store.close();
+    }
+  });
