@@ -31,6 +31,12 @@ export const LIMITS = {
   pushAuthChars: 64,
   /** `unread` in a push payload is capped here. */
   pushUnreadCap: 99,
+  /** Files (see v2.md, Files). */
+  uploadBytes: 20 * 1024 * 1024,
+  uploadNameChars: 120,
+  uploadsPerMinute: 30,
+  maxAttachments: 10,
+  uploadIdPattern: /^f_[A-Za-z0-9_-]{22}$/,
 } as const;
 
 /** `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`: no `I`/`O`, case-insensitive input. */
@@ -57,7 +63,7 @@ export type ThreadInfo = {
 
 export type Request =
   | { type: "req"; id: string; op: "hello"; v: 2; cursor: number | null }
-  | { type: "req"; id: string; op: "send"; key: string; text: string; thread?: ThreadId }
+  | { type: "req"; id: string; op: "send"; key: string; text: string; thread?: ThreadId; attachments?: string[] }
   | { type: "req"; id: string; op: "ack"; cursor: number }
   | { type: "req"; id: string; op: "control"; command: ControlCommand; args?: string; thread?: ThreadId }
   | { type: "req"; id: string; op: "ping" }
@@ -74,7 +80,7 @@ export type PushKeyResult = { key: string };
 /** Content-free Web Push payload; never message text. */
 export type PushPayload = { v: 2; thread: ThreadId; unread: number };
 
-export type HelloResult = { v: 2; device: string; head: number | null; agent: string; commands: CommandInfo[]; presets: PresetInfo[] };
+export type HelloResult = { v: 2; device: string; head: number | null; agent: string; commands: CommandInfo[]; presets: PresetInfo[]; uploads: boolean };
 export type SendResult = { duplicate: boolean };
 export type ThreadsResult = { threads: ThreadInfo[] };
 export type ThreadCreateResult = { thread: ThreadId; duplicate: boolean };
@@ -86,6 +92,8 @@ export type Response =
 export type MessageEvent = {
   type: "event"; event: "message"; cursor: number; thread: ThreadId; id: string;
   role: "user" | "assistant" | "notice"; text: string; at: string; key?: string;
+  /** Files sent with this message (first part only when split). */
+  attachments?: AttachmentInfo[];
   /** Present only on a split message: part `i` (from 0) of `n`. */
   part?: { i: number; n: number };
 };
@@ -107,6 +115,10 @@ export type ModelEvent = { type: "event"; event: "model"; thread: ThreadId; pres
 export type DurableEvent = MessageEvent | SettledEvent | DividerEvent | ThreadEvent;
 export type Event = DurableEvent | PreviewEvent | StatusEvent | ModelEvent;
 export type ServerFrame = Response | Event;
+
+export type AttachmentInfo = { id: string; name: string; type: string; size: number; kind: "image" | "audio" | "file" };
+export type UploadResult = { id: string };
+export type UploadError = "bad_request" | "unsupported" | "unauthorized" | "too_large" | "rate_limited";
 
 export type PairRequest = { code: string; label: string };
 export type PairError = "bad_request" | "invalid_code" | "rate_limited";
