@@ -879,12 +879,14 @@ input#pair-code {
 }
 .reaction-palette {
   display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
   gap: 2px;
   width: fit-content;
   max-width: 100%;
   padding: 3px;
   border: 1px solid var(--line);
-  border-radius: 999px;
+  border-radius: 22px;
   background: var(--card);
   box-shadow: var(--shadow);
 }

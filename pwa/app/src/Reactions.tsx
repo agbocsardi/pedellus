@@ -20,8 +20,8 @@ const REACT_ICON = (
  * Owner reactions on one message (protocol v2, Reactions): a quiet button in the message's own
  * control row, a six-emoji palette and the badge for the reaction the gateway has actually stored.
  *
- * The palette opens inline in that row instead of as a floating overlay, so it never depends on a
- * scroll position, is never clipped by the message list and never moves the page. The badge only
+ * The palette opens inline in that row instead of as a floating overlay, so it is never clipped by
+ * the message list, only that list scrolls to reveal it, and the page itself never moves. The badge only
  * follows the durable `reaction` event: a tap shows nothing until the gateway confirms it (no
  * optimistic state), and tapping the emoji already shown clears the reaction.
  */
