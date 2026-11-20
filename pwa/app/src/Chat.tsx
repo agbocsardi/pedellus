@@ -285,6 +285,10 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   const reflowedAt = useRef(0);
   const fileRef = useRef<HTMLInputElement>(null);
   const voiceRef = useRef<{ recording: Recording; cap: ReturnType<typeof setTimeout>; startedAt: number } | null>(null);
+  /** Set before the permission prompt resolves, so a second tap cannot start a second stream. */
+  const startingVoice = useRef(false);
+  /** False once this screen has gone; a late permission answer must not arm a recording. */
+  const mounted = useRef(true);
   const uploading = useRef(new Set<string>());
   const previews = useRef(new Set<string>());
   const press = useRef<{ x: number; y: number; timer: ReturnType<typeof setTimeout> } | null>(null);
@@ -432,12 +436,26 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     document.addEventListener("visibilitychange", onHide);
     return () => document.removeEventListener("visibilitychange", onHide);
   }, [voice]);
+  // A thread that turns read-only mid-recording takes the recording row with
+  // it, so end the note here with the same honest "keep" path as the rest.
+  useEffect(() => {
+    if (voice && voice.thread === thread && !writable) endVoice(voice.thread, "Recording stopped when the thread became read-only.");
+  }, [voice, thread, writable]);
   // The recording row belongs to the thread it was started in.
   useEffect(() => {
     if (voice && voice.thread !== thread) endVoice(voice.thread, "Recording stopped when you left the thread.");
   }, [voice, thread]);
-  // Leaving this screen ends the note and lets the microphone go.
-  useEffect(() => () => { voiceRef.current?.recording.cancel(); voiceRef.current = null; }, []);
+  // Leaving this screen ends the note and lets the microphone go; a permission
+  // prompt still open must not be answered with a recording nobody can see.
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      startingVoice.current = false;
+      voiceRef.current?.recording.cancel();
+      voiceRef.current = null;
+    };
+  }, []);
   // Files picked while offline (or paused by a rate limit) upload once the
   // stream comes back. Only a transition retries them: reacting to each pick
   // update would loop while an upload keeps failing.
@@ -662,26 +680,34 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
 
   /** Mic tap: the permission prompt happens here, never at load. */
   async function startVoice() {
-    if (voiceRef.current || !store.canWrite(thread)) return;
+    // Synchronous guards only: iOS needs `getUserMedia` called in the tap
+    // handler itself, and two taps must never open two streams.
+    if (startingVoice.current || voiceRef.current || !store.canWrite(thread)) return;
+    startingVoice.current = true;
     setError("");
     setHint("");
     let recording: Recording;
     try {
       recording = await startVoiceNote();
     } catch (err) {
+      startingVoice.current = false;
       setError(err instanceof DOMException && (err.name === "NotAllowedError" || err.name === "SecurityError")
         ? "Microphone access was denied. Allow it for this app to record a voice note."
         : "Could not start recording on this device.");
       return;
     }
-    // The thread may have gone read-only behind the permission prompt.
-    if (!store.canWrite(thread)) {
+    // The screen, the thread or its write access may have gone behind the
+    // permission prompt: nobody could stop this recording, so let it go now.
+    if (!mounted.current || store.openThread !== thread || !store.canWrite(thread)) {
+      startingVoice.current = false;
       recording.cancel();
       return;
     }
-    const cap = setTimeout(() => void sendVoice(), VOICE_MAX_MS);
-    voiceRef.current = { recording, cap, startedAt: Date.now() };
-    setVoice({ startedAt: Date.now(), thread });
+    startingVoice.current = false;
+    const startedAt = Date.now();
+    const cap = setTimeout(() => void sendVoice(true), VOICE_MAX_MS);
+    voiceRef.current = { recording, cap, startedAt };
+    setVoice({ startedAt, thread });
     setVoiceSecs(0);
   }
 
@@ -696,9 +722,25 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   }
 
   /** Stop and send: one file, through the same upload and queue as a picked attachment. */
-  async function sendVoice() {
+  async function sendVoice(fromCap = false) {
+    if (!voiceRef.current) return;
+    // Taking the recorder destroys its audio, so refuse before that when the
+    // send could only be dropped; the row keeps the recording instead.
+    if (savingMessage.current || !store.canWrite(thread)) {
+      if (!fromCap) {
+        setHint("Couldn’t send the voice note; it is still recording.");
+        return;
+      }
+      // The five-minute cap fired: stop here and keep the audio, never record
+      // past the cap because a send was refused.
+      void keepVoice(thread, "Recording stopped at 5 minutes and was kept.");
+      return;
+    }
     const result = await takeVoice();
-    if (!result) return;
+    if (!result) {
+      setHint("Nothing was recorded.");
+      return;
+    }
     if (result.stopped === "size") {
       setHint(`Recording stopped at ${formatBytes(LIMITS.uploadBytes)} and was discarded.`);
       return;
