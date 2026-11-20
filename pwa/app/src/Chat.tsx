@@ -43,6 +43,9 @@ const PLAY_ICON = "M8 5.5v13l11-6.5-11-6.5Z";
 const PAUSE_ICON = "M9.5 5.5v13M14.5 5.5v13";
 /** A voice note's length, `m:ss`. */
 const lengthText = (secs: number) => `${Math.floor(secs / 60)}:${String(Math.floor(secs % 60)).padStart(2, "0")}`;
+/** A name the recorder made (`Voice note 14:32.m4a`): the label is the kind, not the timestamp. */
+const VOICE_NAME = /^Voice note \d{2}:\d{2}(\.[a-z0-9]+)?$/i;
+const noteLabel = (name: string) => (VOICE_NAME.test(name) ? "Voice note" : name);
 
 type CommandState = { online: boolean; writable: boolean; running: boolean };
 const ready = (s: CommandState) => s.online && s.writable;
@@ -128,8 +131,8 @@ function ImageAttachment({ file, url }: { file: AttachmentView; url: string }) {
 
 /**
  * A recorded voice note: one compact row, with the browser's own `<audio>`
- * element underneath as the player. The duration is shown only when the
- * container carries one; otherwise the size is, rather than an invented length.
+ * element underneath as the player. The row says what it is and how long it
+ * runs; the recorder's timestamped file name stays on the download.
  */
 function VoiceAttachment({ file, url }: { file: AttachmentView; url: string }) {
   const audio = useRef<HTMLAudioElement>(null);
@@ -153,8 +156,9 @@ function VoiceAttachment({ file, url }: { file: AttachmentView; url: string }) {
         <Icon d={playing ? PAUSE_ICON : PLAY_ICON} bold={!playing} />
       </button>
       <span className="voice-text">
-        <b>{file.name}</b>
-        <small>{duration === null ? formatBytes(file.size) : lengthText(duration)}</small>
+        <b>{noteLabel(file.name)}</b>
+        {/* Empty until the container reports a length: guessing one would be a lie. */}
+        <small>{duration === null ? "" : lengthText(duration)}</small>
       </span>
       <audio ref={audio} className="voice-audio" src={url} preload="metadata" tabIndex={-1} aria-hidden="true"
         onLoadedMetadata={(e) => {
@@ -174,7 +178,7 @@ function FileChip({ file }: { file: AttachmentView }) {
       <Icon d={file.kind === "image" ? IMAGE_ICON : file.kind === "audio" ? AUDIO_ICON : FILE_ICON} />
     </span>
     <span className="file-chip-text">
-      <b>{file.name}</b>
+      <b>{noteLabel(file.name)}</b>
       <small>{formatBytes(file.size)}</small>
     </span>
   </>;
