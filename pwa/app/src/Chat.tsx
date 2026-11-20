@@ -1411,11 +1411,12 @@ function EventRow({ ev, text, partial, store, conn, thread, last, forks, onActio
         {incomplete}
       </div>
     )}
-    {anchor && (ev.role === "user" || ev.role === "assistant") &&
-      <Reactions store={store} conn={conn} thread={thread} messageId={ev.id} role={ev.role} />}
     {(anchor || !!forks?.length) && <div className="msg fork-links" data-role={ev.role}>
       {anchor && <button className="message-actions" aria-label="Message actions" aria-haspopup="dialog"
         onClick={(e) => onActions(ev, e.currentTarget)}>⋯</button>}
+      {/* One control row per message: the reaction control sits beside ⋯, not on its own line. */}
+      {anchor && (ev.role === "user" || ev.role === "assistant") &&
+        <Reactions store={store} conn={conn} thread={thread} messageId={ev.id} />}
       {forks?.map((t) => <button key={t.id} className="fork-chip" onClick={() => store.selectThread(t.id)}>
         <span aria-hidden="true">↳</span><span className="fork-title">{t.title}</span>
         <ThreadSignals store={store} thread={t.id} />

@@ -3,20 +3,30 @@ import type { Connection } from "./conn";
 import { REACTIONS, type Reaction, type ThreadId } from "./protocol";
 import type { Store } from "./store";
 
-/** The neutral "add a reaction" mark; small next to a message rather than a toolbar. */
-const REACT_ICON = "M12 5v14M5 12h14";
+/** A smiley with a plus: "react", not the plain plus that reads as "add an attachment". */
+const REACT_ICON = (
+  <>
+    <circle cx="9.5" cy="12.5" r="6.5" fill="none" stroke="currentColor" strokeWidth={2} />
+    <path d="M6.9 14.1a3.3 3.3 0 0 0 5.2 0" fill="none" stroke="currentColor" strokeWidth={1.7}
+      strokeLinecap="round" />
+    <path d="M7.5 10.4h.01M11.5 10.4h.01" fill="none" stroke="currentColor" strokeWidth={2.4}
+      strokeLinecap="round" />
+    <path d="M19 5.5v5M16.5 8h5" fill="none" stroke="currentColor" strokeWidth={2}
+      strokeLinecap="round" />
+  </>
+);
 
 /**
- * Owner reactions on one message (protocol v2, Reactions): a quiet button, a six-emoji palette and
- * the badge for the reaction the gateway has actually stored.
+ * Owner reactions on one message (protocol v2, Reactions): a quiet button in the message's own
+ * control row, a six-emoji palette and the badge for the reaction the gateway has actually stored.
  *
- * The palette opens as a card under the message instead of a floating overlay, so it never depends
- * on a scroll position, is never clipped by the message list and never moves the page. The badge
- * only follows the durable `reaction` event: a tap shows nothing until the gateway confirms it
- * (no optimistic state), and tapping the emoji already shown clears the reaction.
+ * The palette opens inline in that row instead of as a floating overlay, so it never depends on a
+ * scroll position, is never clipped by the message list and never moves the page. The badge only
+ * follows the durable `reaction` event: a tap shows nothing until the gateway confirms it (no
+ * optimistic state), and tapping the emoji already shown clears the reaction.
  */
-export function Reactions({ store, conn, thread, messageId, role }: {
-  store: Store; conn: Connection; thread: ThreadId; messageId: string; role: "user" | "assistant";
+export function Reactions({ store, conn, thread, messageId }: {
+  store: Store; conn: Connection; thread: ThreadId; messageId: string;
 }) {
   const [open, setOpen] = useState(false);
   const wrap = useRef<HTMLSpanElement | null>(null);
@@ -46,14 +56,11 @@ export function Reactions({ store, conn, thread, messageId, role }: {
     setOpen(false);
   };
   return (
-    <span className="reactions" data-role={role} ref={wrap}>
+    <span className="reactions" ref={wrap}>
       {current != null && <span className="reaction-badge" role="img" aria-label={`Reacted ${current}`}>{current}</span>}
       <button type="button" className="reaction-trigger" aria-label="React to this message"
         aria-expanded={open} onClick={() => setOpen((value) => !value)}>
-        <svg viewBox="0 0 24 24" aria-hidden="true">
-          <path d={REACT_ICON} fill="none" stroke="currentColor" strokeWidth={2}
-            strokeLinecap="round" strokeLinejoin="round" />
-        </svg>
+        <svg viewBox="0 0 24 24" aria-hidden="true">{REACT_ICON}</svg>
       </button>
       {open && (
         <span className="reaction-palette" role="group" aria-label="Reactions">
