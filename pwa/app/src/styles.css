@@ -3,11 +3,16 @@
    portrait iOS everything at the top clears that zone, and an opaque band (index.html) covers it. */
 :root {
   --inset-top: env(safe-area-inset-top, 0px);
+  --inset-bottom: env(safe-area-inset-bottom, 0px);
 }
 @supports (-webkit-touch-callout: none) {
   @media (display-mode: standalone) and (orientation: portrait) {
     :root {
-      --inset-top: calc(env(safe-area-inset-top, 0px) + 2.5rem);
+      --inset-top: calc(env(safe-area-inset-top, 0px) + 1rem);
+      /* Installed iOS 26 draws the page only down to screen height minus the top inset (852pt
+         screen, 793pt page on device), so the home indicator is never over the page even though
+         env(safe-area-inset-bottom) still reports 34pt. Padding by it only adds a gap. */
+      --inset-bottom: 0px;
     }
   }
 }
@@ -1097,7 +1102,7 @@ input#pair-code {
 .composer {
   position: relative;
   /* The home indicator's inset already leaves room; sit just above it, not a full inset higher. */
-  padding: 6px var(--gutter) max(10px, calc(env(safe-area-inset-bottom) - 12px));
+  padding: 6px var(--gutter) max(8px, calc(var(--inset-bottom) - 12px));
   background: var(--bg);
 }
 .composer::before {
@@ -1282,8 +1287,8 @@ input#pair-code {
   position: absolute;
   left: var(--gutter);
   right: var(--gutter);
-  bottom: calc(env(safe-area-inset-bottom) + 10px);
-  max-height: calc(100% - var(--inset-top) - env(safe-area-inset-bottom) - 20px);
+  bottom: calc(var(--inset-bottom) + 10px);
+  max-height: calc(100% - var(--inset-top) - var(--inset-bottom) - 20px);
   overflow: auto;
   overscroll-behavior: contain;
   max-width: 28rem;
