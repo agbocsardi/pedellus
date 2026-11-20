@@ -15,6 +15,7 @@
 import type { Draft } from "@earendil-works/chord";
 import {
   pendingQuestionViews,
+  validQuestionRecord,
   type AskOptionId,
   type AskQuestionRecord,
   type AskQuestionsDocument,
@@ -127,6 +128,7 @@ export function reconcileQuestionEvents(
   pendingQuestionViews(questions, nowMs);
   const out: AppQuestionEventInput[] = [];
   for (const record of questions.questions) {
+    if (!validQuestionRecord(record)) continue;
     const state = projectedState(record);
     if (state === undefined) continue;
     const previous = known.get(record.id);

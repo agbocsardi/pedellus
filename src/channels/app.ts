@@ -2233,8 +2233,13 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       if (result.status === "busy") return { kind: "refused", text: RESET_BUSY };
       // The host reset cancels pending questions in its own commit; publish their final state so an
       // already-rendered card can no longer be answered. This read is also where a crash between
-      // admitting a question and delivering it is quarantined honestly.
-      if (gateway.askSurfaces !== undefined) await reconcileThreadQuestions(thread);
+      // admitting a question and delivering it is quarantined honestly. Publishing that state is
+      // not part of the reset's contract, so it never turns an applied reset into a failure.
+      if (gateway.askSurfaces !== undefined) {
+        await reconcileThreadQuestions(thread).catch((error: unknown) => {
+          if (!signal?.aborted) journalEvent("app.question.reconcile_failed", {}, error);
+        });
+      }
       return { kind: "applied" };
     } catch (error) {
       if (isConversationBusy(error)) return { kind: "refused", text: RESET_BUSY };
@@ -2942,7 +2947,10 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     for (const thread of [APP_MAIN_THREAD, ...(state.threads ?? [])
       .filter((entry) => entry.id !== APP_MAIN_THREAD && !entry.archived).map((entry) => entry.id)]) {
       if (!hasOrigin(thread)) continue;
-      await reconcileThreadQuestions(thread);
+      // A question projection must never keep the channel from serving other work.
+      await reconcileThreadQuestions(thread).catch((error: unknown) => {
+        if (!signal?.aborted) journalEvent("app.question.reconcile_failed", {}, error);
+      });
     }
   }
   const detachConsole = gateway.appConsole?.attach(consoleHost);
