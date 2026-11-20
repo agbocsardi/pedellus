@@ -43,6 +43,9 @@ export const LIMITS = {
   questionIdPattern: /^[0-9a-f]{10}$/,
   /** Tasks view: entries per reply, title and detail length. */
   maxListedTasks: 50,
+  /** Activity: tool steps kept per turn, tool name length. */
+  maxActivitySteps: 50,
+  activityToolChars: 64,
   taskTitleChars: 120,
   taskDetailChars: 200,
   uploadIdPattern: /^f_[A-Za-z0-9_-]{22}$/,
@@ -106,6 +109,9 @@ export type MessageEvent = {
   role: "user" | "assistant" | "notice"; text: string; at: string; key?: string;
   /** Files sent with this message (first part only when split). */
   attachments?: AttachmentInfo[];
+  /** Assistant only: the turn's tool steps (first part only when split). */
+  steps?: ActivityStep[];
+  omitted?: number;
   /** Present only on a split message: part `i` (from 0) of `n`. */
   part?: { i: number; n: number };
 };
@@ -139,10 +145,17 @@ export type TaskInfo = {
 export type TasksResult = { tasks: TaskInfo[] };
 export type TaskCancelResult = { outcome: "cancelled" | "finished" | "unknown" };
 
+export type ActivityStep = {
+  id: string; tool: string; state: "running" | "done" | "failed"; startedAt: string; endedAt?: string;
+};
+export type ActivityEvent = {
+  type: "event"; event: "activity"; thread: ThreadId; key: string; steps: ActivityStep[]; omitted?: number;
+};
+
 export type ModelEvent = { type: "event"; event: "model"; thread: ThreadId; preset: string | null };
 
 export type DurableEvent = MessageEvent | SettledEvent | DividerEvent | ThreadEvent | QuestionEvent;
-export type Event = DurableEvent | PreviewEvent | StatusEvent | ModelEvent;
+export type Event = DurableEvent | PreviewEvent | StatusEvent | ModelEvent | ActivityEvent;
 export type ServerFrame = Response | Event;
 
 export type AttachmentInfo = { id: string; name: string; type: string; size: number; kind: "image" | "audio" | "file" };
