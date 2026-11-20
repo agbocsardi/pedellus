@@ -49,7 +49,10 @@ const MIC_ICON = "M12 4a3 3 0 0 0-3 3v5a3 3 0 0 0 6 0V7a3 3 0 0 0-3-3M5 11a7 7 0
 const PLAY_ICON = "M8 5.5v13l11-6.5-11-6.5Z";
 const PAUSE_ICON = "M9.5 5.5v13M14.5 5.5v13";
 /** A voice note's length, `m:ss`. */
-const lengthText = (secs: number) => `${Math.floor(secs / 60)}:${String(Math.floor(secs % 60)).padStart(2, "0")}`;
+const lengthText = (secs: number) => {
+  const whole = Math.round(secs);
+  return `${Math.floor(whole / 60)}:${String(whole % 60).padStart(2, "0")}`;
+};
 /** A name the recorder made (`Voice note 14:32.m4a`): the label is the kind, not the timestamp. */
 const VOICE_NAME = /^Voice note \d{2}:\d{2}(\.[a-z0-9]+)?$/i;
 const noteLabel = (name: string) => (VOICE_NAME.test(name) ? "Voice note" : name);

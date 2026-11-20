@@ -45,8 +45,10 @@ function relative(iso: string | undefined): string {
 function when(task: TaskInfo): string {
   // "Last now" reads wrong; anything within a minute is simply "just now".
   const recent = [task.lastAt, task.createdAt].some((at) => at !== undefined && Math.abs(Date.parse(at) - Date.now()) < 60_000);
-  if (task.nextAt === undefined && recent) return "just now";
-  const next = relative(task.nextAt);
+  if ((task.nextAt === undefined || task.state === "cancelled" || task.state === "done" || task.state === "failed") && recent) return "just now";
+  // Only a job that will still run has a next time worth showing.
+  const live = task.state === "running" || task.state === "queued" || task.state === "scheduled";
+  const next = live ? relative(task.nextAt) : "";
   if (next) return `Next ${next}`;
   const last = relative(task.lastAt);
   if (last) return `Last ${last}`;
