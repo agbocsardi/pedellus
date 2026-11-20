@@ -27,7 +27,10 @@ on the mock to try automatic archiving after three seconds of idleness. Ask for
 `a long answer` to get a durable message split into `part: {i, n}` frames
 (protocol v2, *Long messages*), including while it is only partly received.
 The mock records and validates fork origins without copying messages into
-the new thread. It doesn't run a real agent. Push is on: the mock makes
+the new thread. A message containing `start task` seeds one fake worker and
+one fake scheduled job in that thread, so the thread menu's **Tasks** sheet
+(protocol v2, *Tasks*) has something to list and to cancel. It doesn't run a
+real agent. Push is on: the mock makes
 throwaway VAPID keys at start, answers `push.key`, stores one subscription
 per device and really sends content-free pushes with `web-push` to it
 whenever an answer or notice is produced while that device has no open
@@ -66,3 +69,9 @@ one origin and one cookie jar.
   dev server serves no service worker.
 - The store (`src/store.ts`) is a cache: IndexedDB loss means a full replay
   on the next `hello`, nothing more.
+- **Tasks** (`src/TasksSheet.tsx`) lists this thread's own workers and
+  scheduled jobs and can cancel them. There is no task event stream: the sheet
+  fetches when it opens and again after any durable event in the thread while
+  it stays open. Cancelling asks in place first and reports the outcome the
+  gateway returns, so an already-finished or foreign task never reads as a
+  cancellation.
