@@ -1130,11 +1130,9 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
                 <b role="timer">{lengthText(voiceSecs)}</b>
                 <small>Recording</small>
               </span>
-              <button className="send voice-send" aria-label="Stop and send voice note" data-ready=""
+              <button className="send voice-send" aria-label="Send voice note" data-ready=""
                 onClick={() => void sendVoice()}>
-                <svg viewBox="0 0 24 24" aria-hidden="true">
-                  <rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor" />
-                </svg>
+                <Icon d="M12 19V5M5.5 11.5 12 5l6.5 6.5" bold />
               </button>
             </div>
           ) : (
