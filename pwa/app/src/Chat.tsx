@@ -3,6 +3,7 @@ import { Streamdown } from "streamdown";
 import type { Connection } from "./conn";
 import type { AgentStatus, Outgoing, OutgoingState, Store } from "./store";
 import { LIMITS, MAIN_THREAD, type CommandInfo, type DurableEvent, type MessageEvent, type PresetInfo, type ThreadInfo, type ThreadOrigin } from "./protocol";
+import { disablePush, enablePush, hasPushSubscription, pushPermission, pushSupported, type PushPermission } from "./push";
 import { Avatar, type AvatarState } from "./Avatar";
 
 const FINE_POINTER = matchMedia("(pointer: fine)").matches;
@@ -14,6 +15,7 @@ type Sheet = { kind: "list" | "menu" | "tools" | "confirm-new" | "model" } | { k
   | { kind: "message"; title: string; from: ThreadOrigin };
 const LIST_ICON = "M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01";
 const TITLE_CONTROL = /[\p{Cc}\u2028\u2029]/u;
+const BELL_ICON = "M18 14v-3.5a6 6 0 1 0-12 0V14l-2 3.5h16L18 14M10 21h4";
 const WRENCH_ICON = "M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.8-3.8a6 6 0 0 1-7.9 7.9l-6.9 6.9a2.1 2.1 0 0 1-3-3l6.9-6.9a6 6 0 0 1 7.9-7.9l-3.8 3.8Z";
 
 type CommandState = { online: boolean; writable: boolean; running: boolean };
@@ -578,6 +580,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
                 {commands.some((c) => c.name === "status") && <SheetItem icon="M3 12h4l3-8 4 16 3-8h4" title="Status"
                   sub="Ask the agent what it is doing" disabled={!online} onClick={() => command("status")} />}
               </>}
+              <NotificationsItem store={store} conn={conn} online={online} />
               {!main && (writable || archived) && <>
                 <SheetItem icon="M4 20h4L20 8l-4-4L4 16v4Z" title="Rename thread" disabled={!online || busy}
                   onClick={() => show({ kind: "rename", title })} />
@@ -721,6 +724,99 @@ function ThreadList({ store, conn, online, onNew, onSelect }: {
         {archived.map((t) => row(t))}
       </details>}
     </>}
+  </>;
+}
+
+/**
+ * Push is a device setting, so it lives in the thread menu. It asks for
+ * permission only on a tap and hides itself once the gateway answers
+ * `unsupported` (protocol v2, "Notifications (Web Push)").
+ */
+function NotificationsItem({ store, conn, online }: { store: Store; conn: Connection; online: boolean }) {
+  const [permission, setPermission] = useState<PushPermission>(pushPermission);
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState("");
+  // Learn the gateway's answer while the menu is open, so an unconfigured
+  // gateway never shows the row. Opening the menu never asks for permission.
+  useEffect(() => {
+    if (!pushSupported()) return;
+    void (async () => {
+      // A cleared store must not claim "on" when the browser dropped it.
+      if (store.push.endpoint && !(await hasPushSubscription())) await store.setPush({ endpoint: undefined });
+      if (store.push.gatewayUnsupported !== undefined) return;
+      const res = await conn.pushKey();
+      if (res?.ok) await store.setPush({ gatewayUnsupported: false });
+      else if (res && !res.ok && res.error === "unsupported") await store.setPush({ gatewayUnsupported: true });
+    })();
+  }, [store, conn]);
+  if (store.push.gatewayUnsupported) return null;
+  const on = !!store.push.endpoint;
+
+  async function toggle() {
+    if (busy || permission === "denied" || permission === "unsupported") return;
+    setBusy(true);
+    setNote("");
+    try {
+      if (store.push.endpoint) {
+        await conn.pushUnsubscribe();
+        await disablePush();
+        await store.setPush({ endpoint: undefined });
+        setNote("Notifications are off.");
+        return;
+      }
+      if (!online) {
+        setNote("Reconnect to turn notifications on.");
+        return;
+      }
+      const key = await conn.pushKey();
+      if (!key) {
+        setNote("Reconnect to turn notifications on.");
+        return;
+      }
+      if (!key.ok) {
+        if (key.error === "unsupported") await store.setPush({ gatewayUnsupported: true });
+        else setNote("Could not reach notifications on this gateway. Try again.");
+        return;
+      }
+      if (!key.key) {
+        setNote("The gateway did not send a notification key. Try again.");
+        return;
+      }
+      const attempt = await enablePush(key.key);
+      if (attempt.kind !== "subscribed") {
+        setPermission(pushPermission());
+        setNote(attempt.kind === "denied"
+          ? "Notifications are blocked for this app. Allow them in browser settings, then try again."
+          : attempt.kind === "unsupported"
+            ? "This browser cannot receive notifications. On iPhone, open the installed home-screen app."
+            : "Could not subscribe this device. Try again.");
+        return;
+      }
+      const saved = await conn.pushSubscribe(attempt.subscription);
+      if (!saved?.ok) {
+        await disablePush();
+        if (saved?.error === "unsupported") await store.setPush({ gatewayUnsupported: true });
+        else setNote("The gateway did not accept this device. Try again.");
+        return;
+      }
+      await store.setPush({ endpoint: attempt.subscription.endpoint });
+      setPermission(pushPermission());
+      setNote("Notifications are on for this device.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const sub = permission === "unsupported"
+    ? "Not available in this browser. On iPhone, add the app to the home screen first"
+    : permission === "denied"
+      ? "Blocked. Allow notifications for this app in your browser settings"
+      : on ? "On for new messages. Tap to turn off"
+      : online ? "Off. Tap to turn on" : "Off. Reconnect to turn on";
+  return <>
+    <SheetItem icon={BELL_ICON} title="Notifications" sub={sub}
+      disabled={busy || permission === "unsupported" || permission === "denied"} onClick={() => void toggle()} />
+    {note && <p className="sheet-help" role="status">{note}</p>}
   </>;
 }
 
