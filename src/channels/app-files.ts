@@ -102,6 +102,23 @@ export type AppDownloadFile = {
   readonly kind: AttachmentInfo["kind"];
 };
 
+/** The device that owns records an agent stored; no paired device shares it. */
+export const APP_AGENT_DEVICE = "agent";
+
+/** One agent-sent workspace copy, admitted only by the commit that appends its message. */
+export type AppAgentFile = {
+  /** Already referenced: the commit that appends the message is the one that admits it. */
+  readonly record: AppUploadRecord;
+  /** Its wire shape, identical to an owner upload's. */
+  readonly info: AttachmentInfo;
+  /** Delete the stored bytes when the caller's commit does not happen. */
+  discard(): Promise<void>;
+};
+
+export type AppAgentFileOutcome =
+  | { readonly status: "stored"; readonly file: AppAgentFile }
+  | { readonly status: "unavailable" | "too-large" | "empty" | "unreadable" };
+
 /** A refused attachment id; the whole admission is abandoned, so nothing is consumed. */
 export class AppFileRejected extends Error {
   constructor() {
@@ -131,6 +148,22 @@ export type AppFiles = {
     text: string,
     signal?: AbortSignal,
   ): Promise<string | (TextContent | ImageContent)[]>;
+  /**
+   * Store one agent-sent workspace copy as an already-referenced record. The bytes come from the
+   * adapter's own bounded workspace read, so nothing here resolves a path from request input.
+   */
+  storeAgent(request: {
+    /** Stable per tool execution, so a recovered run adopts its own copy instead of a second one. */
+    readonly identity: string;
+    readonly messageId: string;
+    readonly name: string;
+    readonly type: string;
+    readonly kind: "file" | "artifact";
+    readonly bytes: Buffer;
+    readonly maxBytes: number;
+  }): Promise<AppAgentFileOutcome>;
+  /** Admit the referenced record in the caller's commit; refuses when the registry is full. */
+  admitAgent(tx: Tx, file: AppAgentFile): Promise<void>;
   /** The file one durable message references, or `undefined` when it is not downloadable. */
   download(id: string): Promise<AppDownloadFile | undefined>;
   /** Drop unreferenced uploads past their TTL: the record here, then the file. */
@@ -379,6 +412,52 @@ export function createAppFiles(options: {
       if (joined !== "") content.push({ type: "text", text: joined });
       content.push(...images);
       return content;
+    },
+
+    async storeAgent(request): Promise<AppAgentFileOutcome> {
+      if (store === undefined) return { status: "unavailable" };
+      const name = sanitizeOriginalName(request.name);
+      if (name === undefined) return { status: "unreadable" };
+      if (request.bytes.byteLength > request.maxBytes) return { status: "too-large" };
+      if (request.bytes.byteLength === 0) return { status: "empty" };
+      const id = newUploadId();
+      let stored;
+      try {
+        stored = await store.save({
+          kind: STORE_KINDS[request.kind],
+          identity: request.identity,
+          mimeType: request.type,
+          originalName: name,
+          declaredBytes: request.bytes.byteLength,
+          body: (async function* singleChunk() { yield request.bytes; })(),
+        });
+      } catch (error) {
+        if (error instanceof MediaRejected) {
+          return { status: error.reason === "too-large" ? "too-large" : "empty" };
+        }
+        return { status: "unreadable" };
+      }
+      const atMs = now();
+      const record: AppUploadRecord = {
+        id, deviceId: APP_AGENT_DEVICE, name, type: request.type, size: stored.bytes, kind: request.kind,
+        path: stored.relativePath, createdAtMs: atMs, referencedAtMs: atMs, messageId: request.messageId,
+      };
+      return {
+        status: "stored",
+        file: {
+          record,
+          info: { id, name, type: request.type, size: stored.bytes, kind: request.kind },
+          discard: () => store.remove(record.path).catch(() => undefined),
+        },
+      };
+    },
+
+    async admitAgent(tx, file): Promise<void> {
+      const doc = await tx.doc(AppFilesState, conversation.id);
+      // The registry cap is the same one owner uploads respect; the message is not appended if
+      // the record cannot be admitted, so the two never disagree.
+      if (doc.uploads.length >= APP_FILE_LIMITS.maxRecords) throw new AppFileRejected();
+      doc.uploads.push(file.record);
     },
 
     async download(id: string): Promise<AppDownloadFile | undefined> {

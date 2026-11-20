@@ -64,6 +64,12 @@ import {
   type DiscordHistoryRegistry,
 } from "./channels/discord-history.js";
 import {
+  APP_TOOL_NAME,
+  createAppActionRegistry,
+  createAppTool,
+  type AppActionRegistry,
+} from "./channels/app-tool.js";
+import {
   APP_CHAT_SESSION_KEY, APP_STATE_SESSION_KEY, AppState, AppThreadCapacityError, appForkEntry,
   createAppConsoleRegistry, sessionForThread, threadInfo,
   type AppConsoleRegistry, type AppGateway,
@@ -470,6 +476,12 @@ export interface Gateway {
    * `app pair|devices|revoke` commands reach it over the private socket.
    */
   readonly appConsole?: AppConsoleRegistry;
+  /**
+   * Model-action host registry for the app channel's `app` file capability (`send`/`artifact`).
+   * Present only when `config.app` is configured; the running adapter attaches here, and the
+   * runtime offers the tool only in a scope-checked mapped app chat conversation.
+   */
+  readonly appActions?: AppActionRegistry;
   readonly forkAppThread?: NonNullable<AppGateway["forkAppThread"]>;
   readonly appThreadBusy?: NonNullable<AppGateway["appThreadBusy"]>;
   /** Present only when `config.app` is configured: snapshot-slot room and eager thread reservation. */
@@ -1149,6 +1161,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
   const sessionKeyForConversation = new Map<ConversationId, string>();
   const telegramChatConversations = new Set<ConversationId>();
   const discordChatConversations = new Set<ConversationId>();
+  const appChatConversations = new Set<ConversationId>();
   const telegramTool = telegramActions === undefined
     ? undefined
     : createTelegramTool({
@@ -1160,6 +1173,17 @@ export async function openGateway(config: PortConfig, context: Context, options:
         fileSend: config.media !== undefined && toolAllowlist.includes("read"),
       });
   const telegramToolRegistration = telegramTool?.extension.tools?.[0];
+  // Agent file delivery is the app channel's own capability, offered in mapped app chat threads
+  // only while that channel is configured, with its own file storage and a live adapter host.
+  const appActions: AppActionRegistry | undefined =
+    config.app === undefined ? undefined : createAppActionRegistry();
+  const appTool = appActions === undefined || config.media === undefined
+    ? undefined
+    : createAppTool({
+        registry: appActions,
+        sessionKeyFor: (conversationId) => sessionKeyForConversation.get(conversationId),
+      });
+  const appToolRegistration = appTool?.extension.tools?.[0];
   const discordHistoryTool = discordHistory === undefined
     ? undefined
     : createDiscordHistoryTool({
@@ -1226,6 +1250,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
           ...(cronEnabled ? [CRON_TOOL_NAME] : []),
           ...(workersEnabled ? [WORKER_TOOL_NAME] : []),
           ...(telegramTool === undefined ? [] : [TELEGRAM_TOOL_NAME]),
+          ...(appTool === undefined ? [] : [APP_TOOL_NAME]),
           // The read-only Discord history capability is a scoped channel integration, not a coding
           // tool: its own call-time hook decides every scope, so the ceiling must not suppress it.
           ...(discordHistoryTool === undefined ? [] : [DISCORD_HISTORY_TOOL_NAME]),
@@ -1531,6 +1556,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     if (memoryTools && historyConversations.has(conversationId)) selected.push(memoryTools.extension);
     if (webTool && webConversations.has(conversationId)) selected.push(webTool.extension);
     if (telegramTool && telegramChatConversations.has(conversationId)) selected.push(telegramTool.extension);
+    if (appTool && appChatConversations.has(conversationId)) selected.push(appTool.extension);
     if (discordHistoryTool && discordChatConversations.has(conversationId)) selected.push(discordHistoryTool.extension);
     if (cronFoundation && cronTool && cronOwners.has(conversationId)) {
       selected.push(cronFoundation.extension, cronTool.extension);
@@ -2051,6 +2077,11 @@ export async function openGateway(config: PortConfig, context: Context, options:
     const telegramTools = telegramToolRegistration !== undefined && telegramChatConversations.has(conversationId)
       ? [telegramToolRegistration]
       : [];
+    // App file delivery is a scoped channel capability for one mapped app chat thread, never a
+    // coding tool: the live adapter re-derives and rechecks the thread at call time.
+    const appTools = appToolRegistration !== undefined && appChatConversations.has(conversationId)
+      ? [appToolRegistration]
+      : [];
     // Discord history is read-only and host-scoped: the live adapter rechecks the exact session,
     // sender, channel and Discord permissions at call time, so it is offered only in a mapped
     // Discord chat and is never inherited by a worker or a task-owned scope.
@@ -2075,7 +2106,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       ? [...(askUserTool.extension.tools ?? [])]
       : [];
     return [...skillTools, ...cronTools, ...memoryToolsForConversation, ...telegramTools,
-      ...discordHistoryTools, ...webTools, ...workerTools, ...mcpAdminTools, ...askUserTools];
+      ...appTools, ...discordHistoryTools, ...webTools, ...workerTools, ...mcpAdminTools, ...askUserTools];
   };
   /**
    * The authority-derived tool filter. The host ceiling directly authorizes authenticated mapped
@@ -2408,6 +2439,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     if (skillTool) registry.install(skillTool.extension);
     if (memoryTools) registry.install(memoryTools.extension);
     if (telegramTool) registry.install(telegramTool.extension);
+    if (appTool) registry.install(appTool.extension);
     registry.install(askUserTool.extension);
     if (discordHistoryTool) registry.install(discordHistoryTool.extension);
     if (webTool) registry.install(webTool.extension);
@@ -3092,7 +3124,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // conversation can read history, while state-only bookkeeping conversations cannot. Config tool
     // authority is derived from the same validated mapping, so it is loaded whenever either needs it.
     const initialMapping = memoryTools === undefined && !toolsEnabled && telegramTool === undefined
-      && discordHistoryTool === undefined && !workersEnabled
+      && appTool === undefined && discordHistoryTool === undefined && !workersEnabled
       && webTool === undefined && !mcpConfigured && !codeModeEnabled && mcpAdminRef.current === undefined
       ? undefined
       : await harness.snapshot(SessionMap, root.id, context);
@@ -3107,6 +3139,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
         if (workersEnabled) workerSpawners.add(conversationId);
         if (telegramTool !== undefined && sessionKey.startsWith("telegram:")) {
           telegramChatConversations.add(conversationId);
+        }
+        if (appTool !== undefined && sessionKey.startsWith("app:")) {
+          appChatConversations.add(conversationId);
         }
         if (discordHistoryTool !== undefined && sessionKey.startsWith("discord:")) {
           discordChatConversations.add(conversationId);
@@ -4132,6 +4167,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       ...(telegramActions === undefined ? {} : { telegramActions }),
       ...(discordHistory === undefined ? {} : { discordHistory }),
       ...(appConsole === undefined ? {} : { appConsole }),
+      ...(appActions === undefined ? {} : { appActions }),
       askSurfaces,
       get mcp() {
         return mcpRef.current === undefined ? undefined : { servers: mcpRef.current.status };
@@ -4200,6 +4236,11 @@ export async function openGateway(config: PortConfig, context: Context, options:
           telegramChatConversations.add(conversationId!);
         } else {
           telegramChatConversations.delete(conversationId!);
+        }
+        if (mappedChat && sessionKey.startsWith("app:")) {
+          appChatConversations.add(conversationId!);
+        } else {
+          appChatConversations.delete(conversationId!);
         }
         // The same rule for Discord: a scope-checked mapped chat key is the only conversation class
         // offered the read-only history capability.
