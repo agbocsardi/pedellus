@@ -883,6 +883,7 @@ function NotificationsItem({ store, conn, online }: { store: Store; conn: Connec
     }
   }
 
+  const blocked = permission === "unsupported" || permission === "denied";
   const sub = permission === "unsupported"
     ? "Not available in this browser. On iPhone, add the app to the home screen first"
     : permission === "denied"
@@ -890,9 +891,10 @@ function NotificationsItem({ store, conn, online }: { store: Store; conn: Connec
       : on ? (online ? "On for new messages. Tap to turn off" : "On for new messages. Reconnect to turn off")
       : online ? "Off. Tap to turn on" : "Off. Reconnect to turn on";
   return <>
-    <SheetItem icon={BELL_ICON} title="Notifications" sub={sub}
-      disabled={busy || permission === "unsupported" || permission === "denied"} onClick={() => void toggle()} />
-    {note && <p className="sheet-help" role="status">{note}</p>}
+    <SheetItem icon={BELL_ICON} title="Notifications" sub={sub} blocked={blocked}
+      disabled={busy || blocked} onClick={() => void toggle()} />
+    {/* A blocked or unsupported row explains itself; a note would only repeat it. */}
+    {note && !blocked && <p className="sheet-help" role="status">{note}</p>}
   </>;
 }
 
@@ -940,9 +942,9 @@ function ThreadTitleForm({ kind, initial, busy, online, save }: {
   </form>;
 }
 
-function SheetItem(props: { icon: string; title: string; sub?: string; disabled?: boolean; onClick: () => void }) {
+function SheetItem(props: { icon: string; title: string; sub?: string; disabled?: boolean; blocked?: boolean; onClick: () => void }) {
   return (
-    <button className="sheet-item" disabled={props.disabled} onClick={props.onClick}>
+    <button className={props.blocked ? "sheet-item is-blocked" : "sheet-item"} disabled={props.disabled} onClick={props.onClick}>
       <span className="sheet-icon">
         <Icon d={props.icon} />
       </span>

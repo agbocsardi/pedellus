@@ -1029,6 +1029,14 @@ input#pair-code {
   opacity: 0.55;
   cursor: default;
 }
+/* Blocked/unsupported: the explanation stays readable; only the control dims. */
+.sheet-item.is-blocked:disabled {
+  opacity: 1;
+}
+.sheet-item.is-blocked:disabled .sheet-icon,
+.sheet-item.is-blocked:disabled b {
+  opacity: 0.55;
+}
 .sheet-item:not(:disabled):is(:hover, :active),
 .thread-row[aria-current="true"] {
   background: var(--muted);
