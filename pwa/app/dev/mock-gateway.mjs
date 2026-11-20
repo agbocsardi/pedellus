@@ -1,9 +1,13 @@
 #!/usr/bin/env node
 // Development mock of the durable-nanobot gateway's /v1 surface, speaking
 // protocol v2 (../../protocol/v2.md). Pairs with a printed one-time code
-// and has independent fake agent turns per thread. State is in memory.
+// and has independent fake agent turns per thread. State is in memory,
+// including throwaway VAPID keys: pushes are really sent (with web-push) to
+// the stored subscription whenever an answer or notice is produced for a
+// device without an open stream. NO_PUSH=1 makes push look unconfigured.
 import { randomBytes, randomInt } from "node:crypto";
 import http from "node:http";
+import { generateVAPIDKeys, sendNotification, setVapidDetails } from "web-push";
 import { WebSocketServer } from "ws";
 
 const PORT = Number(process.env.PORT || 8791);
@@ -15,6 +19,18 @@ const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const REPLAY_BATCH = 500;
 const MAX_MESSAGE_PARTS = 64;
 const IDLE_ARCHIVE_MS = Number(process.env.IDLE_ARCHIVE_MS ?? 14 * 24 * 60 * 60 * 1000);
+// Push is on by default, with throwaway VAPID keys made at start. Set NO_PUSH=1
+// to make `push.key`/`push.subscribe` answer `unsupported`, like a gateway
+// without push configured.
+const PUSH = process.env.NO_PUSH !== "1";
+const PUSH_ENDPOINT_MAX = 2_048;
+const PUSH_P256DH_MAX = 128;
+const PUSH_AUTH_MAX = 64;
+const PUSH_UNREAD_CAP = 99;
+// One device's send is abandoned after this, so a push service that never
+// answers cannot hold that device in flight.
+const PUSH_TIMEOUT_MS = Number(process.env.PUSH_TIMEOUT_MS ?? 10_000);
+const B64URL = /^[A-Za-z0-9_-]+$/;
 const LABEL_RE = /^[^\p{Cc}\u2028\u2029]{1,40}$/u;
 const TITLE_RE = /^[^\p{Cc}\u2028\u2029]{1,80}$/u;
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // [A-Z2-9] minus I, O
@@ -32,6 +48,12 @@ const tokens = new Map();
 const admitted = new Map();
 /** token -> highest acked cursor */
 const acks = new Map();
+/** token -> { endpoint, keys }; one subscription per device */
+const subscriptions = new Map();
+/** device tokens whose push send is in flight */
+const pushing = new Set();
+const vapid = PUSH ? generateVAPIDKeys() : null;
+if (vapid) setVapidDetails("mailto:mock@durable.invalid", vapid.publicKey, vapid.privateKey);
 /** all durable events, cursor ascending */
 const events = [];
 let cursor = 0;
@@ -78,6 +100,11 @@ function broadcast(ev) {
   if (isDurable(ev)) {
     ev.cursor = ++cursor;
     events.push(ev);
+    // A new answer or notice is the only thing worth waking a sleeping
+    // device for. A split message wakes once, on its first part.
+    if (ev.event === "message" && (ev.role === "assistant" || ev.role === "notice") && !ev.part?.i) {
+      void pushDevices(ev.thread);
+    }
   }
   const frame = JSON.stringify(ev);
   for (const s of sockets) {
@@ -136,6 +163,73 @@ function emitMessage(thread, { text, ...fields }) {
     return;
   }
   parts.forEach((part, i) => emit(thread, "message", { ...fields, text: part, part: { i, n: parts.length } }));
+}
+
+// -- Web Push ---------------------------------------------------------------
+
+/** A device with a hello'd, open stream gets no push. */
+function streamOpen(token) {
+  for (const s of sockets) {
+    if (s.token === token && s.helloed && s.ws.readyState === s.ws.OPEN) return true;
+  }
+  return false;
+}
+
+/** Durable assistant/notice messages above this device's acked cursor. */
+function unreadFor(token) {
+  const acked = acks.get(token) ?? 0;
+  let n = 0;
+  for (const ev of events) {
+    if (ev.cursor <= acked || ev.event !== "message") continue;
+    if (ev.role !== "assistant" && ev.role !== "notice") continue;
+    if (ev.part && ev.part.i !== 0) continue;
+    n++;
+  }
+  return Math.min(n, PUSH_UNREAD_CAP);
+}
+
+/** Topic header: a newer push for one thread replaces an undelivered older one. */
+const topicFor = (thread) => Buffer.from(thread, "utf8").toString("base64url").slice(0, 32);
+
+/**
+ * One device. Runs beside the others (not after them) and is bounded by its own
+ * socket timeout, so a hung endpoint delays nobody and frees its in-flight flag.
+ */
+async function pushOne(token, sub, thread) {
+  pushing.add(token);
+  const payload = { v: 2, thread, unread: unreadFor(token) };
+  const device = tokens.get(token) ?? "device";
+  console.log(`push → "${device}": thread ${thread}, unread ${payload.unread}`);
+  try {
+    await sendNotification({ endpoint: sub.endpoint, keys: sub.keys }, JSON.stringify(payload), {
+      TTL: 24 * 60 * 60,
+      urgency: "normal",
+      topic: topicFor(thread),
+      timeout: PUSH_TIMEOUT_MS,
+    });
+  } catch (err) {
+    const status = err?.statusCode;
+    if (status === 404 || status === 410) {
+      // The push service dropped this subscription; forget it.
+      subscriptions.delete(token);
+      console.log(`push subscription gone (${status}); removed "${device}"`);
+    } else {
+      console.log(`push failed for "${device}": ${status ?? err?.message ?? "unknown error"}`);
+    }
+  } finally {
+    pushing.delete(token);
+  }
+}
+
+/** Content-free payload, never message text (protocol v2, Notifications). */
+async function pushDevices(thread) {
+  if (!PUSH) return;
+  const sends = [];
+  for (const [token, sub] of subscriptions) {
+    if (pushing.has(token) || streamOpen(token)) continue;
+    sends.push(pushOne(token, sub, thread));
+  }
+  await Promise.allSettled(sends);
 }
 
 // -- fake agent turns -------------------------------------------------------
@@ -493,6 +587,34 @@ function onStream(ws, token) {
         reply(ws, frame.id, true);
         break;
       }
+      case "push.key": {
+        if (!PUSH || !vapid) return reply(ws, frame.id, false, { error: "unsupported" });
+        reply(ws, frame.id, true, { key: vapid.publicKey });
+        break;
+      }
+      case "push.subscribe": {
+        if (!PUSH) return reply(ws, frame.id, false, { error: "unsupported" });
+        const sub = frame.subscription;
+        const key = sub?.keys;
+        const ok = !!sub && typeof sub === "object"
+          && typeof sub.endpoint === "string" && /^https:\/\//.test(sub.endpoint)
+          && sub.endpoint.length <= PUSH_ENDPOINT_MAX
+          && !!key && typeof key === "object"
+          && typeof key.p256dh === "string" && key.p256dh.length <= PUSH_P256DH_MAX && B64URL.test(key.p256dh)
+          && typeof key.auth === "string" && key.auth.length <= PUSH_AUTH_MAX && B64URL.test(key.auth);
+        if (!ok) return invalid();
+        // One subscription per device; a new one replaces the old.
+        subscriptions.set(token, { endpoint: sub.endpoint, keys: { p256dh: key.p256dh, auth: key.auth } });
+        reply(ws, frame.id, true);
+        console.log(`push subscription set for "${device}"`);
+        break;
+      }
+      case "push.unsubscribe": {
+        if (!PUSH) return reply(ws, frame.id, false, { error: "unsupported" });
+        subscriptions.delete(token); // idempotent
+        reply(ws, frame.id, true);
+        break;
+      }
       case "history":
       case "tasks": {
         reply(ws, frame.id, false, { error: "unsupported" });
@@ -507,4 +629,5 @@ function onStream(ws, token) {
 
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`mock gateway on http://127.0.0.1:${PORT} (pair code ${pairCode})`);
+  if (!PUSH) console.log("push: disabled (NO_PUSH=1)");
 });

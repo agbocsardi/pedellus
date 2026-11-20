@@ -10,6 +10,11 @@ export type AgentStatus = Pick<StatusEvent, "state" | "label">;
 type ChatEvent = Exclude<DurableEvent, { event: "thread" }>;
 type Identity = { device?: string; agent?: string; commands?: CommandInfo[]; presets?: PresetInfo[] };
 type LiveStatus = AgentStatus & { turnKey?: string };
+/**
+ * Web Push opt-in. `endpoint` is set only once the gateway accepted it; `key`
+ * is the gateway VAPID key that subscription was made with.
+ */
+export type PushState = { endpoint?: string; key?: string; gatewayUnsupported?: boolean };
 
 interface Db extends DBSchema {
   events: { key: number; value: DurableEvent };
@@ -17,7 +22,10 @@ interface Db extends DBSchema {
   threads: { key: string; value: ThreadInfo };
   creates: { key: string; value: ThreadCreate };
   view: { key: string; value: { thread: ThreadId; cursor: number } };
-  settings: { key: "openThread" | "resumeCursor" | "identity"; value: ThreadId | number | Identity };
+  settings: {
+    key: "openThread" | "resumeCursor" | "identity" | "push";
+    value: ThreadId | number | Identity | PushState;
+  };
 }
 
 const IDLE: AgentStatus = { state: "idle" };
@@ -38,6 +46,8 @@ export class Store {
   creates = new Map<string, ThreadCreate>();
   threadListUnavailable = false;
   forkRejected = false;
+  /** Persisted push enrolment; the service worker reads its own copies. */
+  push: PushState = {};
   openThread: ThreadId = MAIN_THREAD;
   connState: ConnState = "offline";
   mode: Mode = "boot";
@@ -46,6 +56,8 @@ export class Store {
   replayReady = false;
   /** Max seen can be ahead of a replay gap; only resumeCursor is safe for hello. */
   cursor: number | null = null;
+  /** Highest cursor the gateway was sent in an `ack`; null until the first one. */
+  ackedCursor: number | null = null;
   resumeCursor: number | null = null;
 
   // Status is live; hello resends it rather than replaying it from storage.
@@ -110,11 +122,11 @@ export class Store {
     this.storageBlocked = false;
     // Load the replay checkpoint and everything it covers from one snapshot.
     const tx = db.transaction(["events", "outbox", "threads", "creates", "view", "settings"], "readonly");
-    const [events, outbox, threads, creates, viewed, open, resume, identity] = await Promise.all([
+    const [events, outbox, threads, creates, viewed, open, resume, identity, push] = await Promise.all([
       tx.objectStore("events").getAll(), tx.objectStore("outbox").getAll(),
       tx.objectStore("threads").getAll(), tx.objectStore("creates").getAll(), tx.objectStore("view").getAll(),
       tx.objectStore("settings").get("openThread"), tx.objectStore("settings").get("resumeCursor"),
-      tx.objectStore("settings").get("identity"), tx.done,
+      tx.objectStore("settings").get("identity"), tx.objectStore("settings").get("push"), tx.done,
     ]).catch((err) => { db.close(); throw err; });
     if (!closed) this.db = db;
     const cachedThreads = new Set(threads.map((t) => t.id));
@@ -146,7 +158,8 @@ export class Store {
       this.openThread = open;
     }
     if (typeof resume === "number") this.resumeCursor = resume;
-    if (typeof identity === "object" && identity) this.identity = identity;
+    if (typeof identity === "object" && identity) this.identity = identity as Identity;
+    if (typeof push === "object" && push) this.push = push as PushState;
     this.changed();
   }
 
@@ -462,6 +475,13 @@ export class Store {
     }
   }
 
+  /** The gateway holds an `ack` for this cursor; drives "acked everything" UI. */
+  setAcked(cursor: number) {
+    if (this.ackedCursor !== null && cursor <= this.ackedCursor) return;
+    this.ackedCursor = cursor;
+    this.changed();
+  }
+
   setMode(m: Mode) {
     if (this.mode !== m) {
       this.mode = m;
@@ -481,6 +501,16 @@ export class Store {
     this.searchCache = undefined;
     this.changed();
     void this.db?.put("settings", this.identity, "identity").catch(console.error);
+  }
+
+  /** Merge a push state change; unchanged values do not re-render. */
+  async setPush(patch: PushState) {
+    const next: PushState = { ...this.push, ...patch };
+    if (next.endpoint === this.push.endpoint && next.key === this.push.key
+      && next.gatewayUnsupported === this.push.gatewayUnsupported) return;
+    this.push = next;
+    this.changed();
+    await this.db?.put("settings", next, "push").catch(console.error);
   }
 
   async createOutgoing(thread: ThreadId, text: string, retryKey?: string): Promise<Outgoing> {

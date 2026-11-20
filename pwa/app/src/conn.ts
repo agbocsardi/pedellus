@@ -6,6 +6,7 @@ import {
   type CommandInfo,
   type ControlCommand,
   type PresetInfo,
+  type PushSubscriptionInfo,
   type Request,
   type Response,
   type ServerFrame,
@@ -94,6 +95,19 @@ export class Connection {
 
   archive(thread: ThreadId, archived: boolean) {
     return this.mutate({ type: "req", id: this.id(), op: "thread.archive", thread, archived });
+  }
+
+  /** The VAPID public key to subscribe to; `unsupported` when push is off. */
+  pushKey() {
+    return this.mutate({ type: "req", id: this.id(), op: "push.key" });
+  }
+
+  pushSubscribe(subscription: PushSubscriptionInfo) {
+    return this.mutate({ type: "req", id: this.id(), op: "push.subscribe", subscription });
+  }
+
+  pushUnsubscribe() {
+    return this.mutate({ type: "req", id: this.id(), op: "push.unsubscribe" });
   }
 
   private mutate(frame: Request): Promise<Response | undefined> {
@@ -423,7 +437,7 @@ export class Connection {
     if (this.ws !== ws || !this.replayComplete || this.ackFrozen) return;
     try {
       if (await this.store.checkpoint(cursor) && this.ws === ws && !this.ackFrozen) {
-        this.write({ type: "req", id: this.id(), op: "ack", cursor });
+        if (this.write({ type: "req", id: this.id(), op: "ack", cursor })) this.store.setAcked(cursor);
       }
     } catch (err) {
       this.ackFrozen = true;
