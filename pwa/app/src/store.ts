@@ -55,6 +55,8 @@ export class Store {
   private pendingModels = new Map<ThreadId, string>();
   private unfinished = new Map<ThreadId, Set<string>>();
   private viewed = new Map<ThreadId, number>();
+  /** Split messages by `${thread}\u0000${id}`: the parts received so far, keyed by `i`. */
+  private splitMessages = new Map<string, { n: number; texts: Map<number, string> }>();
   private db: IDBPDatabase<Db> | null = null;
   private queueChanges = typeof BroadcastChannel === "undefined" ? undefined : new BroadcastChannel("durable-app-queue");
   private durableWriteFailed = false;
@@ -227,6 +229,7 @@ export class Store {
       const text = normalize(ev.text);
       this.searchText.set(ev.cursor, { text, lower: text.toLowerCase() });
       this.searchCache = undefined;
+      if (ev.part) this.absorbPart(ev.thread, ev.id, ev.part.n, ev.part.i, ev.text);
     }
     let events = this.events.get(ev.thread);
     if (!events) this.events.set(ev.thread, events = []);
@@ -253,6 +256,26 @@ export class Store {
         if (m && !terminal(m.state)) return this.updateOutgoing(m, ev.outcome);
       }
     }
+  }
+
+  /** Record one part of a split message (protocol v2, "Long messages"); a replay may repeat one. */
+  private absorbPart(thread: ThreadId, id: string, n: number, index: number, text: string) {
+    const key = `${thread}\u0000${id}`;
+    let split = this.splitMessages.get(key);
+    if (!split) this.splitMessages.set(key, split = { n, texts: new Map() });
+    split.n = Math.max(split.n, n);
+    split.texts.set(index, text);
+  }
+
+  /**
+   * A split message's text as received so far, joined in part order, and whether every one of its
+   * `n` parts arrived. `undefined` for a message that was never split.
+   */
+  splitMessage(thread: ThreadId, id: string): { text: string; complete: boolean } | undefined {
+    const split = this.splitMessages.get(`${thread}\u0000${id}`);
+    if (!split) return undefined;
+    const texts = [...split.texts].sort((left, right) => left[0] - right[0]).map(([, text]) => text);
+    return { text: texts.join(""), complete: texts.length === split.n };
   }
 
   private updateOutgoing(m: Outgoing, state: OutgoingState): Outgoing {

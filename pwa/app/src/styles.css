@@ -600,6 +600,23 @@ input#pair-code {
   display: block;
   overflow-x: auto;
 }
+/* A split message shown before every part has arrived (protocol v2, Long messages). */
+.msg-partial {
+  display: block;
+  margin-top: 6px;
+  color: var(--muted-ink);
+  font-size: 0.78rem;
+  font-style: italic;
+}
+.notice .msg-partial,
+.bubble .msg-partial {
+  display: inline;
+  margin-top: 0;
+}
+.notice .msg-partial::before,
+.bubble .msg-partial::before {
+  content: " · ";
+}
 
 .row.user {
   display: flex;
