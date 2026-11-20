@@ -11,7 +11,8 @@ shared limits, close codes and hello/thread shapes from `src/channels/generated/
 `npm run typecheck`) and adds the gateway-only bounds and pure validation;
 `src/channels/app-listener.ts` owns transport mechanics (sockets, bodies, cookies, MIME types,
 path safety); `src/channels/app.ts` owns admission, the durable event log, controls, pairing and
-the operator console.
+the operator console; `src/channels/app-files.ts` owns uploads, their durable records, attachment
+context and the download lookup.
 
 Status: offline-verified only. No tailnet, `tailscale serve`, real device, installed PWA or live
 pairing has been exercised in this repository. The first deployment is a supervised trial.
@@ -33,6 +34,10 @@ listener is loaded.
 | `staticRoot` | Required absolute directory holding the built PWA. Files are served with safe path resolution (no traversal, no directory listing, encoded separators are not structure), correct MIME types and `index.html` for the root; `sw.js` is always served `no-store`. |
 | `autoArchiveDays` | Optional integer ≥1, default 14. Automatically archive inactive side threads, but never while they have running or queued work. |
 | `agentName` | Optional agent display name, 1–40 printable characters, default `Durable`. Sent as `agent` in every `hello` reply; display only, no authority. |
+
+Uploads and attachments are the existing top-level `media` opt-in — the same block Telegram uses —
+not a new `app` key: with it configured, `hello.uploads` is `true` and originals live under
+`<workspace>/<media.directory>/app`. Without it the app has no upload surface at all.
 
 The block is strict: an unrecognized key is refused at startup instead of being ignored, like the
 Discord block. The listener ignores Tailscale identity headers by construction: any local process
@@ -183,6 +188,61 @@ grouped by error text); an abort or `/new` reset settles `aborted`. An empty ans
 a fixed notice. `followUpMode: "steer"` submits with native `whenBusy: "steer"` under the same
 owner-run check as Telegram.
 
+## Files
+
+Uploads, attachments and downloads follow protocol v2's *Files* section and are available only when
+the top-level `media` block is configured: then `hello.uploads` is `true`, `POST /v1/upload` accepts
+originals and `send.attachments` attaches them. Otherwise the app hides the attach control, an
+upload is the fixed `400 unsupported`, and a send naming ids (which cannot exist) is `bad_request`.
+
+- **Upload.** `POST /v1/upload` is cookie-authenticated exactly like the stream. The body is the raw
+  bytes (no multipart); `Content-Type` is the announced type and `X-Filename` the percent-encoded
+  UTF-8 original name, 1–120 characters after decoding. The listener streams the body straight into
+  the shared media store with a hard `LIMITS.uploadBytes` cap: an advertised length over the cap is
+  refused before a byte is read, an actually-received body over it is aborted and answered `413`,
+  and nothing is buffered whole. `201 {"id":"f_…"}` is answered only after the record is durable;
+  `400 bad_request` (missing, oversize or undecodable name; empty file), `400 unsupported`,
+  `401 unauthorized`, `413 too_large`, `429 rate_limited`.
+- **Storage.** Originals are written byte-for-byte under `<workspace>/<media.directory>/app`
+  (default `media/app`), a code-owned child of the operator's media directory, with the shared
+  store's atomic publication, private permissions and symlink refusal. The path is derived from the
+  random upload id, never from the announced name; the announced type only picks the locator's
+  known extension, and an unknown type is stored as a generic original. Nothing is sniffed and
+  nothing is written to `dataDir`. Stored originals stay ordinary workspace files the configured
+  coding tools can read, like Telegram's.
+- **Pending records.** One durable document next to the channel state holds
+  `{id, deviceId, name, type, size, kind, path, createdAtMs}` per upload, plus the reference once a
+  message used it. An upload is private to the device that made it and unusable until an admitted
+  `send` references it; an unreferenced upload older than 24 hours is discarded — record first,
+  then file — by the adapter's scan (the work is throttled to once a minute). Gateway-only bounds:
+  at most 200 unreferenced uploads per device and 4 000 records in total, both answered
+  `429 rate_limited`; `LIMITS.uploadsPerMinute` is a rolling per-device window held in memory, so a
+  restart clears it (like the pairing window). Referenced records and their files are kept, because
+  a message that showed a file must stay downloadable.
+- **Attach.** `send.attachments` lists up to `LIMITS.maxAttachments` upload ids from this device,
+  each used at most once; `text` may then be empty. The claim runs inside the same durable commit
+  as the echo, the idempotency key and the pending input: an unknown, foreign, expired or reused id
+  refuses the whole send with `bad_request` and records nothing — not even the key, so the upload is
+  still usable afterwards. A repeated `send.key` stays `duplicate` and claims nothing.
+- **Echo.** The admitted user `message` carries `attachments: AttachmentInfo[]` (`id`, bounded
+  `name`, announced `type`, `size`, and `kind` from the announced type only) in send order, on the
+  first part only when the message is split.
+- **What the agent sees** is exactly Telegram's media handling: the send text, then one labeled
+  block per attachment with the bounded untrusted metadata and the workspace-relative locator;
+  images are additionally submitted as native image content (base64 + announced type, no vision
+  call and no preprocessing); audio is transcribed locally when transcription is configured, and
+  says so truthfully when it is disabled, fails or times out; documents are never extracted, and
+  their block says so instead of implying the file was read. A missing stored file is reported as
+  such rather than described.
+- **Download.** `GET /v1/files/<id>` is cookie-authenticated, and any paired device may fetch a file
+  a durable message references. Headers are fixed: the stored type,
+  `X-Content-Type-Options: nosniff`, `Content-Security-Policy: sandbox`,
+  `Cache-Control: private, max-age=31536000, immutable`, and `Content-Disposition: inline` for
+  `image/*` and `audio/*`, `attachment; filename*=UTF-8''…` otherwise. Every other id — pending,
+  pruned, foreign-shaped or malformed — is `404`, and the id shape is checked before any state is
+  read. The served path is the one the store resolved inside its media root; it is never built from
+  request input. `HEAD` answers the same headers without the body.
+
 ## Controls
 
 The `control` op takes `command` (a name from `hello.commands`) and optional `args` (≤ 1 000
@@ -239,6 +299,10 @@ with a fixed reason and a durable fault entry; no raw record contents are logged
 * A delivery that keeps failing is held after ten attempts (`held: true`), never resent
   automatically.
 * Device sockets are bounded by the 16-device pairing limit; the pairing rate window is one minute.
+* Upload records are bounded (200 unreferenced per device, 4 000 total) and uploads are rate limited
+  per device and minute; a refused upload stores no bytes. Referenced originals are never deleted by
+  the adapter and there is no total-disk cap — keeping the workspace media directory bounded is the
+  operator's job, exactly as for Telegram.
 
 ## Known gaps (phase 1)
 
@@ -246,8 +310,12 @@ with a fixed reason and a durable fault entry; no raw record contents are logged
   surface is registered, so the login is refused before delivery) and cannot receive an
   `ask_user` question. Protocol v2 defines no owner-only non-durable event; a later protocol
   revision must add one before this channel can carry URLs or questions.
-* **No uploads, media, history, tasks, cards or Web Push.** The protocol marks them *later*;
-  `history` and `tasks` reply `unsupported`; a `send` with `attachments` replies `unsupported`.
+* **No history, tasks, cards or Web Push.** The protocol marks them *later*; `history` and `tasks`
+  reply `unsupported`. Files are implemented (see *Files*), but with no thumbnails, resumable or
+  multipart uploads, per-file deletion, or a `message.attachments` entry for files the agent sends
+  back to the app: outbound files are only the workspace locator in the answer text.
+* **The upload rate window is in-memory.** A restart clears it, like the pairing window; the durable
+  per-device and total record bounds still apply.
 * **The event log is capped at 2 000.** Beyond it the oldest events are dropped even if
   unacknowledged; a returning device below the floor replays from the floor with a visible cursor
   gap.
@@ -291,6 +359,13 @@ command reported, held acknowledgement released, a pre-restart turn still answer
 (`settled{failed}` with the error presence state), revocation, oversize frames and callback
 interception. v2 coverage includes thread lifecycle, search and list limits, concurrent turns and
 replay, fork context and scope checks after reopen, idle archive, interruption recovery, and cron restore.
+Files coverage: the opt-in (upload and `send.attachments` refused without `media`, `hello.uploads`),
+a durable upload record with byte-for-byte storage, the advertised and streamed `413` with nothing
+stored, name bounds and traversal-shaped names, the per-device rate window, an image riding a send
+into the echo and the model turn as native image content, unknown/foreign/expired/reused ids
+refusing the whole send without consuming anything, and download headers (`inline` for media types,
+`filename*` for documents) with `401` for an unpaired request and `404` for pending, malformed or
+unreferenced ids.
 No tailnet, device, credential or paid inference is
 used. The `app pair`/`devices`/`revoke` local-socket dispatch is exercised through the same console
 host the running adapter exports; the thin socket layer itself follows the `cron` console's

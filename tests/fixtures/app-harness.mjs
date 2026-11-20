@@ -20,6 +20,7 @@ export const { openGateway } = await import(new URL('../../dist/runtime.js', imp
 export const { runApp, AppState, APP_CHAT_SESSION_KEY, validateOptions } = await import(
   new URL('../../dist/channels/app.js', import.meta.url).href
 );
+export const { AppFilesState } = await import(new URL('../../dist/channels/app-files.js', import.meta.url).href);
 export const { APP_LIMITS, APP_CLOSE, resolveStaticPath, staticMimeType } = await import(
   new URL('../../dist/channels/app-protocol.js', import.meta.url).href
 );
@@ -275,3 +276,21 @@ export function userTexts(captured) {
 }
 
 export { assert };
+
+/** The committed upload registry of the app state conversation, for direct assertions and seeding. */
+export async function appFilesState(gateway) {
+  const conversation = await gateway.conversationFor('app:channel-state', context);
+  return conversation.commit(async (tx) => {
+    const doc = await tx.doc(AppFilesState, conversation.id);
+    return JSON.parse(JSON.stringify(doc));
+  }, context);
+}
+
+/** Seed one upload record as an earlier session (or a lapsed TTL) would have left it. */
+export async function seedUpload(gateway, record) {
+  const conversation = await gateway.conversationFor('app:channel-state', context);
+  await conversation.commit(async (tx) => {
+    const doc = await tx.doc(AppFilesState, conversation.id);
+    doc.uploads.push(record);
+  }, context);
+}
