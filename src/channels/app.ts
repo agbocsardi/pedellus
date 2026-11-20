@@ -2626,14 +2626,10 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     }
   };
 
-  /** Discard unreferenced uploads past their TTL; a failure is retried by the next scan. */
+  /** Discard unreferenced uploads past their TTL; a failed pass is retried by the next scan. */
   const pruneUploads = async (): Promise<void> => {
     if (!files.available) return;
-    try {
-      await files.prune(now());
-    } catch (error) {
-      if (!signal?.aborted) journalEvent("app.uploads.prune.failed", {}, error);
-    }
+    await files.prune(now());
   };
 
   const requestScheduledScan = (): void => {

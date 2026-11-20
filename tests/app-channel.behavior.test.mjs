@@ -1871,3 +1871,41 @@ test('documents are located, not read, and download as attachments', { timeout: 
     await client.close();
   });
 });
+
+test('uploads nobody referenced are discarded after 24 hours and referenced ones stay', { timeout: 30_000 }, async () => {
+  await withChannel('files-ttl', { media: { directory: 'media' }, adapter: { scanIntervalMs: 50 } }, async ({ store, base, app }) => {
+    const cookie = await pairedDevice(store, base);
+    const kept = await uploadFile(base, cookie, 'keep.png', 'image/png', PNG_BYTES);
+    const dropped = await uploadFile(base, cookie, 'drop.png', 'image/png', PNG_BYTES);
+    const client = await openDevice(base, cookie);
+    client.send({ type: 'req', id: 'send-keep', op: 'send', key: 'k-keep', text: 'kept', attachments: [kept.body.id] });
+    await client.wait(() => client.response('send-keep') !== undefined, 'send reply');
+
+    const before = await appFilesState(store.gateway);
+    const keptPath = join(store.workspace, ...before.uploads.find((entry) => entry.id === kept.body.id).path.split('/'));
+    const droppedPath = join(store.workspace, ...before.uploads.find((entry) => entry.id === dropped.body.id).path.split('/'));
+    assert.equal((await readFile(keptPath)).equals(PNG_BYTES), true, 'the referenced original is stored');
+    assert.equal((await readFile(droppedPath)).equals(PNG_BYTES), true, 'the unreferenced original is stored');
+
+    // The clock, not a sleep, decides expiry: one scan pass later the lapsed record and file are gone.
+    app.clock.now += 25 * 60 * 60_000;
+    await untilAsync(async () => (await appFilesState(store.gateway)).uploads.length === 1, 'the unreferenced upload is pruned');
+    const after = await appFilesState(store.gateway);
+    assert.deepEqual(after.uploads.map((entry) => entry.id), [kept.body.id], 'the referenced record stays');
+    assert.equal(typeof after.uploads[0].referencedAtMs, 'number', 'the durable reference is what kept it');
+    assert.equal(after.uploads[0].messageId, 'send:k-keep', 'the reference names the message that used it');
+    await untilAsync(async () => {
+      try {
+        await stat(droppedPath);
+        return false;
+      } catch {
+        return true;
+      }
+    }, 'the unreferenced file is removed');
+    assert.equal((await readFile(keptPath)).equals(PNG_BYTES), true, 'the referenced file stays downloadable');
+    const download = await fetch(`${base}/v1/files/${kept.body.id}`, { headers: { cookie } });
+    assert.equal(download.status, 200, 'a referenced file survives the TTL');
+    await download.arrayBuffer();
+    await client.close();
+  });
+});

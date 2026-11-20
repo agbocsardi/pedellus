@@ -203,21 +203,30 @@ export function createAppFiles(options: {
     return false;
   };
 
+  /**
+   * Drop unreferenced uploads past their TTL: the record commits first, then the file. A failed
+   * pass deletes nothing (the records survived it) and is simply retried by the next scan.
+   */
   const prune = async (atMs: number): Promise<void> => {
     if (store === undefined || atMs - lastPrunedAtMs < APP_FILE_LIMITS.pruneIntervalMs) return;
     lastPrunedAtMs = atMs;
     const expired: AppUploadRecord[] = [];
-    await conversation.commit(async (tx) => {
-      const doc = await tx.doc(AppFilesState, conversation.id);
-      const keep: Draft<AppUploadRecord>[] = [];
-      for (const record of doc.uploads) {
-        // A referenced upload stays downloadable for as long as its message exists.
-        if (record.referencedAtMs === undefined && atMs - record.createdAtMs >= APP_FILE_LIMITS.uploadTtlMs) {
-          expired.push({ ...record });
-        } else keep.push(record);
-      }
-      if (expired.length > 0) doc.uploads = keep;
-    }, context);
+    try {
+      await conversation.commit(async (tx) => {
+        const doc = await tx.doc(AppFilesState, conversation.id);
+        const keep: Draft<AppUploadRecord>[] = [];
+        for (const record of doc.uploads) {
+          // A referenced upload stays downloadable for as long as its message exists.
+          if (record.referencedAtMs === undefined && atMs - record.createdAtMs >= APP_FILE_LIMITS.uploadTtlMs) {
+            expired.push({ ...record });
+          } else keep.push(record);
+        }
+        if (expired.length > 0) doc.uploads = keep;
+      }, context);
+    } catch {
+      lastPrunedAtMs = Number.NEGATIVE_INFINITY;
+      return;
+    }
     for (const record of expired) await store.remove(record.path).catch(() => undefined);
   };
 
