@@ -591,11 +591,14 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
       // pairing, devices and the durable event log; this host only supplies the explicit config.
       stage = "gateway.app";
       const { runApp } = await import("./channels/app.js");
+      // The private key is read once here, from the configured variable, and never stored.
+      const push = config.app.push === undefined ? undefined : resolvePushOptions(config.app.push);
       channels.start("gateway.app", runApp(gateway, {
         port: config.app.port,
         staticRoot: config.app.staticRoot,
         autoArchiveDays: config.app.autoArchiveDays ?? 14,
         agentName: config.app.agentName ?? "Durable",
+        ...(push === undefined ? {} : { push }),
         followUpMode: config.followUpMode ?? "followUp",
         restart: restartHost,
       }, context));

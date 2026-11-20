@@ -766,6 +766,42 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     return state;
   };
 
+  // ── Web Push: content-free notifications to devices with no open stream ──
+
+  const push: AppPushDispatcher | undefined = options.push === undefined ? undefined : createAppPushDispatcher({
+    options: options.push,
+    // Read at send time, so a coalesced follow-up carries the latest unread count.
+    snapshot(deviceId, thread) {
+      const device = state.devices.find((entry) => entry.id === deviceId && entry.revokedAtMs === undefined);
+      const subscription = device?.pushSubscription;
+      if (subscription === undefined) return undefined;
+      const acked = state.acks[deviceId] ?? 0;
+      let unread = 0;
+      for (const event of state.events) {
+        if (event.event === "message" && event.role !== "user" && event.cursor > acked) unread += 1;
+      }
+      return { subscription, payload: pushPayload(thread, unread) };
+    },
+    gone(deviceId, endpoint) {
+      void mutateState((doc) => {
+        const device = doc.devices.find((entry) => entry.id === deviceId);
+        // A replacement subscription is not this dead one; only the failed endpoint is dropped.
+        if (device?.pushSubscription?.endpoint === endpoint) delete device.pushSubscription;
+      }).catch(() => undefined);
+    },
+  });
+
+  /** One push per subscribed device without an open, hello'd stream; never message text. */
+  const notifyPush = (thread: string): void => {
+    if (push === undefined) return;
+    for (const device of state.devices) {
+      if (device.revokedAtMs !== undefined || device.pushSubscription === undefined) continue;
+      const live = sockets.get(device.id);
+      if (live !== undefined && live.hello && live.session.isOpen()) continue;
+      push.notify(device.id, thread);
+    }
+  };
+
   // ── Egress: the durable cursor log, replayed and pushed ──────────────────
 
   const wireEvent = (event: AppDurableEvent): string =>
@@ -1327,6 +1363,8 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     }
     if (blocked !== undefined) return sendError(blocked);
     pushEventsToSockets();
+    // Only a callback refusal appended a durable notice; a user echo or duplicate never pushes.
+    if (callback && !duplicate) notifyPush(thread);
     sendOk({ duplicate });
     if (!duplicate && !callback) {
       journalEvent("app.admitted", { "send.key": key, "queue.depth": state.pending.length });
@@ -1395,6 +1433,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     if (item.notice === true) {
       // Idempotent by the notice's own admission stamp: a redelivery after a crash appends nothing.
       const id = `notice:${item.key}#${item.noticeSeq ?? item.admittedAtMs}`;
+      let appended = false;
       await mutateState((doc) => {
         if (hasEventId(doc, id)) return;
         appendEvent(doc, {
@@ -1405,8 +1444,10 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           text: item.text,
           at: new Date(now()).toISOString(),
         });
+        appended = true;
       });
       pushEventsToSockets();
+      if (appended) notifyPush(thread);
       await forget(item.key);
       return;
     }
@@ -1582,6 +1623,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     answerEntry: number,
     answerText: string,
   ): Promise<void> => {
+    let appended = false;
     state = await stateConversation.commit(async (tx) => {
       const doc = await tx.doc(AppState, stateConversation.id);
       const members: { key: string; submissionId: number }[] = [];
@@ -1609,12 +1651,14 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         for (const member of members) {
           appendEvent(doc, { event: "settled", thread, key: member.key, outcome: "answered" });
         }
+        appended = true;
       }
       doc.pending = doc.pending.filter((entry) => !retired.has(entry.key));
       doc.controls = pruneControls(doc.controls, doc.pending);
       return copyJson(doc) as unknown as AppChannelState;
     }, cleanupContext);
     pushEventsToSockets();
+    if (appended) notifyPush(thread);
   };
 
   /** A repeatedly failing delivery is held for inspection, exactly like the other channels. */
@@ -2459,6 +2503,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     // The restore, event append and settlement share a commit. Replaying a stale scan cannot
     // append again, even after the original event has been trimmed.
     let restored = false;
+    let appended = false;
     await outbox.update(sessionKey, record.id, async (entry, tx) => {
       if (entry.status !== "pending" || entry.sessionKey !== sessionKey || archiving.has(thread)) return;
       const doc = await tx.doc(AppState, stateConversation.id);
@@ -2476,6 +2521,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           event: "message", id, thread, role: interruption ? "notice" : "assistant",
           text: entry.text, at: new Date(now()).toISOString(),
         });
+        appended = true;
       }
       entry.status = "delivered";
       entry.settledAt = now();
@@ -2483,6 +2529,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     }, cleanupContext);
     await mutateState(() => undefined);
     pushEventsToSockets();
+    if (appended) notifyPush(thread);
     if (restored) await gateway.reserveAppThread?.(thread, adapterContext);
   };
 
@@ -2688,6 +2735,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     sockets.clear();
     scope.cancel(new DOMException("App adapter stopped", "AbortError"));
     await Promise.allSettled([...active, ...pendingControls, ...scheduledTasks]);
+    await push?.close();
     await listener.close().catch(() => undefined);
   }
   if (fatal !== undefined) throw fatal;
