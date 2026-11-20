@@ -14,6 +14,7 @@
 import { createHash } from "node:crypto";
 import type { SendOptions } from "web-push";
 
+import { journalEvent } from "../observability.js";
 import { APP_LIMITS, validVapidPrivateKey, type AppPushSubscription } from "./app-protocol.js";
 
 /** The strict `app.push` config block: a subject, the public key, and the env var naming the private key. */
@@ -166,8 +167,15 @@ export function createAppPushDispatcher(sources: {
     if (status === 404 || status === 410) {
       sources.gone(deviceId, snapshot.subscription.endpoint);
       queued.delete(deviceId);
+      journalEvent("app.push.removed", { status: String(status) });
+      return;
     }
-    // Anything else (including a network error) is not retried; the next message tries again.
+    // Anything else (including a network error) is not retried; the next message tries again. A
+    // failed send records one terse event: a status code, or a fixed class when the failure carried
+    // none. Never the endpoint, the keys, the payload or the error message.
+    if (status !== undefined && status >= 200 && status <= 299) return;
+    journalEvent("app.push.failed",
+      status === undefined ? { reason: "network_error" } : { status: String(status) });
   }
 
   function start(deviceId: string): void {

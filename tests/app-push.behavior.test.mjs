@@ -24,9 +24,9 @@ import {
 } from './fixtures/app-harness.mjs';
 
 const modules = new URL('../dist/channels/', import.meta.url);
-const { generatePushKeys, pushPayload, pushSendOptions, pushTopic, resolvePushOptions, PUSH_TIMEOUT_MS, PUSH_TTL_SECONDS } =
-  await import(new URL('app-push.js', modules).href);
-const { validVapidPrivateKey, validVapidPublicKey, parsePushSubscription } = await import(
+const { createAppPushDispatcher, generatePushKeys, pushPayload, pushSendOptions, pushTopic, resolvePushOptions,
+  PUSH_TIMEOUT_MS, PUSH_TTL_SECONDS } = await import(new URL('app-push.js', modules).href);
+const { parsePushSubscription, validVapidPrivateKey, validVapidPublicKey } = await import(
   new URL('app-protocol.js', modules).href
 );
 const { parseAppInvocation } = await import(
@@ -439,4 +439,37 @@ test('push endpoints must be a public dotted https host on the default port', { 
   ]) {
     assert.equal(at(endpoint), undefined, `${endpoint} is refused`);
   }
+});
+
+test('a send journals only a status code or a fixed class, never the endpoint or keys', { timeout: 10_000 }, async () => {
+  const lines = [];
+  const original = console.info;
+  console.info = (line) => { lines.push(String(line)); };
+  const gone = [];
+  const dispatcherFor = (transport) => createAppPushDispatcher({
+    options: { ...PUSH, transport },
+    snapshot: () => ({ subscription: subscriptionAt(), payload: pushPayload('main', 1) }),
+    gone: (deviceId, endpoint) => { gone.push(endpoint); },
+  });
+  try {
+    const failing = dispatcherFor(async () => { throw Object.assign(new Error('push.example.test leaked'), { statusCode: 500 }); });
+    failing.notify('phone', 'main');
+    await failing.close();
+    const dead = dispatcherFor(async () => ({ statusCode: 410 }));
+    dead.notify('phone', 'main');
+    await dead.close();
+  } finally {
+    console.info = original;
+  }
+
+  const events = lines.filter((line) => line.includes('app.push.'));
+  assert.deepEqual(events.map((line) => JSON.parse(line.slice(line.indexOf('{'))).event), ['app.push.failed', 'app.push.removed']);
+  assert.match(events[0], /"status":"500"/u);
+  assert.match(events[1], /"status":"410"/u);
+  for (const line of events) {
+    assert.equal(line.includes('push.example.test'), false, 'no endpoint');
+    assert.equal(line.includes('A'.repeat(22)), false, 'no auth key');
+    assert.equal(line.includes('leaked'), false, 'no error text');
+  }
+  assert.deepEqual(gone, ['https://push.example.test/sub']);
 });

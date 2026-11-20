@@ -257,7 +257,9 @@ contract is in `pwa/protocol/v2.md`; this section is the gateway's behavior.
 - Sends are bounded: a request timeout, at most one in flight per device, and one coalesced follow-up
   that re-reads the latest unread count when notifications arrived during a send. A 404 or 410
   answer removes that subscription (unless it was already replaced). Any other failure is not
-  retried; the next message tries again.
+  retried; the next message tries again. Each 404/410 removal and each failed send records one
+  journal event carrying only the status code (or, for a network error, a fixed class) — never the
+  endpoint, the keys, the payload or the error text.
 
 The sender uses the pinned `web-push` library (the same one the phase-0 probe used), imported
 lazily so a gateway without `app.push` never loads it.
