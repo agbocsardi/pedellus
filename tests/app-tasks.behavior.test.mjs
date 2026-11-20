@@ -164,7 +164,7 @@ test('tasks lists one thread\'s own workers and scheduled jobs, newest first and
     assert.equal(job.title, CRON_LABEL);
     assert.equal(job.state, 'scheduled');
     assert.ok(isoLike(job.nextAt), 'a scheduled job carries its next run');
-    assert.ok(job.detail.includes('every 3600s'), 'the detail carries the bounded schedule summary');
+    assert.ok(job.detail.startsWith('every hour'), 'the detail carries the short schedule summary');
 
     // Newest first, and every display field is bounded by the protocol.
     for (let index = 1; index < listed.length; index += 1) {

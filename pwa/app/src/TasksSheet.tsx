@@ -43,6 +43,9 @@ function relative(iso: string | undefined): string {
 }
 
 function when(task: TaskInfo): string {
+  // "Last now" reads wrong; anything within a minute is simply "just now".
+  const recent = [task.lastAt, task.createdAt].some((at) => at !== undefined && Math.abs(Date.parse(at) - Date.now()) < 60_000);
+  if (task.nextAt === undefined && recent) return "just now";
   const next = relative(task.nextAt);
   if (next) return `Next ${next}`;
   const last = relative(task.lastAt);
@@ -85,7 +88,7 @@ function parseTasks(raw: unknown): TaskInfo[] | undefined {
 /** What the owner is told after one cancellation: the outcome, as it came back. */
 function receipt(outcome: Outcome): string {
   switch (outcome) {
-    case "cancelled": return "Cancelled.";
+    case "cancelled": return ""; // the row itself now says Cancelled
     case "finished": return "It had already finished; nothing was cancelled.";
     case "unknown": return "No such task in this thread; nothing was changed.";
   }

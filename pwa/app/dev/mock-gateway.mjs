@@ -115,7 +115,7 @@ function addFakeTasks(thread) {
     state: "scheduled",
     createdAt: new Date(now + 60_000).toISOString(),
     nextAt: new Date(now + 3_600_000).toISOString(),
-    detail: "every 3600s from now",
+    detail: "every hour",
   });
 }
 

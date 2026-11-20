@@ -9,7 +9,7 @@
  * host path is copied into the view.
  */
 import { LIMITS, type TaskInfo } from "./generated/protocol-v2.js";
-import { cronScheduleText } from "../automation/cron-schedule.js";
+import { cronScheduleText, type CronSchedule } from "../automation/cron-schedule.js";
 import type { CronJobStatus, CronJobView } from "../automation/cron.js";
 import type { WorkerStatus, WorkerView } from "../workers/worker-task.js";
 import { clampCodeUnits, plainLabel } from "../history/entry-view.js";
@@ -96,7 +96,7 @@ export function workerTask(view: WorkerView): TaskInfo {
 /** One scheduled job as the Tasks view shows it. */
 export function cronTask(view: CronJobView): TaskInfo {
   const job = view.job;
-  const schedule = cronScheduleText(job.schedule);
+  const schedule = scheduleSummary(job.schedule);
   const notes: string[] = [];
   if (job.lastOutcome !== null) notes.push(`last run ${job.lastOutcome.status}`);
   if (job.lastSkip !== null) notes.push("last run skipped");
@@ -142,4 +142,18 @@ export function taskCancelReceipt(result: AppTaskCancelResult): string {
     case "unknown":
       return "No such task in this thread; nothing was changed.";
   }
+}
+
+/** A short owner-facing schedule ("every hour", "once"); the next run time is shown separately. */
+function scheduleSummary(schedule: CronSchedule): string {
+  if (schedule.kind === "at") return "once";
+  if (schedule.kind !== "every") return cronScheduleText(schedule);
+  const seconds = Math.round(schedule.everyMs / 1000);
+  for (const [unit, size] of [["day", 86_400], ["hour", 3_600], ["min", 60]] as const) {
+    if (seconds >= size && seconds % size === 0) {
+      const count = seconds / size;
+      return count === 1 ? `every ${unit === "min" ? "minute" : unit}` : `every ${count} ${unit === "min" ? "min" : `${unit}s`}`;
+    }
+  }
+  return `every ${seconds}s`;
 }
