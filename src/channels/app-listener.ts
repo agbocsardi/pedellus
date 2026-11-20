@@ -22,6 +22,7 @@ import {
   resolveStaticPath,
   staticMimeType,
 } from "./app-protocol.js";
+import type { AttachmentInfo } from "./generated/protocol-v2.js";
 
 /** A refused upload body is read at most this far before the connection is dropped. */
 const REFUSED_BODY_DRAIN_BYTES = 64 * 1024;
@@ -39,6 +40,14 @@ const FILE_HEADERS = Object.freeze({
   "content-security-policy": "sandbox",
   "cache-control": "private, max-age=31536000, immutable",
 });
+/**
+ * The one policy an agent artifact is rendered under (`?view=artifact`), exactly as protocol v2
+ * states it: scripts run at an opaque origin with no network, so agent HTML cannot reach `/v1`, the
+ * cookie or the app.
+ */
+export const ARTIFACT_PREVIEW_CSP = "sandbox allow-scripts; default-src 'none'; script-src " +
+  "'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'; " +
+  "frame-ancestors 'self'";
 /** Fixed upload replies; `201` carries only the new id. */
 const UPLOAD_ERRORS: Readonly<Record<Exclude<AppUploadOutcome["status"], "created">, [number, string]>> = Object.freeze({
   "bad-request": [400, JSON.stringify({ error: "bad_request" })],
@@ -100,6 +109,8 @@ export type AppDownloadTarget = {
   readonly bytes: number;
   readonly mimeType: string;
   readonly name: string;
+  /** Only an `artifact` may be served inline as a sandboxed preview (`?view=artifact`). */
+  readonly kind: AttachmentInfo["kind"];
 };
 
 /** One upload body as the listener hands it over: already hard-capped, lazily consumed. */
@@ -232,7 +243,9 @@ export async function startAppListener(options: {
 
   async function handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const rawPath = request.url ?? "/";
-    const path = rawPath.split("?", 1)[0]!;
+    const queryIndex = rawPath.indexOf("?");
+    const path = queryIndex < 0 ? rawPath : rawPath.slice(0, queryIndex);
+    const query = queryIndex < 0 ? "" : rawPath.slice(queryIndex + 1);
     if (request.method === "POST" && path === "/v1/pair") {
       await pairEndpoint(request, response);
       return;
@@ -247,7 +260,9 @@ export async function startAppListener(options: {
       return;
     }
     if (path.startsWith("/v1/files/")) {
-      await fileEndpoint(request, response, path.slice("/v1/files/".length));
+      // `?view=artifact` asks for the sandboxed inline preview; every other query is ignored.
+      const view = new URLSearchParams(query).get("view");
+      await fileEndpoint(request, response, path.slice("/v1/files/".length), view === "artifact");
       return;
     }
     if (path === "/v1/stream") {
@@ -368,7 +383,9 @@ export async function startAppListener(options: {
   }
 
   /** One file a durable message references; every other id is a plain 404. */
-  async function fileEndpoint(request: IncomingMessage, response: ServerResponse, rawId: string): Promise<void> {
+  async function fileEndpoint(
+    request: IncomingMessage, response: ServerResponse, rawId: string, artifactView: boolean,
+  ): Promise<void> {
     const token = deviceCookie(request.headers.cookie);
     const device = token === undefined ? undefined : await options.host.authenticate(token);
     if (device === undefined) {
@@ -391,12 +408,23 @@ export async function startAppListener(options: {
       response.end(NOT_FOUND_BODY);
       return;
     }
-    response.writeHead(200, {
-      ...FILE_HEADERS,
-      "content-type": file.mimeType,
-      "content-length": file.bytes,
-      "content-disposition": fileDisposition(file.mimeType, file.name),
-    });
+    // An artifact preview is inline under its own sandbox policy; every other download — including
+    // an artifact without `view=artifact` — keeps the fixed download headers and disposition.
+    const preview = artifactView && file.kind === "artifact";
+    response.writeHead(200, preview
+      ? {
+          ...FILE_HEADERS,
+          "content-security-policy": ARTIFACT_PREVIEW_CSP,
+          "content-disposition": "inline",
+          "content-type": file.mimeType,
+          "content-length": file.bytes,
+        }
+      : {
+          ...FILE_HEADERS,
+          "content-type": file.mimeType,
+          "content-length": file.bytes,
+          "content-disposition": fileDisposition(file.mimeType, file.name),
+        });
     if (request.method === "HEAD") {
       response.end();
       return;

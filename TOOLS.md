@@ -112,6 +112,24 @@ offered only when the top-level `media` configuration is present and
 `toolAllowlist` contains `read`, so it adds no read grant. See
 [Telegram interactions](./TELEGRAM.md#replies-quotes-reactions-and-native-actions).
 
+When `app` and the top-level `media` block are configured, mapped app chat
+threads (an admitted app side-thread fork included) also receive one scoped
+`app` channel-file tool (`send`, `artifact`). It is not a coding-tool name and
+grants no coding authority or new read path: the model names one existing
+workspace file, the running adapter resolves it exactly as the Telegram `send`
+does (workspace-relative, no traversal, no symlink escape, one stable bounded
+read) and copies it into app file storage. `send` takes any regular file up to
+`LIMITS.uploadBytes` with a bounded caption; `artifact` takes only `.html`,
+`.htm` or `.svg` up to `LIMITS.artifactBytes` with a bounded title and stores it
+as `kind: "artifact"`, which the app previews in a sandboxed frame. One commit
+appends the durable assistant message and its referenced attachment record, so
+the file is downloadable exactly when the message is visible; a repeated
+execution appends nothing twice. The thread is derived from the host-owned
+session key, never from model input; the channel-state conversation, the root, a
+worker, a scheduled run and any other fork never receive the tool. The receipt is
+bounded and carries only the workspace-relative path, never a host path or the
+file's bytes. See [`APP.md`](./APP.md#files).
+
 Every mapped ordinary chat (the CLI attach included) also receives the
 model-facing `ask_user` tool. It asks the owner 1-4 bounded decisions with 2-4
 options, delivers them to the unique live surface for that exact session

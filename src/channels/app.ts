@@ -65,6 +65,7 @@ import {
   APP_PAIR_ALPHABET,
   APP_PROTOCOL_VERSION,
   APP_REQUEST_OPS,
+  APP_STATIC_TYPES,
   parseHelloCursor,
   validAppAgentName,
   validVapidPrivateKey,
@@ -91,7 +92,15 @@ import {
 import { createAppPushDispatcher, pushPayload, type AppPushDispatcher, type AppPushOptions } from "./app-push.js";
 import { absorbActivity, activityForWire, emptyActivity, type ActivityTally } from "./app-activity.js";
 import { startAppListener, type AppDeviceSession, type AppSessionHooks } from "./app-listener.js";
-import { AppFileRejected, createAppFiles, type AppMediaOptions } from "./app-files.js";
+import {
+  AppFileRejected,
+  createAppFiles,
+  APP_DEFAULT_TYPE,
+  type AppMediaOptions,
+} from "./app-files.js";
+import { APP_ACTION_LIMITS, type AppActionHost, type AppActionRegistry } from "./app-tool.js";
+import { validTelegramFilePath } from "./telegram-interactions.js";
+import { readTelegramOutboundFile, TelegramOutboundRejected, type TelegramOutboundRejection } from "./telegram-outbound-media.js";
 import {
   isReaction,
   reactionChangeSummary,
@@ -228,6 +237,12 @@ export interface AppGateway {
   ): Promise<import("../runtime.js").GatewaySessionReset>;
   /** Live operator console registry; the running adapter attaches its pairing host here. */
   appConsole?: AppConsoleRegistry;
+  /**
+   * Model-tool host registry for agent file delivery (`send`/`artifact`). The running adapter
+   * attaches here; without a live host a mapped app chat still sees the tool but every call is
+   * refused, because no channel can deliver it.
+   */
+  appActions?: AppActionRegistry;
 }
 
 /** Terminal pairing console results, rendered by `src/channels/app-operator-cli.ts`. */
@@ -347,6 +362,53 @@ function setArchived(doc: Draft<AppChannelState>, info: Draft<AppThreadInfo>, at
   // Idle archive does not make an inactive thread more recent than an active one.
   if (reason !== "idle" && info.lastAt < at) info.lastAt = at;
   appendEvent(doc, { event: "thread", thread: { ...info } });
+}
+
+/** The saved extensions an agent artifact may have, and the exact stored type each is served with. */
+const ARTIFACT_TYPES: Readonly<Record<string, string>> = Object.freeze({
+  html: "text/html",
+  htm: "text/html",
+  svg: "image/svg+xml",
+});
+
+function extensionOfFilename(name: string): string {
+  const dot = name.lastIndexOf(".");
+  return dot < 0 ? "" : name.slice(dot + 1).toLowerCase();
+}
+
+/** One stored type for an agent `send`: the known extension's base type, otherwise generic bytes. */
+function sentFileType(name: string): string {
+  const extension = extensionOfFilename(name);
+  const known = extension === "" ? undefined : APP_STATIC_TYPES[`.${extension}`];
+  return known?.split(";", 1)[0] ?? APP_DEFAULT_TYPE;
+}
+
+/** Fixed pre-send refusal text; never includes a host path, byte count or raw error. */
+function agentFileRefusal(action: "send" | "artifact", reason: TelegramOutboundRejection): string {
+  const maxMiB = action === "artifact" ? APP_LIMITS.artifactBytes / (1024 * 1024) : APP_LIMITS.uploadBytes / (1024 * 1024);
+  switch (reason) {
+    case "unsafe-path":
+      return "the path must be an existing regular file inside the configured workspace";
+    case "not-found":
+      return "no such file exists inside the configured workspace";
+    case "not-a-file":
+      return "the path is not a regular file";
+    case "too-large":
+      return `the file is larger than ${maxMiB} MiB`;
+    case "empty":
+      return "the file is empty";
+    case "unreadable":
+      return "the file could not be read as one stable snapshot";
+    case "unsupported-format":
+      return action === "artifact" ? "an artifact must be a .html, .htm or .svg file" : "the file cannot be delivered";
+  }
+}
+
+/** The model-facing receipt for one delivered agent file; bounded, workspace-relative, no bytes. */
+function agentFileReceipt(action: "send" | "artifact", path: string, size: number): string {
+  return action === "artifact"
+    ? `Delivered the workspace file ${path} as a sandboxed artifact (${size} bytes).`
+    : `Delivered the workspace file ${path} as one attachment (${size} bytes).`;
 }
 
 /** Resolve an app message, not an arbitrary entry ID, to a typed committed transcript entry. */
@@ -3086,6 +3148,129 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     await mutateState((doc) => admitRestartNotices(doc, RESTART_LIVE), adapterContext);
   }
 
+  /**
+   * The model tool's live host. Every call re-derives the thread from the host-owned session key,
+   * rechecks that the thread is open, reads one bounded workspace file through the same resolver
+   * the Telegram send uses, and commits the referenced record with the assistant message. A call
+   * whose referenced record already exists is answered from that record without touching the file.
+   * Nothing the model supplied decides the thread, the device or the storage path.
+   */
+  const actionHost: AppActionHost = {
+    async act(sessionKey, callId, request, ctx) {
+      if (stopping || signal?.aborted || ctx.abortSignal?.aborted) {
+        return { ok: false, text: "The app channel is stopping, so no file was delivered." };
+      }
+      const thread = threadForSession(sessionKey);
+      if (thread === undefined) {
+        return { ok: false, text: "This conversation is not an app chat thread, so no file was delivered." };
+      }
+      if (!openThread(state, thread)) {
+        return { ok: false, text: "This app thread is archived, so no file was delivered." };
+      }
+      if (options.media === undefined || !files.available) {
+        return { ok: false, text: "App file storage is not configured, so no file could be delivered." };
+      }
+      // Defence in depth: the model schema already restricts these, so a decline here means the
+      // caller bypassed the declared surface.
+      if (request.action !== "send" && request.action !== "artifact") {
+        return { ok: false, text: "Unknown app file action; nothing was delivered." };
+      }
+      if (!validTelegramFilePath(request.path)) {
+        return { ok: false, text: "The file was not delivered: " +
+          agentFileRefusal(request.action, "unsafe-path") + "." };
+      }
+      if (request.caption !== undefined && request.caption.length > APP_ACTION_LIMITS.captionChars) {
+        return { ok: false, text: "The file was not delivered: the caption is too long." };
+      }
+      if (request.title !== undefined && request.title.length > APP_ACTION_LIMITS.titleChars) {
+        return { ok: false, text: "The file was not delivered: the title is too long." };
+      }
+      const action = request.action;
+      const maxBytes = action === "artifact" ? APP_LIMITS.artifactBytes : APP_LIMITS.uploadBytes;
+      // One identity per tool execution: a recovered run adopts its own copy instead of storing a
+      // second one, and the message id below makes the durable effect idempotent.
+      const messageId = `agent:${callId}`;
+      // A finished execution of this same tool task already committed its message and referenced
+      // record. That record is the anchor (referenced records are never pruned, unlike the trimmed
+      // event log), so report the receipt again without reading the workspace or storing anything:
+      // a file that was deleted or changed since then cannot turn a delivered file into a failure
+      // or an orphan copy.
+      const committed = await files.agentCommit(messageId);
+      if (committed !== undefined) return { ok: true, text: agentFileReceipt(action, request.path, committed.size) };
+      let file;
+      try {
+        file = await readTelegramOutboundFile({
+          workspace: options.media.workspace,
+          path: request.path,
+          kind: "document",
+          maxBytes,
+        });
+      } catch (error) {
+        const reason = error instanceof TelegramOutboundRejected ? error.reason : "unreadable";
+        return { ok: false, text: `The file was not delivered: ${agentFileRefusal(action, reason)}.` };
+      }
+      const extension = extensionOfFilename(file.filename);
+      const artifactType = ARTIFACT_TYPES[extension];
+      if (action === "artifact" && artifactType === undefined) {
+        return { ok: false, text: "The file was not delivered: an artifact must be a .html, .htm or .svg file." };
+      }
+      const stored = await files.storeAgent({
+        identity: `app:agent:${callId}`,
+        messageId,
+        name: file.filename,
+        type: action === "artifact" ? artifactType! : sentFileType(file.filename),
+        kind: action === "artifact" ? "artifact" : "file",
+        bytes: file.bytes,
+        maxBytes,
+      });
+      if (stored.status !== "stored") {
+        const text = stored.status === "unavailable"
+          ? "App file storage is not configured, so no file could be delivered."
+          : stored.status === "too-large"
+            ? `The file was not delivered: it is larger than ${maxBytes / (1024 * 1024)} MiB.`
+            : stored.status === "empty"
+              ? "The file was not delivered: the file is empty."
+              : "The file was not delivered: it could not be stored.";
+        return { ok: false, text };
+      }
+      let appended = false;
+      try {
+        state = await stateConversation.commit(async (tx) => {
+          const doc = await tx.doc(AppState, stateConversation.id);
+          // A recovered execution finds its own message: it appends nothing and stores nothing new.
+          if (hasEventId(doc, messageId)) return copyJson(doc) as unknown as AppChannelState;
+          appendMessage(doc, {
+            event: "message",
+            thread,
+            id: messageId,
+            role: "assistant",
+            text: action === "artifact" ? (request.title ?? "") : (request.caption ?? ""),
+            at: new Date(now()).toISOString(),
+            attachments: [{ ...stored.file.info }],
+          });
+          await files.admitAgent(tx, stored.file);
+          appended = true;
+          return copyJson(doc) as unknown as AppChannelState;
+        }, ctx);
+      } catch (error) {
+        await stored.file.discard();
+        if (error instanceof AppFileRejected) {
+          return { ok: false, text: "App file storage is full, so no file was delivered." };
+        }
+        return { ok: false, text: "The file could not be attached, so no message was delivered." };
+      }
+      if (!appended) {
+        // The in-commit check (the authority) found the message already present, so no record of
+        // this execution was admitted; drop a copy only this execution stored.
+        await stored.file.discard();
+      } else {
+        pushEventsToSockets();
+        notifyPush(thread);
+      }
+      return { ok: true, text: agentFileReceipt(action, request.path, stored.file.record.size) };
+    },
+  };
+
   // The listener opens only after recovery, so no socket can observe pre-recovery state.
   const listener = await startAppListener({
     port: options.port,
@@ -3100,7 +3285,10 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         const file = await files.download(id);
         return file === undefined
           ? undefined
-          : { absolutePath: file.absolutePath, bytes: file.bytes, mimeType: file.mimeType, name: file.name };
+          : {
+              absolutePath: file.absolutePath, bytes: file.bytes, mimeType: file.mimeType,
+              name: file.name, kind: file.kind,
+            };
       },
     },
     // A listener that dies takes the channel with it: the supervisor reports gateway.app and the
@@ -3112,6 +3300,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     },
   });
   const detachConsole = gateway.appConsole?.attach(consoleHost);
+  const detachActions = gateway.appActions?.attach(actionHost);
   recoveryComplete = true;
   journalEvent("app.serving", { port: listener.port, "queue.depth": state.pending.length });
   options.onListening?.(listener.port);
@@ -3133,6 +3322,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     stopping = true;
     if (scanTimer !== undefined) clearInterval(scanTimer);
     detachConsole?.();
+    detachActions?.();
     for (const socket of sockets.values()) socket.session.close(1001, "stopping");
     sockets.clear();
     scope.cancel(new DOMException("App adapter stopped", "AbortError"));
