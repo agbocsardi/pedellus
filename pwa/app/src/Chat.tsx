@@ -417,16 +417,19 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     return () => navigator.serviceWorker?.removeEventListener("message", onMessage);
   }, [store, store.connState]);
 
-  // The badge counts messages this device has not acked, so it goes once the
-  // replay is applied and acked and the app is on screen.
+  // v2: the badge clears only once the app is visible and has acked
+  // everything, so the replay must have arrived and the gateway must hold an
+  // `ack` for the newest cursor. An unacked message keeps the badge.
   useEffect(() => {
+    const acked = () => store.replayReady && store.cursor !== null
+      && store.ackedCursor !== null && store.ackedCursor >= store.cursor;
     const clear = () => {
-      if (!document.hidden && store.connState === "open") clearAppBadge();
+      if (!document.hidden && acked()) clearAppBadge();
     };
     clear();
     document.addEventListener("visibilitychange", clear);
     return () => document.removeEventListener("visibilitychange", clear);
-  }, [store, store.connState]);
+  }, [store, store.replayReady, store.cursor, store.ackedCursor]);
 
   return (
     <div className="app">

@@ -437,7 +437,7 @@ export class Connection {
     if (this.ws !== ws || !this.replayComplete || this.ackFrozen) return;
     try {
       if (await this.store.checkpoint(cursor) && this.ws === ws && !this.ackFrozen) {
-        this.write({ type: "req", id: this.id(), op: "ack", cursor });
+        if (this.write({ type: "req", id: this.id(), op: "ack", cursor })) this.store.setAcked(cursor);
       }
     } catch (err) {
       this.ackFrozen = true;

@@ -56,6 +56,8 @@ export class Store {
   replayReady = false;
   /** Max seen can be ahead of a replay gap; only resumeCursor is safe for hello. */
   cursor: number | null = null;
+  /** Highest cursor the gateway was sent in an `ack`; null until the first one. */
+  ackedCursor: number | null = null;
   resumeCursor: number | null = null;
 
   // Status is live; hello resends it rather than replaying it from storage.
@@ -448,6 +450,13 @@ export class Store {
       if (s === "offline") this.statuses.clear();
       this.changed();
     }
+  }
+
+  /** The gateway holds an `ack` for this cursor; drives "acked everything" UI. */
+  setAcked(cursor: number) {
+    if (this.ackedCursor !== null && cursor <= this.ackedCursor) return;
+    this.ackedCursor = cursor;
+    this.changed();
   }
 
   setMode(m: Mode) {
