@@ -130,6 +130,10 @@ svg {
   display: block;
 }
 
+/* Room below a revealed field for the keyboard's suggestion bar. */
+.screen input {
+  scroll-margin-block: 24px 72px;
+}
 .screen {
   /* Follows the visual viewport like the chat shell (App.tsx keyboard handling), so an open
      keyboard shrinks the screen instead of covering it, and the screen scrolls inside itself. */
