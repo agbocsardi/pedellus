@@ -4681,6 +4681,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
     async function appTasksFor(sessionKey: string, ctx: Context): Promise<AppTaskList> {
       const conversationId = await mappedConversationId(sessionKey, ctx);
       if (conversationId === undefined) return { tasks: [] };
+      // Only an authenticated mapped chat has tasks to show or cancel (as backgroundStatusFor checks).
+      if (!authorizedChatConversations.has(conversationId)) return { tasks: [] };
       const workers = workerFoundation !== undefined && workerSpawners.has(conversationId)
         ? await workerFoundation.list(harness!, conversationId, ctx)
         : [];
@@ -4702,6 +4704,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
     ): Promise<AppTaskCancelResult> {
       const conversationId = await mappedConversationId(sessionKey, ctx);
       if (conversationId === undefined) return { outcome: "unknown" };
+      // Only an authenticated mapped chat has tasks to show or cancel (as backgroundStatusFor checks).
+      if (!authorizedChatConversations.has(conversationId)) return { outcome: "unknown" };
       if (workerFoundation !== undefined && workerSpawners.has(conversationId)) {
         const worker = (await workerFoundation.list(harness!, conversationId, ctx))
           .find((view) => workerTaskId(view.taskId) === task);

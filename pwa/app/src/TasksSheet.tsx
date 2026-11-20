@@ -69,7 +69,7 @@ function parseTasks(raw: unknown): TaskInfo[] | undefined {
     const createdAt = iso(task.createdAt);
     if (typeof task.id !== "string" || task.id === "" || task.id.length > 96) return [];
     if (task.kind !== "worker" && task.kind !== "cron") return [];
-    if (typeof task.state !== "string" || !(task.state in STATE_LABEL)) return [];
+    if (typeof task.state !== "string" || !Object.hasOwn(STATE_LABEL, task.state)) return [];
     if (title === undefined || createdAt === undefined) return [];
     const nextAt = iso(task.nextAt);
     const lastAt = iso(task.lastAt);
@@ -147,7 +147,7 @@ export function TasksSheet({ store, conn, thread, online, archived }: {
       if (!res) setNote("No reply from the gateway. Check the connection, then refresh.");
       else if (!res.ok) setNote(res.error === "unsupported"
         ? "This gateway does not support cancelling tasks."
-        : "The gateway refused the cancellation. Nothing was changed.");
+        : "The gateway could not confirm the cancellation. Check the list.");
       else if (res.outcome === "cancelled" || res.outcome === "finished" || res.outcome === "unknown") {
         setNote(receipt(res.outcome));
       } else setNote("The gateway did not report an outcome. Refresh to see the task's state.");
