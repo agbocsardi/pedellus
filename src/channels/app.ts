@@ -80,9 +80,10 @@ import {
   type AppPendingInput,
   type AppThreadInfo,
   type AppThreadOrigin,
+  type AppUploadRecord,
 } from "./app-protocol.js";
 import { startAppListener, type AppDeviceSession, type AppSessionHooks } from "./app-listener.js";
-import { createAppFiles, type AppMediaOptions } from "./app-files.js";
+import { AppFileRejected, createAppFiles, type AppMediaOptions } from "./app-files.js";
 
 /** Preserve the original mapped chat and its history. */
 export const APP_CHAT_SESSION_KEY = "app:chat";
@@ -512,7 +513,13 @@ function appendMessage(doc: Draft<AppChannelState>, event: AppMessageInput): voi
     texts[last] = texts[last]!.slice(0, fittingPrefix(texts[last]! + rest, room)) + MESSAGE_TRUNCATED;
     console.warn(`App message ${event.id} exceeds ${APP_LIMITS.maxMessageParts} parts and was truncated.`);
   }
-  texts.forEach((text, i) => appendEvent(doc, { ...event, text, part: { i, n: texts.length } }));
+  texts.forEach((text, i) => {
+    // A split message carries its attachments on the first part only (protocol v2, Files).
+    const { attachments, ...rest } = event;
+    appendEvent(doc, i === 0 && attachments !== undefined
+      ? { ...event, text, part: { i, n: texts.length } }
+      : { ...rest, text, part: { i, n: texts.length } });
+  });
 }
 
 /** Message events carry stable ids, so a replayed or crashed append can be recognized exactly. */
@@ -842,12 +849,12 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   const statuses = new Map<string, string>();
 
   const mutateState = async (
-    change: (doc: Draft<AppChannelState>) => void | Promise<void>,
+    change: (doc: Draft<AppChannelState>, tx: Tx) => void | Promise<void>,
     commitContext: Context = adapterContext,
   ): Promise<AppChannelState> => {
     state = await stateConversation.commit(async (tx) => {
       const doc = await tx.doc(AppState, stateConversation.id);
-      await change(doc);
+      await change(doc, tx);
       return copyJson(doc) as unknown as AppChannelState;
     }, commitContext);
     return state;
@@ -988,7 +995,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           await handleHello(socket, frame, sendOk, sendError);
           return;
         case "send":
-          await handleSendFrame(frame, sendOk, sendError);
+          await handleSendFrame(socket.session.deviceId, frame, sendOk, sendError);
           return;
         case "ack":
           await handleAck(socket, frame, sendOk, sendError);
@@ -1273,6 +1280,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   // ── Ingress ───────────────────────────────────────────────────────────────
 
   async function handleSendFrame(
+    deviceId: string,
     frame: Record<string, unknown>,
     sendOk: (body?: Record<string, unknown>) => void,
     sendError: (error: AppErrorCode) => void,
@@ -1282,17 +1290,25 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     if (archiving.has(thread)) return sendError("not_ready");
     const key = frame.key;
     const text = frame.text;
-    if (typeof key !== "string" || !APP_LIMITS.idPattern.test(key) ||
-        typeof text !== "string" || text.length === 0) {
+    // Upload ids are the only attachment authority: this device's, unexpired, unused, bounded.
+    const rawAttachments = frame.attachments;
+    let attachmentIds: string[] | undefined;
+    if (rawAttachments !== undefined) {
+      if (!Array.isArray(rawAttachments) || rawAttachments.length > APP_LIMITS.maxAttachments ||
+          rawAttachments.some((id) => typeof id !== "string" || !APP_LIMITS.uploadIdPattern.test(id))) {
+        return sendError("bad_request");
+      }
+      attachmentIds = rawAttachments as string[];
+      // Without media storage no upload can exist, so every id is unknown.
+      if (!files.available) return sendError("bad_request");
+    }
+    if (typeof key !== "string" || !APP_LIMITS.idPattern.test(key) || typeof text !== "string" ||
+        (text.length === 0 && (attachmentIds === undefined || attachmentIds.length === 0))) {
       sendError("bad_request");
       return;
     }
     if (text.length > APP_LIMITS.sendTextChars) {
       sendError("too_large");
-      return;
-    }
-    if (frame.attachments !== undefined) {
-      sendError("unsupported");
       return;
     }
     // The first send into a thread creates its mapping and snapshot: reserve that before the
@@ -1324,7 +1340,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     let duplicate = true;
     let blocked: AppErrorCode | undefined;
     try {
-      await mutateState((doc) => {
+      await mutateState(async (doc, tx) => {
         if (!openThread(doc, thread)) { blocked = "bad_request"; return; }
         if (archiving.has(thread)) { blocked = "not_ready"; return; }
         if (doc.sendKeys.some((entry) => entry.key === key)) return;
@@ -1337,14 +1353,30 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         duplicate = false;
         const atMs = now();
         const at = new Date(atMs).toISOString();
+        // Claimed inside this transaction: an unknown, foreign, expired or reused id refuses the
+        // whole send and the commit admits nothing, not even the idempotency key.
+        let claimed: AppUploadRecord[] | undefined;
+        if (!callback && attachmentIds !== undefined) {
+          try {
+            claimed = await files.claim(tx, { deviceId, ids: attachmentIds, atMs, messageId: eventId });
+          } catch (error) {
+            if (!(error instanceof AppFileRejected)) throw error;
+            blocked = "bad_request";
+            return;
+          }
+        }
         doc.sendKeys = pruneKeys([...doc.sendKeys, { key, atMs }], atMs);
         if (callback) {
           appendMessage(doc, { event: "message", thread, id: callbackId, role: "notice", text: CALLBACK_REFUSED_TEXT, at });
           return;
         }
-        appendMessage(doc, { event: "message", thread, id: eventId, role: "user", text, at, key });
+        appendMessage(doc, {
+          event: "message", thread, id: eventId, role: "user", text, at, key,
+          ...(claimed === undefined || claimed.length === 0 ? {} : { attachments: files.infos(claimed) }),
+        });
         doc.pending.push({
           key, thread, text, admittedAtMs: atMs,
+          ...(claimed === undefined ? {} : { attachments: claimed }),
           ...(admittedWhenBusy === undefined ? {} : { whenBusy: admittedWhenBusy }),
         });
         if (thread === APP_MAIN_THREAD) doc.origin = { admittedAtMs: atMs };
@@ -1547,8 +1579,11 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           submission = await gateway.harness?.submission(existing.id, adapterContext);
           if (submission === undefined) return;
         } else {
+          // The same content shape Telegram submits: text plus labeled metadata, images natively.
+          const content = await observeOperation("gateway.app.attachments", {},
+            () => files.prepare(item.attachments, item.text, signal), trace);
           submission = await conversation.submit({
-            type: "input", content: item.text, requestId, whenBusy,
+            type: "input", content, requestId, whenBusy,
           }, withTelemetry(trace, adapterContext));
         }
       }

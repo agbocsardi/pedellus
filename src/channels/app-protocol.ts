@@ -15,6 +15,7 @@ import {
   PAIR_ALPHABET,
   PROTOCOL_VERSION,
   type CommandInfo,
+  type AttachmentInfo,
   type ErrorCode,
   type PresetInfo,
   type ThreadInfo,
@@ -117,6 +118,27 @@ export function parseHelloCursor(value: unknown): number | null | undefined {
   return undefined;
 }
 
+/**
+ * One uploaded original, durable before its id is answered. `path` is the shared media store's
+ * workspace-relative locator; the bytes are never read here, so the record carries no content.
+ * Uploads are device-private and unusable until an admitted `send` references them.
+ */
+export type AppUploadRecord = {
+  readonly id: string;
+  /** Only this device sees the upload until an admitted message references it. */
+  readonly deviceId: string;
+  readonly name: string;
+  readonly type: string;
+  readonly size: number;
+  readonly kind: AttachmentInfo["kind"];
+  readonly path: string;
+  readonly createdAtMs: number;
+  /** Set once an admitted `send` referenced it; downloads require it. */
+  readonly referencedAtMs?: number;
+  /** The durable user `message` that referenced it (`send:<key>`). */
+  readonly messageId?: string;
+};
+
 /** Durable, cursor-numbered events; stored without the `type` wrapper and wrapped on the wire. */
 export type AppDurableEvent =
   | {
@@ -129,6 +151,8 @@ export type AppDurableEvent =
     text: string;
     at: string;
     key?: string;
+    /** Files sent with this user message, in send order; first part only when split. */
+    attachments?: AttachmentInfo[];
     /** Present only on a split message: part `i` (from 0) of `n`; see v2.md, Long messages. */
     part?: { i: number; n: number };
   }
@@ -152,6 +176,8 @@ export type AppPendingInput = {
   readonly whenBusy?: "steer";
   /** Held after repeated delivery failures; never resent automatically, like the other channels. */
   readonly held?: boolean;
+  /** Attachments this input was admitted with; already stored, never re-downloaded. */
+  readonly attachments?: AppUploadRecord[];
 };
 
 /** A command with a native effect on its thread or on this process; a refusal is terminal, never retried. */

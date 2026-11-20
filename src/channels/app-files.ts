@@ -34,7 +34,7 @@ import {
   type Transcriber,
   type TranscriberOptions,
 } from "../media/transcription.js";
-import { APP_LIMITS } from "./app-protocol.js";
+import { APP_LIMITS, type AppUploadRecord } from "./app-protocol.js";
 import type { AttachmentInfo } from "./generated/protocol-v2.js";
 
 /** Gateway-only bounds the app never sees; the wire bounds come from the generated protocol. */
@@ -60,26 +60,7 @@ export const APP_FILE_LIMITS = {
 /** The announced type served when the client sends none or an unusable one. */
 export const APP_DEFAULT_TYPE = "application/octet-stream";
 
-/**
- * One uploaded original. `path` is this store's workspace-relative locator; the bytes themselves
- * are never read here, so the record carries no content.
- */
-export type AppUploadRecord = {
-  readonly id: string;
-  /** Only this device sees the upload until an admitted message references it. */
-  readonly deviceId: string;
-  readonly name: string;
-  readonly type: string;
-  readonly size: number;
-  readonly kind: AttachmentInfo["kind"];
-  readonly path: string;
-  readonly createdAtMs: number;
-  /** Set once an admitted `send` referenced it; downloads require it. */
-  readonly referencedAtMs?: number;
-  /** The durable user `message` that referenced it (`send:<key>`). */
-  readonly messageId?: string;
-};
-
+/** The persisted upload registry; it carries no authority on its own. */
 export type AppFilesChannelState = { uploads: AppUploadRecord[] };
 
 export const AppFilesState = defineDoc<AppFilesChannelState>({
