@@ -60,11 +60,15 @@ function deferred() {
   return { promise, resolve };
 }
 
+// Polling waits use the real timer (not a busy setImmediate spin, which starves parallel test files of CPU),
+// captured at load so a test that mocks setTimeout cannot stall them.
+const realSetTimeout = globalThis.setTimeout;
+
 async function until(predicate, label) {
   const deadline = Date.now() + WAIT_MS;
   while (!predicate()) {
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
-    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => realSetTimeout(resolve, 2));
   }
 }
 
@@ -72,7 +76,7 @@ async function untilAsync(predicate, label) {
   const deadline = Date.now() + WAIT_MS;
   while (!(await predicate())) {
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
-    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => realSetTimeout(resolve, 2));
   }
 }
 

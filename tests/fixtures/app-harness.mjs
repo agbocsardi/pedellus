@@ -27,11 +27,16 @@ export const WebSocket = (await import('ws')).default;
 
 export const WAIT_MS = 15_000;
 
+// Polling waits sleep on the real timer (captured at load) instead of spinning setImmediate, which
+// starves parallel test files of CPU.
+const realSetTimeout = globalThis.setTimeout;
+const pause = () => new Promise((resolve) => realSetTimeout(resolve, 2));
+
 export async function until(predicate, label, timeoutMs = WAIT_MS) {
   const deadline = Date.now() + timeoutMs;
   while (!predicate()) {
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
-    await new Promise((resolve) => setImmediate(resolve));
+    await pause();
   }
 }
 
@@ -39,7 +44,7 @@ export async function untilAsync(predicate, label, timeoutMs = WAIT_MS) {
   const deadline = Date.now() + timeoutMs;
   while (!(await predicate())) {
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
-    await new Promise((resolve) => setImmediate(resolve));
+    await pause();
   }
 }
 

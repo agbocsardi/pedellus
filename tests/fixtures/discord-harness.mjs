@@ -57,11 +57,16 @@ export const DM_CHANNEL_ID = '8001';
 export const SUMMARY_PROMPT_PREFIX = 'You maintain one short factual summary';
 export const SUMMARY_BODY = 'Title: synthetic episode\n## Topics\n- synthetic\n## Keywords\n- synthetic';
 
+// Polling waits sleep on the real timer instead of spinning setImmediate (which starves parallel test files
+// of CPU); it is captured at load so tests that mock setTimeout cannot stall their own waits.
+const realSetTimeout = globalThis.setTimeout;
+const pause = () => new Promise((resolve) => realSetTimeout(resolve, 2));
+
 export async function until(predicate, label, timeoutMs = WAIT_MS) {
   const deadline = Date.now() + timeoutMs;
   while (!predicate()) {
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
-    await new Promise((resolve) => setImmediate(resolve));
+    await pause();
   }
 }
 
@@ -69,7 +74,7 @@ export async function untilAsync(predicate, label) {
   const deadline = Date.now() + WAIT_MS;
   while (!(await predicate())) {
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
-    await new Promise((resolve) => setImmediate(resolve));
+    await pause();
   }
 }
 
@@ -320,7 +325,7 @@ async function waitForListener(list, label) {
   const deadline = Date.now() + WAIT_MS;
   while (list.length === 0) {
     if (Date.now() > deadline) throw new Error(`the adapter never attached a ${label} listener`);
-    await new Promise((resolve) => setImmediate(resolve));
+    await pause();
   }
 }
 

@@ -40,11 +40,15 @@ const TOKEN = '123456:synthetic-token';
 const PHOTO_BYTES = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01]);
 const PDF_BYTES = Buffer.from('%PDF-1.4\nsynthetic document body\n%%EOF\n');
 
+// Polling waits use the real timer (not a busy setImmediate spin, which starves parallel test files of CPU),
+// captured at load so a test that mocks setTimeout cannot stall them.
+const realSetTimeout = globalThis.setTimeout;
+
 async function until(predicate, label) {
   const deadline = Date.now() + WAIT_MS;
   while (!predicate()) {
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
-    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => realSetTimeout(resolve, 2));
   }
 }
 
@@ -52,7 +56,7 @@ async function untilAsync(predicate, label) {
   const deadline = Date.now() + WAIT_MS;
   while (!(await predicate())) {
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
-    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => realSetTimeout(resolve, 2));
   }
 }
 
@@ -804,7 +808,7 @@ test('a too-large or rejected Telegram file becomes a truthful note and the turn
     // Admitted after the first answer, so these are two turns rather than one coalesced input.
     async () => {
       while (!transport.sent.some((entry) => entry.text === 'LARGE-NOTED')) {
-        await new Promise((resolve) => setImmediate(resolve));
+        await new Promise((resolve) => realSetTimeout(resolve, 2));
       }
       return [
         // This one announces a small message but getFile reports the real oversize.
@@ -912,7 +916,7 @@ test('a symlinked or hardlinked locator is refused and never written through', {
     // Admitted after the first answer, so each refusal is its own turn.
     async () => {
       while (!transport.sent.some((entry) => entry.text === 'LINKS-REFUSED')) {
-        await new Promise((resolve) => setImmediate(resolve));
+        await new Promise((resolve) => realSetTimeout(resolve, 2));
       }
       return [documentUpdate(561, 161, {
         fileId: 'link-2', uniqueId: 'unique-link-2', bytes: Buffer.from('HOSTILE TWO'),
@@ -1064,7 +1068,7 @@ test('the same Telegram file sent twice is stored once and every turn keeps the 
     // Admitted after the first answer, so these stay two turns that share one stored original.
     async () => {
       while (!transport.sent.some((entry) => entry.text === 'DEDUPE-OK')) {
-        await new Promise((resolve) => setImmediate(resolve));
+        await new Promise((resolve) => realSetTimeout(resolve, 2));
       }
       return [photoUpdate(581, 181, { fileId: 'photo-7', uniqueId: 'unique-photo-7', bytes: PHOTO_BYTES })];
     },

@@ -37,11 +37,15 @@ const BOT_ID = 7;
 const CHAT_ID = 501;
 const TOKEN = '123456:synthetic-token';
 
+// Polling waits use the real timer (not a busy setImmediate spin, which starves parallel test files of CPU),
+// captured at load so a test that mocks setTimeout cannot stall them.
+const realSetTimeout = globalThis.setTimeout;
+
 async function until(predicate, label) {
   const deadline = Date.now() + WAIT_MS;
   while (!(await predicate())) {
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
-    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => realSetTimeout(resolve, 2));
   }
 }
 
@@ -285,7 +289,7 @@ test('an unsupported rich method latches off and the reply is sent plain', { tim
         // observed on a genuinely later turn rather than inside one coalesced input.
         async () => {
           while (!transport.plain.some((entry) => entry.text === 'FIRST-REPLY')) {
-            await new Promise((resolve) => setImmediate(resolve));
+            await new Promise((resolve) => realSetTimeout(resolve, 2));
           }
           return [update(611, 'second')];
         },

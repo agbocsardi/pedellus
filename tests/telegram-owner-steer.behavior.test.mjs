@@ -38,11 +38,15 @@ const BOT_ID = 7;
 const CHAT_ID = 501;
 const TOKEN = '123456:synthetic-token';
 
+// Polling waits use the real timer (not a busy setImmediate spin, which starves parallel test files of CPU),
+// captured at load so a test that mocks setTimeout cannot stall them.
+const realSetTimeout = globalThis.setTimeout;
+
 async function until(predicate, label) {
   const deadline = Date.now() + WAIT_MS;
   while (!(await predicate())) {
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
-    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => realSetTimeout(resolve, 2));
   }
 }
 
@@ -830,7 +834,7 @@ async function withOriginRun(label, scheduledAnswer, body, options = {}) {
           name: 'origin reminder',
           isolated: false,
           ...(options.silent === true ? { silent: true } : {}),
-          at: new Date(Date.now() + 1_500).toISOString(),
+          at: new Date(Date.now() + 500).toISOString(),
         }, { id: 'origin-cron-add' }),
       ], { stopReason: 'toolUse' });
     }
@@ -1061,7 +1065,7 @@ test('an isolated occurrence in the same origin chat never disables owner steeri
           message: 'ISOLATED-PROMPT',
           name: 'isolated reminder',
           isolated: true,
-          at: new Date(Date.now() + 1_500).toISOString(),
+          at: new Date(Date.now() + 500).toISOString(),
         }, { id: 'isolated-cron-add' }),
       ], { stopReason: 'toolUse' });
     }
@@ -1160,7 +1164,7 @@ test('a stranded steer bounds origin admission waiting and reports the occurrenc
     const deadline = performance.now() + 10_000;
     while ((await store.gateway.harness.getTask(taskId, context)).state.status !== 'terminal') {
       assert.ok(performance.now() < deadline, 'origin wait must expire');
-      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => realSetTimeout(resolve, 2));
     }
     assert.equal((await chatInbox(store.gateway)).steer, 1, 'expiry never withdraws owner input');
     const job = await firstJob(store, origin);
