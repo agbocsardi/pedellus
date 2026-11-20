@@ -3,7 +3,7 @@ import { Streamdown } from "streamdown";
 import type { Connection } from "./conn";
 import type { AgentStatus, Outgoing, OutgoingState, Store } from "./store";
 import { LIMITS, MAIN_THREAD, type CommandInfo, type DurableEvent, type MessageEvent, type PresetInfo, type ThreadInfo, type ThreadOrigin } from "./protocol";
-import { disablePush, enablePush, hasPushSubscription, pushPermission, requestPushPermission, pushSupported, clearAppBadge, type PushPermission } from "./push";
+import { disablePush, enablePush, hasPushSubscription, pushPermission, requestPushPermission, pushSupported, subscribedServerKey, clearAppBadge, type PushPermission } from "./push";
 import { Avatar, type AvatarState } from "./Avatar";
 
 const FINE_POINTER = matchMedia("(pointer: fine)").matches;
@@ -768,15 +768,43 @@ function NotificationsItem({ store, conn, online }: { store: Store; conn: Connec
   const [note, setNote] = useState("");
   // Learn the gateway's answer while the menu is open, so an unconfigured
   // gateway never shows the row. Opening the menu never asks for permission.
+  // A rotated VAPID key rebuilds the browser subscription, but only for a
+  // device the owner already turned notifications on for.
   useEffect(() => {
     if (!pushSupported()) return;
     void (async () => {
       // A cleared store must not claim "on" when the browser dropped it.
-      if (store.push.endpoint && !(await hasPushSubscription())) await store.setPush({ endpoint: undefined });
-      if (store.push.gatewayUnsupported !== undefined) return;
+      if (store.push.endpoint && !(await hasPushSubscription())) {
+        await store.setPush({ endpoint: undefined, key: undefined });
+      }
       const res = await conn.pushKey();
-      if (res?.ok) await store.setPush({ gatewayUnsupported: false });
-      else if (res && !res.ok && res.error === "unsupported") await store.setPush({ gatewayUnsupported: true });
+      if (!res) return; // offline: nothing to compare against yet
+      if (!res.ok) {
+        if (res.error === "unsupported") await store.setPush({ gatewayUnsupported: true });
+        return;
+      }
+      if (!res.key) return;
+      // Compare against the key the store last saw before overwriting it.
+      const rotated = store.push.key !== undefined && store.push.key !== res.key;
+      await store.setPush({ gatewayUnsupported: false, key: res.key });
+      if (!store.push.endpoint) return;
+      if (!rotated && await subscribedServerKey() === res.key) return;
+      // The gateway's key changed under a live subscription: rebuild it on the
+      // new key rather than leaving pushes the gateway cannot address.
+      setBusy(true);
+      try {
+        const renewed = await subscribe(store, conn, res.key);
+        setPermission(renewed.permission);
+        if (renewed.note) {
+          // The old subscription is gone; say so instead of claiming "on".
+          await store.setPush({ endpoint: undefined });
+          setNote(renewed.note);
+        } else {
+          setNote("Notifications renewed for this device.");
+        }
+      } finally {
+        setBusy(false);
+      }
     })();
   }, [store, conn]);
   if (store.push.gatewayUnsupported) return null;
@@ -823,26 +851,9 @@ function NotificationsItem({ store, conn, online }: { store: Store; conn: Connec
         setNote("The gateway did not send a notification key. Try again.");
         return;
       }
-      const attempt = await enablePush(key.key);
-      if (attempt.kind !== "subscribed") {
-        setPermission(pushPermission());
-        setNote(attempt.kind === "denied"
-          ? "Notifications are blocked for this app. Allow them in browser settings, then try again."
-          : "Could not subscribe this device. Try again.");
-        return;
-      }
-      const saved = await conn.pushSubscribe(attempt.subscription);
-      if (!saved?.ok) {
-        await disablePush();
-        if (saved?.error === "unsupported") await store.setPush({ gatewayUnsupported: true });
-        else setNote(saved
-          ? "The gateway did not accept this device. Try again."
-          : "Reconnect to finish turning notifications on, then try again.");
-        return;
-      }
-      await store.setPush({ endpoint: attempt.subscription.endpoint });
-      setPermission(pushPermission());
-      setNote("Notifications are on for this device.");
+      const result = await subscribe(store, conn, key.key);
+      setPermission(result.permission);
+      setNote(result.note ?? "Notifications are on for this device.");
     } finally {
       setBusy(false);
     }
@@ -859,6 +870,33 @@ function NotificationsItem({ store, conn, online }: { store: Store; conn: Connec
       disabled={busy || permission === "unsupported" || permission === "denied"} onClick={() => void toggle()} />
     {note && <p className="sheet-help" role="status">{note}</p>}
   </>;
+}
+
+/**
+ * Browser subscribe with the gateway's key, then `push.subscribe`. Permission
+ * must be granted already; nothing here prompts. On failure nothing stays half
+ * on: the browser subscription is dropped and `push.subscribe` is never sent.
+ */
+async function subscribe(store: Store, conn: Connection, key: string): Promise<{
+  permission: PushPermission; note?: string;
+}> {
+  const attempt = await enablePush(key);
+  const permission = pushPermission();
+  if (attempt.kind !== "subscribed") {
+    return { permission, note: attempt.kind === "denied"
+      ? "Notifications are blocked for this app. Allow them in browser settings, then try again."
+      : "Could not subscribe this device. Try again." };
+  }
+  const saved = await conn.pushSubscribe(attempt.subscription);
+  if (!saved?.ok) {
+    await disablePush();
+    if (saved?.error === "unsupported") await store.setPush({ gatewayUnsupported: true });
+    return { permission, note: saved
+      ? "The gateway did not accept this device. Try again."
+      : "Reconnect to finish turning notifications on, then try again." };
+  }
+  await store.setPush({ endpoint: attempt.subscription.endpoint, key });
+  return { permission };
 }
 
 function ThreadTitleForm({ kind, initial, busy, online, save }: {

@@ -10,8 +10,11 @@ export type AgentStatus = Pick<StatusEvent, "state" | "label">;
 type ChatEvent = Exclude<DurableEvent, { event: "thread" }>;
 type Identity = { device?: string; agent?: string; commands?: CommandInfo[]; presets?: PresetInfo[] };
 type LiveStatus = AgentStatus & { turnKey?: string };
-/** Web Push opt-in. `endpoint` is set only once the gateway accepted it. */
-export type PushState = { endpoint?: string; gatewayUnsupported?: boolean };
+/**
+ * Web Push opt-in. `endpoint` is set only once the gateway accepted it; `key`
+ * is the gateway VAPID key that subscription was made with.
+ */
+export type PushState = { endpoint?: string; key?: string; gatewayUnsupported?: boolean };
 
 interface Db extends DBSchema {
   events: { key: number; value: DurableEvent };
@@ -471,7 +474,8 @@ export class Store {
   /** Merge a push state change; unchanged values do not re-render. */
   async setPush(patch: PushState) {
     const next: PushState = { ...this.push, ...patch };
-    if (next.endpoint === this.push.endpoint && next.gatewayUnsupported === this.push.gatewayUnsupported) return;
+    if (next.endpoint === this.push.endpoint && next.key === this.push.key
+      && next.gatewayUnsupported === this.push.gatewayUnsupported) return;
     this.push = next;
     this.changed();
     await this.db?.put("settings", next, "push").catch(console.error);

@@ -87,6 +87,10 @@ export async function enablePush(key: string): Promise<PushAttempt> {
   try {
     const reg = await activeRegistration();
     if (!reg) return { kind: "failed" };
+    const existing = await reg.pushManager.getSubscription();
+    // `subscribe()` refuses a second, differently keyed subscription, so a
+    // rotated gateway key drops the stale one first.
+    if (existing && toBase64Url(existing.options.applicationServerKey ?? null) !== key) await existing.unsubscribe();
     const sub = await reg.pushManager.subscribe({
       userVisibleOnly: true,
       applicationServerKey: fromBase64Url(key),
@@ -121,5 +125,28 @@ export async function hasPushSubscription(): Promise<boolean> {
     return (await reg?.pushManager.getSubscription()) != null;
   } catch {
     return false;
+  }
+}
+
+function toBase64Url(bytes: ArrayBuffer | null): string | undefined {
+  if (!bytes) return undefined;
+  let binary = "";
+  for (const byte of new Uint8Array(bytes)) binary += String.fromCharCode(byte);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
+/**
+ * The VAPID key this browser's subscription was made with, base64url. A gateway
+ * that rotated its key must not keep pushing to a subscription it cannot
+ * address, so the app compares this with `push.key`.
+ */
+export async function subscribedServerKey(): Promise<string | undefined> {
+  if (!pushSupported()) return undefined;
+  try {
+    const reg = await activeRegistration();
+    const sub = await reg?.pushManager.getSubscription();
+    return toBase64Url(sub?.options.applicationServerKey ?? null);
+  } catch {
+    return undefined;
   }
 }
