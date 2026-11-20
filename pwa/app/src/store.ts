@@ -1,5 +1,5 @@
 import { openDB, type DBSchema, type IDBPDatabase } from "idb";
-import { MAIN_THREAD, type CommandInfo, type DurableEvent, type ModelEvent, type PresetInfo, type StatusEvent, type ThreadId, type ThreadInfo, type ThreadOrigin } from "./protocol";
+import { MAIN_THREAD, type ActivityEvent, type CommandInfo, type DurableEvent, type ModelEvent, type PresetInfo, type StatusEvent, type ThreadId, type ThreadInfo, type ThreadOrigin } from "./protocol";
 
 export type ConnState = "offline" | "connecting" | "replaying" | "open";
 export type Mode = "boot" | "chat" | "pair" | "update";
@@ -64,6 +64,9 @@ export class Store {
   private statuses = new Map<ThreadId, LiveStatus>();
   // Model presets are live too: hello resends each thread's selection.
   private models = new Map<ThreadId, string | null>();
+  // A running turn's tool steps are live as well: `activity` replaces them per thread and
+  // `settled` (or the answer that carries the same list) ends them.
+  private activities = new Map<ThreadId, ActivityEvent>();
   private pendingModels = new Map<ThreadId, string>();
   private unfinished = new Map<ThreadId, Set<string>>();
   private viewed = new Map<ThreadId, number>();
@@ -261,6 +264,7 @@ export class Store {
         return this.updateOutgoing(m, "admitted");
       }
     } else if (ev.event === "settled" || (ev.event === "message" && ev.role === "assistant")) {
+      this.activities.delete(ev.thread);
       const unfinished = this.unfinished.get(ev.thread);
       if (ev.key && unfinished?.delete(ev.key) && !unfinished.size) this.unfinished.delete(ev.thread);
       if (ev.key && this.statuses.get(ev.thread)?.turnKey === ev.key) this.statuses.delete(ev.thread);
@@ -432,6 +436,19 @@ export class Store {
   resetModels() {
     this.models.clear();
     this.pendingModels.clear();
+    this.changed();
+  }
+
+  /** The live tool steps of this thread's running turn; `settled` clears them. */
+  activity(thread: ThreadId): ActivityEvent | undefined { return this.activities.get(thread); }
+
+  resetActivities() {
+    this.activities.clear();
+    this.changed();
+  }
+
+  setActivity(ev: ActivityEvent) {
+    this.activities.set(ev.thread, ev);
     this.changed();
   }
 

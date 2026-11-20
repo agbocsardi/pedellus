@@ -1291,3 +1291,131 @@ input#pair-code {
   gap: 6px;
   min-width: 0;
 }
+
+/* ── Activity: a turn's tool steps (protocol v2, "Activity") ──────────────── */
+
+.activity {
+  margin-top: 6px;
+}
+.activity.is-live {
+  margin-top: 4px;
+  margin-bottom: 4px;
+}
+/* The collapsed line and every step row are real tap targets. */
+.activity-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-height: 44px;
+  padding: 0 2px;
+  border: 0;
+  background: none;
+  color: var(--muted-ink);
+  font-size: 0.85rem;
+  text-align: start;
+}
+.activity-toggle:active {
+  opacity: 0.7;
+}
+.activity-count {
+  font-weight: 600;
+}
+.activity-omitted {
+  color: var(--muted-ink);
+}
+.activity-chevron {
+  margin-inline-start: auto;
+  transition: transform 0.15s ease;
+}
+.activity-toggle[aria-expanded="true"] .activity-chevron {
+  transform: rotate(90deg);
+}
+.activity-list {
+  list-style: none;
+  margin: 0 0 2px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: color-mix(in oklab, var(--muted) 45%, transparent);
+}
+.activity-step {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 44px;
+  padding: 2px 8px;
+  border: 0;
+  border-radius: 10px;
+  background: none;
+  text-align: start;
+  font-size: 0.88rem;
+}
+.activity-step:active {
+  background: var(--muted);
+}
+.activity-mark {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  font-size: 0.85rem;
+  font-weight: 700;
+  color: var(--accent);
+}
+.activity-step[data-state="failed"] .activity-mark {
+  color: var(--danger);
+}
+.activity-tool {
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  overflow-wrap: anywhere;
+}
+.activity-time {
+  color: var(--muted-ink);
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.activity-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid color-mix(in oklab, var(--accent) 30%, transparent);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: activity-spin 0.9s linear infinite;
+}
+@keyframes activity-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+/* One step's detail, inline under its row — never a modal. */
+.activity-detail {
+  display: grid;
+  gap: 2px;
+  margin: 0 8px 8px 36px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: var(--card);
+  font-size: 0.8rem;
+}
+.activity-detail div {
+  display: grid;
+  grid-template-columns: 5.5rem minmax(0, 1fr);
+  gap: 8px;
+}
+.activity-detail dt {
+  color: var(--muted-ink);
+}
+.activity-detail dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.activity-more {
+  padding: 6px 8px;
+  color: var(--muted-ink);
+  font-size: 0.78rem;
+}

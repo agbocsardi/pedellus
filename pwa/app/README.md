@@ -26,6 +26,8 @@ profile or clear site data before pairing again. Set `IDLE_ARCHIVE_MS=3000`
 on the mock to try automatic archiving after three seconds of idleness. Ask for
 `a long answer` to get a durable message split into `part: {i, n}` frames
 (protocol v2, *Long messages*), including while it is only partly received.
+Ask for `use tools` to get three non-durable `activity` steps (one failing)
+before the answer, which carries the same list as `steps`.
 The mock records and validates fork origins without copying messages into
 the new thread. It doesn't run a real agent. Push is on: the mock makes
 throwaway VAPID keys at start, answers `push.key`, stores one subscription

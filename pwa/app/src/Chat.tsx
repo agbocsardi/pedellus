@@ -5,6 +5,7 @@ import type { AgentStatus, Outgoing, OutgoingState, Store } from "./store";
 import { LIMITS, MAIN_THREAD, type CommandInfo, type DurableEvent, type MessageEvent, type PresetInfo, type ThreadInfo, type ThreadOrigin } from "./protocol";
 import { disablePush, enablePush, hasPushSubscription, pushPermission, requestPushPermission, pushSupported, subscribedServerKey, clearAppBadge, type PushPermission } from "./push";
 import { Avatar, type AvatarState } from "./Avatar";
+import { ActivitySteps } from "./ActivitySteps";
 
 const FINE_POINTER = matchMedia("(pointer: fine)").matches;
 /** From here the thread list is a sidebar and the chat sits beside it. */
@@ -154,6 +155,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   const setText = (value: string) => setDrafts((prev) => ({ ...prev, [thread]: value }));
   const online = store.connState === "open";
   const running = !archived && isRunning(store.status(thread).state);
+  const liveActivity = store.activity(thread);
   const p = presence(store);
   const latest = store.latestViewable(thread);
   const origin = info?.origin;
@@ -699,6 +701,11 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
             <i />
           </div>
         )}
+        {running && liveActivity !== undefined && liveActivity.steps.length > 0 && (
+          <div className="msg activity-live">
+            <ActivitySteps live steps={liveActivity.steps} omitted={liveActivity.omitted} />
+          </div>
+        )}
       </div>
 
       <footer className="composer">
@@ -1160,6 +1167,8 @@ function EventRow({ ev, text, partial, store, last, forks, onActions, onRetry }:
     ) : (
       <div className="msg assistant" {...anchor}>
         <Streamdown mode="static">{body}</Streamdown>
+        {ev.steps !== undefined && ev.steps.length > 0 &&
+          <ActivitySteps steps={ev.steps} omitted={ev.omitted} />}
         {incomplete}
       </div>
     )}
