@@ -1,5 +1,5 @@
 import { openDB, type DBSchema, type IDBPDatabase } from "idb";
-import { MAIN_THREAD, type CommandInfo, type DurableEvent, type ModelEvent, type PresetInfo, type StatusEvent, type ThreadId, type ThreadInfo, type ThreadOrigin } from "./protocol";
+import { MAIN_THREAD, type CommandInfo, type DurableEvent, type ModelEvent, type PresetInfo, type Reaction, type StatusEvent, type ThreadId, type ThreadInfo, type ThreadOrigin } from "./protocol";
 
 export type ConnState = "offline" | "connecting" | "replaying" | "open";
 export type Mode = "boot" | "chat" | "pair" | "update";
@@ -430,7 +430,8 @@ export class Store {
   latestViewable(thread: ThreadId): number {
     const events = this.events.get(thread) ?? [];
     for (let i = events.length - 1; i >= 0; i--) {
-      if (events[i].event !== "settled") return events[i].cursor;
+      // A reaction or a settlement changes a message's state, not the thread's read state.
+      if (events[i].event !== "settled" && events[i].event !== "reaction") return events[i].cursor;
     }
     return 0;
   }
@@ -447,6 +448,20 @@ export class Store {
   }
 
   status(thread: ThreadId): AgentStatus { return this.statuses.get(thread) ?? IDLE; }
+
+  /**
+   * The owner's durable reaction on one message: an emoji, `null` when it was cleared, or
+   * `undefined` when this device has seen no reaction event for it. Only the latest event per
+   * (`message`, `by`) counts, so a clear is not shadowed by an earlier reaction.
+   */
+  reaction(thread: ThreadId, messageId: string): Reaction | null | undefined {
+    const events = this.events.get(thread) ?? [];
+    for (let i = events.length - 1; i >= 0; i--) {
+      const ev = events[i];
+      if (ev.event === "reaction" && ev.message === messageId) return ev.emoji;
+    }
+    return undefined;
+  }
 
   resetStatuses() {
     this.statuses.clear();

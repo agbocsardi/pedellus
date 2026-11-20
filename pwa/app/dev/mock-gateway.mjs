@@ -106,8 +106,12 @@ function addThread(id, title, origin) {
 const main = addThread("main", "Main");
 const full = () => [...threads.values()].filter((t) => t !== main && !t.info.archived).length >= MAX_OPEN_THREADS;
 
+/** The owner's reaction palette (protocol v2, Reactions). */
+const REACTIONS = ["👍", "👎", "❤️", "😂", "🤔", "🎉"];
+
 function isDurable(ev) {
-  return ev.event === "message" || ev.event === "settled" || ev.event === "divider" || ev.event === "thread";
+  return ev.event === "message" || ev.event === "settled" || ev.event === "divider" ||
+    ev.event === "reaction" || ev.event === "thread";
 }
 
 function broadcast(ev) {
@@ -689,6 +693,16 @@ function onStream(ws, token) {
         });
         thread.queue.push(key);
         if (!thread.running) startTurn(thread);
+        break;
+      }
+      case "react": {
+        const { message, emoji } = frame;
+        if (!thread || thread.info.archived || typeof message !== "string") return invalid();
+        if (emoji !== null && !REACTIONS.includes(emoji)) return invalid();
+        // The target must be a durable message of this thread, like the real gateway requires.
+        if (!events.some((e) => e.event === "message" && e.thread === thread.info.id && e.id === message)) return invalid();
+        reply(ws, frame.id, true);
+        emit(thread, "reaction", { message, by: "owner", emoji });
         break;
       }
       case "ack": {

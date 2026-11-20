@@ -5,6 +5,7 @@ import type { AgentStatus, NewAttachment, Outgoing, OutgoingState, Store } from 
 import { LIMITS, MAIN_THREAD, type CommandInfo, type DurableEvent, type MessageEvent, type PresetInfo, type ThreadInfo, type ThreadOrigin } from "./protocol";
 import { disablePush, enablePush, hasPushSubscription, pushPermission, requestPushPermission, pushSupported, subscribedServerKey, clearAppBadge, type PushPermission } from "./push";
 import { Avatar, type AvatarState } from "./Avatar";
+import { Reactions } from "./Reactions";
 import { attachmentKind, fileUrl, formatBytes, uploadErrorText, uploadFile } from "./uploads";
 
 const FINE_POINTER = matchMedia("(pointer: fine)").matches;
@@ -888,7 +889,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
         {rows.map((r, i) =>
           r.kind === "ev" ? (
             <EventRow key={`e${r.ev.cursor}`} ev={r.ev} text={r.text} partial={r.partial}
-              store={store} last={i === lastUser}
+              store={store} conn={conn} thread={thread} last={i === lastUser}
               forks={r.ev.event === "message" ? forks.get(r.ev.id) : undefined}
               onActions={(ev, button) => show({ kind: "message", title: suggestedTitle(ev.text),
                 from: { thread: ev.thread, messageId: ev.id } }, button)}
@@ -1375,8 +1376,9 @@ function Icon({ d, bold }: { d: string; bold?: boolean }) {
   );
 }
 
-function EventRow({ ev, text, partial, store, last, forks, onActions, onRetry }: {
-  ev: DurableEvent; text?: string; partial?: boolean; store: Store; last: boolean; forks?: ThreadInfo[];
+function EventRow({ ev, text, partial, store, conn, thread, last, forks, onActions, onRetry }: {
+  ev: DurableEvent; text?: string; partial?: boolean; store: Store; conn: Connection; thread: string;
+  last: boolean; forks?: ThreadInfo[];
   onActions: (ev: MessageEvent, button: HTMLButtonElement) => void;
   onRetry?: (m: Outgoing) => void;
 }) {
@@ -1409,6 +1411,8 @@ function EventRow({ ev, text, partial, store, last, forks, onActions, onRetry }:
         {incomplete}
       </div>
     )}
+    {anchor && (ev.role === "user" || ev.role === "assistant") &&
+      <Reactions store={store} conn={conn} thread={thread} messageId={ev.id} role={ev.role} />}
     {(anchor || !!forks?.length) && <div className="msg fork-links" data-role={ev.role}>
       {anchor && <button className="message-actions" aria-label="Message actions" aria-haspopup="dialog"
         onClick={(e) => onActions(ev, e.currentTarget)}>⋯</button>}

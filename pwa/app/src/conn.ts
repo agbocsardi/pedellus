@@ -7,6 +7,7 @@ import {
   type ControlCommand,
   type PresetInfo,
   type PushSubscriptionInfo,
+  type Reaction,
   type Request,
   type Response,
   type ServerFrame,
@@ -100,6 +101,15 @@ export class Connection {
 
   archive(thread: ThreadId, archived: boolean) {
     return this.mutate({ type: "req", id: this.id(), op: "thread.archive", thread, archived });
+  }
+
+  /**
+   * One owner reaction on a message (protocol v2, Reactions): an emoji, or `null` to clear it.
+   * Fire and forget — the badge follows the durable `reaction` event, never this call.
+   */
+  react(thread: ThreadId, message: string, emoji: Reaction | null) {
+    if (this.store.connState !== "open" || !this.store.canWrite(thread)) return;
+    this.request({ type: "req", id: this.id(), op: "react", thread, message, emoji }, () => undefined);
   }
 
   /** The VAPID public key to subscribe to; `unsupported` when push is off. */
@@ -380,6 +390,7 @@ export class Connection {
       case "message":
       case "settled":
       case "divider":
+      case "reaction":
       case "thread": {
         if (this.replaying && this.replayHead !== null && f.cursor <= this.replayHead) {
           this.replayCount++;
