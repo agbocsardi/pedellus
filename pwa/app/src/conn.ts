@@ -423,6 +423,12 @@ export class Connection {
       case "reaction":
       case "question":
       case "thread": {
+        // A durable event must carry a positive integer cursor; a malformed one from a broken
+        // gateway is dropped instead of being stored and taking the UI down.
+        if (!Number.isSafeInteger(f.cursor) || f.cursor <= 0) {
+          console.error("durable event without a valid cursor dropped", f.event);
+          break;
+        }
         if (this.replaying && this.replayHead !== null && f.cursor <= this.replayHead) {
           this.replayCount++;
           this.replayCursor = f.cursor;

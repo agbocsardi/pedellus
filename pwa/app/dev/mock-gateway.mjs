@@ -150,8 +150,7 @@ const REACTIONS = ["👍", "👎", "❤️", "😂", "🤔", "🎉"];
 
 function isDurable(ev) {
   return ev.event === "message" || ev.event === "settled" || ev.event === "divider" ||
-    ev.event === "reaction" || ev.event === "thread";
-    ev.event === "thread" || ev.event === "question";
+    ev.event === "reaction" || ev.event === "thread" || ev.event === "question";
 }
 
 function broadcast(ev) {
