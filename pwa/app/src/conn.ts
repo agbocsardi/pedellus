@@ -459,7 +459,7 @@ export class Connection {
 }
 
 /** Well-formed `activity.steps` entries, bounded to the protocol's own limits. */
-function activitySteps(raw: unknown): ActivityStep[] {
+export function activitySteps(raw: unknown): ActivityStep[] {
   if (!Array.isArray(raw)) return [];
   const out: ActivityStep[] = [];
   for (const item of raw.slice(0, LIMITS.maxActivitySteps)) {

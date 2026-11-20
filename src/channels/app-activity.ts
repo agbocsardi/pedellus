@@ -21,7 +21,10 @@ export function emptyActivity(): ActivityTally {
 }
 
 /** At most `maxChars` UTF-16 units, never cutting a surrogate pair. */
-function boundedTool(name: string, maxChars: number): string {
+function boundedTool(raw: string, maxChars: number): string {
+  // Tool names come from the model or an MCP server: control, format and bidi characters never
+  // reach a frame (the same rule as thread titles and labels).
+  const name = raw.replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, "");
   if (name.length <= maxChars) return name;
   const last = name.charCodeAt(maxChars - 1);
   return name.slice(0, maxChars > 1 && last >= 0xd800 && last <= 0xdbff ? maxChars - 1 : maxChars);
@@ -29,7 +32,10 @@ function boundedTool(name: string, maxChars: number): string {
 
 /** The message's own timestamp as an ISO instant; a message without one starts no step. */
 function instant(value: unknown): string | undefined {
-  return typeof value === "number" && Number.isFinite(value) ? new Date(value).toISOString() : undefined;
+  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  const date = new Date(value);
+  // A finite timestamp outside Date's range would throw in toISOString and fail the delivery.
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
 }
 
 /** Fold one page of committed transcript entries into the run's steps; idempotent per entry order. */
@@ -42,18 +48,22 @@ export function absorbActivity(tally: ActivityTally, entries: readonly EntryReco
         readonly toolCallId?: unknown; readonly isError?: unknown;
       };
       if (message.role === "assistant") {
+        // An interrupted attempt's partial (kept by Durable on restart) never ran its tool calls.
+        if ((message as { readonly stopReason?: unknown }).stopReason === "aborted") continue;
         if (!Array.isArray(message.content)) continue;
         for (const block of message.content) {
           if (block === null || typeof block !== "object") continue;
           const call = block as { readonly type?: unknown; readonly id?: unknown; readonly name?: unknown };
-          if (call.type !== "toolCall" || typeof call.name !== "string" || call.name === "") continue;
+          if (call.type !== "toolCall" || typeof call.name !== "string") continue;
+          const tool = boundedTool(call.name, maxToolChars);
+          if (tool === "") continue;
           if (typeof call.id !== "string" || call.id === "") continue;
           const startedAt = instant(message.timestamp);
           if (startedAt === undefined) continue;
           tally.steps.push({
             // The wire id is positional, so no provider call id and no tool input reaches it.
             id: `s${tally.steps.length + 1}`,
-            tool: boundedTool(call.name, maxToolChars),
+            tool,
             state: "running",
             startedAt,
           });

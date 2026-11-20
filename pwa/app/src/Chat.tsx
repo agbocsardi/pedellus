@@ -1,6 +1,6 @@
 import { useEffect, useEffectEvent, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { Streamdown } from "streamdown";
-import type { Connection } from "./conn";
+import { activitySteps, type Connection } from "./conn";
 import type { AgentStatus, Outgoing, OutgoingState, Store } from "./store";
 import { LIMITS, MAIN_THREAD, type CommandInfo, type DurableEvent, type MessageEvent, type PresetInfo, type ThreadInfo, type ThreadOrigin } from "./protocol";
 import { disablePush, enablePush, hasPushSubscription, pushPermission, requestPushPermission, pushSupported, subscribedServerKey, clearAppBadge, type PushPermission } from "./push";
@@ -1155,6 +1155,8 @@ function EventRow({ ev, text, partial, store, last, forks, onActions, onRetry }:
   }
   if (ev.event !== "message") return null; // settled only drives delivery state
   const body = text ?? ev.text;
+  // Stored events come from IndexedDB too; render only well-formed steps.
+  const steps = ev.role === "assistant" ? activitySteps(ev.steps) : [];
   const incomplete = partial ? <span className="msg-partial">Incomplete</span> : null;
   const outgoing = ev.key ? store.outgoing(ev.thread, ev.key) : undefined;
   const anchor = Number.isSafeInteger(ev.cursor) && ev.cursor > 0 && ev.role !== "notice"
@@ -1167,8 +1169,7 @@ function EventRow({ ev, text, partial, store, last, forks, onActions, onRetry }:
     ) : (
       <div className="msg assistant" {...anchor}>
         <Streamdown mode="static">{body}</Streamdown>
-        {ev.steps !== undefined && ev.steps.length > 0 &&
-          <ActivitySteps steps={ev.steps} omitted={ev.omitted} />}
+        {steps.length > 0 && <ActivitySteps steps={steps} omitted={typeof ev.omitted === "number" ? ev.omitted : undefined} />}
         {incomplete}
       </div>
     )}
