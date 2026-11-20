@@ -40,6 +40,21 @@ export function App({ store }: { store: Store }) {
     const isField = (el: EventTarget | null): el is HTMLElement =>
       el instanceof HTMLElement && el.matches(".app textarea, .app input");
     const kbOpen = () => vv.height < window.innerHeight - 80;
+    // Installed iOS 26 sometimes lays the page out to the full screen and sometimes stops it a
+    // status bar short of the bottom (measured: 852pt screen, 793pt page), while
+    // env(safe-area-inset-bottom) always reports the home indicator. Pad by the part of that
+    // inset the page really reaches, measured, so the composer neither hides under the home
+    // indicator nor floats above a gap.
+    const probe = document.createElement("div");
+    probe.style.cssText = "position:fixed;visibility:hidden;pointer-events:none;height:env(safe-area-inset-bottom)";
+    document.body.appendChild(probe);
+    const insetBottom = () => {
+      const inset = probe.getBoundingClientRect().height;
+      const landscape = window.innerWidth > window.innerHeight;
+      const screenH = landscape ? Math.min(screen.width, screen.height) : Math.max(screen.width, screen.height);
+      const covered = window.innerHeight - (screenH - inset);
+      return Math.max(0, Math.min(inset, covered));
+    };
     let wasOpen = false;
     const sync = () => {
       const open = kbOpen();
@@ -47,6 +62,7 @@ export function App({ store }: { store: Store }) {
       wasOpen = open;
       if (window.scrollX || window.scrollY) window.scrollTo(0, 0);
       style.setProperty("--app-h", `${vv.height}px`);
+      style.setProperty("--inset-bottom", `${open ? 0 : insetBottom()}px`);
       style.setProperty("--vv-top", `${open ? vv.offsetTop : 0}px`);
     };
     const tap = (e: TouchEvent) => {
@@ -65,6 +81,8 @@ export function App({ store }: { store: Store }) {
       window.removeEventListener("scroll", sync);
       document.removeEventListener("touchend", tap);
       style.removeProperty("--app-h");
+      style.removeProperty("--inset-bottom");
+      probe.remove();
       style.removeProperty("--vv-top");
     };
   }, []);
