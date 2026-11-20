@@ -44,6 +44,11 @@ const UPLOAD_TTL_MS = 24 * 60 * 60 * 1000;
 /** NO_UPLOADS=1 stands in for a gateway without media storage configured. */
 const UPLOADS = process.env.NO_UPLOADS !== "1";
 const MIME_RE = /^[A-Za-z0-9.+-]+\/[A-Za-z0-9.+_-]+$/;
+// v2.md, Agent files and artifacts: the header the real gateway sends for `?view=artifact`.
+const ARTIFACT_CSP =
+  "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline'; " +
+  "style-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'; " +
+  "frame-ancestors 'self'";
 
 const pairCode =
   process.argv[2] ||
@@ -265,6 +270,7 @@ function startTurn(thread) {
 
   emit(thread, "status", { state: "queued" });
   at(300, () => emit(thread, "status", { state: "thinking" }));
+  const artifact = /make artifact/i.test(asked) ? sendArtifact("downloads.html", "text/html", ARTIFACT_HTML) : undefined;
   const tools = /use tools/i.test(asked) ? toolSteps(Date.now()) : undefined;
   if (tools) {
     const labels = ["read", "bash", "web_search"];
@@ -279,6 +285,7 @@ function startTurn(thread) {
   at(600 + chunks.length * 90 + 200, () => {
     emitMessage(thread, {
       id: `a-${key}`, role: "assistant", text, at: iso(), key,
+      ...(artifact === undefined ? {} : { attachments: [artifact] }),
       ...(tools === undefined ? {} : { steps: tools[3]() }),
     });
     emit(thread, "settled", { key, outcome: "answered" });
@@ -364,6 +371,91 @@ function longAnswer(asked) {
   return rows.join("\n");
 }
 
+/**
+ * A small interactive chart the "agent" made: one artifact (.html) sent as a durable
+ * assistant message attachment (v2.md, Agent files and artifacts). It needs no network
+ * and no same-origin access, so the sandboxed frame is all it gets.
+ */
+const ARTIFACT_HTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Weekly downloads</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 14px; font: 14px/1.4 -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: #f7f6f3; color: #22211e; }
+  @media (prefers-color-scheme: dark) { body { background: #212422; color: #eae8e2; } }
+  h1 { margin: 0 0 2px; font-size: 15px; font-weight: 600; }
+  p.sub { margin: 0 0 10px; font-size: 12px; opacity: 0.65; }
+  .bars { display: flex; align-items: flex-end; gap: 6px; height: 120px; }
+  .bar { flex: 1; display: flex; align-items: flex-end; height: 100%; }
+  .bar span { width: 100%; border-radius: 4px 4px 0 0; background: #0e7a6a; transition: height 0.18s ease; }
+  @media (prefers-color-scheme: dark) { .bar span { background: #4fbfa9; } }
+  .days { display: flex; gap: 6px; margin-top: 4px; font-size: 10px; opacity: 0.6; }
+  .days span { flex: 1; text-align: center; }
+  .row { display: flex; gap: 8px; margin-top: 12px; }
+  button { flex: 1; min-height: 32px; border: 1px solid currentColor; border-radius: 8px;
+    background: none; color: inherit; font: inherit; opacity: 0.8; }
+  button[aria-pressed="true"] { opacity: 1; font-weight: 600; border-width: 2px; }
+</style>
+</head>
+<body>
+<h1>Weekly downloads</h1>
+<p class="sub" id="caption">This month</p>
+<div class="bars" id="bars"></div>
+<div class="days" id="days"></div>
+<div class="row">
+  <button data-set="0" aria-pressed="true">This month</button>
+  <button data-set="1" aria-pressed="false">Last month</button>
+</div>
+<script>
+  var days = ["M", "T", "W", "T", "F", "S", "S"];
+  var sets = [[12, 18, 9, 24, 30, 21, 35], [8, 14, 22, 11, 19, 27, 16]];
+  var bars = document.getElementById("bars");
+  var labels = document.getElementById("days");
+  var caption = document.getElementById("caption");
+  days.forEach(function (day) {
+    var cell = document.createElement("span");
+    cell.textContent = day;
+    labels.appendChild(cell);
+  });
+  sets[0].forEach(function () {
+    bars.appendChild(document.createElement("div")).className = "bar";
+  });
+  function draw(set) {
+    var max = Math.max.apply(null, sets[set]);
+    Array.prototype.forEach.call(bars.children, function (bar, i) {
+      var fill = bar.firstChild || bar.appendChild(document.createElement("span"));
+      fill.style.height = Math.round((sets[set][i] / max) * 100) + "%";
+    });
+    caption.textContent = set === 0 ? "This month" : "Last month";
+  }
+  Array.prototype.forEach.call(document.querySelectorAll("button"), function (button) {
+    button.addEventListener("click", function () {
+      Array.prototype.forEach.call(document.querySelectorAll("button"), function (other) {
+        other.setAttribute("aria-pressed", String(other === button));
+      });
+      draw(Number(button.dataset.set));
+    });
+  });
+  draw(0);
+</script>
+</body>
+</html>
+`;
+
+/** Store one artifact in memory and describe it as an `AttachmentInfo` of kind "artifact". */
+function sendArtifact(name, type, body) {
+  const bytes = Buffer.from(body, "utf8");
+  const id = `f_${randomBytes(16).toString("base64url")}`;
+  // No owner token: v2.md lets any paired device fetch a referenced file.
+  files.set(id, { token: null, name, type, size: bytes.length, bytes, at: Date.now(), used: true, artifact: true });
+  return { id, name, type, size: bytes.length, kind: "artifact" };
+}
+
 function answerFor(key) {
   const sent = admitted.get(key);
   const asked = sent?.text ?? "…";
@@ -371,6 +463,11 @@ function answerFor(key) {
   if (!asked.trim() && sent?.attachments?.some((f) => f.kind === "audio")) return "(heard a voice note)";
   // Ask for "use tools" to get three activity steps before the answer.
   if (/use tools/i.test(asked)) return "Used three mock tools, and one of them failed.";
+  // Ask for "make artifact" to get the card, the viewer and the sandboxed frame.
+  if (/make artifact/i.test(asked)) {
+    return "Made it an artifact: **downloads.html** runs only inside the sandboxed frame, " +
+      "with no network, no cookie and no access to this app.";
+  }
   // Ask for "a long answer" to exercise a split durable message.
   if (/long answer/i.test(asked)) return longAnswer(asked);
   const short = asked.length > 60 ? asked.slice(0, 60) + "…" : asked;
@@ -565,13 +662,16 @@ function download(req, res, url) {
   const id = url.pathname.slice("/v1/files/".length);
   const file = UPLOAD_ID_RE.test(id) ? files.get(id) : undefined;
   if (!file || !file.used) return json(res, 404, { error: "bad_request" });
+  // `?view=artifact` is the only way an artifact is ever rendered; without it the
+  // bytes download like any other document (v2.md, Agent files and artifacts).
+  const asArtifact = file.artifact === true && url.searchParams.get("view") === "artifact";
   res.writeHead(200, {
     "Content-Type": file.type,
     "Content-Length": file.size,
     "X-Content-Type-Options": "nosniff",
-    "Content-Security-Policy": "sandbox",
+    "Content-Security-Policy": asArtifact ? ARTIFACT_CSP : "sandbox",
     "Cache-Control": "private, max-age=31536000, immutable",
-    "Content-Disposition": disposition(file),
+    "Content-Disposition": asArtifact ? "inline" : disposition(file),
   });
   res.end(file.bytes);
 }

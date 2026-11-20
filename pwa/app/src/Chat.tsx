@@ -6,7 +6,7 @@ import { LIMITS, MAIN_THREAD, type CommandInfo, type DurableEvent, type MessageE
 import { disablePush, enablePush, hasPushSubscription, pushPermission, requestPushPermission, pushSupported, subscribedServerKey, clearAppBadge, type PushPermission } from "./push";
 import { Avatar, type AvatarState } from "./Avatar";
 import { Reactions } from "./Reactions";
-import { attachmentKind, fileUrl, formatBytes, uploadErrorText, uploadFile } from "./uploads";
+import { artifactUrl, attachmentKind, fileUrl, formatBytes, uploadErrorText, uploadFile } from "./uploads";
 import { canRecord, startVoiceNote, VOICE_MAX_MS, type Recording, type VoiceStop } from "./recorder";
 import { ActivitySteps } from "./ActivitySteps";
 import { TasksSheet } from "./TasksSheet";
@@ -20,7 +20,9 @@ const WIDE = "(min-width: 900px)";
 type Row = { kind: "ev"; ev: DurableEvent; text?: string; partial?: boolean } | { kind: "pending"; m: Outgoing };
 type Tone = "ok" | "run" | "warn" | "bad";
 /** What a bubble or chip row shows; `url` is absent while a file has no id yet. */
-type AttachmentView = { id: string; name: string; type: string; size: number; kind: "image" | "audio" | "file"; url?: string };
+type AttachmentView = {
+  id: string; name: string; type: string; size: number; kind: "image" | "audio" | "file" | "artifact"; url?: string;
+};
 /** A file picked in the composer and not yet sent. */
 type Pick = {
   id: string; file: File; name: string; type: string; size: number;
@@ -51,6 +53,7 @@ const lengthText = (secs: number) => `${Math.floor(secs / 60)}:${String(Math.flo
 /** A name the recorder made (`Voice note 14:32.m4a`): the label is the kind, not the timestamp. */
 const VOICE_NAME = /^Voice note \d{2}:\d{2}(\.[a-z0-9]+)?$/i;
 const noteLabel = (name: string) => (VOICE_NAME.test(name) ? "Voice note" : name);
+const ARTIFACT_ICON = "M4 4h16v13H4zM8 21h8M12 17v4M8 9l2 2 4-4";
 
 type CommandState = { online: boolean; writable: boolean; running: boolean };
 const ready = (s: CommandState) => s.online && s.writable;
@@ -103,11 +106,12 @@ function pendingViews(m: Outgoing): AttachmentView[] {
 function messageViews(list: MessageEvent["attachments"]): AttachmentView[] {
   // Ids come from the gateway; only the protocol's shape ever becomes a URL.
   return (list ?? []).filter((file) => LIMITS.uploadIdPattern.test(file.id))
-    // Until the artifact viewer lands, an artifact is offered as a download chip.
-    .map((file) => ({ ...file, kind: file.kind === "artifact" ? "file" as const : file.kind, url: fileUrl(file.id) }));
+    .map((file) => ({ ...file, url: fileUrl(file.id) }));
 }
 
-function AttachmentList({ files }: { files: AttachmentView[] }) {
+function AttachmentList({ files, onOpenArtifact, openArtifactId }: {
+  files: AttachmentView[]; onOpenArtifact?: (file: AttachmentView) => void; openArtifactId?: string;
+}) {
   if (!files.length) return null;
   return (
     <div className="attachments">
@@ -116,9 +120,105 @@ function AttachmentList({ files }: { files: AttachmentView[] }) {
         if (!file.url) return <FileChip key={key} file={file} />;
         if (file.kind === "image") return <ImageAttachment key={key} file={file} url={file.url} />;
         if (file.kind === "audio") return <VoiceAttachment key={key} file={file} url={file.url} />;
+        // An artifact is agent-made HTML/SVG; it is only ever rendered through
+        // `?view=artifact` inside the sandboxed frame (protocol v2).
+        if (file.kind === "artifact" && onOpenArtifact) {
+          return <ArtifactCard key={key} file={file} inViewer={file.id === openArtifactId}
+            onOpen={() => onOpenArtifact(file)} />;
+        }
         return <FileChip key={key} file={file} />;
       })}
     </div>
+  );
+}
+
+/**
+ * An artifact in the chat: a still preview (never interactive — the frame takes no
+ * pointer input) and the two real actions, Open and Download. The preview exists only
+ * while this card is near the viewport, so an artifact scrolled past keeps no live
+ * script context, and it is off entirely while this artifact's own viewer is open.
+ */
+function ArtifactCard({ file, onOpen, inViewer }: {
+  file: AttachmentView; onOpen: () => void; inViewer?: boolean;
+}) {
+  const [near, setNear] = useState(false);
+  const box = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = box.current;
+    if (!el) return;
+    if (typeof IntersectionObserver !== "function") {
+      setNear(true);
+      return;
+    }
+    // Two-way, not a latch. The margin is the same on entry and exit, and the frame's
+    // height is fixed, so mounting it again never pushes the card out of the margin.
+    const io = new IntersectionObserver((entries) => {
+      const last = entries[entries.length - 1];
+      if (last) setNear(last.isIntersecting);
+    }, { rootMargin: "240px" });
+    io.observe(el);
+    return () => io.disconnect();
+  }, []);
+  const preview = near && !inViewer;
+  return (
+    <div className="artifact-card">
+      <div className="artifact-frame" ref={box}>
+        {preview ? <iframe className="artifact-preview" title={`${file.name} preview`}
+          src={artifactUrl(file.id)} sandbox="allow-scripts" referrerPolicy="no-referrer" allow=""
+          loading="lazy" tabIndex={-1} />
+          : <span className="artifact-placeholder" aria-hidden="true">
+            <Icon d={ARTIFACT_ICON} /><small>Preview</small>
+          </span>}
+      </div>
+      <div className="artifact-head">
+        <b className="artifact-title">{file.name}</b>
+        <small className="artifact-meta">Artifact · {formatBytes(file.size)}</small>
+      </div>
+      <div className="artifact-actions">
+        <button className="artifact-action is-primary" onClick={onOpen}>Open</button>
+        <a className="artifact-action" href={fileUrl(file.id)} download={file.name}>Download</a>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Full-screen artifact view (protocol v2, Agent files and artifacts). It is a dialog,
+ * not a route: nothing here is reachable from the frame, and the frame gets
+ * `allow-scripts` alone, no referrer and no permissions.
+ */
+function ArtifactViewer({ file, onClose }: { file: AttachmentView; onClose: () => void }) {
+  const ref = useRef<HTMLDialogElement>(null);
+  const close = useRef<HTMLButtonElement>(null);
+  const opener = useRef(document.activeElement instanceof HTMLElement ? document.activeElement : null);
+  useLayoutEffect(() => {
+    const dialog = ref.current!;
+    dialog.showModal();
+    return () => {
+      dialog.close();
+      if (opener.current?.isConnected) opener.current.focus({ preventScroll: true });
+    };
+  }, []);
+  // Focus opens on Close, never in the frame: once the artifact has focus, its own
+  // document owns the keyboard (protocol v2), so this button is the guaranteed way out
+  // and it stays above the frame. Escape is the dialog's own cancel event.
+  useLayoutEffect(() => { close.current?.focus({ preventScroll: true }); }, []);
+  return (
+    <dialog ref={ref} className="artifact-layer" aria-label={`${file.name} artifact`}
+      onCancel={(e) => { e.preventDefault(); onClose(); }}>
+      <div className="artifact-view">
+        <header className="artifact-view-head">
+          {/* First focusable in the dialog, and above the frame in paint order. */}
+          <button ref={close} className="artifact-close" onClick={onClose} aria-label="Close artifact">
+            <Icon d="M6 6l12 12M18 6 6 18" />
+          </button>
+          <h2 className="artifact-view-title">{file.name}</h2>
+          <a className="artifact-action" href={fileUrl(file.id)} download={file.name}>Download</a>
+        </header>
+        <iframe className="artifact-view-frame" title={file.name} src={artifactUrl(file.id)}
+          sandbox="allow-scripts" referrerPolicy="no-referrer" allow="" />
+      </div>
+    </dialog>
   );
 }
 
@@ -273,6 +373,10 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   /** A short, non-error explanation (a recording that stopped on its own). */
   const [hint, setHint] = useState("");
   const [sheet, setSheet] = useState<Sheet | null>(null);
+  /** The artifact in the full-screen viewer, if one is open. */
+  const [artifact, setArtifact] = useState<AttachmentView | null>(null);
+  // The viewer belongs to one message of one thread; a thread switch closes it.
+  useEffect(() => { setArtifact(null); }, [store.openThread]);
   const wide = useWideLayout();
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -1107,6 +1211,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
               forks={r.ev.event === "message" ? forks.get(r.ev.id) : undefined}
               onActions={(ev, button) => show({ kind: "message", title: suggestedTitle(ev.text),
                 from: { thread: ev.thread, messageId: ev.id } }, button)}
+              onOpenArtifact={setArtifact} openArtifactId={artifact?.id}
               onRetry={canRetry ? (m) => void queueMessage(m.text, m.key) : undefined} />
           ) : (
             <UserBubble key={`p${r.m.key}`} text={r.m.text} state={r.m.state} at={r.m.at} last={i === lastUser}
@@ -1328,6 +1433,8 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
             </button>
         </Modal>
       )}
+
+      {artifact && <ArtifactViewer file={artifact} onClose={() => setArtifact(null)} />}
     </div>
   );
 }
@@ -1641,11 +1748,13 @@ function Icon({ d, bold }: { d: string; bold?: boolean }) {
   );
 }
 
-function EventRow({ ev, text, partial, store, conn, thread, last, forks, onActions, onRetry }: {
+function EventRow({ ev, text, partial, store, conn, thread, last, forks, onActions, onRetry, onOpenArtifact, openArtifactId }: {
   ev: DurableEvent; text?: string; partial?: boolean; store: Store; conn: Connection; thread: string;
   last: boolean; forks?: ThreadInfo[];
   onActions: (ev: MessageEvent, button: HTMLButtonElement) => void;
   onRetry?: (m: Outgoing) => void;
+  onOpenArtifact: (file: AttachmentView) => void;
+  openArtifactId?: string;
 }) {
   if (ev.event === "question") return <QuestionCard ev={ev} store={store} conn={conn} />;
   if (ev.event === "divider") {
@@ -1677,6 +1786,8 @@ function EventRow({ ev, text, partial, store, conn, thread, last, forks, onActio
       <div className="msg assistant" {...anchor}>
         <Streamdown mode="static">{body}</Streamdown>
         {steps.length > 0 && <ActivitySteps steps={steps} omitted={typeof ev.omitted === "number" ? ev.omitted : undefined} />}
+        <AttachmentList files={messageViews(ev.attachments)} onOpenArtifact={onOpenArtifact}
+          openArtifactId={openArtifactId} />
         {incomplete}
       </div>
     )}

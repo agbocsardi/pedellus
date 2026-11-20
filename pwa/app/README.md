@@ -32,7 +32,12 @@ The mock advertises `hello.uploads` and implements `POST /v1/upload` and
 /v1/upload` with `400 {"error":"unsupported"}`, which is what a gateway
 without media storage does. Uploads are discarded when the mock restarts.
 Ask for `use tools` to get three non-durable `activity` steps (one failing)
-before the answer, which carries the same list as `steps`.
+before the answer, which carries the same list as `steps`. Ask for `make
+artifact` to get an assistant message carrying one `kind: "artifact"`
+attachment: a small interactive HTML chart kept in memory and served from `GET
+/v1/files/<id>?view=artifact` with the v2.md artifact CSP (without that view it
+downloads instead), so the preview card and the full-screen viewer have a real
+sandboxed document to show.
 The mock records and validates fork origins without copying messages into
 the new thread. A message containing `start task` seeds one fake worker and
 one fake scheduled job in that thread, so the thread menu's **Tasks** sheet
