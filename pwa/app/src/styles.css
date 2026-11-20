@@ -1512,6 +1512,71 @@ input#pair-code {
 .bubble .attachment-audio {
   flex-basis: 100%;
 }
+/* A recorded voice note: one compact row, 44px controls, tap to play. */
+.voice-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  min-height: 44px;
+  padding: 4px 14px 4px 4px;
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  background: var(--card);
+  color: var(--ink);
+}
+.bubble .voice-note {
+  border-color: color-mix(in oklab, var(--bubble-ink) 28%, transparent);
+  background: color-mix(in oklab, var(--bubble-ink) 14%, transparent);
+  color: var(--bubble-ink);
+}
+.voice-toggle {
+  flex: none;
+  width: 44px;
+  height: 44px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--color-primary-foreground);
+}
+.voice-toggle svg {
+  width: 20px;
+  height: 20px;
+}
+.bubble .voice-toggle {
+  background: color-mix(in oklab, var(--bubble-ink) 22%, transparent);
+  color: var(--bubble-ink);
+}
+.voice-text {
+  display: grid;
+  min-width: 0;
+}
+.voice-text b {
+  font-size: 0.85rem;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.voice-text small {
+  color: var(--muted-ink);
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+}
+.bubble .voice-text small {
+  color: color-mix(in oklab, var(--bubble-ink) 88%, transparent);
+}
+/* The element is the player; the row above is its only visible control. */
+.voice-audio {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
 /* Composer: the mic, the recording row and a short, non-error hint. */
 /* A real 44px tap target that keeps the 36px slot it looks like. */
 .wrench.mic {

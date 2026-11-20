@@ -35,7 +35,10 @@ const ATTACH_ICON = "M12 5v14M5 12h14";
 const REMOVE_ICON = "M6 6l12 12M18 6 6 18";
 const FILE_ICON = "M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5ZM14 3v5h5";
 const IMAGE_ICON = "M4 5h16v14H4zM4 16l4-4 3 3 3-3 6 6M15 10h.01";
+const AUDIO_ICON = "M4 12h2M8 8v8M12 5v14M16 8v8M20 12h2";
 const MIC_ICON = "M12 4a3 3 0 0 0-3 3v5a3 3 0 0 0 6 0V7a3 3 0 0 0-3-3M5 11a7 7 0 0 0 14 0M12 18v3";
+const PLAY_ICON = "M8 5.5v13l11-6.5-11-6.5Z";
+const PAUSE_ICON = "M9.5 5.5v13M14.5 5.5v13";
 /** A voice note's length, `m:ss`. */
 const lengthText = (secs: number) => `${Math.floor(secs / 60)}:${String(Math.floor(secs % 60)).padStart(2, "0")}`;
 
@@ -101,10 +104,7 @@ function AttachmentList({ files }: { files: AttachmentView[] }) {
         const key = `${file.id}-${file.name}`;
         if (!file.url) return <FileChip key={key} file={file} />;
         if (file.kind === "image") return <ImageAttachment key={key} file={file} url={file.url} />;
-        if (file.kind === "audio") {
-          return <audio key={key} className="attachment-audio" controls preload="none"
-            src={file.url} aria-label={file.name} />;
-        }
+        if (file.kind === "audio") return <VoiceAttachment key={key} file={file} url={file.url} />;
         return <FileChip key={key} file={file} />;
       })}
     </div>
@@ -124,10 +124,52 @@ function ImageAttachment({ file, url }: { file: AttachmentView; url: string }) {
   );
 }
 
+/**
+ * A recorded voice note: one compact row, with the browser's own `<audio>`
+ * element underneath as the player. The duration is shown only when the
+ * container carries one; otherwise the size is, rather than an invented length.
+ */
+function VoiceAttachment({ file, url }: { file: AttachmentView; url: string }) {
+  const audio = useRef<HTMLAudioElement>(null);
+  const [duration, setDuration] = useState<number | null>(null);
+  const [playing, setPlaying] = useState(false);
+  const [unsupported, setUnsupported] = useState(false);
+  if (unsupported) {
+    // Not decodable here: fall back to the plain player instead of a dead button.
+    return <audio className="attachment-audio" controls preload="none" src={url} aria-label={file.name} />;
+  }
+  const toggle = () => {
+    const el = audio.current;
+    if (!el) return;
+    if (el.paused) void el.play().catch(() => setUnsupported(true));
+    else el.pause();
+  };
+  return (
+    <div className="voice-note">
+      <button className="voice-toggle" aria-label={playing ? "Pause voice note" : "Play voice note"}
+        aria-pressed={playing} onClick={toggle}>
+        <Icon d={playing ? PAUSE_ICON : PLAY_ICON} bold={!playing} />
+      </button>
+      <span className="voice-text">
+        <b>{file.name}</b>
+        <small>{duration === null ? formatBytes(file.size) : lengthText(duration)}</small>
+      </span>
+      <audio ref={audio} className="voice-audio" src={url} preload="metadata" tabIndex={-1} aria-hidden="true"
+        onLoadedMetadata={(e) => {
+          const d = e.currentTarget.duration;
+          if (Number.isFinite(d) && d > 0) setDuration(d);
+        }}
+        onPlay={() => setPlaying(true)}
+        onPause={() => setPlaying(false)}
+        onEnded={() => setPlaying(false)} />
+    </div>
+  );
+}
+
 function FileChip({ file }: { file: AttachmentView }) {
   const body = <>
     <span className="file-chip-icon" aria-hidden="true">
-      <Icon d={file.kind === "image" ? IMAGE_ICON : FILE_ICON} />
+      <Icon d={file.kind === "image" ? IMAGE_ICON : file.kind === "audio" ? AUDIO_ICON : FILE_ICON} />
     </span>
     <span className="file-chip-text">
       <b>{file.name}</b>
@@ -1046,7 +1088,8 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
                   <img className="pick-thumb" src={pick.preview} alt="" />
                 ) : (
                   <span className="pick-icon" aria-hidden="true">
-                    <Icon d={attachmentKind(pick.type) === "image" ? IMAGE_ICON : FILE_ICON} />
+                    <Icon d={attachmentKind(pick.type) === "image" ? IMAGE_ICON
+                      : attachmentKind(pick.type) === "audio" ? AUDIO_ICON : FILE_ICON} />
                   </span>
                 )}
                 <span className="pick-text">
