@@ -26,6 +26,11 @@ profile or clear site data before pairing again. Set `IDLE_ARCHIVE_MS=3000`
 on the mock to try automatic archiving after three seconds of idleness. Ask for
 `a long answer` to get a durable message split into `part: {i, n}` frames
 (protocol v2, *Long messages*), including while it is only partly received.
+The mock advertises `hello.uploads` and implements `POST /v1/upload` and
+`GET /v1/files/<id>` (protocol v2, *Files*) with the uploaded bytes in memory;
+`NO_UPLOADS=1` makes it advertise `uploads: false` and answer `POST
+/v1/upload` with `400 {"error":"unsupported"}`, which is what a gateway
+without media storage does. Uploads are discarded when the mock restarts.
 The mock records and validates fork origins without copying messages into
 the new thread. It doesn't run a real agent. Push is on: the mock makes
 throwaway VAPID keys at start, answers `push.key`, stores one subscription

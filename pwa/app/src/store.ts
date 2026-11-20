@@ -4,11 +4,25 @@ import { MAIN_THREAD, type CommandInfo, type DurableEvent, type ModelEvent, type
 export type ConnState = "offline" | "connecting" | "replaying" | "open";
 export type Mode = "boot" | "chat" | "pair" | "update";
 export type OutgoingState = "queued" | "sent" | "admitted" | "answered" | "failed" | "aborted";
-export type Outgoing = { key: string; thread: ThreadId; text: string; state: OutgoingState; at: number };
+/** A file in a queued send that the gateway has not accepted yet (no upload id). */
+export type PendingFile = { id: string; name: string; type: string; size: number; uploadId?: string };
+export type Outgoing = {
+  key: string; thread: ThreadId; text: string; state: OutgoingState; at: number;
+  /** Upload ids in send order; set once, never changed for this key. */
+  attachments?: string[];
+  /** Local files still waiting for an upload id, kept so a reconnect can finish them. */
+  pending?: PendingFile[];
+  /** IndexedDB blob ids for cleanup; the bytes stay until the turn is over. */
+  fileIds?: string[];
+  /** Short delivery explanation, e.g. why an upload stopped. */
+  note?: string;
+};
+/** A file picked in the composer, handed to the outbox when its message is sent. */
+export type NewAttachment = { id: string; name: string; type: string; size: number; blob: Blob; uploadId?: string };
 export type ThreadCreate = { key: string; title?: string; from?: ThreadOrigin; failed?: boolean };
 export type AgentStatus = Pick<StatusEvent, "state" | "label">;
 type ChatEvent = Exclude<DurableEvent, { event: "thread" }>;
-type Identity = { device?: string; agent?: string; commands?: CommandInfo[]; presets?: PresetInfo[] };
+type Identity = { device?: string; agent?: string; commands?: CommandInfo[]; presets?: PresetInfo[]; uploads?: boolean };
 type LiveStatus = AgentStatus & { turnKey?: string };
 /**
  * Web Push opt-in. `endpoint` is set only once the gateway accepted it; `key`
@@ -16,9 +30,12 @@ type LiveStatus = AgentStatus & { turnKey?: string };
  */
 export type PushState = { endpoint?: string; key?: string; gatewayUnsupported?: boolean };
 
+type StoredFile = { id: string; name: string; type: string; size: number; blob: Blob };
+
 interface Db extends DBSchema {
   events: { key: number; value: DurableEvent };
   outbox: { key: string; value: Outgoing };
+  files: { key: string; value: StoredFile };
   threads: { key: string; value: ThreadInfo };
   creates: { key: string; value: ThreadCreate };
   view: { key: string; value: { thread: ThreadId; cursor: number } };
@@ -95,9 +112,11 @@ export class Store {
   get commands() { return this.identity?.commands; }
   /** The gateway's last advertised model presets; undefined until a hello listed them. */
   get presets() { return this.identity?.presets; }
+  /** `hello.uploads`: whether this gateway accepts files (protocol v2, Files). */
+  get uploads() { return this.identity?.uploads === true; }
 
   async init() {
-    const db = await openDB<Db>("durable-app", 2, {
+    const db = await openDB<Db>("durable-app", 3, {
       blocked: () => {
         this.storageBlocked = true;
         this.changed();
@@ -107,10 +126,14 @@ export class Store {
           db.createObjectStore("events", { keyPath: "cursor" });
           db.createObjectStore("outbox", { keyPath: "key" });
         }
-        db.createObjectStore("threads", { keyPath: "id" });
-        db.createObjectStore("creates", { keyPath: "key" });
-        db.createObjectStore("view", { keyPath: "thread" });
-        db.createObjectStore("settings");
+        if (oldVersion < 2) {
+          db.createObjectStore("threads", { keyPath: "id" });
+          db.createObjectStore("creates", { keyPath: "key" });
+          db.createObjectStore("view", { keyPath: "thread" });
+          db.createObjectStore("settings");
+        }
+        // Uploaded/failed file bytes for queued sends (protocol v2, Files).
+        if (oldVersion < 3) db.createObjectStore("files", { keyPath: "id" });
       },
     });
     let closed = false;
@@ -217,6 +240,11 @@ export class Store {
         info && tx.objectStore("threads").put(info),
         tx.done,
       ]);
+      // The turn is over: the cached bytes are no longer needed for a retry.
+      // A `failed` entry keeps them so Retry can upload a fresh copy.
+      if (outgoing?.fileIds?.length && (outgoing.state === "answered" || outgoing.state === "aborted")) {
+        void this.deleteFiles(outgoing.fileIds).catch(console.error);
+      }
       return true;
     } catch (err) {
       // Don't persist later cursors over a hole in the cache.
@@ -490,14 +518,16 @@ export class Store {
   }
 
   setIdentity(device: string | undefined, agent: string | undefined, commands: CommandInfo[] | undefined,
-    presets: PresetInfo[] | undefined) {
+    presets: PresetInfo[] | undefined, uploads: boolean | undefined) {
     device ??= this.identity?.device;
     commands ??= this.identity?.commands;
     presets ??= this.identity?.presets;
+    uploads ??= this.identity?.uploads;
     if (this.identity?.device === device && this.identity?.agent === agent
       && JSON.stringify(this.identity?.commands) === JSON.stringify(commands)
-      && JSON.stringify(this.identity?.presets) === JSON.stringify(presets)) return;
-    this.identity = { device, agent, commands, presets };
+      && JSON.stringify(this.identity?.presets) === JSON.stringify(presets)
+      && this.identity?.uploads === uploads) return;
+    this.identity = { device, agent, commands, presets, uploads };
     this.searchCache = undefined;
     this.changed();
     void this.db?.put("settings", this.identity, "identity").catch(console.error);
@@ -513,11 +543,47 @@ export class Store {
     await this.db?.put("settings", next, "push").catch(console.error);
   }
 
-  async createOutgoing(thread: ThreadId, text: string, retryKey?: string): Promise<Outgoing> {
+  /** Queue a message with its files; the blob cache and the outbox commit together. */
+  async createOutgoing(thread: ThreadId, text: string, retryKey?: string,
+    picked: NewAttachment[] = []): Promise<Outgoing> {
     if (!this.db) throw new Error("IndexedDB unavailable");
+    const tx = this.db.transaction(["outbox", "files"], "readwrite");
+    const old = retryKey ? await tx.objectStore("outbox").get(retryKey) : undefined;
     const m: Outgoing = { key: newKey(), thread, text, state: "queued", at: Date.now() };
-    const tx = this.db.transaction("outbox", "readwrite");
-    await Promise.all([tx.store.put(m), retryKey && tx.store.delete(retryKey), tx.done]);
+    const cache: StoredFile[] = [];
+    if (picked.length) {
+      m.pending = picked.map(({ id, name, type, size, uploadId }) =>
+        ({ id, name, type, size, ...(uploadId ? { uploadId } : {}) }));
+      m.fileIds = picked.map((f) => f.id);
+      for (const f of picked) {
+        if (!f.uploadId) cache.push({ id: f.id, name: f.name, type: f.type, size: f.size, blob: f.blob });
+      }
+    } else if (old?.pending?.length) {
+      // Retry: upload a fresh copy whenever the bytes are still cached, because
+      // an admitted send has already consumed its upload ids (v2.md, Files).
+      m.fileIds = old.fileIds;
+      m.pending = [];
+      for (const f of old.pending) {
+        const kept = await tx.objectStore("files").get(f.id);
+        if (kept) {
+          cache.push(kept);
+          m.pending.push({ id: f.id, name: f.name, type: f.type, size: f.size });
+        } else {
+          m.pending.push({ ...f });
+        }
+      }
+    } else if (old?.attachments?.length) {
+      // No cached bytes to upload again: keep the original ids rather than
+      // silently sending the text without its files.
+      m.attachments = old.attachments;
+      m.fileIds = old.fileIds;
+    }
+    await Promise.all([
+      tx.objectStore("outbox").put(m),
+      ...cache.map((f) => tx.objectStore("files").put(f)),
+      retryKey && tx.objectStore("outbox").delete(retryKey),
+      tx.done,
+    ]);
     if (retryKey) this.outbox.delete(retryKey);
     this.outbox.set(m.key, m);
     this.queueChanges?.postMessage(null);
@@ -527,20 +593,71 @@ export class Store {
 
   async discardOutgoing(key: string) {
     if (!this.db) throw new Error("IndexedDB unavailable");
+    const m = this.outbox.get(key);
     await this.db.delete("outbox", key);
+    if (m?.fileIds?.length) void this.deleteFiles(m.fileIds).catch(console.error);
     this.outbox.delete(key);
     this.queueChanges?.postMessage(null);
     this.changed();
   }
 
-  async setOutgoingState(key: string, state: "queued" | "sent" | "admitted" | "failed") {
+  async setOutgoingState(key: string, state: "queued" | "sent" | "admitted" | "failed", note?: string) {
     const m = this.outbox.get(key);
     if (!m || m.state === state || m.state === "admitted" || terminal(m.state)) return;
     const next = this.updateOutgoing(m, state);
+    if (note) next.note = note;
     this.changed();
     if (!this.db) return;
     const tx = this.db.transaction("outbox", "readwrite");
     await Promise.all([this.persistReceipt(tx.store, next), tx.done]);
+  }
+
+  /** The cached bytes for a queued file, if this device still has them. */
+  async fileBlob(id: string): Promise<Blob | undefined> {
+    return (await this.db?.get("files", id))?.blob;
+  }
+
+  /** Record one accepted upload id on a queued send; never changes an existing set. */
+  async setPendingUploadId(key: string, fileId: string, uploadId: string): Promise<Outgoing | undefined> {
+    if (!this.db) return undefined;
+    const tx = this.db.transaction("outbox", "readwrite");
+    const saved = await tx.store.get(key);
+    if (!saved?.pending?.length || saved.attachments?.length) {
+      await tx.done;
+      return undefined;
+    }
+    const next = { ...saved, pending: saved.pending.map((p) => p.id === fileId ? { ...p, uploadId } : p) };
+    await Promise.all([tx.store.put(next), tx.done]);
+    this.outbox.set(key, next);
+    this.changed();
+    this.queueChanges?.postMessage(null);
+    return next;
+  }
+
+  /**
+   * Once every queued file has an upload id, freeze them onto the entry in send
+   * order. A later resend of the same key sends exactly these ids.
+   */
+  async promotePending(key: string): Promise<Outgoing | undefined> {
+    if (!this.db) return undefined;
+    const tx = this.db.transaction("outbox", "readwrite");
+    const saved = await tx.store.get(key);
+    if (!saved?.pending?.length || saved.attachments?.length || saved.pending.some((p) => !p.uploadId)) {
+      await tx.done;
+      return undefined;
+    }
+    const next = { ...saved, attachments: saved.pending.map((p) => p.uploadId!) };
+    await Promise.all([tx.store.put(next), tx.done]);
+    this.outbox.set(key, next);
+    this.changed();
+    this.queueChanges?.postMessage(null);
+    return next;
+  }
+
+  async deleteFiles(ids: string[]) {
+    if (!this.db || !ids.length) return;
+    const tx = this.db.transaction("files", "readwrite");
+    await Promise.all([...ids.map((id) => tx.store.delete(id)), tx.done]);
   }
 
   private async persistReceipt(store: {

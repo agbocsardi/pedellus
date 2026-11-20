@@ -60,8 +60,8 @@ port. `tailscale serve` terminates TLS with the node's `*.ts.net` certificate
 | `/` | The built PWA (static files from a configured absolute directory) |
 | `GET /v1/stream` (WebSocket) | Events down, requests up |
 | `POST /v1/pair` | One-time pairing exchange |
-| `POST /v1/uploads` | Attachment upload, bounded size, stored under `media/app/` |
-| `GET /v1/media/<id>` | Download of a file the agent sent to this chat |
+| `POST /v1/upload` | Attachment upload, bounded size, stored under `media/app/` |
+| `GET /v1/files/<id>` | Download of a file a durable message references |
 | `push.key` / `push.subscribe` / `push.unsubscribe` (stream requests) | Web Push enrolment: the gateway's VAPID public key, then store or drop this device's subscription |
 
 Same origin for app and API: no CORS, and the device credential can be an
