@@ -30,7 +30,8 @@ throwaway VAPID keys at start, answers `push.key`, stores one subscription
 per device and really sends content-free pushes with `web-push` to it
 whenever an answer or notice is produced while that device has no open
 stream. A push to a made-up endpoint fails at the network, which is
-expected; the mock logs `push → …` before every send. `NO_PUSH=1` makes
+expected; the mock logs `push → …` before every send and abandons a send
+that outlives `PUSH_TIMEOUT_MS` (default 10 s). `NO_PUSH=1` makes
 push look unconfigured (`unsupported`).
 
 The production build, incl. the service worker and its precache manifest:

@@ -26,6 +26,9 @@ const PUSH_ENDPOINT_MAX = 2_048;
 const PUSH_P256DH_MAX = 128;
 const PUSH_AUTH_MAX = 64;
 const PUSH_UNREAD_CAP = 99;
+// One device's send is abandoned after this, so a push service that never
+// answers cannot hold that device in flight.
+const PUSH_TIMEOUT_MS = Number(process.env.PUSH_TIMEOUT_MS ?? 10_000);
 const B64URL = /^[A-Za-z0-9_-]+$/;
 const LABEL_RE = /^[^\p{Cc}\u2028\u2029]{1,40}$/u;
 const TITLE_RE = /^[^\p{Cc}\u2028\u2029]{1,80}$/u;
@@ -160,34 +163,45 @@ function unreadFor(token) {
 /** Topic header: a newer push for one thread replaces an undelivered older one. */
 const topicFor = (thread) => Buffer.from(thread, "utf8").toString("base64url").slice(0, 32);
 
+/**
+ * One device. Runs beside the others (not after them) and is bounded by its own
+ * socket timeout, so a hung endpoint delays nobody and frees its in-flight flag.
+ */
+async function pushOne(token, sub, thread) {
+  pushing.add(token);
+  const payload = { v: 2, thread, unread: unreadFor(token) };
+  const device = tokens.get(token) ?? "device";
+  console.log(`push → "${device}": thread ${thread}, unread ${payload.unread}`);
+  try {
+    await sendNotification({ endpoint: sub.endpoint, keys: sub.keys }, JSON.stringify(payload), {
+      TTL: 24 * 60 * 60,
+      urgency: "normal",
+      topic: topicFor(thread),
+      timeout: PUSH_TIMEOUT_MS,
+    });
+  } catch (err) {
+    const status = err?.statusCode;
+    if (status === 404 || status === 410) {
+      // The push service dropped this subscription; forget it.
+      subscriptions.delete(token);
+      console.log(`push subscription gone (${status}); removed "${device}"`);
+    } else {
+      console.log(`push failed for "${device}": ${status ?? err?.message ?? "unknown error"}`);
+    }
+  } finally {
+    pushing.delete(token);
+  }
+}
+
 /** Content-free payload, never message text (protocol v2, Notifications). */
 async function pushDevices(thread) {
   if (!PUSH) return;
+  const sends = [];
   for (const [token, sub] of subscriptions) {
     if (pushing.has(token) || streamOpen(token)) continue;
-    const payload = { v: 2, thread, unread: unreadFor(token) };
-    const device = tokens.get(token) ?? "device";
-    pushing.add(token);
-    console.log(`push → "${device}": thread ${thread}, unread ${payload.unread}`);
-    try {
-      await sendNotification({ endpoint: sub.endpoint, keys: sub.keys }, JSON.stringify(payload), {
-        TTL: 24 * 60 * 60,
-        urgency: "normal",
-        topic: topicFor(thread),
-      });
-    } catch (err) {
-      const status = err?.statusCode;
-      if (status === 404 || status === 410) {
-        // The push service dropped this subscription; forget it.
-        subscriptions.delete(token);
-        console.log(`push subscription gone (${status}); removed "${device}"`);
-      } else {
-        console.log(`push failed for "${device}": ${status ?? err?.message ?? "unknown error"}`);
-      }
-    } finally {
-      pushing.delete(token);
-    }
+    sends.push(pushOne(token, sub, thread));
   }
+  await Promise.allSettled(sends);
 }
 
 // -- fake agent turns -------------------------------------------------------
