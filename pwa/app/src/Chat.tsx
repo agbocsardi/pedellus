@@ -133,6 +133,10 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   const jumpCursor = useRef<number | undefined>(undefined);
   const pinned = useRef(true);
   const taRef = useRef<HTMLTextAreaElement>(null);
+  /** The message at the top of the list, so a layout switch can restore it. */
+  const anchor = useRef<{ cursor: string; offset: number; width: number } | null>(null);
+  const layoutWidth = useRef(0);
+  const reflowedAt = useRef(0);
   const press = useRef<{ x: number; y: number; timer: ReturnType<typeof setTimeout> } | null>(null);
 
   const thread = store.openThread;
@@ -203,7 +207,40 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     }
   }
 
-  useLayoutEffect(() => { pinned.current = true; }, [thread]);
+  /** The message under the top edge and how far it is pushed up out of view. */
+  function rememberTop(el: HTMLDivElement) {
+    // A reflowing column fires scroll events too. Keep the anchor taken before
+    // the switch, or the restore would target the already-moved position.
+    if (el.clientWidth !== layoutWidth.current) {
+      layoutWidth.current = el.clientWidth;
+      reflowedAt.current = performance.now();
+      return;
+    }
+    if (performance.now() - reflowedAt.current < 250) return;
+    const box = el.getBoundingClientRect();
+    // Children are in flow order, so binary search the first one still visible.
+    let lo = 0;
+    let hi = el.children.length - 1;
+    let i = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (el.children[mid].getBoundingClientRect().bottom > box.top + 1) {
+        i = mid;
+        hi = mid - 1;
+      } else lo = mid + 1;
+    }
+    anchor.current = null;
+    for (let n = i; n >= 0 && n < el.children.length && n < i + 4; n++) {
+      const row = el.children[n];
+      const node = row.matches("[data-message-cursor]") ? row : row.querySelector("[data-message-cursor]");
+      if (node) {
+        anchor.current = { cursor: (node as HTMLElement).dataset.messageCursor!, offset: node.getBoundingClientRect().top - box.top, width: el.clientWidth };
+        return;
+      }
+    }
+  }
+
+  useLayoutEffect(() => { pinned.current = true; anchor.current = null; }, [thread]);
   useEffect(() => cancelPress, []);
   // Clear an unconfirmed pick after a while; a `model` event clears it sooner.
   useEffect(() => {
@@ -240,6 +277,19 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     if (pinned.current) el.scrollTop = el.scrollHeight;
     markAtBottom(el);
   });
+  useLayoutEffect(() => {
+    const el = scroller.current;
+    const a = anchor.current;
+    if (!el || !a || pinned.current || a.width === el.clientWidth) return;
+    const node = el.querySelector<HTMLElement>(`[data-message-cursor="${a.cursor}"]`);
+    // Phone ↔ wide reflows the column; keep the message that was at the top
+    // where it was. Browsers only anchor across a container resize sometimes.
+    if (!node) return;
+    el.scrollTop += node.getBoundingClientRect().top - el.getBoundingClientRect().top - a.offset;
+    a.width = el.clientWidth;
+    layoutWidth.current = el.clientWidth;
+    reflowedAt.current = performance.now();
+  }, [wide]);
   useEffect(() => {
     const el = scroller.current;
     if (!el) return;
@@ -419,6 +469,12 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
 
   useEffect(() => { setSheet(null); setError(""); setSlashHidden(false); }, [thread]);
 
+  // The sidebar carries the thread list on wide screens, so a list sheet left
+  // open across the switch closes instead of listing every thread twice.
+  useEffect(() => {
+    if (wide) setSheet((s) => (s?.kind === "list" ? null : s));
+  }, [wide]);
+
   // Wide-layout keys only. Escape closes an open sheet, Ctrl/Cmd+K focuses the
   // thread search, Alt+↑/↓ steps through the visible threads; the composer
   // keeps its own Enter/Shift+Enter handling (see onKeyDown).
@@ -451,12 +507,6 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     const onKey = (e: KeyboardEvent) => shortcut(e);
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [wide]);
-
-  // The sidebar carries the thread list on wide screens, so a list sheet left
-  // open across the switch closes instead of listing every thread twice.
-  useEffect(() => {
-    if (wide) setSheet((s) => (s?.kind === "list" ? null : s));
   }, [wide]);
 
   return (
@@ -516,6 +566,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
           if (sheet || document.hidden) return;
           pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight <= 2;
           if (pinned.current) markAtBottom(el);
+          rememberTop(el);
         }}
         onContextMenu={(e) => {
           const action = forkAction(e.target, thread);
