@@ -145,8 +145,8 @@ export const COMMANDS: readonly CommandHelp[] = [
   },
   {
     name: "app",
-    synopsis: "durable-nanobot app <pair [--label <label>]|devices|revoke <label>|shortcut <add --label <label>|list|revoke <label>>> [--config <path>] | app push-keys",
-    summary: "Pair, list or revoke devices of the installable web app channel, manage its shortcut tokens, or generate its Web Push keys",
+    synopsis: "durable-nanobot app <pair|devices|revoke <label>|shortcut> [--config <path>] | app push-keys",
+    summary: "Pair or revoke app devices and shortcut tokens, or generate Web Push keys",
     options: [
       CONFIG_OPTION,
       { flags: "--label <label>", text: "pair or shortcut add: optional printable device label (1-40); required for shortcut add." },
