@@ -9,6 +9,7 @@ import { Reactions } from "./Reactions";
 import { attachmentKind, fileUrl, formatBytes, uploadErrorText, uploadFile } from "./uploads";
 import { ActivitySteps } from "./ActivitySteps";
 import { TasksSheet } from "./TasksSheet";
+import { LoginCard } from "./LoginCard";
 
 const FINE_POINTER = matchMedia("(pointer: fine)").matches;
 /** From here the thread list is a sidebar and the chat sits beside it. */
@@ -249,6 +250,8 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   const files = picks[thread] ?? [];
   const canSendFiles = files.every((f) => f.state !== "failed");
   const liveActivity = store.activity(thread);
+  // A live MCP login offer for this thread; memory-only, so a reload drops it.
+  const login = store.login(thread);
   const p = presence(store);
   const latest = store.latestViewable(thread);
   const origin = info?.origin;
@@ -907,6 +910,11 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
               note={r.m.note}
               onDiscard={!writable || r.m.state === "failed" ? () => void discardMessage(r.m.key) : undefined} />
           ),
+        )}
+        {login !== undefined && (
+          <div className="msg login-card-wrap">
+            <LoginCard login={login} />
+          </div>
         )}
         {running && (
           <div className="typing" role="status" aria-label={p.text}>
