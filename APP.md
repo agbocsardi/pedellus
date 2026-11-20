@@ -209,12 +209,27 @@ key can ever leave a second echo), the shared-answer retirement of steered input
 with held acknowledgements, gating, applied/refused/unconfirmed outcomes and unconfirmed reporting
 at reopen.
 
-Ordering for one turn: `message{role:"user",key}` at admission, `status`/`preview` (non-durable,
-replaced by the next) while it runs, `message{role:"assistant",key}` and one `settled{key}` per
-consumed key. A failed run settles each consumed key `failed` individually (failures are never
+Ordering for one turn: `message{role:"user",key}` at admission, `status`/`preview`/`activity`
+(non-durable, replaced by the next) while it runs, `message{role:"assistant",key}` and one
+`settled{key}` per consumed key. A failed run settles each consumed key `failed` individually (failures are never
 grouped by error text); an abort or `/new` reset settles `aborted`. An empty answer is replaced by
 a fixed notice. `followUpMode: "steer"` submits with native `whenBusy: "steer"` under the same
 owner-run check as Telegram.
+
+## Activity steps
+
+While a turn runs, the adapter derives its tool steps from that run's committed transcript entries
+and sends non-durable `activity {thread, key, steps, omitted?}` whenever they change, coalesced
+like previews. An assistant `toolCall` starts a step and the `toolResult` carrying the same call id
+ends it `done`, or `failed` when that result is an error; both times are the entries' own. A step
+carries only its id, the tool name (bounded to `LIMITS.activityToolChars`), its state and its times
+— never arguments, results, file paths or error text, so nothing a tool was handed or returned can
+reach channel state or a socket. The list is bounded to `LIMITS.maxActivitySteps`: the first
+`maxActivitySteps - 1` steps and the newest one are kept, and `omitted` counts the rest. Only the
+run's first input publishes activity, exactly as for previews. The final assistant `message`
+carries the same bounded list as `steps` and `omitted`, on its first part only when it is split; a
+turn without tools carries neither, and `settled` ends the live list. The transcript remains the
+only place a tool's arguments, output or errors are kept.
 
 ## Files
 
@@ -418,7 +433,11 @@ synthetic WebSocket client and a controllable clock. It covers config strictness
 types, pairing (good/bad/expired/reused codes, the rate limit and its rolling window, label
 uniqueness), the auth close codes (4401, 4409, 4400, 4426), bounded replay with later `hello`
 continuation and ack trimming, idempotent send and the `too_large` text bound, a full streaming
-turn (echo, preview, status, answer, settled), a steered pair answered once with a settled per
+turn (echo, preview, status, answer, settled), activity steps (a `running` step while its tool
+runs, `done` and `failed` after, the answer carrying the same bounded list, the
+`maxActivitySteps` bound with its `omitted` count, no tool argument or result text anywhere in the
+channel's durable log or frames, and no `steps` on a turn without tools), a steered pair answered
+once with a settled per
 key, reconnect without loss, controls with their replay reporting, the `hello.commands`
 catalogue with `model`/`help`/`digest`/`restart` arguments, usage notices and `unsupported`, a seeded reopen (interrupted
 command reported, held acknowledgement released, a pre-restart turn still answered), a failed run

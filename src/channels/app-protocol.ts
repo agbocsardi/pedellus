@@ -14,6 +14,7 @@ import {
   MAIN_THREAD,
   PAIR_ALPHABET,
   PROTOCOL_VERSION,
+  type ActivityStep,
   type CommandInfo,
   type AttachmentInfo,
   type ErrorCode,
@@ -69,6 +70,8 @@ export const APP_REQUEST_OPS: readonly string[] = [
 
 export type AppThreadOrigin = ThreadOrigin;
 export type AppThreadInfo = ThreadInfo;
+/** One tool step of a turn: id, bounded tool name, state and times; never its arguments or result. */
+export type AppActivityStep = ActivityStep;
 
 export function validThreadTitle(value: unknown): value is string {
   return typeof value === "string" && Array.from(value).length <= APP_LIMITS.threadTitleChars &&
@@ -154,6 +157,10 @@ export type AppDurableEvent =
     key?: string;
     /** Files sent with this user message, in send order; first part only when split. */
     attachments?: AttachmentInfo[];
+    /** Assistant only: the turn's tool steps, first part only when split (protocol v2, Activity). */
+    steps?: AppActivityStep[];
+    /** Assistant only: steps dropped by the `maxActivitySteps` bound. */
+    omitted?: number;
     /** Present only on a split message: part `i` (from 0) of `n`; see v2.md, Long messages. */
     part?: { i: number; n: number };
   }

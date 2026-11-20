@@ -31,6 +31,8 @@ The mock advertises `hello.uploads` and implements `POST /v1/upload` and
 `NO_UPLOADS=1` makes it advertise `uploads: false` and answer `POST
 /v1/upload` with `400 {"error":"unsupported"}`, which is what a gateway
 without media storage does. Uploads are discarded when the mock restarts.
+Ask for `use tools` to get three non-durable `activity` steps (one failing)
+before the answer, which carries the same list as `steps`.
 The mock records and validates fork origins without copying messages into
 the new thread. It doesn't run a real agent. Push is on: the mock makes
 throwaway VAPID keys at start, answers `push.key`, stores one subscription

@@ -3,6 +3,7 @@ import {
   LIMITS,
   MAIN_THREAD,
   PROTOCOL_VERSION,
+  type ActivityStep,
   type CommandInfo,
   type ControlCommand,
   type PresetInfo,
@@ -419,6 +420,16 @@ export class Connection {
           this.store.setModel(f);
         }
         break;
+      case "activity": {
+        // Tool steps are display-only: keep well-formed steps, never renderer input.
+        const steps = activitySteps(f.steps);
+        const omitted = typeof f.omitted === "number" && Number.isSafeInteger(f.omitted) && f.omitted > 0
+          ? f.omitted : undefined;
+        if (typeof f.thread === "string" && typeof f.key === "string" && steps.length > 0) {
+          this.store.setActivity({ ...f, steps, ...(omitted === undefined ? {} : { omitted }) });
+        }
+        break;
+      }
     }
   }
 
@@ -441,6 +452,7 @@ export class Connection {
       this.replayHead = res.head ?? null;
       this.store.resetStatuses();
       this.store.resetModels();
+      this.store.resetActivities();
       const device = typeof res.device === "string" ? res.device : undefined;
       const name = typeof res.agent === "string" ? res.agent.trim() : "";
       this.store.setIdentity(device, name && [...name].length <= 40 ? name : undefined, commandList(res.commands),
@@ -508,6 +520,27 @@ export class Connection {
       console.error("replay checkpoint not persisted; acks stop", err);
     }
   }
+}
+
+/** Well-formed `activity.steps` entries, bounded to the protocol's own limits. */
+export function activitySteps(raw: unknown): ActivityStep[] {
+  if (!Array.isArray(raw)) return [];
+  const out: ActivityStep[] = [];
+  for (const item of raw.slice(0, LIMITS.maxActivitySteps)) {
+    if (!item || typeof item !== "object") continue;
+    const { id, tool, state, startedAt, endedAt } = item as Record<string, unknown>;
+    if (typeof id !== "string" || id === "" || typeof tool !== "string" || tool === "") continue;
+    if (state !== "running" && state !== "done" && state !== "failed") continue;
+    if (typeof startedAt !== "string" || Number.isNaN(Date.parse(startedAt))) continue;
+    out.push({
+      id: id.slice(0, 64),
+      tool: tool.slice(0, LIMITS.activityToolChars),
+      state,
+      startedAt,
+      ...(typeof endedAt === "string" && !Number.isNaN(Date.parse(endedAt)) ? { endedAt } : {}),
+    });
+  }
+  return out;
 }
 
 const COMMAND_NAME = /^[a-z][a-z0-9_-]{0,22}$/;

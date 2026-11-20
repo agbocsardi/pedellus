@@ -176,9 +176,74 @@ function emitMessage(thread, { text, ...fields }) {
     emit(thread, "message", { ...fields, text });
     return;
   }
-  parts.forEach((part, i) => emit(thread, "message", { ...fields, text: part, part: { i, n: parts.length } }));
+  // Steps live on the first part only, like the gateway's split messages.
+  const { steps, omitted, ...rest } = fields;
+  parts.forEach((part, i) => emit(thread, "message", i === 0
+    ? { ...fields, text: part, part: { i, n: parts.length } }
+    : { ...rest, text: part, part: { i, n: parts.length } }));
 }
 
+/**
+ * Three fake tool steps for a "use tools" turn, one of them failing, so the app's collapsed line,
+ * step list and step detail have something real to render. They are non-durable, like the
+ * gateway's `activity` events; the final answer carries the same bounded list.
+ */
+function toolSteps(base) {
+  const at = (ms) => new Date(base + ms).toISOString();
+  const step = (id, tool, state, started, ended) => ({
+    id, tool, state, startedAt: at(started), ...(ended === undefined ? {} : { endedAt: at(ended) }),
+  });
+  return [
+    () => [step("s1", "read", "running", 300)],
+    () => [step("s1", "read", "done", 300, 640), step("s2", "bash", "running", 660)],
+    () => [
+      step("s1", "read", "done", 300, 640),
+      step("s2", "bash", "failed", 660, 980),
+      step("s3", "web_search", "running", 990),
+    ],
+    () => [
+      step("s1", "read", "done", 300, 640),
+      step("s2", "bash", "failed", 660, 980),
+      step("s3", "web_search", "done", 990, 1330),
+    ],
+  ];
+}
+
+function startTurn(thread) {
+  const key = thread.queue.shift();
+  if (!key) return;
+  const asked = admitted.get(key)?.text ?? "";
+  const text = answerFor(key);
+  // Stream a bounded number of preview ticks, whatever the answer's length.
+  const width = Math.max(1, Math.ceil(text.length / 40));
+  const chunks = text.match(new RegExp(`[\\s\\S]{1,${width}}`, "g")) ?? [""];
+  const turn = thread.running = { key, timers: [] };
+  const at = (ms, fn) => turn.timers.push(setTimeout(fn, ms));
+
+  emit(thread, "status", { state: "queued" });
+  at(300, () => emit(thread, "status", { state: "thinking" }));
+  const tools = /use tools/i.test(asked) ? toolSteps(Date.now()) : undefined;
+  if (tools) {
+    const labels = ["read", "bash", "web_search"];
+    tools.forEach((steps, index) => at(320 + index * 340, () => {
+      emit(thread, "status", { state: "tool", label: labels[Math.min(index, 2)] });
+      broadcast({ type: "event", event: "activity", thread: thread.info.id, key, steps: steps() });
+    }));
+  }
+  for (let n = 1; n <= chunks.length; n++) {
+    at(600 + n * 90, () => emit(thread, "preview", { key, text: chunks.slice(0, n).join("") }));
+  }
+  at(600 + chunks.length * 90 + 200, () => {
+    emitMessage(thread, {
+      id: `a-${key}`, role: "assistant", text, at: iso(), key,
+      ...(tools === undefined ? {} : { steps: tools[3]() }),
+    });
+    emit(thread, "settled", { key, outcome: "answered" });
+    emit(thread, "status", { state: "idle" });
+    thread.running = null;
+    startTurn(thread);
+  });
+}
 // -- Web Push ---------------------------------------------------------------
 
 /** A device with a hello'd, open stream gets no push. */
@@ -258,6 +323,8 @@ function longAnswer(asked) {
 
 function answerFor(key) {
   const asked = admitted.get(key)?.text ?? "…";
+  // Ask for "use tools" to get three activity steps before the answer.
+  if (/use tools/i.test(asked)) return "Used three mock tools, and one of them failed.";
   // Ask for "a long answer" to exercise a split durable message.
   if (/long answer/i.test(asked)) return longAnswer(asked);
   const short = asked.length > 60 ? asked.slice(0, 60) + "…" : asked;
@@ -280,30 +347,6 @@ function answerFor(key) {
     "",
     "> Everything after this point is filler so the stream visibly ticks: the quick brown fox jumps over the lazy dog while five wizards quench a very long sentence indeed.",
   ].join("\n");
-}
-
-function startTurn(thread) {
-  const key = thread.queue.shift();
-  if (!key) return;
-  const text = answerFor(key);
-  // Stream a bounded number of preview ticks, whatever the answer's length.
-  const width = Math.max(1, Math.ceil(text.length / 40));
-  const chunks = text.match(new RegExp(`[\\s\\S]{1,${width}}`, "g")) ?? [""];
-  const turn = thread.running = { key, timers: [] };
-  const at = (ms, fn) => turn.timers.push(setTimeout(fn, ms));
-
-  emit(thread, "status", { state: "queued" });
-  at(300, () => emit(thread, "status", { state: "thinking" }));
-  for (let n = 1; n <= chunks.length; n++) {
-    at(600 + n * 90, () => emit(thread, "preview", { key, text: chunks.slice(0, n).join("") }));
-  }
-  at(600 + chunks.length * 90 + 200, () => {
-    emitMessage(thread, { id: `a-${key}`, role: "assistant", text, at: iso(), key });
-    emit(thread, "settled", { key, outcome: "answered" });
-    emit(thread, "status", { state: "idle" });
-    thread.running = null;
-    startTurn(thread);
-  });
 }
 
 function abortTurn(thread) {

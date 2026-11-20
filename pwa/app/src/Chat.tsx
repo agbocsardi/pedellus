@@ -1,11 +1,12 @@
 import { useEffect, useEffectEvent, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { Streamdown } from "streamdown";
-import type { Connection } from "./conn";
+import { activitySteps, type Connection } from "./conn";
 import type { AgentStatus, NewAttachment, Outgoing, OutgoingState, Store } from "./store";
 import { LIMITS, MAIN_THREAD, type CommandInfo, type DurableEvent, type MessageEvent, type PresetInfo, type ThreadInfo, type ThreadOrigin } from "./protocol";
 import { disablePush, enablePush, hasPushSubscription, pushPermission, requestPushPermission, pushSupported, subscribedServerKey, clearAppBadge, type PushPermission } from "./push";
 import { Avatar, type AvatarState } from "./Avatar";
 import { attachmentKind, fileUrl, formatBytes, uploadErrorText, uploadFile } from "./uploads";
+import { ActivitySteps } from "./ActivitySteps";
 
 const FINE_POINTER = matchMedia("(pointer: fine)").matches;
 /** From here the thread list is a sidebar and the chat sits beside it. */
@@ -243,6 +244,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   const running = !archived && isRunning(store.status(thread).state);
   const files = picks[thread] ?? [];
   const canSendFiles = files.every((f) => f.state !== "failed");
+  const liveActivity = store.activity(thread);
   const p = presence(store);
   const latest = store.latestViewable(thread);
   const origin = info?.origin;
@@ -909,6 +911,11 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
             <i />
           </div>
         )}
+        {running && liveActivity !== undefined && liveActivity.steps.length > 0 && (
+          <div className="msg activity-live">
+            <ActivitySteps live steps={liveActivity.steps} omitted={liveActivity.omitted} />
+          </div>
+        )}
       </div>
 
       <footer className="composer">
@@ -1390,6 +1397,8 @@ function EventRow({ ev, text, partial, store, last, forks, onActions, onRetry }:
   }
   if (ev.event !== "message") return null; // settled only drives delivery state
   const body = text ?? ev.text;
+  // Stored events come from IndexedDB too; render only well-formed steps.
+  const steps = ev.role === "assistant" ? activitySteps(ev.steps) : [];
   const incomplete = partial ? <span className="msg-partial">Incomplete</span> : null;
   const outgoing = ev.key ? store.outgoing(ev.thread, ev.key) : undefined;
   const spentFiles = outgoing?.state === "failed" && !!outgoing.attachments?.length && store.hasEcho(ev.thread, ev.key!);
@@ -1406,6 +1415,7 @@ function EventRow({ ev, text, partial, store, last, forks, onActions, onRetry }:
     ) : (
       <div className="msg assistant" {...anchor}>
         <Streamdown mode="static">{body}</Streamdown>
+        {steps.length > 0 && <ActivitySteps steps={steps} omitted={typeof ev.omitted === "number" ? ev.omitted : undefined} />}
         {incomplete}
       </div>
     )}

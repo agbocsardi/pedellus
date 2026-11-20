@@ -84,9 +84,11 @@ import {
   type AppPendingInput,
   type AppThreadInfo,
   type AppThreadOrigin,
+  type AppActivityStep,
   type AppUploadRecord,
 } from "./app-protocol.js";
 import { createAppPushDispatcher, pushPayload, type AppPushDispatcher, type AppPushOptions } from "./app-push.js";
+import { absorbActivity, activityForWire, emptyActivity, type ActivityTally } from "./app-activity.js";
 import { startAppListener, type AppDeviceSession, type AppSessionHooks } from "./app-listener.js";
 import { AppFileRejected, createAppFiles, type AppMediaOptions } from "./app-files.js";
 
@@ -99,6 +101,10 @@ const threadOf = (record: { readonly thread?: string }): string => record.thread
 
 const CONTROL_PENDING_NOTICE_MS = 30_000;
 const PREVIEW_COALESCE_MS = 700;
+/** Tool steps are coalesced like previews; the first change of a turn goes out at once. */
+const ACTIVITY_COALESCE_MS = 400;
+/** Entries read per transcript page while deriving a turn's activity steps. */
+const ACTIVITY_SCAN_PAGE = 200;
 const MAX_DELIVERY_FAILURES = 10;
 const MAX_CONTROL_ATTEMPTS = 10;
 const SCHEDULED_SCAN_INTERVAL_MS = 2_000;
@@ -521,9 +527,10 @@ function appendMessage(doc: Draft<AppChannelState>, event: AppMessageInput): voi
     console.warn(`App message ${event.id} exceeds ${APP_LIMITS.maxMessageParts} parts and was truncated.`);
   }
   texts.forEach((text, i) => {
-    // A split message carries its attachments on the first part only (protocol v2, Files).
-    const { attachments, ...rest } = event;
-    appendEvent(doc, i === 0 && attachments !== undefined
+    // A split message carries its attachments and its tool steps on the first part only
+    // (protocol v2, Files and Activity).
+    const { attachments, steps, omitted, ...rest } = event;
+    appendEvent(doc, i === 0
       ? { ...event, text, part: { i, n: texts.length } }
       : { ...rest, text, part: { i, n: texts.length } });
   });
@@ -768,6 +775,35 @@ export function validateOptions(options: AppOptions): void {
 }
 
 // ── The adapter ──────────────────────────────────────────────────────────────
+
+/**
+ * The tool steps of a run, read from its committed transcript entries (protocol v2, "Activity").
+ * `from` is the run's first entry and `to` its answer; the walk is one bounded page at a time and
+ * keeps only tool names, states and times, never arguments, results, paths or error text.
+ */
+async function readRunActivity(
+  conversation: Conversation,
+  conversationId: ConversationId,
+  from: EntryId,
+  to: EntryId | undefined,
+  context: Context,
+): Promise<ActivityTally> {
+  const tally = emptyActivity();
+  let minEntryId: number | undefined = from;
+  while (minEntryId !== undefined) {
+    const page = await conversation.commit((tx) => tx.scanEntries({
+      conversationId,
+      minEntryId: minEntryId as EntryId,
+      order: "ascending",
+      ...(to === undefined ? {} : { maxEntryId: to }),
+    }, ACTIVITY_SCAN_PAGE), context);
+    absorbActivity(tally, page.items.filter((entry) => entry.conversationId === conversationId),
+      APP_LIMITS.activityToolChars);
+    const last = page.items.at(-1)?.id;
+    minEntryId = page.items.length < ACTIVITY_SCAN_PAGE || last === undefined ? undefined : last + 1;
+  }
+  return tally;
+}
 
 export async function runApp(gateway: AppGateway, options: AppOptions, context: Context): Promise<void> {
   validateOptions(options);
@@ -1598,6 +1634,13 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     let latestPreview = "";
     let submissionId: SubmissionId | undefined;
     let watchStopped = false;
+    // Live activity: the run's tool steps, derived from its committed transcript entries and sent
+    // as non-durable events whenever they change (protocol v2, "Activity").
+    let activityFrom: EntryId | undefined;
+    let activityTimer: ReturnType<typeof setTimeout> | undefined;
+    let activityWork: Promise<void> | undefined;
+    let activityDirty = false;
+    let activitySent: string | undefined;
     const schedulePreview = () => {
       if (previewTimer !== undefined || watchStopped || signal?.aborted) return;
       previewTimer = setTimeout(() => {
@@ -1634,8 +1677,64 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         if (socket.hello && socket.session.isOpen()) socket.session.send(frame);
       }
     };
+    const sendActivity = (wire: { steps: AppActivityStep[]; omitted?: number }): void => {
+      const signature = JSON.stringify(wire);
+      if (signature === activitySent) return;
+      activitySent = signature;
+      const frame = JSON.stringify({ type: "event", event: "activity", thread, key: item.key, ...wire });
+      for (const socket of sockets.values()) {
+        if (socket.hello && socket.session.isOpen()) socket.session.send(frame);
+      }
+    };
+    const publishActivity = async (): Promise<void> => {
+      const from = activityFrom;
+      if (from === undefined || watchStopped || signal?.aborted) return;
+      const tally = await readRunActivity(conversation, conversation.id, from, undefined, adapterContext);
+      if (watchStopped || signal?.aborted) return;
+      const wire = activityForWire(tally, APP_LIMITS.maxActivitySteps);
+      if (wire.steps.length > 0) sendActivity(wire);
+    };
+    const queueActivity = (): void => {
+      if (watchStopped || signal?.aborted || activityFrom === undefined) return;
+      activityDirty = true;
+      if (activityTimer !== undefined || activityWork !== undefined) return;
+      activityTimer = setTimeout(() => {
+        activityTimer = undefined;
+        activityDirty = false;
+        activityWork = publishActivity().catch(() => undefined).finally(() => {
+          activityWork = undefined;
+          if (activityDirty && !watchStopped && !signal?.aborted) queueActivity();
+        });
+      }, activitySent === undefined ? 0 : ACTIVITY_COALESCE_MS);
+      activityTimer.unref?.();
+    };
+    const stopActivity = async (): Promise<void> => {
+      if (activityTimer !== undefined) {
+        clearTimeout(activityTimer);
+        activityTimer = undefined;
+      }
+      activityDirty = false;
+      await activityWork;
+    };
+    /**
+     * The run's whole step list for the final message: one fresh scan of the run's entries, so a
+     * coalesced publish can never leave the answer with fewer steps than the run took.
+     */
+    const finalActivity = async (
+      answer: EntryId,
+    ): Promise<{ steps: AppActivityStep[]; omitted?: number } | undefined> => {
+      let from = activityFrom;
+      if (from === undefined) {
+        const record = await conversation.commit((tx) => tx.submissionByRequest(conversation.id, requestId), adapterContext);
+        from = record?.type === "input" ? record.entry : undefined;
+      }
+      if (from === undefined) return undefined;
+      const tally = await readRunActivity(conversation, conversation.id, from, answer, adapterContext);
+      const wire = activityForWire(tally, APP_LIMITS.maxActivitySteps);
+      return wire.steps.length === 0 ? undefined : wire;
+    };
     type LiveView = {
-      run?: { inputs?: SubmissionId[] };
+      run?: { inputs?: SubmissionId[]; first?: EntryId };
       generation?: unknown;
     };
     const syncStatus = (view: { docs: Record<string, unknown> }, queued = false): void => {
@@ -1665,6 +1764,10 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         syncStatus(call.value, submissionId === undefined);
         const inputs = live?.run?.inputs;
         if (submissionId === undefined || inputs === undefined || !inputs.includes(submissionId)) return;
+        // The run's first entry bounds its activity scan; it is kept for the final answer's steps.
+        if (live?.run?.first !== undefined) activityFrom = live.run.first;
+        // One activity stream per run, like the preview: the run's first input owns it.
+        if (submissionId === firstInput(inputs)) queueActivity();
         // One preview per run: the run's first input owns the single live preview.
         if (submissionId !== firstInput(inputs)) return;
         const text = (live as {
@@ -1717,7 +1820,10 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       const message = answer?.model?.[0] as AssistantMessage | undefined;
       const answerText = message?.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("") ?? "";
       const text = answerText.trim() === "" ? "The assistant returned no text response." : answerText;
-      await settleShared(thread, conversation, settled.answer, text);
+      // The final complete step list goes out before the answer, which carries it too.
+      const steps = await finalActivity(settled.answer);
+      if (steps !== undefined) sendActivity(steps);
+      await settleShared(thread, conversation, settled.answer, text, steps);
       await refreshStatus();
     } finally {
       await stopPreviewWatch();
@@ -1732,6 +1838,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       watchStopped = true;
       previewDirty = false;
       await watch.stop();
+      await stopActivity();
       await previewWork;
     }
   };
@@ -1759,6 +1866,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     conversation: Conversation,
     answerEntry: number,
     answerText: string,
+    steps?: { steps: AppActivityStep[]; omitted?: number },
   ): Promise<void> => {
     let appended = false;
     state = await stateConversation.commit(async (tx) => {
@@ -1784,6 +1892,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           text: answerText,
           at: new Date(now()).toISOString(),
           ...(members[0] === undefined ? {} : { key: members[0].key }),
+          ...(steps === undefined ? {} : { steps: steps.steps, ...(steps.omitted === undefined ? {} : { omitted: steps.omitted }) }),
         });
         for (const member of members) {
           appendEvent(doc, { event: "settled", thread, key: member.key, outcome: "answered" });

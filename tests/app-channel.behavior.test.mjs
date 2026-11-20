@@ -699,6 +699,95 @@ test('a steering owner message joins the tool round and the pair is answered onc
   });
 });
 
+test('a turn with tools streams activity steps and the answer carries them', { timeout: 30_000 }, async () => {
+  // The arguments of both calls are planted canaries: they must stay in the transcript and never
+  // reach app channel state or an activity frame (APP.md, secrets never reach channel state).
+  const SECRET = 'CANARY-ARG-NOT-IN-APP';
+  await withChannel('activity', { tools: ['bash'] }, async ({ store, base }) => {
+    store.script([
+      () => fauxAssistantMessage([
+        // The slow call keeps a step `running` long enough for one activity frame to show it.
+        fauxToolCall('bash', { command: `printf ${SECRET} > /dev/null; sleep 0.4` }, { id: 'call-run' }),
+        fauxToolCall('bash', { command: `exit 3 # ${SECRET}` }, { id: 'call-fail' }),
+      ], { stopReason: 'toolUse' }),
+      () => fauxAssistantMessage('TOOL-ANSWER'),
+      () => fauxAssistantMessage('PLAIN-ANSWER'),
+    ]);
+    const cookie = await pairedDevice(store, base);
+    const device = deviceClient(base, cookie);
+    await device.open();
+    device.send({ type: 'req', id: 'h1', op: 'hello', v: 2, cursor: null });
+    await device.wait(() => device.response('h1') !== undefined, 'hello reply');
+
+    device.send({ type: 'req', id: 's1', op: 'send', key: 'k1', text: 'use two tools' });
+    await device.wait(() => device.events('settled').length === 1, 'the tool turn settled');
+
+    const activity = device.events('activity');
+    assert.ok(activity.length > 0, 'the turn published activity events');
+    assert.ok(activity.every((event) => event.key === 'k1' && Array.isArray(event.steps)));
+    assert.ok(activity.some((event) => event.steps.some((step) => step.state === 'running')),
+      'a tool call was reported while it ran');
+    const last = activity.at(-1);
+    assert.deepEqual(last.steps.map((step) => [step.tool, step.state]), [['bash', 'done'], ['bash', 'failed']],
+      'a failed tool result is a failed step');
+    for (const step of last.steps) {
+      assert.deepEqual(Object.keys(step).sort(), ['endedAt', 'id', 'startedAt', 'state', 'tool']);
+      assert.ok(Number.isFinite(Date.parse(step.startedAt)) && Number.isFinite(Date.parse(step.endedAt)));
+    }
+
+    const answered = device.events('message').find((event) => event.role === 'assistant');
+    assert.equal(answered.text, 'TOOL-ANSWER');
+    assert.deepEqual(answered.steps, last.steps, 'the answer carries the same step list as the last activity');
+    assert.equal(answered.omitted, undefined);
+
+    // Nothing a tool was handed or returned is anywhere in the app channel's durable log or frames.
+    for (const frame of device.frames) assert.equal(JSON.stringify(frame).includes(SECRET), false);
+    const state = await appState(store.gateway);
+    assert.equal(JSON.stringify(state).includes(SECRET), false);
+    assert.equal(JSON.stringify(state).includes('exit 3'), false);
+
+    // A later turn without tools carries no steps at all.
+    device.send({ type: 'req', id: 's2', op: 'send', key: 'k2', text: 'answer without tools' });
+    await device.wait(() => device.events('settled').some((event) => event.key === 'k2'), 'the plain turn settled');
+    const plain = device.events('message').filter((event) => event.role === 'assistant').at(-1);
+    assert.equal(plain.text, 'PLAIN-ANSWER');
+    assert.equal('steps' in plain, false);
+    assert.equal('omitted' in plain, false);
+    await device.close();
+  });
+});
+
+test('a turn with more tools than the wire allows keeps the bound and counts the omitted', { timeout: 60_000 }, async () => {
+  await withChannel('activity-bound', { tools: ['bash'] }, async ({ store, base }) => {
+    const calls = Array.from({ length: 52 }, (_, index) =>
+      fauxToolCall('bash', { command: 'true' }, { id: `call-${index}` }));
+    store.script([
+      () => fauxAssistantMessage(calls, { stopReason: 'toolUse' }),
+      () => fauxAssistantMessage('MANY-ANSWER'),
+    ]);
+    const cookie = await pairedDevice(store, base);
+    const device = deviceClient(base, cookie);
+    await device.open();
+    device.send({ type: 'req', id: 'h1', op: 'hello', v: 2, cursor: null });
+    await device.wait(() => device.response('h1') !== undefined, 'hello reply');
+
+    device.send({ type: 'req', id: 's1', op: 'send', key: 'k1', text: 'use many tools' });
+    await device.wait(() => device.events('settled').length === 1, 'the long tool turn settled');
+
+    const answered = device.events('message').find((event) => event.role === 'assistant');
+    assert.equal(answered.steps.length, APP_LIMITS.maxActivitySteps);
+    assert.equal(answered.omitted, 52 - APP_LIMITS.maxActivitySteps);
+    assert.equal(answered.steps[0].id, 's1', 'the first steps are kept');
+    assert.equal(answered.steps.at(-1).id, 's52', 'the newest step is kept');
+    assert.equal(answered.steps.at(-2).id, `s${APP_LIMITS.maxActivitySteps - 1}`);
+    assert.equal(new Set(answered.steps.map((step) => step.id)).size, APP_LIMITS.maxActivitySteps);
+    const activity = device.events('activity').at(-1);
+    assert.deepEqual(activity.steps, answered.steps, 'the last activity event matches the answer');
+    assert.equal(activity.omitted, answered.omitted);
+    await device.close();
+  });
+});
+
 test('a reopen reports interrupted controls, releases held acknowledgements and answers admitted work', { timeout: 30_000 }, async () => {
   // Seed the channel exactly as a crash would have left it: one admitted-but-unconfirmed command
   // with its held acknowledgement, one applied command whose acknowledgement never went out, and
