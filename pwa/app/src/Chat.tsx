@@ -419,6 +419,40 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
 
   useEffect(() => { setSheet(null); setError(""); setSlashHidden(false); }, [thread]);
 
+  // Wide-layout keys only. Escape closes an open sheet, Ctrl/Cmd+K focuses the
+  // thread search, Alt+↑/↓ steps through the visible threads; the composer
+  // keeps its own Enter/Shift+Enter handling (see onKeyDown).
+  const shortcut = useEffectEvent((e: KeyboardEvent) => {
+    if (e.defaultPrevented) return;
+    if (e.key === "Escape") {
+      if (!sheet) return;
+      e.preventDefault();
+      setError("");
+      setSheet(null);
+      return;
+    }
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "k") {
+      e.preventDefault();
+      document.querySelector<HTMLInputElement>(sheet?.kind === "list" ? ".sheet-layer .thread-search" : ".sidebar .thread-search")?.focus();
+      return;
+    }
+    const field = e.target instanceof HTMLElement && e.target.matches("input, textarea, select, [contenteditable]");
+    if (field || e.ctrlKey || e.metaKey || sheet) return;
+    if (!e.altKey || (e.key !== "ArrowUp" && e.key !== "ArrowDown")) return;
+    const ids = openThreads(store).map((t) => t.id);
+    const i = ids.indexOf(thread);
+    if (i < 0) return;
+    const next = ids[(i + (e.key === "ArrowDown" ? 1 : -1) + ids.length) % ids.length];
+    e.preventDefault();
+    if (next !== thread) store.selectThread(next);
+  });
+  useEffect(() => {
+    if (!wide) return;
+    const onKey = (e: KeyboardEvent) => shortcut(e);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [wide]);
+
   // The sidebar carries the thread list on wide screens, so a list sheet left
   // open across the switch closes instead of listing every thread twice.
   useEffect(() => {
