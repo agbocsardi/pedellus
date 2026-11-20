@@ -12,6 +12,7 @@
  * removed; any other failure is not retried, because the next message tries again.
  */
 import { createHash } from "node:crypto";
+import type { SendOptions } from "web-push";
 
 import { APP_LIMITS, validVapidPrivateKey, type AppPushSubscription } from "./app-protocol.js";
 
@@ -87,6 +88,15 @@ export function resolvePushOptions(
   return { subject: config.subject, publicKey: config.publicKey, privateKey };
 }
 
+/**
+ * The `web-push` option object for one request. The library validates every option key against a
+ * fixed list and throws on anything else (`TTL` is upper-case, the rest lower-case), so the object
+ * is built here once and the behavior test feeds it to the real library offline.
+ */
+export function pushSendOptions(request: AppPushRequest): SendOptions {
+  return { TTL: request.ttlSeconds, urgency: request.urgency, topic: request.topic, timeout: request.timeoutMs };
+}
+
 /** `web-push` is imported lazily, exactly like `ws` from the listener, so an unconfigured gateway never loads it. */
 async function webPushTransport(options: AppPushOptions): Promise<AppPushTransport> {
   const webpush = await import("web-push");
@@ -95,7 +105,7 @@ async function webPushTransport(options: AppPushOptions): Promise<AppPushTranspo
     const result = await webpush.sendNotification(
       { endpoint: request.subscription.endpoint, keys: { p256dh: request.subscription.p256dh, auth: request.subscription.auth } },
       request.payload,
-      { ttl: request.ttlSeconds, urgency: request.urgency, topic: request.topic, timeout: request.timeoutMs },
+      pushSendOptions(request),
     );
     return { statusCode: result.statusCode };
   };

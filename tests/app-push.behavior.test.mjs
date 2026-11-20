@@ -24,9 +24,8 @@ import {
 } from './fixtures/app-harness.mjs';
 
 const modules = new URL('../dist/channels/', import.meta.url);
-const { generatePushKeys, pushPayload, resolvePushOptions, PUSH_TTL_SECONDS } = await import(
-  new URL('app-push.js', modules).href
-);
+const { generatePushKeys, pushPayload, pushSendOptions, pushTopic, resolvePushOptions, PUSH_TIMEOUT_MS, PUSH_TTL_SECONDS } =
+  await import(new URL('app-push.js', modules).href);
 const { validVapidPrivateKey, validVapidPublicKey } = await import(
   new URL('app-protocol.js', modules).href
 );
@@ -380,4 +379,31 @@ test('pushes to one device coalesce while a send is in flight', { timeout: 30_00
 test('the payload caps unread and hashes the thread into a valid Topic', { timeout: 10_000 }, async () => {
   assert.deepEqual(JSON.parse(pushPayload('main', 250)), { v: 2, thread: 'main', unread: 99 });
   assert.deepEqual(JSON.parse(pushPayload('main', -1)), { v: 2, thread: 'main', unread: 0 });
+});
+
+test('the transport hands the real web-push exactly the option keys it validates', { timeout: 10_000 }, async () => {
+  // The real library rejects an unknown option key before any I/O, so this runs offline and still
+  // catches a misnamed key (lower-case `ttl` would throw here, and every production send would fail).
+  const webpush = await import('web-push');
+  webpush.setVapidDetails(PUSH.subject, PUSH.publicKey, PUSH.privateKey);
+  const subscription = subscriptionAt();
+  const request = {
+    subscription,
+    payload: pushPayload('main', 3),
+    topic: pushTopic('main'),
+    ttlSeconds: PUSH_TTL_SECONDS,
+    urgency: 'normal',
+    timeoutMs: PUSH_TIMEOUT_MS,
+  };
+  const details = webpush.generateRequestDetails(
+    { endpoint: subscription.endpoint, keys: { p256dh: subscription.keys.p256dh, auth: subscription.keys.auth } },
+    request.payload,
+    pushSendOptions(request),
+  );
+  assert.equal(details.headers.TTL, PUSH_TTL_SECONDS, 'TTL is upper-case for web-push');
+  assert.equal(details.headers.Topic, request.topic);
+  assert.equal(details.headers.Urgency, 'normal');
+  assert.equal(details.timeout, PUSH_TIMEOUT_MS);
+  assert.equal(details.method, 'POST');
+  assert.ok(Buffer.isBuffer(details.body) && details.body.length > 0, 'the payload is encrypted');
 });
