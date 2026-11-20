@@ -304,10 +304,11 @@ upload is the fixed `400 unsupported`, and a send naming ids (which cannot exist
   send resolves it — workspace-relative, no traversal, no symlink escape, one stable bounded read —
   and nothing else about the file is read back to the model. The referenced record and the message
   commit together, so a message that shows a file always has it downloadable (and vice versa), and a
-  repeated execution appends nothing twice. The tool exists only in a mapped app chat (an admitted
-  app side-thread fork included) while the adapter is running; it is never offered to the channel
-  state conversation, the root, a worker, a scheduled run or any other fork, and the model cannot
-  choose a thread or a device. The receipt is bounded and names only the workspace-relative path.
+  repeated execution appends nothing twice. The tool is offered in a mapped app chat (an admitted
+  app side-thread fork included) whenever `app` and the top-level `media` block are configured;
+  while the adapter itself is stopped there is no live host, so every call is refused with fixed
+  text and delivers nothing. It is never offered to the channel state conversation, the root, a
+  worker, a scheduled run or any other fork, and the model cannot choose a thread or a device. The receipt is bounded and names only the workspace-relative path.
 
 ## Controls
 
