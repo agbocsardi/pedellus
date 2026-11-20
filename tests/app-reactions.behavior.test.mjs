@@ -163,6 +163,21 @@ test('a reaction is refused while its thread is being archived', { timeout: 30_0
   release.resolve();
 });
 
+test('a notice is not a reaction target', { timeout: 30_000 }, async () => {
+  await withChannel('reaction-notice', async ({ store, base }) => {
+    const device = await connectV2(base, await pairedDevice(store, base));
+    // An OAuth-callback send is stored as a gateway `notice`, never as the owner's own text.
+    const callback = 'https://example.test/cb?state=s1&code=c1';
+    assert.equal((await request(device, 'send-callback', 'send', { key: 'cb', text: callback })).ok, true);
+    await device.wait(() => device.events('message').some((event) => event.role === 'notice'), 'callback notice');
+    const notice = device.events('message').find((event) => event.role === 'notice');
+    assert.equal((await request(device, 'react-notice', 'react', { message: notice.id, emoji: '👍' })).error, 'bad_request');
+    assert.equal(device.events('reaction').length, 0, 'no reaction was appended');
+    assert.equal((await appState(store.gateway)).reactions?.main, undefined, 'no note was retained');
+    await device.close();
+  });
+});
+
 test('reaction context is bounded, ages out, and refuses bad or archived targets', { timeout: 60_000 }, async () => {
   await withChannel('reaction-bounds', async ({ store, base, app }) => {
     const device = await connectV2(base, await pairedDevice(store, base));

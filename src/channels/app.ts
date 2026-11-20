@@ -1579,7 +1579,9 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         // flight, while this request waited for its own commit.
         if (!openThread(doc, thread) || archiving.has(thread)) { blocked = "bad_request"; return; }
         const target = findDurableMessage(doc, thread, message);
-        if (target === undefined) { blocked = "bad_request"; return; }
+        // A gateway `notice` is neither the owner's nor the agent's message. Summarising it would
+        // attribute the gateway's own text to the owner, so it is not a target at all.
+        if (target === undefined || target.role === "notice") { blocked = "bad_request"; return; }
         const previous = latestReaction(doc, thread, message)?.emoji ?? null;
         const atMs = now();
         if (doc.reactions === undefined) doc.reactions = {};

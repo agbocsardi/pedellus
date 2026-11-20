@@ -275,8 +275,11 @@ upload is the fixed `400 unsupported`, and a send naming ids (which cannot exist
 
 The owner can react to one message of a thread with one emoji from protocol v2's fixed `REACTIONS`
 palette, or clear it: `react {thread?, message, emoji|null}`. `message` must be a durable `message`
-id in that thread (any role). An unknown id, an emoji outside the palette, a `emoji` that is
-neither the palette nor `null`, a malformed thread and an archived thread are all `bad_request`, and
+id in that thread whose role is `user` or `assistant`. A `notice` is not a target — it is the
+gateway's own text, so a note naming it would attribute it to the owner — and is refused like any
+other untargetable id. An unknown id, a `notice` id, an emoji outside the palette, a `emoji` that
+is neither the palette nor `null`, a malformed thread and an archived (or archiving) thread are all
+`bad_request`, and
 nothing is appended. The reply is a bare `ok`; the visible result is the durable
 `reaction {cursor, thread, message, by:"owner", emoji}` event every device replays, and the latest
 event per (`message`, `by`) is the current state — clearing appends `emoji: null` instead of

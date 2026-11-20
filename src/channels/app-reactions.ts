@@ -70,11 +70,13 @@ function quoteTarget(text: string): string {
 /**
  * One bounded reaction-change summary, mirroring the Telegram adapter's note: the target, whether
  * it was the owner's or the assistant's message, a short excerpt, and the explicit old/new/added/
- * removed reaction lists (`none` while the message carried no reaction).
+ * removed reaction lists (`none` while the message carried no reaction). A gateway `notice` is not
+ * a target at all: the `react` op refuses it before this is ever built, so a notice can never be
+ * summarised as the owner's own message.
  */
 export function reactionChangeSummary(input: {
   readonly messageId: string;
-  readonly role: "user" | "assistant" | "notice";
+  readonly role: "user" | "assistant";
   readonly text: string;
   readonly previous: Reaction | null;
   readonly emoji: Reaction | null;
@@ -84,8 +86,7 @@ export function reactionChangeSummary(input: {
   const added = after.filter((label) => !before.includes(label));
   const removed = before.filter((label) => !after.includes(label));
   const list = (labels: readonly string[]): string => labels.length === 0 ? "none" : labels.join(", ");
-  const direction = input.role === "assistant" ? "assistant" : "user";
-  return `reaction on message ${input.messageId} (${direction}): ` +
+  return `reaction on message ${input.messageId} (${input.role}): ` +
     `old ${list(before)}; new ${list(after)}; added ${list(added)}; removed ${list(removed)}; ` +
     `target ${quoteTarget(input.text)}`;
 }
