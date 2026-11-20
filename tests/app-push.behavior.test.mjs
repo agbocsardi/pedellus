@@ -436,6 +436,10 @@ test('push endpoints must be a public dotted https host on the default port', { 
     'https://phone.local/sub',
     'https://db.internal/sub',
     'https://machine.tailnet.ts.net/sub',
+    // A trailing dot is the DNS root, not a different host.
+    'https://localhost./sub',
+    'https://phone.localhost./sub',
+    'https://127.0.0.1./sub',
   ]) {
     assert.equal(at(endpoint), undefined, `${endpoint} is refused`);
   }

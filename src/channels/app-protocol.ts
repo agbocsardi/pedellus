@@ -198,7 +198,9 @@ const LOCAL_PUSH_SUFFIXES = [".localhost", ".local", ".internal", ".ts.net"] as 
  * notation to a dotted quad) and never a loopback or local-only name. This is what keeps a
  * `push.subscribe` from pointing the gateway's HTTPS client at an internal address.
  */
-function validPushHostname(hostname: string): boolean {
+function validPushHostname(raw: string): boolean {
+  // A trailing dot is the DNS root: `localhost.` names the same host, so drop it before checking.
+  const hostname = raw.endsWith(".") ? raw.slice(0, -1) : raw;
   if (hostname.startsWith("[") || hostname.includes(":")) return false;
   if (/^\d{1,3}(?:\.\d{1,3}){3}$/u.test(hostname)) return false;
   if (!hostname.includes(".")) return false;
