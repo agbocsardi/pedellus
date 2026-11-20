@@ -88,7 +88,8 @@ function pendingViews(m: Outgoing): AttachmentView[] {
 function messageViews(list: MessageEvent["attachments"]): AttachmentView[] {
   // Ids come from the gateway; only the protocol's shape ever becomes a URL.
   return (list ?? []).filter((file) => LIMITS.uploadIdPattern.test(file.id))
-    .map((file) => ({ ...file, url: fileUrl(file.id) }));
+    // Until the artifact viewer lands, an artifact is offered as a download chip.
+    .map((file) => ({ ...file, kind: file.kind === "artifact" ? "file" as const : file.kind, url: fileUrl(file.id) }));
 }
 
 function AttachmentList({ files }: { files: AttachmentView[] }) {

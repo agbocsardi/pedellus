@@ -38,6 +38,8 @@ export const LIMITS = {
   uploadNameChars: 120,
   uploadsPerMinute: 30,
   maxAttachments: 10,
+  /** An agent artifact (.html/.svg) the app renders in a sandboxed frame. */
+  artifactBytes: 2 * 1024 * 1024,
   /** Owner questions (ASK_USER.md bounds): prompt, option label, option description. */
   questionPromptChars: 500,
   questionLabelChars: 60,
@@ -168,7 +170,7 @@ export type DurableEvent = MessageEvent | SettledEvent | DividerEvent | ThreadEv
 export type Event = DurableEvent | PreviewEvent | StatusEvent | ModelEvent | ActivityEvent;
 export type ServerFrame = Response | Event;
 
-export type AttachmentInfo = { id: string; name: string; type: string; size: number; kind: "image" | "audio" | "file" };
+export type AttachmentInfo = { id: string; name: string; type: string; size: number; kind: "image" | "audio" | "file" | "artifact" };
 export type UploadResult = { id: string };
 export type UploadError = "bad_request" | "unsupported" | "unauthorized" | "too_large" | "rate_limited";
 

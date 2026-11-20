@@ -141,6 +141,8 @@ const STORE_KINDS: Readonly<Record<AttachmentInfo["kind"], MediaKind>> = Object.
   image: "photo",
   audio: "audio",
   file: "document",
+  // Agent artifacts are stored like documents; only the agent `app` tool ever produces them.
+  artifact: "document",
 });
 
 /** A bounded, printable announced type; anything else is served as a generic binary. */
