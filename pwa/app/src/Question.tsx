@@ -22,7 +22,7 @@ export function QuestionCard({ ev, store, conn }: { ev: QuestionEvent; store: St
   const writable = store.connState === "open" && store.canWrite(ev.thread);
   const chosen = ev.answer === undefined ? undefined : ev.options.find((option) => option.id === ev.answer);
   const final = ev.state === "answered"
-    ? `Answered${chosen === undefined ? "" : `: ${chosen.label}`}`
+    ? <>✓ Answered{chosen === undefined ? "" : <>: <b>{chosen.label}</b></>}</>
     : ev.state === "expired" ? "Expired"
       : ev.state === "cancelled" ? "Cancelled"
         : ev.state === "unknown" ? "Delivery unknown"
@@ -71,7 +71,7 @@ function expiryLabel(expiresAt: string): string {
   const at = Date.parse(expiresAt);
   if (Number.isNaN(at)) return "";
   const left = at - Date.now();
-  if (left <= 0) return "window closed";
+  if (left <= 0) return "Expired";
   const minutes = Math.ceil(left / 60_000);
   return minutes <= 1 ? "expires in under a minute" : `expires in ${minutes} min`;
 }

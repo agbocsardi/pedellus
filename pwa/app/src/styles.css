@@ -675,9 +675,17 @@ input#pair-code {
   padding: 12px 14px;
   max-width: 32rem;
   border: 1px solid var(--line);
-  border-inline-start: 3px solid var(--accent);
   border-radius: 14px;
+  /* A straight accent bar (a thick start border bends with the radius). */
+  box-shadow: inset 3px 0 0 var(--accent);
   background: var(--card);
+}
+/* An open question waits on the owner: a light tint sets it apart from answered ones. */
+.question[data-state="open"] {
+  background: color-mix(in oklab, var(--accent) 6%, var(--card));
+}
+.question:not([data-state="open"]) {
+  box-shadow: inset 3px 0 0 var(--line);
 }
 .question-head {
   display: flex;
@@ -745,8 +753,8 @@ input#pair-code {
   font-size: 0.9rem;
   color: var(--muted-ink);
 }
-.question-final[data-state="answered"] {
-  color: var(--accent);
+.question-final[data-state="answered"] b {
+  color: var(--ink);
   font-weight: 600;
 }
 .question-final[data-state="unknown"] {
