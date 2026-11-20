@@ -50,12 +50,15 @@ export function validReactionNote(value: unknown): value is AppReactionNote {
   return true;
 }
 
-/** One line of reference text: control characters removed, one paragraph, bounded. */
+/**
+ * One line of reference text: control characters, bidi overrides/isolates and zero-width
+ * characters removed (the same set the rest of the app channel strips), one paragraph, bounded.
+ */
 function referenceText(value: string, maxChars: number): string {
   const cleaned = value
-    .replace(/\r\n?/g, " ")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\u00ad\u200b-\u200d\u202a-\u202e\u2060\u2066-\u2069\ufeff]/gu, " ")
+    .replace(/[\r\n]+/gu, " ")
     .replace(/\s+/gu, " ")
-    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, " ")
     .trim();
   if (cleaned.length <= maxChars) return cleaned;
   return `${cleaned.slice(0, Math.max(0, maxChars - 1))}…`;
