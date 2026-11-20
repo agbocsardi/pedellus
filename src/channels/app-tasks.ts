@@ -18,7 +18,10 @@ import { clampCodeUnits, plainLabel } from "../history/entry-view.js";
 export const WORKER_TASK_PREFIX = "w:";
 export const CRON_TASK_PREFIX = "c:";
 
+export type AppTaskOutcome = "cancelled" | "finished" | "unknown";
 export type AppTaskList = { readonly tasks: readonly TaskInfo[] };
+/** The outcome and the bounded label the receipt names, when the task was found. */
+export type AppTaskCancelResult = { readonly outcome: AppTaskOutcome; readonly title?: string };
 
 export const workerTaskId = (taskId: number): string => `${WORKER_TASK_PREFIX}${taskId}`;
 export const cronTaskId = (jobId: string): string => `${CRON_TASK_PREFIX}${jobId}`;
@@ -126,4 +129,17 @@ export function selectTasks(workers: readonly WorkerView[], jobs: readonly CronJ
   ];
   entries.sort((left, right) => right.createdAtMs - left.createdAtMs);
   return entries.slice(0, LIMITS.maxListedTasks).map((entry) => entry.task);
+}
+
+/** The durable receipt text for one cancellation; always says what actually happened. */
+export function taskCancelReceipt(result: AppTaskCancelResult): string {
+  const what = result.title === undefined ? "the task" : `task “${result.title}”`;
+  switch (result.outcome) {
+    case "cancelled":
+      return `Cancelled ${what}.`;
+    case "finished":
+      return `Task${result.title === undefined ? "" : ` “${result.title}”`} had already finished; nothing was cancelled.`;
+    case "unknown":
+      return "No such task in this thread; nothing was changed.";
+  }
 }

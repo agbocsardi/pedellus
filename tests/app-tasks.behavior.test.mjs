@@ -189,3 +189,85 @@ test('tasks lists one thread\'s own workers and scheduled jobs, newest first and
     await channel.close();
   }
 });
+
+test('task.cancel cancels, removes, reports finished, and never touches another thread\'s task', { timeout: 45_000 }, async () => {
+  const channel = await openChannel('tasks-cancel');
+  try {
+    assert.equal((await channel.request('hello', { v: 2, cursor: null })).v, 2);
+    const mine = await createSide(channel, 'thread-mine', 'Mine');
+    const other = await createSide(channel, 'thread-other', 'Other');
+
+    assert.equal((await channel.request('send', { thread: mine, key: 'start-tasks', text: 'start tasks' })).ok, true);
+    assert.equal((await channel.request('send', { thread: other, key: 'start-other', text: 'start other' })).ok, true);
+
+    let listed = [];
+    await untilAsync(async () => {
+      listed = await channel.tasks(mine);
+      return listed.length === 2;
+    }, 'this thread has its worker and job');
+    let foreign = [];
+    await untilAsync(async () => {
+      foreign = await channel.tasks(other);
+      return foreign.length === 1 && foreign[0].state === 'running';
+    }, 'the other thread has its own live worker');
+
+    const workerId = listed.find((task) => task.kind === 'worker').id;
+    const jobId = listed.find((task) => task.kind === 'cron').id;
+
+    // A worker from another thread is not ours to cancel: nothing changes there.
+    const denied = await channel.request('task.cancel', { thread: mine, task: foreign[0].id });
+    assert.equal(denied.ok, true);
+    assert.equal(denied.outcome, 'unknown');
+    assert.deepEqual((await channel.tasks(other)).map((task) => [task.id, task.state]), [[foreign[0].id, 'running']]);
+    await channel.device.wait(() => channel.device.events('message').some((event) =>
+      event.thread === mine && event.role === 'notice' && event.text === 'No such task in this thread; nothing was changed.'),
+      'the unknown cancellation leaves an honest receipt');
+    assert.equal((await channel.tasks(other))[0].state, 'running', 'the foreign worker is still running');
+
+    // Cancel our live worker: the existing durable cancel path.
+    const cancelled = await channel.request('task.cancel', { thread: mine, task: workerId });
+    assert.equal(cancelled.ok, true);
+    assert.equal(cancelled.outcome, 'cancelled');
+    await untilAsync(async () => (await channel.tasks(mine))
+      .find((task) => task.id === workerId)?.state === 'cancelled', 'the worker is cancelled');
+    await channel.device.wait(() => channel.device.events('message').some((event) =>
+      event.thread === mine && event.role === 'notice' && event.text === `Cancelled task “${WORKER_TASK}”.`),
+      'the cancellation receipt is a durable notice in this thread');
+
+    // Remove the scheduled job; a second attempt is already terminal.
+    const removed = await channel.request('task.cancel', { thread: mine, task: jobId });
+    assert.equal(removed.ok, true);
+    assert.equal(removed.outcome, 'cancelled');
+    await untilAsync(async () => (await channel.tasks(mine))
+      .find((task) => task.id === jobId)?.state === 'cancelled', 'the job is cancelled');
+    const again = await channel.request('task.cancel', { thread: mine, task: jobId });
+    assert.equal(again.ok, true);
+    assert.equal(again.outcome, 'finished');
+
+    // A worker that already completed reports its real outcome, not a cancellation. Releasing the
+    // held child lets the other thread's worker finish; the cancelled one stays aborted.
+    channel.held.release.resolve();
+    await untilAsync(async () => (await channel.tasks(other))
+      .find((task) => task.id === foreign[0].id)?.state === 'done', 'the released worker finishes');
+    const late = await channel.request('task.cancel', { thread: other, task: foreign[0].id });
+    assert.equal(late.ok, true);
+    assert.equal(late.outcome, 'finished');
+    await channel.device.wait(() => channel.device.events('message').some((event) =>
+      event.thread === other && event.role === 'notice'
+      && event.text === 'Task “other thread work” had already finished; nothing was cancelled.'),
+      'the finished receipt is honest');
+    assert.deepEqual((await channel.tasks(other)).map((task) => [task.id, task.state]), [[foreign[0].id, 'done']]);
+
+    // Sample the whole log once: every receipt is one of the honest fixed texts, in its own thread.
+    const receipts = new Set(['No such task in this thread; nothing was changed.',
+      `Cancelled task “${WORKER_TASK}”.`,
+      `Cancelled task “${CRON_LABEL}”.`,
+      `Task “${CRON_LABEL}” had already finished; nothing was cancelled.`,
+      'Task “other thread work” had already finished; nothing was cancelled.']);
+    for (const event of channel.device.events('message').filter((entry) => entry.role === 'notice')) {
+      assert.ok(receipts.has(event.text), event.text);
+    }
+  } finally {
+    await channel.close();
+  }
+});

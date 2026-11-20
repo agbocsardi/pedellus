@@ -335,6 +335,32 @@ contract is in `pwa/protocol/v2.md`; this section is the gateway's behavior.
 The sender uses the pinned `web-push` library (the same one the phase-0 probe used), imported
 lazily so a gateway without `app.push` never loads it.
 
+## Tasks
+
+`tasks {thread?}` lists one thread's own background work: the retained workers and scheduled jobs
+of that thread's mapped conversation, read through the same owner-scoped functions the agent's
+`worker list` and `cron list` use. Nothing another thread or chat owns is listed or named. A thread
+that is not mapped lists nothing, and the read maps no conversation, so it creates nothing and the
+`main` thread stays empty until it has received input. Entries are newest first and capped at
+`LIMITS.maxListedTasks`; ids are namespaced (`w:<task id>` for a worker, `c:<job id>` for a job).
+
+`TaskInfo.title` is a bounded one-line label (the worker's instruction or the job's name, never a
+stored prompt body in full), and `detail` is a bounded derived line such as the job's schedule and
+its last-run status. Neither carries worker output, a credential or a host path; the read calls no
+model, reads no transcript and starts, retries or changes nothing.
+
+`task.cancel {thread?, task}` is final. A worker goes through the existing durable worker cancel, a
+scheduled job through the existing owner-scoped cron cancel. The task is resolved through that
+thread's own list first, so an id from another conversation reports `unknown` and neither
+foundation is called: nothing there is touched. `cancelled` means the cancellation was recorded,
+`finished` means it had already ended (a second removal of the same job reports this), and
+`unknown` means this thread has no such task. A worker cancel that throws is reported as a failed
+request, like the model-facing tool, rather than inventing an outcome; a cron cancel that throws
+after recording the cancellation still reports `cancelled`, as the cron tool does. The visible
+receipt is one bounded durable `notice` in the thread; an archived thread refuses `task.cancel`
+with `bad_request`, like `send` and `control`. There is no task event stream: the app fetches the
+list when the sheet opens and after any durable event in that thread while it stays open.
+
 ## Scheduled results and interruption notices
 
 The adapter consumes the channel-neutral durable outbox (`nanobot.cron.deliveries`) for each
@@ -369,10 +395,11 @@ with a fixed reason and a durable fault entry; no raw record contents are logged
   surface is registered, so the login is refused before delivery) and cannot receive an
   `ask_user` question. Protocol v2 defines no owner-only non-durable event; a later protocol
   revision must add one before this channel can carry URLs or questions.
-* **No history, tasks or cards.** The protocol marks them *later*; `history` and `tasks` reply
-  `unsupported`. Files are implemented (see *Files*), but with no thumbnails, resumable or
-  multipart uploads, per-file deletion, or a `message.attachments` entry for files the agent sends
-  back to the app: outbound files are only the workspace locator in the answer text.
+* **No history or cards.** The protocol marks them *later*; `history` still replies
+  `unsupported`. The Tasks view is implemented (see *Tasks*). Files are implemented (see *Files*),
+  but with no thumbnails, resumable or multipart uploads, per-file deletion, or a
+  `message.attachments` entry for files the agent sends back to the app: outbound files are only
+  the workspace locator in the answer text.
 * **The upload rate window is in-memory.** A restart clears it, like the pairing window; the durable
   per-device and total record bounds still apply.
 * **Web Push is offline-verified only.** No real push service, browser subscription or service
@@ -436,6 +463,13 @@ No tailnet, device, credential or paid inference is
 used. The `app pair`/`devices`/`revoke` local-socket dispatch is exercised through the same console
 host the running adapter exports; the thin socket layer itself follows the `cron` console's
 existing tests.
+
+`tests/app-tasks.behavior.test.mjs` covers the Tasks view offline: the list is scoped to one
+thread's own worker and scheduled job (another thread and the unmapped `main` thread list nothing),
+newest first and bounded with no host path in any field; cancelling a worker aborts it and leaves one
+honest durable notice; removing a scheduled job cancels it and a second attempt reports `finished`; a
+task id from another thread reports `unknown` and leaves that thread untouched; and a worker that
+already completed reports `finished`.
 
 `tests/app-push.behavior.test.mjs` covers Web Push offline: config strictness, local key generation,
 the unconfigured `unsupported` replies, subscription validation/replacement/unsubscription, a

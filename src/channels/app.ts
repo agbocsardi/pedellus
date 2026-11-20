@@ -57,7 +57,7 @@ import {
 import { renderMemoryDigestStart, renderMemoryDigestStatus } from "../history/memory-digest.js";
 import { RESTART_BUSY_MESSAGE, RestartBusyError } from "../restart.js";
 import type { GatewayMemoryDigest, GatewayModelList, GatewayModelPresets, GatewayModelSelection } from "../runtime.js";
-import type { AppTaskList } from "./app-tasks.js";
+import { taskCancelReceipt, type AppTaskCancelResult, type AppTaskList } from "./app-tasks.js";
 import {
   APP_CLOSE,
   APP_LIMITS,
@@ -195,6 +195,11 @@ export interface AppGateway {
    * bounded. Read-only; an unmapped thread lists nothing and creates nothing.
    */
   appTasks?(sessionKey: string, context: Context): Promise<AppTaskList>;
+  /**
+   * Cancel one task of that thread (`task.cancel`). A worker is aborted and a job removed through
+   * the existing durable paths; a task that is not this thread's own reports `unknown` untouched.
+   */
+  appTaskCancel?(sessionKey: string, task: string, context: Context): Promise<AppTaskCancelResult>;
   /**
    * Paired reset for `new`: a native reset plus the host's prompt-snapshot rebuild in one
    * operation, refused atomically while a run is live. Absent keeps the plain native reset.
@@ -1101,6 +1106,26 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           // Read-only expansion: listing never maps a thread, so an unknown thread lists nothing.
           const listed = await gateway.appTasks(sessionForThread(thread), adapterContext);
           sendOk({ tasks: [...listed.tasks] });
+          return;
+        }
+        case "task.cancel": {
+          const thread = parseThreadId(frame.thread === undefined ? APP_MAIN_THREAD : frame.thread);
+          const task = frame.task;
+          if (thread === undefined || typeof task !== "string" || !APP_LIMITS.taskIdPattern.test(task)) {
+            return sendError("bad_request");
+          }
+          if (gateway.appTaskCancel === undefined) return sendError("unsupported");
+          // An archived thread is read-only here as it is for `send` and `control`.
+          if (!openThread(state, thread)) return sendError("bad_request");
+          const result = await gateway.appTaskCancel(sessionForThread(thread), task, adapterContext);
+          sendOk({ outcome: result.outcome });
+          // The visible receipt is a durable `notice`; a full queue must not turn a recorded
+          // cancellation into a failure reply, so only the notice is lost and it is journaled.
+          try {
+            await admitNotice(thread, `task.cancel:${id}`, taskCancelReceipt(result));
+          } catch (error) {
+            journalEvent("app.task.cancel.receipt-failed", { op: "task.cancel" }, error);
+          }
           return;
         }
         default:
