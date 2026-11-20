@@ -71,6 +71,7 @@ export async function openAppStore(label, options = {}) {
       toolAllowlist: options.tools ?? [],
       ...(options.cron === true ? { cron: { enabled: true } } : {}),
       ...(options.followUpMode === undefined ? {} : { followUpMode: options.followUpMode }),
+      ...(options.media === undefined ? {} : { media: options.media }),
       app: { port: 43190, staticRoot, ...(options.appBlock ?? {}) },
     };
     let config;
@@ -120,6 +121,16 @@ export function startApp(store, options = {}) {
   const clock = { now: options.now ?? Date.now() };
   let portResolve;
   const port = new Promise((resolvePort) => { portResolve = resolvePort; });
+  // Mirror the shipped CLI: attachments are the top-level `media` block, absent by default.
+  const media = options.media ?? (store.config.media === undefined
+    ? undefined
+    : {
+        workspace: store.workspace,
+        directory: store.config.media.directory,
+        ...(store.config.media.transcription === undefined
+          ? {}
+          : { transcription: store.config.media.transcription }),
+      });
   const adapter = runApp(options.gateway ?? store.gateway, {
     port: options.port ?? 0,
     staticRoot: options.staticRoot ?? store.staticRoot,
@@ -128,6 +139,7 @@ export function startApp(store, options = {}) {
     agentName: options.agentName ?? store.config.app.agentName,
     ...(options.scanIntervalMs === undefined ? {} : { scanIntervalMs: options.scanIntervalMs }),
     ...(options.restart === undefined ? {} : { restart: options.restart }),
+    ...(media === undefined ? {} : { media }),
     now: () => clock.now,
     onListening: (bound) => portResolve(bound),
   }, scope.context);

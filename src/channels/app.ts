@@ -82,6 +82,7 @@ import {
   type AppThreadOrigin,
 } from "./app-protocol.js";
 import { startAppListener, type AppDeviceSession, type AppSessionHooks } from "./app-listener.js";
+import { createAppFiles, type AppMediaOptions } from "./app-files.js";
 
 /** Preserve the original mapped chat and its history. */
 export const APP_CHAT_SESSION_KEY = "app:chat";
@@ -250,6 +251,8 @@ export type AppOptions = {
   readonly followUpMode?: FollowUpMode;
   /** Host process replacement for the `restart` control; absent leaves it unoffered. */
   readonly restart?: AppRestartHost;
+  /** Attachment opt-in, exactly the other channels' `media` block; absent means no uploads. */
+  readonly media?: AppMediaOptions;
   /** Controlled clock for offline checks; absent keeps wall time. */
   readonly now?: () => number;
   /** Adapter scan cadence; tests may shorten it. Default 2s, bounds 50ms–60s. */
@@ -771,6 +774,15 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     }
     return copyJson(doc) as unknown as AppChannelState;
   }, context);
+  // Files share the state conversation's storage: an upload is durable before its id is answered,
+  // and an admitted attachment reference commits in the same transaction as the echo and pending
+  // input, so a refused id admits nothing. Without `media` the host reports itself unavailable.
+  const files = createAppFiles({
+    ...(options.media === undefined ? {} : { media: options.media }),
+    conversation: stateConversation,
+    context: adapterContext,
+    now,
+  });
   /**
    * The busy-mode each admitted input asked for, written onto it so a later configuration change or
    * a recovery never re-reads it. Delivery may still fall back to follow-up queueing when another
@@ -1044,7 +1056,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     socket.hello = true;
     sendOk({
       v: APP_PROTOCOL_VERSION, device: socket.session.label, head: headCursor(), agent: agentName, commands: commandInfos,
-      presets,
+      presets, uploads: files.available,
     });
     // Replay from the acknowledged position (or the retention floor), oldest first, bounded.
     const head = headCursor();
@@ -2577,6 +2589,16 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     }
   };
 
+  /** Discard unreferenced uploads past their TTL; a failure is retried by the next scan. */
+  const pruneUploads = async (): Promise<void> => {
+    if (!files.available) return;
+    try {
+      await files.prune(now());
+    } catch (error) {
+      if (!signal?.aborted) journalEvent("app.uploads.prune.failed", {}, error);
+    }
+  };
+
   const requestScheduledScan = (): void => {
     if (scheduledScanning || stopping || signal?.aborted) return;
     scheduledScanning = true;
@@ -2678,6 +2700,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       pairRedeem: (code, label) => pairRedeem(code, label),
       authenticate: (token) => authenticate(token),
       onSocket: (session, hooks) => onSocket(session, hooks),
+      upload: (device, request) => files.upload({ deviceId: device.deviceId, ...request }),
     },
     // A listener that dies takes the channel with it: the supervisor reports gateway.app and the
     // host shuts down, instead of a half-open listener nobody is serving.
@@ -2693,11 +2716,13 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   options.onListening?.(listener.port);
   drain();
   requestScheduledScan();
+  await pruneUploads();
   scanTimer = setInterval(() => {
     failedThisCycle.clear();
     resumeDeferredControls();
     drain();
     requestScheduledScan();
+    void pruneUploads();
   }, scanIntervalMs);
   scanTimer.unref?.();
 

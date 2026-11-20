@@ -590,6 +590,17 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
         autoArchiveDays: config.app.autoArchiveDays ?? 14,
         agentName: config.app.agentName ?? "Durable",
         followUpMode: config.followUpMode ?? "followUp",
+        ...(config.media === undefined
+          ? {}
+          : {
+              media: {
+                workspace: config.workspace,
+                directory: config.media.directory,
+                ...(config.media.transcription === undefined
+                  ? {}
+                  : { transcription: config.media.transcription }),
+              },
+            }),
         restart: restartHost,
       }, context));
     }

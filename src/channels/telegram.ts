@@ -54,7 +54,7 @@ import { RESTART_BUSY_MESSAGE, RestartBusyError } from "../restart.js";
 import { isTurnInterruptionNotice } from "../recovery/interruption.js";
 import { CHANNEL_STATE_SESSION_SUFFIX } from "../history/scope.js";
 import { MEDIA_LIMITS, MediaRejected, createMediaStore, type MediaRejectionReason, type MediaStore, type StoredMedia } from "../media/attachments.js";
-import { createTranscriber, type HexEngine, type Transcriber, type TranscriptionBackend, type TranscriptionFailure, type WhisperCliEngine } from "../media/transcription.js";
+import { createTranscriber, TRANSCRIPTION_FAILURE_TEXT, type HexEngine, type Transcriber, type TranscriptionBackend, type WhisperCliEngine } from "../media/transcription.js";
 import {
   TELEGRAM_FILE_ORIGIN,
   TELEGRAM_MEDIA_LIMITS,
@@ -4136,15 +4136,6 @@ const MEDIA_REJECTION_TEXT: Record<MediaRejectionReason, string> = {
   "unsafe-directory": "the attachment directory is not a plain directory inside the workspace",
   empty: "the file was empty",
   unavailable: "Telegram did not provide the file",
-};
-
-const TRANSCRIPTION_FAILURE_TEXT: Record<TranscriptionFailure, string> = {
-  unavailable: "the local speech backend or model is not provisioned",
-  timeout: "local transcription timed out",
-  cancelled: "local transcription was cancelled",
-  "too-large": "the audio exceeds the duration limit",
-  failed: "local transcription failed",
-  empty: "no speech was recognized",
 };
 
 /**

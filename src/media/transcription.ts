@@ -39,6 +39,16 @@ export type TranscriptionFailure =
   | "failed"
   | "empty";
 
+/** Model-facing wording for a failed automatic transcription; never implies the speech was heard. */
+export const TRANSCRIPTION_FAILURE_TEXT: Record<TranscriptionFailure, string> = {
+  unavailable: "the local speech backend or model is not provisioned",
+  timeout: "local transcription timed out",
+  cancelled: "local transcription was cancelled",
+  "too-large": "the audio exceeds the duration limit",
+  failed: "local transcription failed",
+  empty: "no speech was recognized",
+};
+
 export type TranscriptionOutcome =
   | { readonly ok: true; readonly text: string }
   | { readonly ok: false; readonly reason: TranscriptionFailure };
