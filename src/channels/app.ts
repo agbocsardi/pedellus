@@ -1841,12 +1841,10 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         return;
       }
     }
-    // Never store callback text. A refused callback still has an idempotent key.
-    const callback = looksLikeOAuthCallback(text);
     // A typed ordinary message settles the oldest delivered question in this thread in the same
-    // commit as its admission, as Telegram and the terminal do; commands and callback text never
-    // count, and an attachment-only send has no text to count with.
-    const answerConversation = callback || gateway.askSurfaces === undefined
+    // commit as its admission, as Telegram and the terminal do; commands never count (callback text
+    // never reaches here), and an attachment-only send has no text to count with.
+    const answerConversation = gateway.askSurfaces === undefined
       ? undefined
       : await gateway.conversationFor(sessionForThread(thread), adapterContext).catch((error: unknown) => {
           if (!stopping && !signal?.aborted) journalEvent("app.send.failed", {}, error);
