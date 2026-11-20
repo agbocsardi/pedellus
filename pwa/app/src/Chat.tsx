@@ -3,7 +3,7 @@ import { Streamdown } from "streamdown";
 import type { Connection } from "./conn";
 import type { AgentStatus, Outgoing, OutgoingState, Store } from "./store";
 import { LIMITS, MAIN_THREAD, type CommandInfo, type DurableEvent, type MessageEvent, type PresetInfo, type ThreadInfo, type ThreadOrigin } from "./protocol";
-import { disablePush, enablePush, hasPushSubscription, pushPermission, pushSupported, clearAppBadge, type PushPermission } from "./push";
+import { disablePush, enablePush, hasPushSubscription, pushPermission, requestPushPermission, pushSupported, clearAppBadge, type PushPermission } from "./push";
 import { Avatar, type AvatarState } from "./Avatar";
 
 const FINE_POINTER = matchMedia("(pointer: fine)").matches;
@@ -798,6 +798,17 @@ function NotificationsItem({ store, conn, online }: { store: Store; conn: Connec
         setNote("Reconnect to turn notifications on.");
         return;
       }
+      // Permission first: the prompt must come straight off the tap.
+      const granted = await requestPushPermission();
+      setPermission(granted);
+      if (granted !== "granted") {
+        setNote(granted === "denied"
+          ? "Notifications are blocked for this app. Allow them in browser settings, then try again."
+          : granted === "unsupported"
+            ? "This browser cannot receive notifications. On iPhone, open the installed home-screen app."
+            : "Notifications were not allowed. Tap again to ask.");
+        return;
+      }
       const key = await conn.pushKey();
       if (!key) {
         setNote("Reconnect to turn notifications on.");
@@ -817,16 +828,16 @@ function NotificationsItem({ store, conn, online }: { store: Store; conn: Connec
         setPermission(pushPermission());
         setNote(attempt.kind === "denied"
           ? "Notifications are blocked for this app. Allow them in browser settings, then try again."
-          : attempt.kind === "unsupported"
-            ? "This browser cannot receive notifications. On iPhone, open the installed home-screen app."
-            : "Could not subscribe this device. Try again.");
+          : "Could not subscribe this device. Try again.");
         return;
       }
       const saved = await conn.pushSubscribe(attempt.subscription);
       if (!saved?.ok) {
         await disablePush();
         if (saved?.error === "unsupported") await store.setPush({ gatewayUnsupported: true });
-        else setNote("The gateway did not accept this device. Try again.");
+        else setNote(saved
+          ? "The gateway did not accept this device. Try again."
+          : "Reconnect to finish turning notifications on, then try again.");
         return;
       }
       await store.setPush({ endpoint: attempt.subscription.endpoint });

@@ -68,15 +68,22 @@ function wellFormed(sub: PushSubscriptionInfo): boolean {
 }
 
 /**
- * Ask for permission (only ever from a tap) and subscribe this browser. The
- * permission prompt is the first await, so it stays inside the gesture.
+ * Ask for permission. Called only from the tap, before anything slower, so the
+ * prompt stays inside the gesture.
+ */
+export async function requestPushPermission(): Promise<PushPermission> {
+  if (!pushSupported()) return "unsupported";
+  if (Notification.permission !== "default") return Notification.permission;
+  return Notification.requestPermission();
+}
+
+/**
+ * Subscribe this browser with the gateway's key. Permission must already be
+ * granted (`requestPushPermission`); nothing here prompts.
  */
 export async function enablePush(key: string): Promise<PushAttempt> {
   if (!pushSupported()) return { kind: "unsupported" };
-  if (Notification.permission !== "granted") {
-    const granted = await Notification.requestPermission();
-    if (granted !== "granted") return granted === "denied" ? { kind: "denied" } : { kind: "failed" };
-  }
+  if (Notification.permission !== "granted") return { kind: "denied" };
   try {
     const reg = await activeRegistration();
     if (!reg) return { kind: "failed" };
