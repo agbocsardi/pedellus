@@ -248,11 +248,13 @@ export function createAppFiles(options: {
     async upload(request: AppUploadRequest): Promise<AppUploadOutcome> {
       if (store === undefined) return { status: "unsupported" };
       const atMs = now();
+      // Bound the name before the window: a request refused for its metadata does no work and
+      // must not spend the uploader's quota.
+      const name = sanitizeOriginalName(request.name);
+      if (name === undefined) return { status: "bad-request" };
       if (rateLimited(request.deviceId, atMs)) return { status: "rate-limited" };
       // Expired records must not hold the record cap against a fresh upload.
       await prune(atMs);
-      const name = sanitizeOriginalName(request.name);
-      if (name === undefined) return { status: "bad-request" };
       const type = announcedMimeType(request.mimeType);
       const kind = kindOfType(type);
       const id = newUploadId();

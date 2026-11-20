@@ -1299,8 +1299,10 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         return sendError("bad_request");
       }
       attachmentIds = rawAttachments as string[];
-      // Without media storage no upload can exist, so every id is unknown.
-      if (!files.available) return sendError("bad_request");
+      // Without media storage no upload can exist, so every id is unknown. An empty list is
+      // indistinguishable from no attachments at all.
+      if (attachmentIds.length > 0 && !files.available) return sendError("bad_request");
+      if (attachmentIds.length === 0) attachmentIds = undefined;
     }
     if (typeof key !== "string" || !APP_LIMITS.idPattern.test(key) || typeof text !== "string" ||
         (text.length === 0 && (attachmentIds === undefined || attachmentIds.length === 0))) {
