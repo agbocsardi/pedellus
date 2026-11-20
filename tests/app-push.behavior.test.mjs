@@ -26,7 +26,7 @@ import {
 const modules = new URL('../dist/channels/', import.meta.url);
 const { generatePushKeys, pushPayload, pushSendOptions, pushTopic, resolvePushOptions, PUSH_TIMEOUT_MS, PUSH_TTL_SECONDS } =
   await import(new URL('app-push.js', modules).href);
-const { validVapidPrivateKey, validVapidPublicKey } = await import(
+const { validVapidPrivateKey, validVapidPublicKey, parsePushSubscription } = await import(
   new URL('app-protocol.js', modules).href
 );
 const { parseAppInvocation } = await import(
@@ -212,6 +212,8 @@ test('push.subscribe validates, replaces and unsubscribes one subscription per d
           { endpoint: `https://push.example.test/${'a'.repeat(2_050)}`, keys: subscriptionAt().keys },
           { endpoint: 'https://push.example.test/x', keys: { p256dh: 'A'.repeat(129), auth: 'A'.repeat(22) } },
           { endpoint: 'https://push.example.test/x', keys: { p256dh: 'A'.repeat(30), auth: 'A'.repeat(65) } },
+          { endpoint: 'https://127.0.0.1/x', keys: subscriptionAt().keys },
+          { endpoint: 'https://push.example.test:8443/x', keys: subscriptionAt().keys },
         ]) {
           const id = nextId('p');
           client.send({ type: 'req', id, op: 'push.subscribe', subscription: bad });
@@ -406,4 +408,35 @@ test('the transport hands the real web-push exactly the option keys it validates
   assert.equal(details.timeout, PUSH_TIMEOUT_MS);
   assert.equal(details.method, 'POST');
   assert.ok(Buffer.isBuffer(details.body) && details.body.length > 0, 'the payload is encrypted');
+});
+
+test('push endpoints must be a public dotted https host on the default port', { timeout: 10_000 }, async () => {
+  const at = (endpoint) => parsePushSubscription({ endpoint, keys: subscriptionAt().keys });
+  assert.equal(at('https://push.example.test/sub')?.endpoint, 'https://push.example.test/sub');
+  assert.equal(at('https://push.example.test:443/sub')?.endpoint, 'https://push.example.test:443/sub',
+    'the default port is accepted');
+
+  for (const endpoint of [
+    'http://push.example.test/sub',
+    'https://user@push.example.test/sub',
+    'https://user:secret@push.example.test/sub',
+    'https://push.example.test:8443/sub',
+    // IP literals, including the shorthand notations WHATWG normalizes to a dotted quad.
+    'https://127.0.0.1/sub',
+    'https://10.0.0.1:443/sub',
+    'https://2130706433/sub',
+    'https://0x7f.1/sub',
+    'https://0177.0.0.1/sub',
+    'https://[::1]/sub',
+    'https://[fd00::1]/sub',
+    // Loopback, single-label and local-only names.
+    'https://localhost/sub',
+    'https://phone.localhost/sub',
+    'https://push/sub',
+    'https://phone.local/sub',
+    'https://db.internal/sub',
+    'https://machine.tailnet.ts.net/sub',
+  ]) {
+    assert.equal(at(endpoint), undefined, `${endpoint} is refused`);
+  }
 });

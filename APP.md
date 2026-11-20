@@ -244,7 +244,9 @@ contract is in `pwa/protocol/v2.md`; this section is the gateway's behavior.
 - `push.key` returns the configured VAPID public key. `push.subscribe` validates the browser's
   `PushSubscription.toJSON()` bounds and stores exactly one subscription per device, replacing the
   previous one; `push.unsubscribe` removes it and is idempotent. All three reply `unsupported` when
-  push is not configured. Subscriptions live in the device record of the app channel state, never in
+  push is not configured. The endpoint must be a public DNS name: `https:` on port 443, no userinfo,
+  no IP literal and no `localhost`, single-label or `.local`/`.internal`/`.ts.net` name; anything
+  else is `bad_request`. Subscriptions live in the device record of the app channel state, never in
   a transcript, model context or log line; revoking a device drops its subscription with its token.
 - After a durable `message` with role `assistant` or `notice` is appended, each subscribed device
   without an open, `hello`'d stream is sent one push. The payload is content-free JSON

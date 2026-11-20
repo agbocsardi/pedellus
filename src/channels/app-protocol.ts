@@ -190,6 +190,21 @@ export type AppPairingRecord = {
 
 const BASE64URL = /^[A-Za-z0-9_-]+$/u;
 
+/** Dotted local-only zones; a public push service never lives in one. */
+const LOCAL_PUSH_SUFFIXES = [".localhost", ".local", ".internal", ".ts.net"] as const;
+
+/**
+ * A push endpoint's host: a dotted DNS name, never an IP literal (whatwg normalizes every IPv4
+ * notation to a dotted quad) and never a loopback or local-only name. This is what keeps a
+ * `push.subscribe` from pointing the gateway's HTTPS client at an internal address.
+ */
+function validPushHostname(hostname: string): boolean {
+  if (hostname.startsWith("[") || hostname.includes(":")) return false;
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/u.test(hostname)) return false;
+  if (!hostname.includes(".")) return false;
+  return !LOCAL_PUSH_SUFFIXES.some((suffix) => hostname.endsWith(suffix));
+}
+
 /** VAPID `sub`: an absolute `mailto:` or `https:` URI, bounded and printable. */
 export function validVapidSubject(value: unknown): value is string {
   if (typeof value !== "string" || value.length === 0 || value.length > 200) return false;
@@ -219,7 +234,8 @@ export function validVapidPrivateKey(value: unknown): value is string {
 
 /**
  * One `push.subscribe` subscription, or `undefined` when any field is out of bounds. The endpoint
- * is an `https:` URL within `pushEndpointChars`; both keys are non-empty base64url within their
+ * is an `https:` URL within `pushEndpointChars`, on the default port, with no userinfo and a
+ * public dotted hostname (see `validPushHostname`); both keys are non-empty base64url within their
  * bounds. Unknown extra keys are ignored, like the browser's own `toJSON()` output.
  */
 export function parsePushSubscription(value: unknown): AppPushSubscription | undefined {
@@ -235,7 +251,9 @@ export function parsePushSubscription(value: unknown): AppPushSubscription | und
   } catch {
     return undefined;
   }
-  if (url.protocol !== "https:" || url.hostname === "") return undefined;
+  if (url.protocol !== "https:" || url.username !== "" || url.password !== "") return undefined;
+  // An explicit port is refused; push services all listen on 443, which the parser normalizes to "".
+  if (url.port !== "" || !validPushHostname(url.hostname)) return undefined;
   const keys = raw.keys;
   if (keys === null || typeof keys !== "object" || Array.isArray(keys)) return undefined;
   const { p256dh, auth } = keys as Record<string, unknown>;
