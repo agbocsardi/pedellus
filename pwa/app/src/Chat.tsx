@@ -17,6 +17,8 @@ const LIST_ICON = "M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01";
 const TITLE_CONTROL = /[\p{Cc}\u2028\u2029]/u;
 const BELL_ICON = "M18 14v-3.5a6 6 0 1 0-12 0V14l-2 3.5h16L18 14M10 21h4";
 const WRENCH_ICON = "M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.8-3.8a6 6 0 0 1-7.9 7.9l-6.9 6.9a2.1 2.1 0 0 1-3-3l6.9-6.9a6 6 0 0 1 7.9-7.9l-3.8 3.8Z";
+/** A DOM `MessageEvent`; the protocol's `MessageEvent` shadows the global in this file. */
+type SwMessage = Event & { origin: string; source: MessageEventSource | null; data?: unknown };
 
 type CommandState = { online: boolean; writable: boolean; running: boolean };
 const ready = (s: CommandState) => s.online && s.writable;
@@ -408,10 +410,15 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     };
     const param = new URLSearchParams(location.search).get("thread") ?? undefined;
     if (param && open(param)) history.replaceState(null, "", location.pathname);
-    // `MessageEvent` here is the protocol's message frame, hence the plain Event.
+    // Only this origin's active service worker may steer navigation; a frame
+    // or another origin posting the same shape is ignored.
     const onMessage = (e: Event) => {
-      const data = (e as { data?: { type?: string; thread?: string } }).data;
-      if (data?.type === "open-thread") open(data.thread);
+      const { origin, source, data } = e as SwMessage;
+      if (origin !== location.origin) return;
+      const sw = navigator.serviceWorker.controller;
+      if (sw && source !== sw) return;
+      const message = data as { type?: string; thread?: string } | undefined;
+      if (message?.type === "open-thread") open(message.thread);
     };
     navigator.serviceWorker?.addEventListener("message", onMessage);
     return () => navigator.serviceWorker?.removeEventListener("message", onMessage);
