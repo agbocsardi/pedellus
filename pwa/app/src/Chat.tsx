@@ -6,6 +6,7 @@ import { LIMITS, MAIN_THREAD, type CommandInfo, type DurableEvent, type MessageE
 import { disablePush, enablePush, hasPushSubscription, pushPermission, requestPushPermission, pushSupported, subscribedServerKey, clearAppBadge, type PushPermission } from "./push";
 import { Avatar, type AvatarState } from "./Avatar";
 import { attachmentKind, fileUrl, formatBytes, uploadErrorText, uploadFile } from "./uploads";
+import { canRecord, startVoiceNote, VOICE_MAX_MS, type Recording, type VoiceStop } from "./recorder";
 import { ActivitySteps } from "./ActivitySteps";
 
 const FINE_POINTER = matchMedia("(pointer: fine)").matches;
@@ -34,6 +35,9 @@ const ATTACH_ICON = "M12 5v14M5 12h14";
 const REMOVE_ICON = "M6 6l12 12M18 6 6 18";
 const FILE_ICON = "M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5ZM14 3v5h5";
 const IMAGE_ICON = "M4 5h16v14H4zM4 16l4-4 3 3 3-3 6 6M15 10h.01";
+const MIC_ICON = "M12 4a3 3 0 0 0-3 3v5a3 3 0 0 0 6 0V7a3 3 0 0 0-3-3M5 11a7 7 0 0 0 14 0M12 18v3";
+/** A voice note's length, `m:ss`. */
+const lengthText = (secs: number) => `${Math.floor(secs / 60)}:${String(Math.floor(secs % 60)).padStart(2, "0")}`;
 
 type CommandState = { online: boolean; writable: boolean; running: boolean };
 const ready = (s: CommandState) => s.online && s.writable;
@@ -209,6 +213,11 @@ function clock(at: string | number | undefined): string {
 export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [picks, setPicks] = useState<Record<string, Pick[]>>({});
+  /** A voice note being recorded, and the thread it belongs to. */
+  const [voice, setVoice] = useState<{ startedAt: number; thread: string } | null>(null);
+  const [voiceSecs, setVoiceSecs] = useState(0);
+  /** A short, non-error explanation (a recording that stopped on its own). */
+  const [hint, setHint] = useState("");
   const [sheet, setSheet] = useState<Sheet | null>(null);
   const wide = useWideLayout();
   const [error, setError] = useState("");
@@ -227,6 +236,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   const layoutWidth = useRef(0);
   const reflowedAt = useRef(0);
   const fileRef = useRef<HTMLInputElement>(null);
+  const voiceRef = useRef<{ recording: Recording; cap: ReturnType<typeof setTimeout> } | null>(null);
   const uploading = useRef(new Set<string>());
   const previews = useRef(new Set<string>());
   const press = useRef<{ x: number; y: number; timer: ReturnType<typeof setTimeout> } | null>(null);
@@ -244,6 +254,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   const running = !archived && isRunning(store.status(thread).state);
   const files = picks[thread] ?? [];
   const canSendFiles = files.every((f) => f.state !== "failed");
+  const canVoice = store.uploads && canRecord();
   const liveActivity = store.activity(thread);
   const p = presence(store);
   const latest = store.latestViewable(thread);
@@ -355,6 +366,30 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     for (const url of previews.current) URL.revokeObjectURL(url);
     previews.current.clear();
   }, []);
+  // The elapsed time of a running recording; the five-minute cap is its own timer.
+  useEffect(() => {
+    if (!voice) return;
+    const tick = () => setVoiceSecs(Math.floor((Date.now() - voice.startedAt) / 1000));
+    tick();
+    const timer = setInterval(tick, 500);
+    return () => clearInterval(timer);
+  }, [voice]);
+  // iOS suspends media in a backgrounded app, and a recorder that no longer
+  // records is a lie: end the note honestly and keep what it captured.
+  const endVoice = useEffectEvent((threadId: string, why: string) => { void keepVoice(threadId, why); });
+  useEffect(() => {
+    const onHide = () => {
+      if (document.hidden && voice) endVoice(voice.thread, "Recording stopped when the app went to the background.");
+    };
+    document.addEventListener("visibilitychange", onHide);
+    return () => document.removeEventListener("visibilitychange", onHide);
+  }, [voice]);
+  // The recording row belongs to the thread it was started in.
+  useEffect(() => {
+    if (voice && voice.thread !== thread) endVoice(voice.thread, "Recording stopped when you left the thread.");
+  }, [voice, thread]);
+  // Leaving this screen ends the note and lets the microphone go.
+  useEffect(() => () => { voiceRef.current?.recording.cancel(); voiceRef.current = null; }, []);
   // Files picked while offline (or paused by a rate limit) upload once the
   // stream comes back. Only a transition retries them: reacting to each pick
   // update would loop while an upload keeps failing.
@@ -527,13 +562,11 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     }
   }
 
-  /** Picker callback: limit checks first, then upload what the gateway will take. */
-  function addFiles(list: FileList | null) {
-    const chosen = [...(list ?? [])];
-    if (fileRef.current) fileRef.current.value = "";
+  /** Picked or recorded files: limit checks first, then upload what the gateway will take. */
+  function addFiles(chosen: File[], threadId: string = thread) {
     if (!chosen.length) return;
     const problems: string[] = [];
-    const room = Math.max(0, LIMITS.maxAttachments - files.length);
+    const room = Math.max(0, LIMITS.maxAttachments - (picks[threadId] ?? []).length);
     const added: Pick[] = [];
     for (const file of chosen) {
       if (file.size > LIMITS.uploadBytes) {
@@ -558,8 +591,8 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     }
     setError(problems.join(" "));
     if (!added.length) return;
-    setPicks((prev) => ({ ...prev, [thread]: [...(prev[thread] ?? []), ...added] }));
-    for (const pick of added) if (pick.state === "uploading") void runUpload(thread, pick);
+    setPicks((prev) => ({ ...prev, [threadId]: [...(prev[threadId] ?? []), ...added] }));
+    for (const pick of added) if (pick.state === "uploading") void runUpload(threadId, pick);
   }
 
   function removePick(threadId: string, id: string) {
@@ -576,6 +609,78 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
       ...prev,
       [threadId]: (prev[threadId] ?? []).filter((pick) => !sent.some((s) => s.id === pick.id)),
     }));
+  }
+
+  /** Mic tap: the permission prompt happens here, never at load. */
+  async function startVoice() {
+    if (voiceRef.current || !store.canWrite(thread)) return;
+    setError("");
+    setHint("");
+    let recording: Recording;
+    try {
+      recording = await startVoiceNote();
+    } catch (err) {
+      setError(err instanceof DOMException && (err.name === "NotAllowedError" || err.name === "SecurityError")
+        ? "Microphone access was denied. Allow it for this app to record a voice note."
+        : "Could not start recording on this device.");
+      return;
+    }
+    // The thread may have gone read-only behind the permission prompt.
+    if (!store.canWrite(thread)) {
+      recording.cancel();
+      return;
+    }
+    const cap = setTimeout(() => void sendVoice(), VOICE_MAX_MS);
+    voiceRef.current = { recording, cap };
+    setVoice({ startedAt: Date.now(), thread });
+    setVoiceSecs(0);
+  }
+
+  /** Take the recorder down once; the caller decides what becomes of the audio. */
+  async function takeVoice() {
+    const current = voiceRef.current;
+    if (!current) return undefined;
+    voiceRef.current = null;
+    clearTimeout(current.cap);
+    setVoice(null);
+    return current.recording.finish();
+  }
+
+  /** Stop and send: one file, through the same upload and queue as a picked attachment. */
+  async function sendVoice() {
+    const result = await takeVoice();
+    if (!result) return;
+    if (result.stopped === "size") {
+      setHint(`Recording stopped at ${formatBytes(LIMITS.uploadBytes)} and was discarded.`);
+      return;
+    }
+    const pick: Pick = {
+      id: crypto.randomUUID().replaceAll("-", ""), file: result.file, name: result.file.name,
+      type: result.file.type, size: result.file.size, state: "done",
+    };
+    await queueMessage("", undefined, [pick]);
+    if (result.stopped === "cap") setHint("Recording stopped at 5 minutes and was sent.");
+  }
+
+  async function cancelVoice() {
+    const current = voiceRef.current;
+    if (!current) return;
+    voiceRef.current = null;
+    clearTimeout(current.cap);
+    setVoice(null);
+    current.recording.cancel();
+  }
+
+  /** The composer can no longer show this recording: stop it and keep what it captured. */
+  async function keepVoice(threadId: string, why: string) {
+    const result = await takeVoice();
+    if (!result) return;
+    if (result.stopped === "size") {
+      setHint(`Recording stopped at ${formatBytes(LIMITS.uploadBytes)} and was discarded.`);
+      return;
+    }
+    setHint(why);
+    addFiles([result.file], threadId);
   }
 
   async function discardMessage(key: string) {
@@ -920,6 +1025,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
 
       <footer className="composer">
         {!sheet && (error || forkError) && <p className="error-text" role="alert">{error || forkError}</p>}
+        {!sheet && !error && !forkError && hint && <p className="composer-hint" role="status">{hint}</p>}
         {slashOpen && <div className="slash-list" aria-label="Commands" role="group">
           {matches.map((c) => <CommandItem key={c.name} c={c} state={cmdState} active={c === picked}
             onClick={() => runCommand(c, args)} keepFocus />)}
@@ -956,6 +1062,24 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
               </li>
             ))}
           </ul>}
+          {voice ? (
+            <div className="capsule recording" role="group" aria-label="Voice note recording">
+              <button className="wrench voice-cancel" aria-label="Cancel recording" onClick={() => void cancelVoice()}>
+                <Icon d={REMOVE_ICON} />
+              </button>
+              <span className="voice-status">
+                <i className="voice-dot" aria-hidden="true" />
+                <b role="timer">{lengthText(voiceSecs)}</b>
+                <small>Recording</small>
+              </span>
+              <button className="send voice-send" aria-label="Stop and send voice note" data-ready=""
+                onClick={() => void sendVoice()}>
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor" />
+                </svg>
+              </button>
+            </div>
+          ) : (
           <div className="capsule">
             <button ref={wrenchRef} className="wrench" aria-label="Commands" aria-haspopup="dialog"
               aria-expanded={sheet?.kind === "tools"}
@@ -966,8 +1090,17 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
               onClick={() => fileRef.current?.click()}>
               <Icon d={ATTACH_ICON} bold />
             </button>}
+            {canVoice && <button className="wrench mic" aria-label="Record a voice note"
+              onClick={() => void startVoice()}>
+              <Icon d={MIC_ICON} />
+            </button>}
             <input ref={fileRef} type="file" multiple hidden tabIndex={-1}
-              onChange={(e) => addFiles(e.target.files)} />
+              onChange={(e) => {
+                const chosen = [...(e.currentTarget.files ?? [])];
+                e.currentTarget.value = "";
+                setHint("");
+                addFiles(chosen);
+              }} />
             <textarea
               ref={taRef}
               value={text}
@@ -995,6 +1128,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
               )}
             </button>
           </div>
+          )}
         </>}
       </footer>
 

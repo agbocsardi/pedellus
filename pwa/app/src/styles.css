@@ -1512,6 +1512,61 @@ input#pair-code {
 .bubble .attachment-audio {
   flex-basis: 100%;
 }
+/* Composer: the mic, the recording row and a short, non-error hint. */
+/* A real 44px tap target that keeps the 36px slot it looks like. */
+.wrench.mic {
+  width: 44px;
+  height: 44px;
+  margin: -4px -2px;
+}
+.capsule.recording {
+  align-items: center;
+  justify-content: space-between;
+  padding: 5px;
+}
+.voice-cancel,
+.voice-send {
+  width: 44px;
+  height: 44px;
+}
+.voice-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 0 6px;
+  color: var(--ink);
+}
+.voice-status b {
+  font-size: 1rem;
+  font-variant-numeric: tabular-nums;
+}
+.voice-status small {
+  color: var(--muted-ink);
+  font-size: 0.82rem;
+}
+.voice-dot {
+  width: 9px;
+  height: 9px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--danger);
+  animation: voice-pulse 1.2s ease-in-out infinite;
+}
+@keyframes voice-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .voice-dot { animation: none; }
+}
+.composer-hint {
+  max-width: 44rem;
+  margin: 0 auto 6px;
+  color: var(--muted-ink);
+  font-size: 0.8rem;
+  text-align: center;
+}
 /* ── Activity: a turn's tool steps (protocol v2, "Activity") ──────────────── */
 
 .activity {
