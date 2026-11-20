@@ -1825,6 +1825,17 @@ input#pair-code {
 .artifact-action:active {
   opacity: 0.85;
 }
+/* Keyboard focus only: a tap on Open must never render as an already-chosen button,
+   and the Download link gets the same ring as the button from this one rule. */
+.artifact-action:focus:not(:focus-visible),
+.artifact-close:focus:not(:focus-visible) {
+  outline: none;
+}
+.artifact-action:focus-visible,
+.artifact-close:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
 /* Full-screen viewer: a dialog, so no route and no swipe; the page behind stays put. */
 .artifact-layer {
   position: fixed;
@@ -1857,7 +1868,7 @@ input#pair-code {
   align-items: center;
   gap: 8px;
   flex: none;
-  padding: calc(env(safe-area-inset-top) + 4px) calc(env(safe-area-inset-right) + 8px) 4px
+  padding: calc(env(safe-area-inset-top) + 8px) calc(env(safe-area-inset-right) + 8px) 8px
     calc(env(safe-area-inset-left) + 8px);
   border-bottom: 1px solid var(--line);
   background: var(--card);
