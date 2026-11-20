@@ -4,11 +4,27 @@ Installable web app (PWA) for a personal [Durable Nanobot](../README.md)
 gateway, reached over the tailnet with `tailscale serve`. Personal use only,
 one owner.
 
-Status: app (`app/`) and gateway `app` channel (`../src/channels/app*.ts`,
-[../APP.md](../APP.md)) both speak protocol v2; offline-verified, not yet
-deployed.
+Status: the app (`app/`) and the gateway's `app` channel
+(`../src/channels/app*.ts`, [../APP.md](../APP.md)) both speak protocol v2, and
+the features below are on `main`. Offline-verified only: no check has run
+against a real device or a live `tailscale serve`, and the supervised deployment
+is still pending.
 
-- [ARCHITECTURE.md](./ARCHITECTURE.md) — how the app and gateway fit together.
+Shipped: threads with side threads, forks, archiving and search; model preset
+chip and command toolbox; whole answers with long-message splitting; activity
+disclosure; owner questions; owner reactions; the Tasks sheet; files (upload,
+attach, render, offline queue); voice notes; Web Push (permission, service
+worker notifications, badge, thread deep links, VAPID key rotation); the wide
+layout with keyboard shortcuts; MCP login cards; agent-sent files.
+
+In review, not on `main`: the sandboxed artifact viewer in the app, and the
+gateway's Shortcuts `POST /v1/ask` endpoint.
+
+- [protocol/v2.md](./protocol/v2.md) — the normative wire contract.
+- [ARCHITECTURE.md](./ARCHITECTURE.md) — components, data flow, every op and
+  route, storage, security model, known gaps.
+- [app/README.md](./app/README.md) — dev workflow and the mock gateway's
+  affordances.
 - [2026-11-18_pwa_TODO.md](./2026-11-18_pwa_TODO.md) — plan and work log.
 - [docs/native-ios/](./docs/native-ios/) — parked native SwiftUI plan, kept for
   a possible later iOS app.
