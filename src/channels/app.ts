@@ -527,9 +527,10 @@ function appendMessage(doc: Draft<AppChannelState>, event: AppMessageInput): voi
     console.warn(`App message ${event.id} exceeds ${APP_LIMITS.maxMessageParts} parts and was truncated.`);
   }
   texts.forEach((text, i) => {
-    // A split message carries its attachments on the first part only (protocol v2, Files).
-    const { attachments, ...rest } = event;
-    appendEvent(doc, i === 0 && attachments !== undefined
+    // A split message carries its attachments and its tool steps on the first part only
+    // (protocol v2, Files and Activity).
+    const { attachments, steps, omitted, ...rest } = event;
+    appendEvent(doc, i === 0
       ? { ...event, text, part: { i, n: texts.length } }
       : { ...rest, text, part: { i, n: texts.length } });
   });
@@ -1715,6 +1716,23 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       activityDirty = false;
       await activityWork;
     };
+    /**
+     * The run's whole step list for the final message: one fresh scan of the run's entries, so a
+     * coalesced publish can never leave the answer with fewer steps than the run took.
+     */
+    const finalActivity = async (
+      answer: EntryId,
+    ): Promise<{ steps: AppActivityStep[]; omitted?: number } | undefined> => {
+      let from = activityFrom;
+      if (from === undefined) {
+        const record = await conversation.commit((tx) => tx.submissionByRequest(conversation.id, requestId), adapterContext);
+        from = record?.type === "input" ? record.entry : undefined;
+      }
+      if (from === undefined) return undefined;
+      const tally = await readRunActivity(conversation, conversation.id, from, answer, adapterContext);
+      const wire = activityForWire(tally, APP_LIMITS.maxActivitySteps);
+      return wire.steps.length === 0 ? undefined : wire;
+    };
     type LiveView = {
       run?: { inputs?: SubmissionId[]; first?: EntryId };
       generation?: unknown;
@@ -1802,7 +1820,10 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       const message = answer?.model?.[0] as AssistantMessage | undefined;
       const answerText = message?.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("") ?? "";
       const text = answerText.trim() === "" ? "The assistant returned no text response." : answerText;
-      await settleShared(thread, conversation, settled.answer, text);
+      // The final complete step list goes out before the answer, which carries it too.
+      const steps = await finalActivity(settled.answer);
+      if (steps !== undefined) sendActivity(steps);
+      await settleShared(thread, conversation, settled.answer, text, steps);
       await refreshStatus();
     } finally {
       await stopPreviewWatch();
@@ -1845,6 +1866,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     conversation: Conversation,
     answerEntry: number,
     answerText: string,
+    steps?: { steps: AppActivityStep[]; omitted?: number },
   ): Promise<void> => {
     let appended = false;
     state = await stateConversation.commit(async (tx) => {
@@ -1870,6 +1892,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           text: answerText,
           at: new Date(now()).toISOString(),
           ...(members[0] === undefined ? {} : { key: members[0].key }),
+          ...(steps === undefined ? {} : { steps: steps.steps, ...(steps.omitted === undefined ? {} : { omitted: steps.omitted }) }),
         });
         for (const member of members) {
           appendEvent(doc, { event: "settled", thread, key: member.key, outcome: "answered" });
