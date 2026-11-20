@@ -397,9 +397,9 @@ input#pair-code {
   gap: 12px;
   padding: calc(env(safe-area-inset-top) + 8px) var(--gutter) 10px;
   border-bottom: 1px solid color-mix(in oklab, var(--line) 70%, transparent);
-  background: color-mix(in oklab, var(--bg) 90%, transparent);
-  backdrop-filter: saturate(1.4) blur(12px);
-  -webkit-backdrop-filter: saturate(1.4) blur(12px);
+  /* Solid, no backdrop-filter: nothing scrolls under the header, and in the installed iOS app a
+     backdrop-filtered header inside the transformed shell rasterized blurry (avatar and title). */
+  background: var(--bg);
   z-index: 4;
 }
 .who {
