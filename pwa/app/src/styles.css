@@ -1311,6 +1311,8 @@ input#pair-code {
   overflow-x: auto;
   overscroll-behavior-x: contain;
   scrollbar-width: none;
+  /* The strip scrolls sideways without a scrollbar; a faded edge says there is more. */
+  mask-image: linear-gradient(to right, #000 calc(100% - 20px), transparent);
 }
 .picks::-webkit-scrollbar {
   display: none;
@@ -1321,7 +1323,7 @@ input#pair-code {
   align-items: center;
   gap: 8px;
   flex: none;
-  max-width: 220px;
+  max-width: 170px;
   padding: 5px 6px 5px 5px;
   border: 1px solid var(--line);
   border-radius: 14px;
@@ -1371,11 +1373,13 @@ input#pair-code {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* 44px tap targets; negative margins keep the chip as compact as the 28px look. */
 .pick-action,
 .pick-remove {
   flex: none;
-  min-width: 28px;
-  min-height: 28px;
+  min-width: 44px;
+  min-height: 44px;
+  margin: -8px -4px;
   border: 0;
   border-radius: 9px;
   background: var(--muted);
@@ -1456,7 +1460,7 @@ input#pair-code {
   min-width: 0;
 }
 .file-chip-text b {
-  font-size: 0.82rem;
+  font-size: 0.85rem;
   font-weight: 600;
   overflow-wrap: anywhere;
   display: -webkit-box;
@@ -1466,7 +1470,7 @@ input#pair-code {
 }
 .file-chip-text small {
   color: var(--muted-ink);
-  font-size: 0.72rem;
+  font-size: 0.78rem;
 }
 /* Inside a user bubble the chip keeps the bubble's contrast. */
 .bubble .file-chip {
@@ -1479,7 +1483,7 @@ input#pair-code {
   color: var(--bubble-ink);
 }
 .bubble .file-chip-text small {
-  color: color-mix(in oklab, var(--bubble-ink) 78%, transparent);
+  color: color-mix(in oklab, var(--bubble-ink) 88%, transparent);
 }
 /* Images and audio render from the durable message; the tap opens the file. */
 .attachment-image {
