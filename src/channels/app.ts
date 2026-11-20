@@ -1364,9 +1364,11 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
             }
             doc.pending = doc.pending.filter((item) => !retired.has(item.key));
             // An archived thread has no question surface, so its open cards can never be answered and
-            // the record would block every later ask. Withdraw them in this same commit; restoring the
-            // thread does not reopen them.
+            // the record would block every later ask. Repair a delivery mark lost in a crash first, in
+            // this same commit: a quarantined question whose card is still live must be cancelled with
+            // the archive, not reopened by a later repair. Restoring the thread does not reopen them.
             const questions = await tx.doc(AskQuestionsDoc, conversation.id);
+            publishQuestionEvents(doc, questions, thread, now());
             cancelPendingQuestions(questions);
             publishQuestionEvents(doc, questions, thread, now());
           }

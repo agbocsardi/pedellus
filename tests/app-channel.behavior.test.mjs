@@ -1955,3 +1955,26 @@ test('/new cancels a quarantined question whose live open card the repair would 
       await store.close();
     }
   });
+
+test('archiving a thread cancels a quarantined question whose live open card the repair would reopen',
+  { timeout: 30_000 }, async () => {
+    await withChannel('archive-unknown-question', {}, async ({ store, base }) => {
+      const device = await questionDevice(store, base);
+      const side = await createSide(device, 'quarantined-thread');
+      const record = await seedQuarantinedQuestion(store, side, 'aaaabbbb07');
+
+      assert.equal((await request(device, 'ar', 'thread.archive', { thread: side, archived: true })).ok, true);
+      await device.wait(() => device.events('question').some((event) => event.id === record.id && event.state === 'cancelled'),
+        'the cancelled card published with the archive');
+      assert.equal(await storedQuestionStatus(store, `app:chat:${side}`, record.id), 'cancelled',
+        'the archive cancelled the repaired record, not the quarantine');
+
+      // Answering the old card after the restore must still be refused, not admitted.
+      assert.equal((await request(device, 'rs', 'thread.archive', { thread: side, archived: false })).ok, true);
+      assert.equal((await request(device, 'a1', 'answer', { thread: side, question: record.id, option: 'a' })).accepted, false);
+      await device.wait(() => device.events('message').some((event) => event.role === 'notice' &&
+        event.text === 'This question was cancelled.'), 'the cancelled notice');
+      assert.equal(store.captured.length, 0, 'the stale card admitted no turn');
+      await device.close();
+    });
+  });

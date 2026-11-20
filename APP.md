@@ -281,10 +281,10 @@ quarantined question whose card is still live is cancelled too instead of being 
 repair: the plain native reset repairs and cancels in one commit right after the reset, while the
 host paired reset repairs first, commits the reset, and commits the cancellation immediately after
 (so the `cancelled` card is published right after them) — a refused reset cancels nothing.
-Archiving a thread cancels its open questions in the archive's own commit, so the archived thread
-and the `cancelled` card arrive together and restoring the thread does not reopen them; an open
-question would otherwise leave a card that can never be answered and a record that blocks every
-later ask. `abort` and a restart cancel nothing.
+Archiving a thread cancels its open questions in the archive's own commit, after the same repair,
+so the archived thread and the `cancelled` card arrive together and restoring the thread does not
+reopen them; an open question would otherwise leave a card that can never be answered and a record
+that blocks every later ask. `abort` and a restart cancel nothing.
 
 ## Notifications (Web Push)
 
