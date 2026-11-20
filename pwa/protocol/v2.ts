@@ -36,6 +36,11 @@ export const LIMITS = {
   uploadNameChars: 120,
   uploadsPerMinute: 30,
   maxAttachments: 10,
+  /** Owner questions (ASK_USER.md bounds): prompt, option label, option description. */
+  questionPromptChars: 500,
+  questionLabelChars: 60,
+  questionDescriptionChars: 200,
+  questionIdPattern: /^[0-9a-f]{10}$/,
   uploadIdPattern: /^f_[A-Za-z0-9_-]{22}$/,
 } as const;
 
@@ -73,7 +78,8 @@ export type Request =
   | { type: "req"; id: string; op: "thread.archive"; thread: ThreadId; archived: boolean }
   | { type: "req"; id: string; op: "push.key" }
   | { type: "req"; id: string; op: "push.subscribe"; subscription: PushSubscriptionInfo }
-  | { type: "req"; id: string; op: "push.unsubscribe" };
+  | { type: "req"; id: string; op: "push.unsubscribe" }
+  | { type: "req"; id: string; op: "answer"; thread: ThreadId; question: string; option: QuestionOptionId };
 
 export type PushSubscriptionInfo = { endpoint: string; keys: { p256dh: string; auth: string } };
 export type PushKeyResult = { key: string };
@@ -86,7 +92,7 @@ export type ThreadsResult = { threads: ThreadInfo[] };
 export type ThreadCreateResult = { thread: ThreadId; duplicate: boolean };
 
 export type Response =
-  | ({ type: "res"; id: string; ok: true } & Partial<HelloResult & SendResult & ThreadsResult & ThreadCreateResult & PushKeyResult>)
+  | ({ type: "res"; id: string; ok: true } & Partial<HelloResult & SendResult & ThreadsResult & ThreadCreateResult & PushKeyResult & AnswerResult>)
   | { type: "res"; id: string; ok: false; error: ErrorCode };
 
 export type MessageEvent = {
@@ -110,9 +116,18 @@ export type StatusEvent = {
 
 export type ThreadEvent = { type: "event"; event: "thread"; cursor: number; thread: ThreadInfo };
 
+export type QuestionOptionId = "a" | "b" | "c" | "d";
+export type QuestionOption = { id: QuestionOptionId; label: string; description?: string };
+export type QuestionEvent = {
+  type: "event"; event: "question"; cursor: number; thread: ThreadId; id: string; prompt: string;
+  options: QuestionOption[]; expiresAt: string;
+  state: "open" | "answered" | "expired" | "cancelled" | "unknown"; answer?: QuestionOptionId;
+};
+export type AnswerResult = { accepted: boolean };
+
 export type ModelEvent = { type: "event"; event: "model"; thread: ThreadId; preset: string | null };
 
-export type DurableEvent = MessageEvent | SettledEvent | DividerEvent | ThreadEvent;
+export type DurableEvent = MessageEvent | SettledEvent | DividerEvent | ThreadEvent | QuestionEvent;
 export type Event = DurableEvent | PreviewEvent | StatusEvent | ModelEvent;
 export type ServerFrame = Response | Event;
 
