@@ -66,10 +66,14 @@ import {
   APP_REQUEST_OPS,
   parseHelloCursor,
   validAppAgentName,
+  validVapidPrivateKey,
+  validVapidPublicKey,
+  validVapidSubject,
   appPresetInfos,
   validAppLabel,
   validThreadTitle,
   parseThreadId,
+  parsePushSubscription,
   type AppCommandInfo,
   type AppControlRecord,
   type AppMutation,
@@ -81,6 +85,7 @@ import {
   type AppThreadInfo,
   type AppThreadOrigin,
 } from "./app-protocol.js";
+import { createAppPushDispatcher, pushPayload, type AppPushDispatcher, type AppPushOptions } from "./app-push.js";
 import { startAppListener, type AppDeviceSession, type AppSessionHooks } from "./app-listener.js";
 
 /** Preserve the original mapped chat and its history. */
@@ -246,6 +251,8 @@ export type AppOptions = {
   readonly autoArchiveDays?: number;
   /** Agent display name sent in every hello reply; 1–40 printable characters. */
   readonly agentName?: string;
+  /** Resolved Web Push configuration; absent leaves every push op `unsupported` and sends nothing. */
+  readonly push?: AppPushOptions;
   /** Configured owner busy-mode, written onto each admitted input. */
   readonly followUpMode?: FollowUpMode;
   /** Host process replacement for the `restart` control; absent leaves it unoffered. */
@@ -743,6 +750,11 @@ export function validateOptions(options: AppOptions): void {
   if (options.agentName !== undefined && !validAppAgentName(options.agentName)) {
     throw new Error("App agentName must be 1 to 40 printable characters");
   }
+  if (options.push !== undefined &&
+      (!validVapidSubject(options.push.subject) || !validVapidPublicKey(options.push.publicKey) ||
+       !validVapidPrivateKey(options.push.privateKey))) {
+    throw new Error("App push configuration is not a valid VAPID key pair");
+  }
 }
 
 // ── The adapter ──────────────────────────────────────────────────────────────
@@ -839,6 +851,43 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       return copyJson(doc) as unknown as AppChannelState;
     }, commitContext);
     return state;
+  };
+
+  // ── Web Push: content-free notifications to devices with no open stream ──
+
+  const push: AppPushDispatcher | undefined = options.push === undefined ? undefined : createAppPushDispatcher({
+    options: options.push,
+    // Read at send time, so a coalesced follow-up carries the latest unread count.
+    snapshot(deviceId, thread) {
+      const device = state.devices.find((entry) => entry.id === deviceId && entry.revokedAtMs === undefined);
+      const subscription = device?.pushSubscription;
+      if (subscription === undefined) return undefined;
+      const acked = state.acks[deviceId] ?? 0;
+      let unread = 0;
+      for (const event of state.events) {
+        // A split message counts once (its first part), as v2.md's "first part only" says.
+        if (event.event === "message" && event.role !== "user" && event.cursor > acked && !(event.part?.i)) unread += 1;
+      }
+      return { subscription, payload: pushPayload(thread, unread) };
+    },
+    gone(deviceId, endpoint) {
+      void mutateState((doc) => {
+        const device = doc.devices.find((entry) => entry.id === deviceId);
+        // A replacement subscription is not this dead one; only the failed endpoint is dropped.
+        if (device?.pushSubscription?.endpoint === endpoint) delete device.pushSubscription;
+      }).catch(() => undefined);
+    },
+  });
+
+  /** One push per subscribed device without an open, hello'd stream; never message text. */
+  const notifyPush = (thread: string): void => {
+    if (push === undefined) return;
+    for (const device of state.devices) {
+      if (device.revokedAtMs !== undefined || device.pushSubscription === undefined) continue;
+      const live = sockets.get(device.id);
+      if (live !== undefined && live.hello && live.session.isOpen()) continue;
+      push.notify(device.id, thread);
+    }
   };
 
   // ── Egress: the durable cursor log, replayed and pushed ──────────────────
@@ -1006,6 +1055,14 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         case "thread.archive":
           await archiveThread(frame, sendOk, sendError);
           return;
+        case "push.key":
+          if (options.push === undefined) return sendError("unsupported");
+          sendOk({ key: options.push.publicKey });
+          return;
+        case "push.subscribe":
+          return await handlePushSubscribe(socket, frame, sendOk, sendError);
+        case "push.unsubscribe":
+          return await handlePushUnsubscribe(socket, sendOk, sendError);
         case "ping":
           sendOk();
           return;
@@ -1092,6 +1149,48 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       doc.acks[deviceId] = clamped;
       pruneEvents(doc);
     });
+    sendOk();
+  }
+
+  async function handlePushSubscribe(
+    socket: LiveSocket,
+    frame: Record<string, unknown>,
+    sendOk: (body?: Record<string, unknown>) => void,
+    sendError: (error: AppErrorCode) => void,
+  ): Promise<void> {
+    if (options.push === undefined) {
+      sendError("unsupported");
+      return;
+    }
+    const subscription = parsePushSubscription(frame.subscription);
+    if (subscription === undefined) {
+      sendError("bad_request");
+      return;
+    }
+    const deviceId = socket.session.deviceId;
+    await mutateState((doc) => {
+      const device = doc.devices.find((entry) => entry.id === deviceId && entry.revokedAtMs === undefined);
+      // One subscription per device: a new one replaces the old, endpoints and keys included.
+      if (device !== undefined) device.pushSubscription = subscription;
+    });
+    sendOk();
+  }
+
+  async function handlePushUnsubscribe(
+    socket: LiveSocket,
+    sendOk: (body?: Record<string, unknown>) => void,
+    sendError: (error: AppErrorCode) => void,
+  ): Promise<void> {
+    if (options.push === undefined) {
+      sendError("unsupported");
+      return;
+    }
+    const deviceId = socket.session.deviceId;
+    await mutateState((doc) => {
+      const device = doc.devices.find((entry) => entry.id === deviceId);
+      if (device !== undefined) delete device.pushSubscription;
+    });
+    // Idempotent: a device that never subscribed is simply already unsubscribed.
     sendOk();
   }
 
@@ -1352,6 +1451,8 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     }
     if (blocked !== undefined) return sendError(blocked);
     pushEventsToSockets();
+    // Only a callback refusal appended a durable notice; a user echo or duplicate never pushes.
+    if (callback && !duplicate) notifyPush(thread);
     sendOk({ duplicate });
     if (!duplicate && !callback) {
       journalEvent("app.admitted", { "send.key": key, "queue.depth": state.pending.length });
@@ -1420,6 +1521,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     if (item.notice === true) {
       // Idempotent by the notice's own admission stamp: a redelivery after a crash appends nothing.
       const id = `notice:${item.key}#${item.noticeSeq ?? item.admittedAtMs}`;
+      let appended = false;
       await mutateState((doc) => {
         if (hasEventId(doc, id)) return;
         appendMessage(doc, {
@@ -1430,8 +1532,10 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           text: item.text,
           at: new Date(now()).toISOString(),
         });
+        appended = true;
       });
       pushEventsToSockets();
+      if (appended) notifyPush(thread);
       await forget(item.key);
       return;
     }
@@ -1607,6 +1711,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     answerEntry: number,
     answerText: string,
   ): Promise<void> => {
+    let appended = false;
     state = await stateConversation.commit(async (tx) => {
       const doc = await tx.doc(AppState, stateConversation.id);
       const members: { key: string; submissionId: number }[] = [];
@@ -1634,12 +1739,14 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         for (const member of members) {
           appendEvent(doc, { event: "settled", thread, key: member.key, outcome: "answered" });
         }
+        appended = true;
       }
       doc.pending = doc.pending.filter((entry) => !retired.has(entry.key));
       doc.controls = pruneControls(doc.controls, doc.pending);
       return copyJson(doc) as unknown as AppChannelState;
     }, cleanupContext);
     pushEventsToSockets();
+    if (appended) notifyPush(thread);
   };
 
   /** A repeatedly failing delivery is held for inspection, exactly like the other channels. */
@@ -2350,6 +2457,8 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         const entry = doc.devices.find((device) => device.revokedAtMs === undefined && device.label === label);
         if (entry === undefined) return;
         entry.revokedAtMs = now();
+        // The subscription is device authority: revoking the device drops it with the token.
+        delete entry.pushSubscription;
         revokedId = entry.id;
       });
       if (revokedId === undefined) return "missing";
@@ -2482,6 +2591,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     // The restore, event append and settlement share a commit. Replaying a stale scan cannot
     // append again, even after the original event has been trimmed.
     let restored = false;
+    let appended = false;
     await outbox.update(sessionKey, record.id, async (entry, tx) => {
       if (entry.status !== "pending" || entry.sessionKey !== sessionKey || archiving.has(thread)) return;
       const doc = await tx.doc(AppState, stateConversation.id);
@@ -2499,6 +2609,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           event: "message", id, thread, role: interruption ? "notice" : "assistant",
           text: entry.text, at: new Date(now()).toISOString(),
         });
+        appended = true;
       }
       entry.status = "delivered";
       entry.settledAt = now();
@@ -2506,6 +2617,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     }, cleanupContext);
     await mutateState(() => undefined);
     pushEventsToSockets();
+    if (appended) notifyPush(thread);
     if (restored) await gateway.reserveAppThread?.(thread, adapterContext);
   };
 
@@ -2711,6 +2823,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     sockets.clear();
     scope.cancel(new DOMException("App adapter stopped", "AbortError"));
     await Promise.allSettled([...active, ...pendingControls, ...scheduledTasks]);
+    await push?.close();
     await listener.close().catch(() => undefined);
   }
   if (fatal !== undefined) throw fatal;

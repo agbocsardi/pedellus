@@ -11,6 +11,7 @@
 import type { Context } from "@earendil-works/chord";
 import type { LocalGatewayClient } from "../local/client.js";
 import { commandUsage, findCommandHelp, renderCommandHelp } from "../help/cli.js";
+import { generatePushKeys } from "./app-push.js";
 
 /** A refusal or failure to report as `durable-nanobot app: <message>`; exit status 1. */
 export class AppCommandError extends Error {
@@ -25,7 +26,9 @@ export class AppUsageError extends Error {
 export type AppCommand =
   | { readonly kind: "pair"; readonly label?: string }
   | { readonly kind: "devices" }
-  | { readonly kind: "revoke"; readonly label: string };
+  | { readonly kind: "revoke"; readonly label: string }
+  // Local only: generates a VAPID pair and prints it once. No gateway, config or file is involved.
+  | { readonly kind: "push-keys" };
 
 export interface AppInvocation {
   readonly command: AppCommand;
@@ -33,7 +36,7 @@ export interface AppInvocation {
   readonly configPath: string | undefined;
 }
 
-const ACTIONS = new Set(["pair", "devices", "revoke"]);
+const ACTIONS = new Set(["pair", "devices", "revoke", "push-keys"]);
 
 function usage(): AppUsageError {
   const page = findCommandHelp("app");
@@ -47,6 +50,11 @@ function usage(): AppUsageError {
 export function parseAppInvocation(args: readonly string[]): AppInvocation {
   const [action, ...rest] = args;
   if (action === undefined || !ACTIONS.has(action)) throw usage();
+  if (action === "push-keys") {
+    // Local key generation reads no configuration: any argument is refused, not ignored.
+    if (rest.length > 0) throw usage();
+    return { command: { kind: "push-keys" }, configPath: undefined };
+  }
   const allowed = action === "pair" ? new Set(["--config", "--label"]) : new Set(["--config"]);
   const flags = new Map<string, string>();
   const positional: string[] = [];
@@ -91,6 +99,16 @@ const REFUSAL_TEXT: Record<string, string> = {
   "invalid-label": "That label is not printable in 1-40 characters.",
 };
 
+export async function runAppPushKeys(output: NodeJS.WriteStream): Promise<void> {
+  const keys = await generatePushKeys();
+  output.write([
+    `VAPID public key: ${keys.publicKey}`,
+    `VAPID private key: ${keys.privateKey}`,
+    "Put the private key in the gateway environment file (never in the repository) and reference it by name from app.push.privateKeyEnv; put the public key in app.push.publicKey and a mailto: or https: contact in app.push.subject.",
+    "",
+  ].join("\n"));
+}
+
 /** Render one command's bounded answer; the caller owns the connection's lifecycle. */
 export async function runAppCommand(options: {
   readonly client: LocalGatewayClient;
@@ -125,6 +143,10 @@ export async function runAppCommand(options: {
     for (const row of rows) {
       output.write(`  ${row[0]!.padEnd(labelWidth)}  created ${row[1]}  ${row[2]}\n`);
     }
+    return;
+  }
+  if (command.kind === "push-keys") {
+    await runAppPushKeys(output);
     return;
   }
   const result = await client.appRevoke(command.label, context);

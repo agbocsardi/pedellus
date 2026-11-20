@@ -128,6 +128,7 @@ export function startApp(store, options = {}) {
     agentName: options.agentName ?? store.config.app.agentName,
     ...(options.scanIntervalMs === undefined ? {} : { scanIntervalMs: options.scanIntervalMs }),
     ...(options.restart === undefined ? {} : { restart: options.restart }),
+    ...(options.push === undefined ? {} : { push: options.push }),
     now: () => clock.now,
     onListening: (bound) => portResolve(bound),
   }, scope.context);

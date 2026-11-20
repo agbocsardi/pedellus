@@ -145,8 +145,8 @@ export const COMMANDS: readonly CommandHelp[] = [
   },
   {
     name: "app",
-    synopsis: "durable-nanobot app <pair [--label <label>]|devices|revoke <label>> [--config <path>]",
-    summary: "Pair, list or revoke devices of the installable web app channel",
+    synopsis: "durable-nanobot app <pair [--label <label>]|devices|revoke <label>> [--config <path>] | app push-keys",
+    summary: "Pair, list or revoke devices of the installable web app channel, or generate its Web Push keys",
     options: [
       CONFIG_OPTION,
       { flags: "--label <label>", text: "pair: optional printable device label (1-40); a default is chosen when omitted." },
@@ -155,12 +155,14 @@ export const COMMANDS: readonly CommandHelp[] = [
     details: [
       "Needs the app channel configured and the gateway running; every decision is the running adapter's.",
       "A pairing code is single-use and expires after ten minutes; only its hash is stored.",
+      "push-keys needs no gateway and reads no config: it prints one fresh VAPID key pair once and writes nothing.",
     ],
     examples: [
       "durable-nanobot app pair",
       "durable-nanobot app pair --label iphone",
       "durable-nanobot app devices",
       "durable-nanobot app revoke iphone",
+      "durable-nanobot app push-keys",
     ],
   },
 ];

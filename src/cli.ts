@@ -18,8 +18,10 @@ import {
   AppUsageError,
   parseAppInvocation,
   runAppCommand,
+  runAppPushKeys,
   type AppInvocation,
 } from "./channels/app-operator-cli.js";
+import { resolvePushOptions } from "./channels/app-push.js";
 import { runModelsCommand, type ModelsInvocation } from "./model-catalog-cli.js";
 import { workspaceContextGatewayOptions } from "./context/workspace-host.js";
 import { COMMANDS, commandUsage, findCommandHelp, renderCommandHelp, renderOverview, renderUsage } from "./help/cli.js";
@@ -318,6 +320,11 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   }
   const app = appInvocation(args);
   if (app !== undefined) {
+    // Key generation is local and writes nothing: no gateway, config or environment is read.
+    if (app.invocation.command.kind === "push-keys") {
+      await runAppPushKeys(stdout);
+      return;
+    }
     await runAppOperator(app.invocation, await readConfig(app.config));
     return;
   }
@@ -584,11 +591,14 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
       // pairing, devices and the durable event log; this host only supplies the explicit config.
       stage = "gateway.app";
       const { runApp } = await import("./channels/app.js");
+      // The private key is read once here, from the configured variable, and never stored.
+      const push = config.app.push === undefined ? undefined : resolvePushOptions(config.app.push);
       channels.start("gateway.app", runApp(gateway, {
         port: config.app.port,
         staticRoot: config.app.staticRoot,
         autoArchiveDays: config.app.autoArchiveDays ?? 14,
         agentName: config.app.agentName ?? "Durable",
+        ...(push === undefined ? {} : { push }),
         followUpMode: config.followUpMode ?? "followUp",
         restart: restartHost,
       }, context));

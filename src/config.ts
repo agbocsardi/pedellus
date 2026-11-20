@@ -6,7 +6,7 @@ import {
   MemoryContextInputError,
   validateMemoryLoadedFiles,
 } from "./context/memory.js";
-import { validAppAgentName } from "./channels/app-protocol.js";
+import { validAppAgentName, validVapidPublicKey, validVapidSubject } from "./channels/app-protocol.js";
 import {
   WorkspaceContextInputError,
   validateWorkspaceMemoryFiles,
@@ -431,6 +431,15 @@ export interface PortConfig {
     readonly autoArchiveDays?: number;
     /** Agent display name in every hello reply; 1–40 printable characters. */
     readonly agentName?: string;
+    /**
+     * Optional Web Push: off unless this block exists and its private key variable is set at
+     * gateway start. The private key itself is named here, never stored in config.
+     */
+    readonly push?: {
+      readonly subject: string;
+      readonly publicKey: string;
+      readonly privateKeyEnv: string;
+    };
   };
 }
 
@@ -1348,7 +1357,25 @@ function discordConfig(value: unknown): NonNullable<PortConfig["discord"]> {
 }
 
 /** Exactly the accepted `app` keys; an unknown key is a typo that must not silently widen access. */
-const APP_KEYS = ["port", "staticRoot", "autoArchiveDays", "agentName"] as const;
+const APP_KEYS = ["port", "staticRoot", "autoArchiveDays", "agentName", "push"] as const;
+/** Exactly the accepted `app.push` keys; the private key is an environment variable name. */
+const APP_PUSH_KEYS = ["subject", "publicKey", "privateKeyEnv"] as const;
+
+function appPushConfig(value: unknown): NonNullable<NonNullable<PortConfig["app"]>["push"]> {
+  const p = object(value, "app.push");
+  rejectUnknownKeys(p, APP_PUSH_KEYS, "app.push");
+  if (!validVapidSubject(p.subject)) {
+    throw new Error("app.push.subject must be a mailto: or https: URI");
+  }
+  if (!validVapidPublicKey(p.publicKey)) {
+    throw new Error("app.push.publicKey must be a base64url uncompressed P-256 public key");
+  }
+  return Object.freeze({
+    subject: p.subject,
+    publicKey: p.publicKey,
+    privateKeyEnv: envName(p.privateKeyEnv, "app.push.privateKeyEnv"),
+  });
+}
 
 /** `app`: opt-in, loopback-only, with an explicit port and an absolute static root. */
 function appConfig(value: unknown): NonNullable<PortConfig["app"]> {
@@ -1368,7 +1395,8 @@ function appConfig(value: unknown): NonNullable<PortConfig["app"]> {
   if (!validAppAgentName(agentName)) {
     throw new Error("app.agentName must be 1 to 40 printable characters");
   }
-  return Object.freeze({ port: a.port, staticRoot: a.staticRoot, autoArchiveDays, agentName });
+  const push = a.push === undefined ? undefined : appPushConfig(a.push);
+  return Object.freeze({ port: a.port, staticRoot: a.staticRoot, autoArchiveDays, agentName, ...(push === undefined ? {} : { push }) });
 }
 
 /**
