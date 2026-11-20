@@ -23,6 +23,7 @@ export {
   questionView,
   renderQuestionText,
   validAskQuestionView,
+  validQuestionRecord,
   type AskClaimResult,
   type AskOptionId,
   type AskQuestionInput,

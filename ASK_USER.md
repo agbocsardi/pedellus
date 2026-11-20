@@ -9,8 +9,8 @@ crash can never leave a model coroutine or a task waiting for an answer.
 ## Scope
 
 - Offered only in an authenticated mapped ordinary chat: the local CLI attach
-  (`cli:*`), a mapped Telegram private chat, or another mapped chat that attaches
-  an owner surface. Root, channel-state, fork, worker, digest and scheduled-run
+  (`cli:*`), a mapped Telegram private chat, or a mapped app thread whose adapter
+  is running. Root, channel-state, fork, worker, digest and scheduled-run
   automation conversations never receive the extension.
 - It is not a `toolAllowlist` name and grants no coding, filesystem, network,
   channel-send, worker or scheduling authority. `toolAllowlist` neither enables nor
@@ -33,7 +33,8 @@ is cancelled; the tool reports that fixed reason.
 The tool admits each question in the conversation's own durable document
 (`nanobot.ask-questions`, version 1, conversation scope, latest history, initial
 fork), marks it `sending`, delivers it to the live surface, then marks it
-`delivered`. It returns a bounded receipt naming the question ids, sets
+`delivered`. For the app channel the delivery itself is a durable append, so a
+completed append is proof of delivery even when the tool's own mark was lost. It returns a bounded receipt naming the question ids, sets
 `control.terminate`, and the run ends at that tool round: no further model request
 is made and no answer is claimed in the tool result. Asking alongside another tool is refused
 before delivery: the model must finish other work, then issue `ask_user` alone, because native
@@ -59,6 +60,20 @@ follow-up inputs over time, never a combined fabricated answer).
   (`nanobot.ask-answer`) with fixed text `Answered question <id>: <label>`, so the
   existing delivery path sends the run's reply. The keyboard is removed best effort
   after any terminal outcome; a later press is still refused by the durable record.
+- **App** (protocol v2, `question` event) appends one durable event with
+  `state: "open"` in the thread's log; every later change (`answered`, `expired`,
+  `cancelled`, `unknown`) is another event for the same id and the app keeps the
+  latest. The channel also remembers the last state it published per id, so an
+  event trimmed by retention is never published again. Tapping sends
+  `answer {thread, question, option}`; the gateway claims
+  the record against that exact thread session and admits the stored label
+  (`Answered question <id>: <label>`) as the follow-up turn in one commit, replies
+  `accepted: true`, then publishes the `answered` event. A refused tap replies
+  `accepted: false`, appends one fixed notice and admits nothing. A typed ordinary
+  message settles the oldest delivered question in that thread in the same commit
+  as its admission, exactly like Telegram and the CLI, and `/new` cancels pending
+  questions with the reset (see below); archiving the thread cancels them with the
+  archive, and restoring it does not reopen them.
 - **Local terminal** has no button protocol: the question is printed with numbered
   options and the owner types an answer as an ordinary message. Attaching prints
   questions that are still open in that conversation, so a gateway restart does not
@@ -70,18 +85,25 @@ follow-up inputs over time, never a combined fabricated answer).
 Only the option label from the stored record is admitted, never the callback payload,
 so a forged or stale payload cannot inject text. The callback id, chat id, sender and
 answer are validated in that order. A reply the owner types instead of pressing a
-button is an ordinary message: Telegram and CLI atomically settle the oldest delivered question
-when admitting it. Commands, empty text and attachment-only inputs do not count as typed answers.
-A later button for that answered question is refused as a replay.
+button is an ordinary message: Telegram, the CLI and the app atomically settle the oldest delivered
+question when admitting it. Commands, empty text and attachment-only inputs do not count as typed
+answers. A later button for that answered question is refused as a replay.
 
 ## Expiry and cancellation
 
 Expiry is enforced when a question is read or claimed, not by a timer. An overdue
 `pending` question becomes `expired`; a foreign session, unknown id or superseded
 record answers `stale`; an already-answered one answers `replay`. `/new` (a context
-reset) cancels every pending question in that conversation in the same operation,
-because an answer would otherwise start a turn whose context no longer contains the
-question. `/abort` and a host restart do not cancel questions: the answer is still a
+reset) cancels every pending question in that conversation, because an answer would
+otherwise start a turn whose context no longer contains the question. A delivery mark lost
+in a crash is repaired before that cancellation, so a quarantined question whose `open`
+event is still in the log is cancelled by the reset rather than reopened by the repair. The plain
+native reset commits the cancellation immediately after the reset (two commits; a crash between
+them can leave one pending question in the new context until it is answered or expires); when
+the host owns the
+reset as a paired operation, the repair runs first, the reset commits, and the cancellation
+immediately after, so a rendered card is retracted a moment later rather than
+atomically; if the repair fails, the reset is refused and nothing changes. `/abort` and a host restart do not cancel questions: the answer is still a
 meaningful next turn, and an expired or cancelled button is refused with fixed text.
 
 ## Retention and limits

@@ -62,6 +62,8 @@ const files = new Map();
 const uploadTimes = new Map();
 /** token -> highest acked cursor */
 const acks = new Map();
+/** `${thread}:${id}` -> open owner question, for the mock's `answer` */
+const questions = new Map();
 /** token -> { endpoint, keys }; one subscription per device */
 const subscriptions = new Map();
 /** device tokens whose push send is in flight */
@@ -149,6 +151,7 @@ const REACTIONS = ["👍", "👎", "❤️", "😂", "🤔", "🎉"];
 function isDurable(ev) {
   return ev.event === "message" || ev.event === "settled" || ev.event === "divider" ||
     ev.event === "reaction" || ev.event === "thread";
+    ev.event === "thread" || ev.event === "question";
 }
 
 function broadcast(ev) {
@@ -774,6 +777,20 @@ function onStream(ws, token) {
           id: `u-${key}`, role: "user", text, at: iso(), key,
           ...(info?.length ? { attachments: info } : {}),
         });
+        // "ask me …" exercises the owner-question card: an open question ends the turn and the
+        // owner's tap (see `answer`) or a typed message does the rest.
+        if (/\bask me\b/i.test(text)) {
+          const id = randomBytes(5).toString("hex");
+          const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+          const options = [
+            { id: "a", label: "Deploy now", description: "publish the current build" },
+            { id: "b", label: "Wait", description: "keep the current build running" },
+          ];
+          questions.set(`${thread.info.id}:${id}`, { id, prompt: "Deploy the current build now?", options, expiresAt, state: "open" });
+          emit(thread, "question", { id, prompt: "Deploy the current build now?", options, expiresAt, state: "open" });
+          emit(thread, "settled", { key, outcome: "answered" });
+          break;
+        }
         thread.queue.push(key);
         if (!thread.running) startTurn(thread);
         break;
@@ -786,6 +803,31 @@ function onStream(ws, token) {
         if (!events.some((e) => e.event === "message" && e.thread === thread.info.id && e.id === message)) return invalid();
         reply(ws, frame.id, true);
         emit(thread, "reaction", { message, by: "owner", emoji });
+        break;
+      }
+      case "answer": {
+        // One owner question from the mock: the send that contained "ask me" opened it.
+        const { question, option } = frame;
+        if (!thread || thread.info.archived || typeof question !== "string" || !/^[0-9a-f]{10}$/.test(question) ||
+            !["a", "b", "c", "d"].includes(option)) return invalid();
+        const found = questions.get(`${thread.info.id}:${question}`);
+        if (!found || found.state !== "open") {
+          reply(ws, frame.id, true, { accepted: false });
+          notice(thread, "This question is no longer open.");
+          break;
+        }
+        found.state = "answered";
+        reply(ws, frame.id, true, { accepted: true });
+        // The state change is the answered event; then the chosen option starts one follow-up turn.
+        emit(thread, "question", {
+          id: found.id, prompt: found.prompt, options: found.options,
+          expiresAt: found.expiresAt, state: "answered", answer: option,
+        });
+        const label = found.options.find((candidate) => candidate.id === option)?.label ?? option;
+        emitMessage(thread, {
+          id: `q-answer-${found.id}`, role: "assistant", at: iso(),
+          text: `Noted — you chose **${label}**. The mock gateway has no real turn behind this answer.`,
+        });
         break;
       }
       case "ack": {

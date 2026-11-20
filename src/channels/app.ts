@@ -22,10 +22,11 @@
  *   outbox record id.
  *
  * No new tool authority exists: the adapter grants nothing. The app chat is denied the MCP login
- * and `ask_user` owner surfaces in phase 1 because protocol v2 defines no event that could carry a
- * one-time authorization URL or a question without persisting it, and persisting such a URL in
- * channel state is forbidden by the other channels' binding contract. A callback-shaped `send` is
- * consumed before admission and never stored.
+ * surface because protocol v2 defines no event that could carry a one-time authorization URL
+ * without persisting it, and persisting such a URL in channel state is forbidden by the other
+ * channels' binding contract. It does own an `ask_user` surface: a durable `question` event is the
+ * channel's delivery path, so the append is a definite delivery (app-questions.ts, APP.md). A
+ * callback-shaped `send` is consumed before admission and never stored.
  */
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { defineDoc, AssistantEntry, ConversationBusy, InboxDoc, LiveDoc, UserEntry } from "@earendil-works/pi-durable";
@@ -55,6 +56,13 @@ import {
   offeredConversationCommands,
 } from "../help/commands.js";
 import { renderMemoryDigestStart, renderMemoryDigestStatus } from "../history/memory-digest.js";
+import { AskQuestionsDoc, cancelPendingQuestions, claimOutcomeText, claimQuestionAnswer, claimTypedQuestionAnswer, type AskQuestionsDocument, type AskSurfaceRegistry } from "../questions/index.js";
+import {
+  openQuestionEvent,
+  questionMarkOf,
+  reconcileQuestionEvents,
+  type AppQuestionMarksByThread,
+} from "./app-questions.js";
 import { RESTART_BUSY_MESSAGE, RestartBusyError } from "../restart.js";
 import type { GatewayMemoryDigest, GatewayModelList, GatewayModelPresets, GatewayModelSelection } from "../runtime.js";
 import { taskCancelReceipt, type AppTaskCancelResult, type AppTaskList } from "./app-tasks.js";
@@ -64,9 +72,11 @@ import {
   APP_MAIN_THREAD,
   APP_PAIR_ALPHABET,
   APP_PROTOCOL_VERSION,
+  APP_QUESTION_OPTION_IDS,
   APP_REQUEST_OPS,
   APP_STATIC_TYPES,
   parseHelloCursor,
+  parseQuestionId,
   validAppAgentName,
   validVapidPrivateKey,
   validVapidPublicKey,
@@ -167,6 +177,13 @@ export type AppChannelState = {
    * thread's next ordinary owner message in the same commit that admits it.
    */
   reactions?: Record<string, AppReactionNote[]>;
+  /**
+   * The last `question` state published per thread and question id. The durable log is trimmed by
+   * retention, so this is what keeps a terminal state from being re-published after its event was
+   * pruned. Bounded by the question records of each thread: an entry goes away with the record that
+   * owns it, and a thread's map is rebuilt only by that thread's own reconcile.
+   */
+  questionMarks?: AppQuestionMarksByThread;
 };
 
 export const AppState = defineDoc<AppChannelState>({
@@ -243,6 +260,11 @@ export interface AppGateway {
    * refused, because no channel can deliver it.
    */
   appActions?: AppActionRegistry;
+  /**
+   * Live owner-question surfaces. The running adapter attaches one host for the mapped threads of
+   * this channel; `ask_user` delivers only to the exact session that host owns.
+   */
+  askSurfaces?: AskSurfaceRegistry;
 }
 
 /** Terminal pairing console results, rendered by `src/channels/app-operator-cli.ts`. */
@@ -654,6 +676,24 @@ function latestReaction(
 }
 
 /**
+ * Append this thread's missing `question` events and keep the marks they leave, in the caller's own
+ * commit. Returns true when the app has new question state to replay.
+ */
+function publishQuestionEvents(
+  doc: Draft<AppChannelState>,
+  questions: Draft<AskQuestionsDocument>,
+  thread: string,
+  nowMs: number,
+): boolean {
+  const byThread = doc.questionMarks ?? {};
+  const reconciled = reconcileQuestionEvents(questions, doc.events, byThread[thread], thread, nowMs);
+  // Only this thread's map is rebuilt: another thread's marks belong to its own question document.
+  doc.questionMarks = { ...byThread, [thread]: reconciled.marks };
+  for (const event of reconciled.events) appendEvent(doc, event);
+  return reconciled.events.length > 0;
+}
+
+/**
  * Keep every unresolved control record, only the most recent applied ones, and a reported terminal
  * record only while its report is still queued — the same bounds the Telegram controls log keeps.
  */
@@ -706,6 +746,7 @@ const CALLBACK_REFUSED_TEXT =
   "This looks like an OAuth callback URL. MCP login cannot be initiated from the app channel, so " +
   "it was not stored and was not sent to the assistant.";
 const RESET_BUSY = "Reset refused: chat busy. Abort or retry when idle.";
+const RESET_UNREPAIRED = "Reset refused: open questions could not be checked. Nothing changed; try again.";
 const ARCHIVED_CONTROL_TEXT =
   "That command was not applied: its thread is archived. Restore the thread first.";
 
@@ -1195,6 +1236,9 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         case "control":
           await handleControlFrame(frame, sendOk, sendError);
           return;
+        case "answer":
+          await handleAnswerFrame(frame, sendOk, sendError);
+          return;
         case "threads": {
           const query = frame.query;
           if (query !== undefined && (typeof query !== "string" || query.length === 0 ||
@@ -1513,6 +1557,14 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
               retired.add(item.key);
             }
             doc.pending = doc.pending.filter((item) => !retired.has(item.key));
+            // An archived thread has no question surface, so its open cards can never be answered and
+            // the record would block every later ask. Repair a delivery mark lost in a crash first, in
+            // this same commit: a quarantined question whose card is still live must be cancelled with
+            // the archive, not reopened by a later repair. Restoring the thread does not reopen them.
+            const questions = await tx.doc(AskQuestionsDoc, conversation.id);
+            publishQuestionEvents(doc, questions, thread, now());
+            cancelPendingQuestions(questions);
+            publishQuestionEvents(doc, questions, thread, now());
           }
           const entry = threadInfo(doc, thread)!;
           setArchived(doc, entry, new Date(now()).toISOString(), archived ? "manual" : undefined);
@@ -1538,11 +1590,25 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     const expired = (info: AppThreadInfo) => info.id !== APP_MAIN_THREAD && !info.archived &&
       atMs - Date.parse(info.lastAt) >= archiveAfterMs && !archiving.has(info.id) && !controlPendingSet.has(info.id);
     if (!state.threads?.some(expired)) return;
+    // The idle archive cancels a thread's questions exactly like a manual archive, so it needs the
+    // same repair. A question document is addressed by its conversation id, which a session key
+    // cannot be resolved to inside the commit: resolve the candidate threads' conversations first,
+    // and leave any thread that only became eligible since then to the next scan.
+    const conversations = new Map<string, Conversation>();
+    for (const info of state.threads ?? []) {
+      if (!expired(info) || state.pending.some((item) => threadOf(item) === info.id)) continue;
+      conversations.set(info.id, await gateway.conversationFor(sessionForThread(info.id), adapterContext));
+    }
     state = await stateConversation.commit(async (tx) => {
       const doc = await tx.doc(AppState, stateConversation.id);
       for (const info of doc.threads ?? []) {
-        if (!expired(info) || doc.pending.some((item) => threadOf(item) === info.id) ||
+        const conversation = conversations.get(info.id);
+        if (!expired(info) || conversation === undefined || doc.pending.some((item) => threadOf(item) === info.id) ||
             await gateway.appThreadBusy!(tx, info.id)) continue;
+        const questions = await tx.doc(AskQuestionsDoc, conversation.id);
+        publishQuestionEvents(doc, questions, info.id, atMs);
+        cancelPendingQuestions(questions);
+        publishQuestionEvents(doc, questions, info.id, atMs);
         setArchived(doc, info, at, "idle");
       }
       return copyJson(doc) as unknown as AppChannelState;
@@ -1551,6 +1617,81 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   }
 
   // ── Ingress ───────────────────────────────────────────────────────────────
+
+  /**
+   * One tapped option becomes one ordinary follow-up turn only after the durable record accepts it.
+   * The claim and the admission share one commit, so a duplicate, stale, expired, cancelled or
+   * replayed tap can never admit a second turn; the gateway replies and then publishes the change.
+   */
+  async function handleAnswerFrame(
+    frame: Record<string, unknown>,
+    sendOk: (body?: Record<string, unknown>) => void,
+    sendError: (error: AppErrorCode) => void,
+  ): Promise<void> {
+    const thread = parseThreadId(frame.thread === undefined ? APP_MAIN_THREAD : frame.thread);
+    if (thread === undefined || !openThread(state, thread)) return sendError("bad_request");
+    if (archiving.has(thread)) return sendError("not_ready");
+    const questionId = parseQuestionId(frame.question);
+    const option = frame.option;
+    if (questionId === undefined || typeof option !== "string" || !APP_QUESTION_OPTION_IDS.includes(option)) {
+      return sendError("bad_request");
+    }
+    const sessionKey = sessionForThread(thread);
+    let accepted = false;
+    let blocked: AppErrorCode | undefined;
+    try {
+      const conversation = await gateway.conversationFor(sessionKey, adapterContext);
+      await mutateState(async (doc, tx) => {
+        if (!openThread(doc, thread)) { blocked = "bad_request"; return; }
+        if (archiving.has(thread)) { blocked = "not_ready"; return; }
+        const questions = await tx.doc(AskQuestionsDoc, conversation.id);
+        // Repair a delivery mark lost in a crash before the claim reads the record, so a live open
+        // card is answerable even when a read already quarantined it.
+        publishQuestionEvents(doc, questions, thread, now());
+        const claim = claimQuestionAnswer(questions, {
+          questionId, optionId: option, sessionKey, nowMs: now(),
+        });
+        // Expiry, and every other settled record, becomes durable before this reply leaves.
+        publishQuestionEvents(doc, questions, thread, now());
+        if (claim.result.status !== "accepted") {
+          // Nothing is admitted. A retried request id explains once; a fresh tap explains again.
+          const noticeId = `notice:answer:${questionId}:${frame.id as string}`;
+          if (!hasEventId(doc, noticeId)) {
+            appendMessage(doc, {
+              event: "message", thread, id: noticeId, role: "notice",
+              text: claimOutcomeText(claim.result), at: new Date(now()).toISOString(),
+            });
+          }
+          return;
+        }
+        if (doc.pending.length >= APP_LIMITS.maxPending) throw new Error(QUEUE_FULL);
+        // Only the stored record's own label is admitted, never a client-supplied payload.
+        doc.pending.push({
+          key: `answer:${questionId}`,
+          thread,
+          text: claim.result.text,
+          admittedAtMs: now(),
+          ...(admittedWhenBusy === undefined ? {} : { whenBusy: admittedWhenBusy }),
+        });
+        accepted = true;
+      });
+    } catch (error) {
+      if (stopping || signal?.aborted) return;
+      if (error instanceof Error && error.message === QUEUE_FULL) return sendError("not_ready");
+      journalEvent("app.answer.failed", {}, error);
+      sendError("internal");
+      return;
+    }
+    if (blocked !== undefined) return sendError(blocked);
+    // The reply precedes the state event; the app still treats the card as answered only once the
+    // `question` event arrives (protocol v2, "Owner questions").
+    sendOk({ accepted });
+    pushEventsToSockets();
+    if (accepted) {
+      journalEvent("app.answered", { "send.key": `answer:${questionId}` });
+      drain();
+    }
+  }
 
   async function handleSendFrame(
     deviceId: string,
@@ -1612,6 +1753,15 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     }
     // Never store callback text. A refused callback still has an idempotent key.
     const callback = looksLikeOAuthCallback(text);
+    // A typed ordinary message settles the oldest delivered question in this thread in the same
+    // commit as its admission, as Telegram and the terminal do; commands and callback text never
+    // count, and an attachment-only send has no text to count with.
+    const answerConversation = callback || gateway.askSurfaces === undefined
+      ? undefined
+      : await gateway.conversationFor(sessionForThread(thread), adapterContext).catch((error: unknown) => {
+          if (!stopping && !signal?.aborted) journalEvent("app.send.failed", {}, error);
+          return undefined;
+        });
     let duplicate = true;
     let blocked: AppErrorCode | undefined;
     try {
@@ -1667,6 +1817,14 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         if (thread === APP_MAIN_THREAD) doc.origin = { admittedAtMs: atMs };
         else if (doc.sideOrigins === undefined) doc.sideOrigins = { [thread]: { admittedAtMs: atMs } };
         else doc.sideOrigins[thread] = { admittedAtMs: atMs };
+        if (answerConversation !== undefined) {
+          const questions = await tx.doc(AskQuestionsDoc, answerConversation.id);
+          // The read repairs a delivery mark lost in a crash before the claim, so a live open card
+          // can be answered by typing as well as by tapping.
+          publishQuestionEvents(doc, questions, thread, atMs);
+          claimTypedQuestionAnswer(questions, sessionForThread(thread), text, atMs);
+          publishQuestionEvents(doc, questions, thread, atMs);
+        }
       });
     } catch (error) {
       if (stopping || signal?.aborted) return;
@@ -2471,11 +2629,45 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     if (resetSession === undefined) {
       const conversation = await gateway.conversationFor(sessionForThread(thread), adapterContext);
       await conversation.reset(undefined, adapterContext);
+      // A context boundary retires questions the new context can no longer answer. Repair a delivery
+      // mark lost in a crash first, in this same commit: a quarantined question whose card is still
+      // live must be cancelled by the reset, not reopened by a repair that runs after it.
+      if (gateway.askSurfaces !== undefined) {
+        let changed = false;
+        await mutateState(async (doc, tx) => {
+          const questions = await tx.doc(AskQuestionsDoc, conversation.id);
+          changed = publishQuestionEvents(doc, questions, thread, now());
+          cancelPendingQuestions(questions);
+          changed = publishQuestionEvents(doc, questions, thread, now()) || changed;
+        });
+        if (changed) pushEventsToSockets();
+      }
       return { kind: "applied" };
     }
     try {
+      // The host's reset cancels pending questions in its own commit, so repair a quarantined question
+      // whose card is still live before that commit reads the record. Otherwise the repair below would
+      // reopen a question the reset had already skipped, and a tap could answer into the new context.
+      // If that repair fails, the reset is refused: proceeding would let the repair after it reopen a
+      // question the reset skipped.
+      if (gateway.askSurfaces !== undefined) {
+        const repaired = await reconcileThreadQuestions(thread).then(() => true, (error: unknown) => {
+          if (!signal?.aborted) journalEvent("app.question.reconcile_failed", {}, error);
+          return false;
+        });
+        if (!repaired) return { kind: "refused", text: RESET_UNREPAIRED };
+      }
       const result = await resetSession(sessionForThread(thread), adapterContext);
       if (result.status === "busy") return { kind: "refused", text: RESET_BUSY };
+      // The host reset cancels pending questions in its own commit; publish their final state so an
+      // already-rendered card can no longer be answered. This read is also where a crash between
+      // admitting a question and delivering it is quarantined honestly. Publishing that state is
+      // not part of the reset's contract, so it never turns an applied reset into a failure.
+      if (gateway.askSurfaces !== undefined) {
+        await reconcileThreadQuestions(thread).catch((error: unknown) => {
+          if (!signal?.aborted) journalEvent("app.question.reconcile_failed", {}, error);
+        });
+      }
       return { kind: "applied" };
     } catch (error) {
       if (isConversationBusy(error)) return { kind: "refused", text: RESET_BUSY };
@@ -2903,6 +3095,21 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   const hasOrigin = (thread: string): boolean =>
     (thread === APP_MAIN_THREAD ? state.origin : state.sideOrigins?.[thread]) !== undefined;
 
+  /**
+   * Publish this thread's question changes the app has not seen yet. The read is where expiry and a
+   * crashed delivery settle, so nothing here runs on a timer; the append and the record change share
+   * one commit and the durable log (not a live socket) is what the app replays.
+   */
+  const reconcileThreadQuestions = async (thread: string): Promise<void> => {
+    const conversation = await gateway.conversationFor(sessionForThread(thread), adapterContext);
+    let changed = false;
+    await mutateState(async (doc, tx) => {
+      changed = publishQuestionEvents(
+        doc, await tx.doc(AskQuestionsDoc, conversation.id), thread, now());
+    });
+    if (changed) pushEventsToSockets();
+  };
+
   const updateScheduled = async (
     sessionKey: string,
     id: string,
@@ -3299,8 +3506,53 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       scope.cancel(fatal as Error);
     },
   });
+  // Questions admitted before this process started, or whose delivery mark did not survive a
+  // crash, are projected once here. Only a thread with durable admission evidence can have asked.
+  if (gateway.askSurfaces !== undefined) {
+    for (const thread of [APP_MAIN_THREAD, ...(state.threads ?? [])
+      .filter((entry) => entry.id !== APP_MAIN_THREAD && !entry.archived).map((entry) => entry.id)]) {
+      if (!hasOrigin(thread)) continue;
+      // A question projection must never keep the channel from serving other work.
+      await reconcileThreadQuestions(thread).catch((error: unknown) => {
+        if (!signal?.aborted) journalEvent("app.question.reconcile_failed", {}, error);
+      });
+    }
+  }
   const detachConsole = gateway.appConsole?.attach(consoleHost);
   const detachActions = gateway.appActions?.attach(actionHost);
+  // A question is delivered by appending its `open` event: this log is the channel's delivery path,
+  // so the append is definite and needs none of Telegram's external-send fencing. Only a mapped,
+  // open thread is owned; an archived thread has no surface, and the tool then admits nothing.
+  const detachAskSurface = gateway.askSurfaces?.attach({
+    owns(sessionKey) {
+      const target = threadForSession(sessionKey);
+      return target !== undefined && openThread(state, target);
+    },
+    async deliverQuestion(sessionKey, question) {
+      const target = threadForSession(sessionKey);
+      if (target === undefined || !openThread(state, target)) {
+        throw new Error("the app thread is not open");
+      }
+      await mutateState((doc) => {
+        if (!openThread(doc, target)) throw new Error("the app thread is not open");
+        const event = openQuestionEvent(target, question);
+        appendEvent(doc, event);
+        // Recorded now so the append stays known even after retention trims this event.
+        const byThread = doc.questionMarks ?? {};
+        doc.questionMarks = {
+          ...byThread,
+          [target]: { ...(byThread[target] ?? {}), [event.id]: questionMarkOf(event) },
+        };
+      });
+      // The commit above is the delivery. A failing live push must not report it as failed: every
+      // device replays the same durable event after `hello`.
+      try {
+        pushEventsToSockets();
+      } catch {
+        // A closed socket is replaced by its own reconnect and replay.
+      }
+    },
+  });
   recoveryComplete = true;
   journalEvent("app.serving", { port: listener.port, "queue.depth": state.pending.length });
   options.onListening?.(listener.port);
@@ -3323,6 +3575,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     if (scanTimer !== undefined) clearInterval(scanTimer);
     detachConsole?.();
     detachActions?.();
+    detachAskSurface?.();
     for (const socket of sockets.values()) socket.session.close(1001, "stopping");
     sockets.clear();
     scope.cancel(new DOMException("App adapter stopped", "AbortError"));

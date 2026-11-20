@@ -38,6 +38,9 @@ the new thread. A message containing `start task` seeds one fake worker and
 one fake scheduled job in that thread, so the thread menu's **Tasks** sheet
 (protocol v2, *Tasks*) has something to list and to cancel. It doesn't run a
 real agent. Push is on: the mock makes
+the new thread. A message containing "ask me" makes it emit an open owner
+question (protocol v2, *Owner questions*) instead of starting a turn; tapping an
+option answers it. It doesn't run a real agent. Push is on: the mock makes
 throwaway VAPID keys at start, answers `push.key`, stores one subscription
 per device and really sends content-free pushes with `web-push` to it
 whenever an answer or notice is produced while that device has no open

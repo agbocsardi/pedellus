@@ -9,6 +9,7 @@ import { Reactions } from "./Reactions";
 import { attachmentKind, fileUrl, formatBytes, uploadErrorText, uploadFile } from "./uploads";
 import { ActivitySteps } from "./ActivitySteps";
 import { TasksSheet } from "./TasksSheet";
+import { QuestionCard } from "./Question";
 
 const FINE_POINTER = matchMedia("(pointer: fine)").matches;
 /** From here the thread list is a sidebar and the chat sits beside it. */
@@ -290,7 +291,13 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   // parts have not arrived yet is marked incomplete.
   const rows: Row[] = [];
   const splitSeen = new Set<string>();
+  // A question changes state through further events for the same id; only the latest is shown.
+  const latestQuestion = new Map<string, number>();
   for (const ev of store.events.get(thread) ?? []) {
+    if (ev.event === "question") latestQuestion.set(ev.id, ev.cursor);
+  }
+  for (const ev of store.events.get(thread) ?? []) {
+    if (ev.event === "question" && latestQuestion.get(ev.id) !== ev.cursor) continue;
     if (ev.event === "message" && ev.part !== undefined) {
       if (splitSeen.has(ev.id)) continue;
       splitSeen.add(ev.id);
@@ -1395,6 +1402,7 @@ function EventRow({ ev, text, partial, store, conn, thread, last, forks, onActio
   onActions: (ev: MessageEvent, button: HTMLButtonElement) => void;
   onRetry?: (m: Outgoing) => void;
 }) {
+  if (ev.event === "question") return <QuestionCard ev={ev} store={store} conn={conn} />;
   if (ev.event === "divider") {
     const t = clock(ev.at);
     return (

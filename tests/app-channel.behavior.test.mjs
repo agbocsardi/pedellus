@@ -1998,3 +1998,423 @@ test('uploads nobody referenced are discarded after 24 hours and referenced ones
     await client.close();
   });
 });
+// ── Owner questions (ASK_USER.md, protocol v2 "Owner questions") ─────────────
+
+const { AskQuestionsDoc } = await import(new URL('../dist/questions/index.js', import.meta.url).href);
+
+/** One hello'd paired device for a question test. */
+async function questionDevice(store, base) {
+  const device = deviceClient(base, await pairedDevice(store, base));
+  await device.open();
+  device.send({ type: 'req', id: 'h1', op: 'hello', v: 2, cursor: null });
+  await device.wait(() => device.response('h1') !== undefined, 'hello reply');
+  return device;
+}
+
+/** Script one asking turn, then the follow-up turn the owner's answer starts. */
+function scriptAsk(store, followUp) {
+  store.script([
+    () => fauxAssistantMessage(fauxToolCall('ask_user', {
+      questions: [{
+        question: 'Deploy now?',
+        options: [{ label: 'Yes', description: 'publish the current build' }, { label: 'No' }],
+      }],
+    }, { id: 'ask-1' }), { stopReason: 'toolUse' }),
+    () => fauxAssistantMessage(followUp),
+  ]);
+}
+
+/** One stored question record and, when asked, the open card an earlier process had delivered. */
+async function seedQuestion(store, thread, record, { open = false } = {}) {
+  const conversation = await store.gateway.conversationFor(record.sessionKey, context);
+  await conversation.commit(async (tx) => {
+    const doc = await tx.doc(AskQuestionsDoc, conversation.id);
+    doc.questions.push(record);
+  }, context);
+  if (!open) return record;
+  const stateConversation = await store.gateway.conversationFor('app:channel-state', context);
+  const { AppState } = await import(new URL('../dist/channels/app.js', import.meta.url).href);
+  await stateConversation.commit(async (tx) => {
+    const doc = await tx.doc(AppState, stateConversation.id);
+    const cursor = doc.nextCursor;
+    doc.nextCursor = cursor + 1;
+    doc.events.push({
+      event: 'question', cursor, thread, id: record.id, prompt: record.question,
+      options: record.options, expiresAt: new Date(record.expiresAtMs).toISOString(), state: 'open',
+    });
+  }, context);
+  return record;
+}
+
+/** Seed one already-expired pending record and the open card an earlier process delivered. */
+async function seedExpiredQuestion(store, thread, id) {
+  return seedQuestion(store, thread, {
+    id,
+    taskId: 1,
+    sessionKey: thread === 'main' ? 'app:chat' : `app:chat:${thread}`,
+    question: 'Still want the old deploy?',
+    options: [{ id: 'a', label: 'Yes' }, { id: 'b', label: 'No' }],
+    createdAtMs: Date.now() - 120_000,
+    expiresAtMs: Date.now() - 60_000,
+    delivery: 'delivered',
+    status: 'pending',
+  }, { open: true });
+}
+
+test('ask_user delivers a durable question and one tap admits exactly one follow-up turn', { timeout: 30_000 }, async () => {
+  await withChannel('questions', {}, async ({ store, base }) => {
+    const device = await questionDevice(store, base);
+    scriptAsk(store, 'SYNTHETIC-DEPLOY-ANSWER');
+    device.send({ type: 'req', id: 's1', op: 'send', key: 'k1', text: 'ask me about the deploy' });
+    await device.wait(() => device.events('question').some((event) => event.state === 'open'), 'the open question');
+    const open = device.events('question').find((event) => event.state === 'open');
+    assert.equal(open.thread, 'main');
+    assert.match(open.id, /^[0-9a-f]{10}$/u);
+    assert.equal(open.prompt, 'Deploy now?');
+    assert.deepEqual(open.options.map((option) => [option.id, option.label]), [['a', 'Yes'], ['b', 'No']]);
+    assert.equal(open.options[0].description, 'publish the current build');
+    assert.equal(Number.isNaN(Date.parse(open.expiresAt)), false, 'expiresAt is an ISO timestamp');
+    // Asking ends the run: no assistant reply is fabricated for that turn.
+    await device.wait(() => device.events('settled').some((event) => event.key === 'k1'), 'the asking turn settled');
+
+    device.send({ type: 'req', id: 'a1', op: 'answer', thread: 'main', question: open.id, option: 'a' });
+    await device.wait(() => device.response('a1') !== undefined, 'answer reply');
+    assert.equal(device.response('a1').accepted, true);
+    await device.wait(() => device.events('question').some((event) => event.id === open.id && event.state === 'answered'),
+      'the answered question event');
+    const answered = device.events('question').filter((event) => event.id === open.id).at(-1);
+    assert.equal(answered.answer, 'a');
+    // Only the stored record's label reaches the model, as one ordinary follow-up turn.
+    await device.wait(() => store.captured.some((entry) => entry.messages.at(-1)?.content ===
+      `Answered question ${open.id}: Yes`), 'the follow-up input');
+    await device.wait(() => device.events('message').some((event) => event.role === 'assistant' &&
+      event.text === 'SYNTHETIC-DEPLOY-ANSWER'), 'the follow-up answer');
+    assert.equal(store.captured.filter((entry) => JSON.stringify(entry.messages).includes(`Answered question ${open.id}`)).length, 1,
+      'exactly one follow-up turn was admitted');
+
+    // A stale tap for the now-answered question is refused with the fixed notice and admits nothing.
+    device.send({ type: 'req', id: 'a2', op: 'answer', thread: 'main', question: open.id, option: 'b' });
+    await device.wait(() => device.response('a2') !== undefined, 'duplicate reply');
+    assert.equal(device.response('a2').accepted, false);
+    await device.wait(() => device.events('message').some((event) => event.role === 'notice' &&
+      event.text === 'Already answered.'), 'the replay notice');
+    assert.equal(store.captured.filter((entry) => JSON.stringify(entry.messages).includes(`Answered question ${open.id}`)).length, 1);
+
+    // An unknown id and a malformed option never reach the model either.
+    device.send({ type: 'req', id: 'a3', op: 'answer', thread: 'main', question: 'ffffffffff', option: 'a' });
+    await device.wait(() => device.response('a3') !== undefined, 'stale reply');
+    assert.equal(device.response('a3').accepted, false);
+    await device.wait(() => device.events('message').some((event) => event.role === 'notice' &&
+      event.text === 'This question is no longer open.'), 'the stale notice');
+    device.send({ type: 'req', id: 'a4', op: 'answer', thread: 'main', question: open.id, option: 'z' });
+    await device.wait(() => device.response('a4') !== undefined, 'malformed reply');
+    assert.equal(device.response('a4').ok, false, 'a malformed option is a bad request');
+    assert.equal(device.response('a4').error, 'bad_request');
+    assert.equal(store.captured.filter((entry) => JSON.stringify(entry.messages).includes(`Answered question ${open.id}`)).length, 1);
+    await device.close();
+  });
+});
+
+test('an expired question is refused on claim, published as expired and admits nothing', { timeout: 30_000 }, async () => {
+  await withChannel('expired-question', {}, async ({ store, base }) => {
+    const device = await questionDevice(store, base);
+    const record = await seedExpiredQuestion(store, 'main', 'abcdef1234');
+    device.send({ type: 'req', id: 'a1', op: 'answer', thread: 'main', question: record.id, option: 'a' });
+    await device.wait(() => device.response('a1') !== undefined, 'expired answer reply');
+    assert.equal(device.response('a1').accepted, false);
+    await device.wait(() => device.events('question').some((event) => event.id === record.id && event.state === 'expired'),
+      'the expired event');
+    await device.wait(() => device.events('message').some((event) => event.role === 'notice' &&
+      event.text === 'This question expired without an answer.'), 'the expired notice');
+    assert.equal(store.captured.length, 0, 'an expired answer starts no turn');
+    await device.close();
+  });
+});
+
+test('a typed ordinary message settles the oldest open question in the same admission', { timeout: 30_000 }, async () => {
+  await withChannel('typed-question', {}, async ({ store, base }) => {
+    const device = await questionDevice(store, base);
+    scriptAsk(store, 'SYNTHETIC-TYPED-ANSWER');
+    device.send({ type: 'req', id: 's1', op: 'send', key: 'k1', text: 'ask me about the deploy' });
+    await device.wait(() => device.events('question').some((event) => event.state === 'open'), 'the open question');
+    const open = device.events('question').find((event) => event.state === 'open');
+    await device.wait(() => device.events('settled').some((event) => event.key === 'k1'), 'the asking turn settled');
+
+    device.send({ type: 'req', id: 's2', op: 'send', key: 'k2', text: 'Yes, go ahead' });
+    await device.wait(() => device.response('s2') !== undefined, 'typed reply admitted');
+    assert.equal(device.response('s2').duplicate, false);
+    await device.wait(() => device.events('question').some((event) => event.id === open.id && event.state === 'answered'),
+      'the typed answer settled the question');
+    const answered = device.events('question').filter((event) => event.id === open.id).at(-1);
+    assert.equal(answered.answer, undefined, 'a typed answer carries no option id');
+    await device.wait(() => store.captured.some((entry) => entry.messages.at(-1)?.content === 'Yes, go ahead'),
+      'the typed input reached the model');
+    await device.wait(() => device.events('message').some((event) => event.role === 'assistant' &&
+      event.text === 'SYNTHETIC-TYPED-ANSWER'), 'the typed answer turn');
+    assert.equal(store.captured.filter((entry) => entry.messages.at(-1)?.content === 'Yes, go ahead').length, 1,
+      'the typed answer is admitted once');
+
+    // A later tap for that already-answered question is a replay, never a second turn.
+    device.send({ type: 'req', id: 'a1', op: 'answer', thread: 'main', question: open.id, option: 'b' });
+    await device.wait(() => device.response('a1') !== undefined, 'replay reply');
+    assert.equal(device.response('a1').accepted, false);
+    assert.equal(store.captured.filter((entry) => entry.messages.at(-1)?.content === `Answered question ${open.id}: No`).length, 0);
+    await device.close();
+  });
+});
+
+test('/new cancels the open question and a later tap is refused', { timeout: 30_000 }, async () => {
+  await withChannel('cancelled-question', {}, async ({ store, base }) => {
+    const device = await questionDevice(store, base);
+    scriptAsk(store, 'must not answer a cancelled question');
+    device.send({ type: 'req', id: 's1', op: 'send', key: 'k1', text: 'ask me about the deploy' });
+    await device.wait(() => device.events('question').some((event) => event.state === 'open'), 'the open question');
+    const open = device.events('question').find((event) => event.state === 'open');
+    await device.wait(() => device.events('settled').some((event) => event.key === 'k1'), 'the asking turn settled');
+
+    device.send({ type: 'req', id: 'c1', op: 'control', command: 'new' });
+    await device.wait(() => device.response('c1') !== undefined, 'new acknowledged');
+    await device.wait(() => device.events('question').some((event) => event.id === open.id && event.state === 'cancelled'),
+      'the cancelled question event');
+    await device.wait(() => device.events('divider').length === 1, 'the new-context divider');
+
+    device.send({ type: 'req', id: 'a1', op: 'answer', thread: 'main', question: open.id, option: 'a' });
+    await device.wait(() => device.response('a1') !== undefined, 'cancelled answer reply');
+    assert.equal(device.response('a1').accepted, false);
+    await device.wait(() => device.events('message').some((event) => event.role === 'notice' &&
+      event.text === 'This question was cancelled.'), 'the cancelled notice');
+    assert.equal(store.captured.some((entry) => entry.messages.at(-1)?.content === `Answered question ${open.id}: Yes`), false);
+    await device.close();
+  });
+});
+
+test('archiving a thread cancels its open question and a restore does not reopen it', { timeout: 30_000 }, async () => {
+  await withChannel('archive-question', {}, async ({ store, base }) => {
+    const device = await questionDevice(store, base);
+    device.send({ type: 'req', id: 'tc', op: 'thread.create', key: 'question-thread' });
+    await device.wait(() => device.response('tc') !== undefined, 'side thread created');
+    const side = device.response('tc').thread;
+    scriptAsk(store, 'must not answer an archived question');
+    device.send({ type: 'req', id: 's1', op: 'send', thread: side, key: 'k1', text: 'ask me in the side thread' });
+    await device.wait(() => device.events('question').some((event) => event.thread === side && event.state === 'open'),
+      'the side thread open question');
+    const open = device.events('question').find((event) => event.thread === side);
+    await device.wait(() => device.events('settled').some((event) => event.key === 'k1'), 'the asking turn settled');
+
+    // The archive commit withdraws the thread's surface, so it also cancels the open card: the reply
+    // is sent after that same commit.
+    device.send({ type: 'req', id: 'ar', op: 'thread.archive', thread: side, archived: true });
+    await device.wait(() => device.response('ar') !== undefined, 'archive reply');
+    assert.equal(device.response('ar').ok, true);
+    const questions = await store.gateway.conversationFor(`app:chat:${side}`, context);
+    const stored = await questions.commit(async (tx) => {
+      const doc = await tx.doc(AskQuestionsDoc, questions.id);
+      return doc.questions.find((record) => record.id === open.id)?.status;
+    }, context);
+    assert.equal(stored, 'cancelled', 'the archived question is settled in the archive commit');
+    const cancelled = device.events('question').find((event) => event.id === open.id && event.state === 'cancelled');
+    assert.ok(cancelled !== undefined, 'the cancelled card was published with the archive');
+    const archivedEvent = device.events('thread').find((event) => event.thread.id === side && event.thread.archived);
+    assert.ok(cancelled.cursor < archivedEvent.cursor, 'both were appended by the one archive commit');
+
+    // Restoring does not reopen it, and the settled record no longer blocks a new ask.
+    assert.equal((await request(device, 'rs', 'thread.archive', { thread: side, archived: false })).ok, true);
+    scriptAsk(store, 'answered after the restore');
+    device.send({ type: 'req', id: 's2', op: 'send', thread: side, key: 'k2', text: 'ask again' });
+    await device.wait(() => device.events('question').some((event) => event.thread === side &&
+      event.state === 'open' && event.id !== open.id), 'the second question was delivered');
+    const second = device.events('question').find((event) => event.thread === side &&
+      event.state === 'open' && event.id !== open.id);
+
+    // A later reconcile (this tap) re-publishes nothing for the cancelled question.
+    assert.equal((await request(device, 'a1', 'answer', { thread: side, question: second.id, option: 'b' })).accepted, true);
+    await device.wait(() => device.events('question').some((event) => event.id === second.id && event.state === 'answered'),
+      'the second question answered');
+    assert.deepEqual(device.events('question').filter((event) => event.id === open.id).map((event) => event.state),
+      ['open', 'cancelled']);
+    await device.close();
+  });
+});
+
+test('an answered question is not re-published after retention trims its event', { timeout: 30_000 }, async () => {
+  await withChannel('pruned-question', {}, async ({ store, base }) => {
+    const device = await questionDevice(store, base);
+    scriptAsk(store, 'SYNTHETIC-PRUNED-ANSWER');
+    device.send({ type: 'req', id: 's1', op: 'send', key: 'k1', text: 'ask me about the deploy' });
+    await device.wait(() => device.events('question').some((event) => event.state === 'open'), 'the open question');
+    const open = device.events('question').find((event) => event.state === 'open');
+    await device.wait(() => device.events('settled').some((event) => event.key === 'k1'), 'the asking turn settled');
+    assert.equal((await request(device, 'a1', 'answer', { thread: 'main', question: open.id, option: 'a' })).accepted, true);
+    await device.wait(() => device.events('question').some((event) => event.id === open.id && event.state === 'answered'),
+      'the answered question event');
+
+    // Ack the current head: every durable event, including the question's own, is trimmed.
+    device.send({ type: 'req', id: 'h2', op: 'hello', v: 2, cursor: null });
+    await device.wait(() => device.response('h2') !== undefined, 'second hello');
+    assert.equal((await request(device, 'ack1', 'ack', { cursor: device.response('h2').head })).ok, true);
+    const trimmed = await appState(store.gateway);
+    assert.equal(trimmed.events.filter((event) => event.event === 'question').length, 0, 'the question events were trimmed');
+    assert.equal(trimmed.questionMarks.main[open.id].state, 'answered', 'the published state is remembered');
+
+    // A later reconcile (this typed input) sees the record settled and publishes nothing again.
+    assert.equal((await request(device, 's2', 'send', { key: 'k2', text: 'anything else' })).duplicate, false);
+    await device.wait(() => device.events('message').some((event) => event.role === 'user' && event.key === 'k2'),
+      'the typed input echoed');
+    const after = await appState(store.gateway);
+    assert.deepEqual(after.events.filter((event) => event.event === 'question'), [], 'no terminal state was re-published');
+
+    // Another thread's reconcile rebuilds only its own marks, so main's answered state stays known
+    // and is still never re-published.
+    const side = await createSide(device, 'pruned-side');
+    scriptAsk(store, 'side done');
+    device.send({ type: 'req', id: 's3', op: 'send', thread: side, key: 'k3', text: 'ask in the side thread' });
+    await device.wait(() => device.events('question').some((event) => event.thread === side && event.state === 'open'),
+      'the side thread question');
+    const sideOpen = device.events('question').find((event) => event.thread === side && event.state === 'open');
+    assert.equal((await request(device, 'a3', 'answer', { thread: side, question: sideOpen.id, option: 'a' })).accepted, true);
+    await device.wait(() => device.events('question').some((event) => event.id === sideOpen.id && event.state === 'answered'),
+      'the side thread answered');
+    const marks = (await appState(store.gateway)).questionMarks;
+    assert.equal(marks.main[open.id].state, 'answered', 'the side thread left main\'s entry alone');
+    assert.equal((await appState(store.gateway)).events.some((event) => event.id === open.id), false,
+      'main\'s trimmed terminal state is still not re-published');
+    await device.close();
+  });
+});
+
+test('a quarantined question is repaired by its live open event; one without stays quarantined', { timeout: 30_000 }, async () => {
+  await withChannel('unknown-question', {}, async ({ store, base }) => {
+    const device = await questionDevice(store, base);
+    const base_ = {
+      taskId: 1,
+      sessionKey: 'app:chat',
+      question: 'Still want the deploy?',
+      options: [{ id: 'a', label: 'Yes' }, { id: 'b', label: 'No' }],
+      createdAtMs: Date.now() - 600_000,
+      expiresAtMs: Date.now() + 600_000,
+      delivery: 'unknown',
+      status: 'unknown',
+    };
+    const delivered = await seedQuestion(store, 'main', { ...base_, id: 'aaaabbbb01' }, { open: true });
+    const lost = await seedQuestion(store, 'main', { ...base_, id: 'aaaabbbb02' });
+
+    // The open event proves the append happened, so the quarantined record is answerable again.
+    assert.equal((await request(device, 'a1', 'answer', { thread: 'main', question: delivered.id, option: 'a' })).accepted, true);
+    await device.wait(() => device.events('question').some((event) => event.id === delivered.id && event.state === 'answered'),
+      'the repaired question answered');
+    assert.equal(store.captured.some((entry) => entry.messages.at(-1)?.content === `Answered question ${delivered.id}: Yes`), true,
+      'only the stored label was admitted');
+
+    // No open event was ever appended, so this one stays quarantined and admits nothing.
+    assert.equal((await request(device, 'a2', 'answer', { thread: 'main', question: lost.id, option: 'b' })).accepted, false);
+    await device.wait(() => device.events('message').some((event) => event.role === 'notice' &&
+      event.text === 'This question is no longer open.'), 'the quarantined notice');
+    assert.equal(store.captured.some((entry) => JSON.stringify(entry.messages).includes(lost.id)), false);
+    await device.close();
+  });
+});
+
+/** A record quarantined by a lost delivery mark, whose open card an earlier process had delivered. */
+async function seedQuarantinedQuestion(store, thread, id, expiresAtMs = Date.now() + 600_000) {
+  return seedQuestion(store, thread, {
+    id,
+    taskId: 1,
+    sessionKey: thread === 'main' ? 'app:chat' : `app:chat:${thread}`,
+    question: 'Still want the deploy?',
+    options: [{ id: 'a', label: 'Yes' }, { id: 'b', label: 'No' }],
+    createdAtMs: expiresAtMs - 60_000,
+    expiresAtMs,
+    delivery: 'unknown',
+    status: 'unknown',
+  }, { open: true });
+}
+
+async function storedQuestionStatus(store, sessionKey, id) {
+  const conversation = await store.gateway.conversationFor(sessionKey, context);
+  return conversation.commit(async (tx) => {
+    const doc = await tx.doc(AskQuestionsDoc, conversation.id);
+    return doc.questions.find((record) => record.id === id)?.status;
+  }, context);
+}
+
+/** Both reset paths must cancel a repaired quarantined question and refuse the stale card. */
+async function assertResetCancelsQuarantined(store, device, record) {
+  assert.equal((await request(device, 'c1', 'control', { command: 'new' })).ok, true);
+  await device.wait(() => device.events('question').some((event) => event.id === record.id && event.state === 'cancelled'),
+    'the quarantined question cancelled by the reset');
+  assert.equal(await storedQuestionStatus(store, 'app:chat', record.id), 'cancelled',
+    'the reset cancelled the repaired record, not the quarantine');
+
+  assert.equal((await request(device, 'a1', 'answer', { thread: 'main', question: record.id, option: 'a' })).accepted, false);
+  await device.wait(() => device.events('message').some((event) => event.role === 'notice' &&
+    event.text === 'This question was cancelled.'), 'the cancelled notice');
+  assert.equal(store.captured.length, 0, 'the stale card admitted no turn into the new context');
+}
+
+test('/new cancels a quarantined question whose live open card the repair would reopen (host reset)',
+  { timeout: 30_000 }, async () => {
+    await withChannel('new-unknown-question', {}, async ({ store, base }) => {
+      const device = await questionDevice(store, base);
+      const record = await seedQuarantinedQuestion(store, 'main', 'aaaabbbb05');
+      await assertResetCancelsQuarantined(store, device, record);
+      await device.close();
+    });
+  });
+
+test('/new cancels a quarantined question whose live open card the repair would reopen (plain reset)',
+  { timeout: 30_000 }, async () => {
+    const store = await openAppStore('new-unknown-question-plain');
+    const app = startApp(store, { gateway: { ...store.gateway, resetSession: undefined } });
+    const base = `http://127.0.0.1:${await app.port}`;
+    try {
+      const device = await questionDevice(store, base);
+      const record = await seedQuarantinedQuestion(store, 'main', 'aaaabbbb06');
+      await assertResetCancelsQuarantined(store, device, record);
+      await device.close();
+    } finally {
+      await app.stop();
+      await store.close();
+    }
+  });
+
+test('archiving a thread cancels a quarantined question whose live open card the repair would reopen',
+  { timeout: 30_000 }, async () => {
+    await withChannel('archive-unknown-question', {}, async ({ store, base }) => {
+      const device = await questionDevice(store, base);
+      const side = await createSide(device, 'quarantined-thread');
+      const record = await seedQuarantinedQuestion(store, side, 'aaaabbbb07');
+
+      assert.equal((await request(device, 'ar', 'thread.archive', { thread: side, archived: true })).ok, true);
+      await device.wait(() => device.events('question').some((event) => event.id === record.id && event.state === 'cancelled'),
+        'the cancelled card published with the archive');
+      assert.equal(await storedQuestionStatus(store, `app:chat:${side}`, record.id), 'cancelled',
+        'the archive cancelled the repaired record, not the quarantine');
+
+      // Answering the old card after the restore must still be refused, not admitted.
+      assert.equal((await request(device, 'rs', 'thread.archive', { thread: side, archived: false })).ok, true);
+      assert.equal((await request(device, 'a1', 'answer', { thread: side, question: record.id, option: 'a' })).accepted, false);
+      await device.wait(() => device.events('message').some((event) => event.role === 'notice' &&
+        event.text === 'This question was cancelled.'), 'the cancelled notice');
+      assert.equal(store.captured.length, 0, 'the stale card admitted no turn');
+      await device.close();
+    });
+  });
+
+test('the idle archive cancels a quarantined question whose live open card the repair would reopen',
+  { timeout: 30_000 }, async () => {
+    await withChannel('idle-unknown-question', { adapter: { autoArchiveDays: 1, scanIntervalMs: 50 } },
+      async ({ app, store, base }) => {
+        const device = await questionDevice(store, base);
+        const side = await createSide(device, 'idle-quarantined');
+        const record = await seedQuarantinedQuestion(store, side, 'aaaabbbb08', app.clock.now + 10 * 86_400_000);
+
+        app.clock.now += 86_400_001;
+        await device.wait(() => device.events('thread').some((event) => event.thread.id === side &&
+          event.thread.archivedReason === 'idle'), 'the idle archive scan');
+        await device.wait(() => device.events('question').some((event) => event.id === record.id && event.state === 'cancelled'),
+          'the cancelled card published with the idle archive');
+        assert.equal(await storedQuestionStatus(store, `app:chat:${side}`, record.id), 'cancelled',
+          'the idle archive cancelled the repaired record, not the quarantine');
+        await device.close();
+      });
+  });

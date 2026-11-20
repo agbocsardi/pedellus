@@ -189,11 +189,12 @@ may select the optional direct-workspace Bubblewrap shell with
 never falls back to the unconfined host shell. See
 [coding tools](./TOOLS.md) and [direct Bubblewrap shell](./DIRECT_BWRAP.md).
 
-A mapped ordinary chat (the local CLI attach or an authenticated Telegram private
-chat) also holds the model-facing `ask_user` capability: 1-4 bounded questions with
-2-4 options are delivered to that chat's live owner surface with Telegram buttons
-or numbered terminal text, and the turn ends. The owner's answer arrives later as
-an ordinary follow-up turn; nothing is parked and no authority is granted. See
+A mapped ordinary chat (the local CLI attach, an authenticated Telegram private
+chat, or a mapped app thread while its adapter runs) also holds the model-facing
+`ask_user` capability: 1-4 bounded questions with 2-4 options are delivered to that
+chat's live owner surface with Telegram buttons, numbered terminal text or an app
+question card, and the turn ends. The owner's answer arrives later as an ordinary
+follow-up turn; nothing is parked and no authority is granted. See
 [owner questions](./ASK_USER.md).
 
 ## Internal cron (opt-in)

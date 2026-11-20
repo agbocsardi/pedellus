@@ -20,6 +20,7 @@ import {
   type ErrorCode,
   type PresetInfo,
   type Reaction,
+  type QuestionEvent,
   type ThreadInfo,
   type ThreadOrigin,
 } from "./generated/protocol-v2.js";
@@ -66,10 +67,18 @@ export type AppCommandInfo = CommandInfo;
 export type AppPresetInfo = PresetInfo;
 /** Accepted ops; `history` is declared in v2.md as later work. */
 export const APP_REQUEST_OPS: readonly string[] = [
-  "hello", "send", "ack", "control", "ping", "history", "tasks", "task.cancel",
+  "hello", "send", "ack", "control", "ping", "history", "tasks", "task.cancel", "answer",
   "threads", "thread.create", "thread.rename", "thread.archive",
   "push.key", "push.subscribe", "push.unsubscribe", "react",
 ];
+
+/** One `answer.option`: exactly the four durable option ids, never a label from the client. */
+export const APP_QUESTION_OPTION_IDS: readonly string[] = ["a", "b", "c", "d"];
+
+/** One `answer.question`: the stored record's opaque 10-hex id. */
+export function parseQuestionId(value: unknown): string | undefined {
+  return typeof value === "string" && APP_LIMITS.questionIdPattern.test(value) ? value : undefined;
+}
 
 export type AppThreadOrigin = ThreadOrigin;
 export type AppThreadInfo = ThreadInfo;
@@ -180,6 +189,7 @@ export type AppDurableEvent =
     emoji: Reaction | null;
   }
   | { event: "divider"; cursor: number; thread?: string; at: string; reason: "new" }
+  | (Omit<QuestionEvent, "type" | "thread"> & { thread?: string })
   | { event: "thread"; cursor: number; thread: AppThreadInfo };
 
 /** One pending model input (an admitted `send`) or held host notice. */
