@@ -23,6 +23,14 @@ export const LIMITS = {
   agentNameMaxChars: 40,
   /** `control.args`: the text after the command name. */
   controlArgsChars: 1_000,
+  /** A split `message` has at most this many parts (see v2.md, Long messages). */
+  maxMessageParts: 64,
+  /** `push.subscribe` bounds. */
+  pushEndpointChars: 2_048,
+  pushP256dhChars: 128,
+  pushAuthChars: 64,
+  /** `unread` in a push payload is capped here. */
+  pushUnreadCap: 99,
 } as const;
 
 /** `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`: no `I`/`O`, case-insensitive input. */
@@ -56,7 +64,15 @@ export type Request =
   | { type: "req"; id: string; op: "threads"; query?: string }
   | { type: "req"; id: string; op: "thread.create"; key: string; title?: string; from?: ThreadOrigin }
   | { type: "req"; id: string; op: "thread.rename"; thread: ThreadId; title: string }
-  | { type: "req"; id: string; op: "thread.archive"; thread: ThreadId; archived: boolean };
+  | { type: "req"; id: string; op: "thread.archive"; thread: ThreadId; archived: boolean }
+  | { type: "req"; id: string; op: "push.key" }
+  | { type: "req"; id: string; op: "push.subscribe"; subscription: PushSubscriptionInfo }
+  | { type: "req"; id: string; op: "push.unsubscribe" };
+
+export type PushSubscriptionInfo = { endpoint: string; keys: { p256dh: string; auth: string } };
+export type PushKeyResult = { key: string };
+/** Content-free Web Push payload; never message text. */
+export type PushPayload = { v: 2; thread: ThreadId; unread: number };
 
 export type HelloResult = { v: 2; device: string; head: number | null; agent: string; commands: CommandInfo[]; presets: PresetInfo[] };
 export type SendResult = { duplicate: boolean };
@@ -64,12 +80,14 @@ export type ThreadsResult = { threads: ThreadInfo[] };
 export type ThreadCreateResult = { thread: ThreadId; duplicate: boolean };
 
 export type Response =
-  | ({ type: "res"; id: string; ok: true } & Partial<HelloResult & SendResult & ThreadsResult & ThreadCreateResult>)
+  | ({ type: "res"; id: string; ok: true } & Partial<HelloResult & SendResult & ThreadsResult & ThreadCreateResult & PushKeyResult>)
   | { type: "res"; id: string; ok: false; error: ErrorCode };
 
 export type MessageEvent = {
   type: "event"; event: "message"; cursor: number; thread: ThreadId; id: string;
   role: "user" | "assistant" | "notice"; text: string; at: string; key?: string;
+  /** Present only on a split message: part `i` (from 0) of `n`. */
+  part?: { i: number; n: number };
 };
 export type SettledEvent = {
   type: "event"; event: "settled"; cursor: number; thread: ThreadId; key: string;
