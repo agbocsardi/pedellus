@@ -5,6 +5,7 @@ import type { AgentStatus, Outgoing, OutgoingState, Store } from "./store";
 import { LIMITS, MAIN_THREAD, type CommandInfo, type DurableEvent, type MessageEvent, type PresetInfo, type ThreadInfo, type ThreadOrigin } from "./protocol";
 import { disablePush, enablePush, hasPushSubscription, pushPermission, requestPushPermission, pushSupported, subscribedServerKey, clearAppBadge, type PushPermission } from "./push";
 import { Avatar, type AvatarState } from "./Avatar";
+import { QuestionCard } from "./Question";
 
 const FINE_POINTER = matchMedia("(pointer: fine)").matches;
 
@@ -168,7 +169,13 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   // parts have not arrived yet is marked incomplete.
   const rows: Row[] = [];
   const splitSeen = new Set<string>();
+  // A question changes state through further events for the same id; only the latest is shown.
+  const latestQuestion = new Map<string, number>();
   for (const ev of store.events.get(thread) ?? []) {
+    if (ev.event === "question") latestQuestion.set(ev.id, ev.cursor);
+  }
+  for (const ev of store.events.get(thread) ?? []) {
+    if (ev.event === "question" && latestQuestion.get(ev.id) !== ev.cursor) continue;
     if (ev.event === "message" && ev.part !== undefined) {
       if (splitSeen.has(ev.id)) continue;
       splitSeen.add(ev.id);
@@ -549,7 +556,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
         {rows.map((r, i) =>
           r.kind === "ev" ? (
             <EventRow key={`e${r.ev.cursor}`} ev={r.ev} text={r.text} partial={r.partial}
-              store={store} last={i === lastUser}
+              store={store} conn={conn} last={i === lastUser}
               forks={r.ev.event === "message" ? forks.get(r.ev.id) : undefined}
               onActions={(ev, button) => show({ kind: "message", title: suggestedTitle(ev.text),
                 from: { thread: ev.thread, messageId: ev.id } }, button)}
@@ -1001,11 +1008,13 @@ function Icon({ d, bold }: { d: string; bold?: boolean }) {
   );
 }
 
-function EventRow({ ev, text, partial, store, last, forks, onActions, onRetry }: {
-  ev: DurableEvent; text?: string; partial?: boolean; store: Store; last: boolean; forks?: ThreadInfo[];
+function EventRow({ ev, text, partial, store, conn, last, forks, onActions, onRetry }: {
+  ev: DurableEvent; text?: string; partial?: boolean; store: Store; conn: Connection; last: boolean;
+  forks?: ThreadInfo[];
   onActions: (ev: MessageEvent, button: HTMLButtonElement) => void;
   onRetry?: (m: Outgoing) => void;
 }) {
+  if (ev.event === "question") return <QuestionCard ev={ev} store={store} conn={conn} />;
   if (ev.event === "divider") {
     const t = clock(ev.at);
     return (

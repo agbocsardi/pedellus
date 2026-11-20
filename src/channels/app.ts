@@ -22,10 +22,11 @@
  *   outbox record id.
  *
  * No new tool authority exists: the adapter grants nothing. The app chat is denied the MCP login
- * and `ask_user` owner surfaces in phase 1 because protocol v2 defines no event that could carry a
- * one-time authorization URL or a question without persisting it, and persisting such a URL in
- * channel state is forbidden by the other channels' binding contract. A callback-shaped `send` is
- * consumed before admission and never stored.
+ * surface because protocol v2 defines no event that could carry a one-time authorization URL
+ * without persisting it, and persisting such a URL in channel state is forbidden by the other
+ * channels' binding contract. It does own an `ask_user` surface: a durable `question` event is the
+ * channel's delivery path, so the append is a definite delivery (app-questions.ts, APP.md). A
+ * callback-shaped `send` is consumed before admission and never stored.
  */
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { defineDoc, AssistantEntry, ConversationBusy, InboxDoc, LiveDoc, UserEntry } from "@earendil-works/pi-durable";
@@ -1534,6 +1535,11 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         else doc.sideOrigins[thread] = { admittedAtMs: atMs };
         if (answerConversation !== undefined) {
           const questions = await tx.doc(AskQuestionsDoc, answerConversation.id);
+          // The read repairs a delivery mark lost in a crash before the claim, so a live open card
+          // can be answered by typing as well as by tapping.
+          for (const event of reconcileQuestionEvents(questions, doc.events, thread, atMs)) {
+            appendEvent(doc, event);
+          }
           claimTypedQuestionAnswer(questions, sessionForThread(thread), text, atMs);
           for (const event of reconcileQuestionEvents(questions, doc.events, thread, atMs)) {
             appendEvent(doc, event);

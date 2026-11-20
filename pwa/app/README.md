@@ -27,7 +27,9 @@ on the mock to try automatic archiving after three seconds of idleness. Ask for
 `a long answer` to get a durable message split into `part: {i, n}` frames
 (protocol v2, *Long messages*), including while it is only partly received.
 The mock records and validates fork origins without copying messages into
-the new thread. It doesn't run a real agent. Push is on: the mock makes
+the new thread. A message containing "ask me" makes it emit an open owner
+question (protocol v2, *Owner questions*) instead of starting a turn; tapping an
+option answers it. It doesn't run a real agent. Push is on: the mock makes
 throwaway VAPID keys at start, answers `push.key`, stores one subscription
 per device and really sends content-free pushes with `web-push` to it
 whenever an answer or notice is produced while that device has no open

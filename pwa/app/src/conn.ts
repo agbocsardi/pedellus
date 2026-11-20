@@ -7,6 +7,7 @@ import {
   type ControlCommand,
   type PresetInfo,
   type PushSubscriptionInfo,
+  type QuestionOptionId,
   type Request,
   type Response,
   type ServerFrame,
@@ -108,6 +109,21 @@ export class Connection {
 
   pushUnsubscribe() {
     return this.mutate({ type: "req", id: this.id(), op: "push.unsubscribe" });
+  }
+
+  /**
+   * Answer one open owner question. Resolves `true` only when the gateway claimed it; the card is
+   * answered by the durable `question` event that follows, never by this reply.
+   */
+  answer(thread: ThreadId, question: string, option: QuestionOptionId): Promise<boolean> {
+    return new Promise((resolve) => {
+      if (this.store.connState !== "open" || !this.store.canWrite(thread)) {
+        resolve(false);
+        return;
+      }
+      const frame = { type: "req", id: this.id(), op: "answer", thread, question, option } as const;
+      if (!this.request(frame, (res) => resolve(res?.ok === true && res.accepted === true))) resolve(false);
+    });
   }
 
   private mutate(frame: Request): Promise<Response | undefined> {
@@ -316,6 +332,7 @@ export class Connection {
       case "message":
       case "settled":
       case "divider":
+      case "question":
       case "thread": {
         if (this.replaying && this.replayHead !== null && f.cursor <= this.replayHead) {
           this.replayCount++;
