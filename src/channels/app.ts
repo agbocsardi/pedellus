@@ -465,8 +465,8 @@ function fittingPrefix(text: string, budget: number): number {
 
 /** `[truncated]` ends a message that needed more parts than the protocol allows. */
 const MESSAGE_TRUNCATED = "\n\n[truncated]";
-/** Two-digit `i` and `n`: `maxMessageParts` is 64, so the real marker never needs more. */
-const PART_MARKER_DIGITS = 99;
+/** The widest `{i, n}` the real splitter can emit: `maxMessageParts` is 64, so never three digits. */
+const PART_MARKER_BOUND = 99;
 
 /** One message frame's exact size in bytes, in the shape `wireEvent` emits. */
 function messageFrameBytes(
@@ -494,7 +494,7 @@ function appendMessage(doc: Draft<AppChannelState>, event: AppMessageInput): voi
   // `n` is unknown until the text is split, so every budget assumes the widest `{i, n}`; the
   // cursor is exact per part because each append takes the next one.
   const budget = (index: number): number => APP_LIMITS.frameBytes - messageFrameBytes(
-    { ...event, text: "" }, first + index, { i: PART_MARKER_DIGITS, n: PART_MARKER_DIGITS }) + 2;
+    { ...event, text: "" }, first + index, { i: PART_MARKER_BOUND, n: PART_MARKER_BOUND }) + 2;
   const texts: string[] = [];
   let rest = event.text;
   while (rest !== "" && texts.length < APP_LIMITS.maxMessageParts) {
