@@ -816,9 +816,21 @@ function NotificationsItem({ store, conn, online }: { store: Store; conn: Connec
     setNote("");
     try {
       if (store.push.endpoint) {
-        await conn.pushUnsubscribe();
+        // Offline the gateway cannot drop the subscription, so nothing here is
+        // "off" until it says so; the browser side is kept in step after.
+        if (!online) {
+          setNote("Reconnect to turn notifications off.");
+          return;
+        }
+        const off = await conn.pushUnsubscribe();
+        if (!off?.ok) {
+          setNote(off
+            ? "The gateway did not confirm that notifications are off. Try again."
+            : "Reconnect to turn notifications off.");
+          return;
+        }
         await disablePush();
-        await store.setPush({ endpoint: undefined });
+        await store.setPush({ endpoint: undefined, key: undefined });
         setNote("Notifications are off.");
         return;
       }
@@ -863,7 +875,7 @@ function NotificationsItem({ store, conn, online }: { store: Store; conn: Connec
     ? "Not available in this browser. On iPhone, add the app to the home screen first"
     : permission === "denied"
       ? "Blocked. Allow notifications for this app in your browser settings"
-      : on ? "On for new messages. Tap to turn off"
+      : on ? (online ? "On for new messages. Tap to turn off" : "On for new messages. Reconnect to turn off")
       : online ? "Off. Tap to turn on" : "Off. Reconnect to turn on";
   return <>
     <SheetItem icon={BELL_ICON} title="Notifications" sub={sub}
