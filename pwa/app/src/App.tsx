@@ -45,14 +45,22 @@ export function App({ store }: { store: Store }) {
     // env(safe-area-inset-bottom) always reports the home indicator. Pad by the part of that
     // inset the page really reaches, measured, so the composer neither hides under the home
     // indicator nor floats above a gap.
+    // Measured on device: with a translucent status bar the page starts at the screen top and may
+    // end short of the bottom (top inset 59, page 793 of 852); with the default style it starts
+    // below the status bar and reaches the bottom (top inset 0, page 793 from y=59).
     const probe = document.createElement("div");
     probe.style.cssText = "position:fixed;visibility:hidden;pointer-events:none;height:env(safe-area-inset-bottom)";
-    document.body.appendChild(probe);
+    const probeTop = document.createElement("div");
+    probeTop.style.cssText = "position:fixed;visibility:hidden;pointer-events:none;height:env(safe-area-inset-top)";
+    document.body.append(probe, probeTop);
     const insetBottom = () => {
       const inset = probe.getBoundingClientRect().height;
+      const insetTop = probeTop.getBoundingClientRect().height;
       const landscape = window.innerWidth > window.innerHeight;
       const screenH = landscape ? Math.min(screen.width, screen.height) : Math.max(screen.width, screen.height);
-      const covered = window.innerHeight - (screenH - inset);
+      // A page with no top inset that is shorter than the screen sits below the status bar.
+      const pageTop = insetTop > 0 ? 0 : Math.max(0, screenH - window.innerHeight);
+      const covered = pageTop + window.innerHeight - (screenH - inset);
       return Math.max(0, Math.min(inset, covered));
     };
     let wasOpen = false;
@@ -83,6 +91,7 @@ export function App({ store }: { store: Store }) {
       style.removeProperty("--app-h");
       style.removeProperty("--inset-bottom");
       probe.remove();
+      probeTop.remove();
       style.removeProperty("--vv-top");
     };
   }, []);
