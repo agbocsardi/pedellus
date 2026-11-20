@@ -30,10 +30,16 @@ export function Reactions({ store, conn, thread, messageId }: {
 }) {
   const [open, setOpen] = useState(false);
   const wrap = useRef<HTMLSpanElement | null>(null);
+  const palette = useRef<HTMLSpanElement | null>(null);
   const current = store.reaction(thread, messageId);
 
   useEffect(() => {
     if (!open) return;
+    // Focus the group, never an emoji: a ring on one emoji reads as a pre-selected reaction.
+    // `preventScroll` keeps the page still, and the palette is then revealed inside the message
+    // list itself, so a palette opened on the last message is never left under the composer.
+    palette.current?.focus({ preventScroll: true });
+    palette.current?.scrollIntoView({ block: "nearest" });
     const pointer = (event: Event) => {
       if (wrap.current && event.target instanceof Node && !wrap.current.contains(event.target)) setOpen(false);
     };
@@ -63,7 +69,7 @@ export function Reactions({ store, conn, thread, messageId }: {
         <svg viewBox="0 0 24 24" aria-hidden="true">{REACT_ICON}</svg>
       </button>
       {open && (
-        <span className="reaction-palette" role="group" aria-label="Reactions">
+        <span className="reaction-palette" role="group" aria-label="Reactions" tabIndex={-1} ref={palette}>
           {REACTIONS.map((emoji) => (
             <button key={emoji} type="button" className="reaction-choice" aria-pressed={current === emoji}
               aria-label={current === emoji ? `Clear your ${emoji} reaction` : `React with ${emoji}`}
