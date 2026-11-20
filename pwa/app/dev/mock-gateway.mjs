@@ -34,6 +34,16 @@ const B64URL = /^[A-Za-z0-9_-]+$/;
 const LABEL_RE = /^[^\p{Cc}\u2028\u2029]{1,40}$/u;
 const TITLE_RE = /^[^\p{Cc}\u2028\u2029]{1,80}$/u;
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // [A-Z2-9] minus I, O
+// Files (protocol v2, Files). The app enforces the same bounds before sending.
+const UPLOAD_BYTES = 20 * 1024 * 1024;
+const UPLOAD_NAME_CHARS = 120;
+const UPLOADS_PER_MINUTE = 30;
+const MAX_ATTACHMENTS = 10;
+const UPLOAD_ID_RE = /^f_[A-Za-z0-9_-]{22}$/;
+const UPLOAD_TTL_MS = 24 * 60 * 60 * 1000;
+/** NO_UPLOADS=1 stands in for a gateway without media storage configured. */
+const UPLOADS = process.env.NO_UPLOADS !== "1";
+const MIME_RE = /^[A-Za-z0-9.+-]+\/[A-Za-z0-9.+_-]+$/;
 
 const pairCode =
   process.argv[2] ||
@@ -44,8 +54,12 @@ console.log(`pair code (single use, 10 min): ${pairCode}`);
 
 /** token -> device label */
 const tokens = new Map();
-/** send key -> text (idempotency for at least the mock's lifetime) */
+/** send key -> { text, attachments } (idempotency for at least the mock's lifetime) */
 const admitted = new Map();
+/** upload id -> { token, name, type, size, bytes, at, used }; memory only */
+const files = new Map();
+/** device token -> upload timestamps in the last minute */
+const uploadTimes = new Map();
 /** token -> highest acked cursor */
 const acks = new Map();
 /** token -> { endpoint, keys }; one subscription per device */
@@ -243,7 +257,7 @@ function longAnswer(asked) {
 }
 
 function answerFor(key) {
-  const asked = admitted.get(key) ?? "…";
+  const asked = admitted.get(key)?.text ?? "…";
   // Ask for "a long answer" to exercise a split durable message.
   if (/long answer/i.test(asked)) return longAnswer(asked);
   const short = asked.length > 60 ? asked.slice(0, 60) + "…" : asked;
@@ -302,6 +316,74 @@ function abortTurn(thread) {
 
 // -- HTTP: pairing ----------------------------------------------------------
 
+function json(res, code, body) {
+  res.writeHead(code, { "content-type": "application/json" });
+  res.end(JSON.stringify(body));
+}
+
+const kindOf = (type) =>
+  type.startsWith("image/") ? "image" : type.startsWith("audio/") ? "audio" : "file";
+
+/** Unreferenced uploads are discarded after 24 h (v2.md, Files). */
+function pruneUploads() {
+  const now = Date.now();
+  for (const [id, file] of files) {
+    if (!file.used && now - file.at > UPLOAD_TTL_MS) files.delete(id);
+  }
+}
+if (UPLOADS) setInterval(pruneUploads, 60_000).unref();
+
+/** `X-Filename` is percent-encoded UTF-8; 1–120 characters after decoding. */
+function uploadName(req) {
+  const raw = req.headers["x-filename"];
+  if (typeof raw !== "string") return null;
+  let name;
+  try {
+    name = decodeURIComponent(raw);
+  } catch {
+    return null;
+  }
+  if (/[\u0000-\u001f\u007f]/.test(name)) return null;
+  const chars = [...name].length;
+  return chars >= 1 && chars <= UPLOAD_NAME_CHARS ? name : null;
+}
+
+function mediaType(req) {
+  const raw = req.headers["content-type"];
+  const type = typeof raw === "string" ? raw.split(";")[0].trim().toLowerCase() : "";
+  return type.length <= 100 && MIME_RE.test(type) ? type : null;
+}
+
+/** Raw request bytes, capped; rejects with `tooLarge` instead of buffering past it. */
+function readRaw(req, limit) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on("data", (d) => {
+      size += d.length;
+      if (size > limit) {
+        const err = new Error("too_large");
+        err.tooLarge = true;
+        reject(err);
+        req.destroy();
+        return;
+      }
+      chunks.push(d);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
+  });
+}
+
+function disposition(file) {
+  // v2.md: inline for image/* except SVG (it is scriptable) and for audio/*.
+  if ((file.type.startsWith("image/") && file.type !== "image/svg+xml") || file.type.startsWith("audio/")) {
+    return "inline";
+  }
+  const ascii = file.name.replace(/[^\x20-\x7e]/g, "_").replace(/["\\]/g, "_");
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(file.name)}`;
+}
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let size = 0;
@@ -320,18 +402,12 @@ function readBody(req) {
   });
 }
 
-const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, "http://localhost");
-  if (url.pathname !== "/v1/pair" || req.method !== "POST") {
-    res.writeHead(404).end();
-    return;
-  }
+async function pair(req, res) {
   let body;
   try {
     body = JSON.parse(await readBody(req));
   } catch {
-    res.writeHead(400, { "content-type": "application/json" });
-    res.end('{"error":"bad_request"}');
+    json(res, 400, { error: "bad_request" });
     return;
   }
   const { code, label } = body ?? {};
@@ -340,8 +416,7 @@ const server = http.createServer(async (req, res) => {
     typeof label !== "string" ||
     !LABEL_RE.test(label.trim())
   ) {
-    res.writeHead(400, { "content-type": "application/json" });
-    res.end('{"error":"bad_request"}');
+    json(res, 400, { error: "bad_request" });
     return;
   }
   // rate limit: more than 5 failures per minute across all clients
@@ -351,9 +426,8 @@ const server = http.createServer(async (req, res) => {
     !pairUsed && Date.now() < pairExpires && code.trim().toUpperCase() === pairCode;
   if (!codeOk) {
     rateFailures.push(now);
-    const code = rateFailures.length > 5 ? 429 : 401;
-    res.writeHead(code, { "content-type": "application/json" });
-    res.end(code === 429 ? '{"error":"rate_limited"}' : '{"error":"invalid_code"}');
+    const status = rateFailures.length > 5 ? 429 : 401;
+    json(res, status, { error: status === 429 ? "rate_limited" : "invalid_code" });
     return;
   }
   pairUsed = true;
@@ -367,6 +441,62 @@ const server = http.createServer(async (req, res) => {
   );
   res.writeHead(204).end();
   console.log(`paired device "${device}"`);
+}
+
+/** `POST /v1/upload`: raw bytes, cookie-authenticated, memory only. */
+async function upload(req, res) {
+  if (!UPLOADS) return json(res, 400, { error: "unsupported" });
+  const token = cookieToken(req);
+  if (!token || !tokens.has(token)) return json(res, 401, { error: "unauthorized" });
+  const now = Date.now();
+  const recent = (uploadTimes.get(token) ?? []).filter((at) => at > now - 60_000);
+  uploadTimes.set(token, recent);
+  if (recent.length >= UPLOADS_PER_MINUTE) return json(res, 429, { error: "rate_limited" });
+  const name = uploadName(req);
+  const type = mediaType(req);
+  if (!name || !type) return json(res, 400, { error: "bad_request" });
+  if (Number(req.headers["content-length"]) > UPLOAD_BYTES) return json(res, 413, { error: "too_large" });
+  let bytes;
+  try {
+    bytes = await readRaw(req, UPLOAD_BYTES);
+  } catch (err) {
+    return json(res, err?.tooLarge ? 413 : 400, { error: err?.tooLarge ? "too_large" : "bad_request" });
+  }
+  recent.push(now);
+  pruneUploads();
+  const id = `f_${randomBytes(16).toString("base64url")}`;
+  files.set(id, { token, name, type, size: bytes.length, bytes, at: now, used: false });
+  json(res, 201, { id });
+}
+
+/** `GET /v1/files/<id>`: only files a durable message references. */
+function download(req, res, url) {
+  const token = cookieToken(req);
+  if (!token || !tokens.has(token)) return json(res, 401, { error: "unauthorized" });
+  const id = url.pathname.slice("/v1/files/".length);
+  const file = UPLOAD_ID_RE.test(id) ? files.get(id) : undefined;
+  if (!file || !file.used) return json(res, 404, { error: "bad_request" });
+  res.writeHead(200, {
+    "Content-Type": file.type,
+    "Content-Length": file.size,
+    "X-Content-Type-Options": "nosniff",
+    "Content-Security-Policy": "sandbox",
+    "Cache-Control": "private, max-age=31536000, immutable",
+    "Content-Disposition": disposition(file),
+  });
+  res.end(file.bytes);
+}
+
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, "http://localhost");
+  try {
+    if (url.pathname === "/v1/pair" && req.method === "POST") return await pair(req, res);
+    if (url.pathname === "/v1/upload" && req.method === "POST") return await upload(req, res);
+    if (url.pathname.startsWith("/v1/files/") && req.method === "GET") return download(req, res, url);
+  } catch (err) {
+    console.error("request failed", err?.message ?? "unknown");
+  }
+  res.writeHead(404).end();
 });
 
 // -- WebSocket: the stream ---------------------------------------------------
@@ -447,7 +577,7 @@ function onStream(ws, token) {
           return;
         }
         conn.helloed = true;
-        reply(ws, frame.id, true, { v: 2, device, head: cursor || null, agent: AGENT_NAME, commands: COMMANDS, presets: PRESETS });
+        reply(ws, frame.id, true, { v: 2, device, head: cursor || null, agent: AGENT_NAME, commands: COMMANDS, presets: PRESETS, uploads: UPLOADS });
         // replay: oldest first, one bounded batch; the client re-hellos
         // with its new cursor if the batch was full
         const from = frame.cursor ?? 0;
@@ -521,19 +651,42 @@ function onStream(ws, token) {
         break;
       }
       case "send": {
-        const { key, text } = frame;
+        const { key, text, attachments } = frame;
         if (!thread || thread.info.archived || typeof key !== "string" || !ID_RE.test(key) || typeof text !== "string") return invalid();
         if (text.length > SEND_TEXT_CHARS) {
           reply(ws, frame.id, false, { error: "too_large" });
           return;
         }
+        // A repeated key stays `duplicate` whatever it is carrying now
+        // (v2.md, "Attach"), so this check comes before the ids are consumed.
         if (admitted.has(key)) {
           reply(ws, frame.id, true, { duplicate: true });
           return;
         }
-        admitted.set(key, text);
+        let info;
+        if (attachments !== undefined) {
+          if (!Array.isArray(attachments) || attachments.length > MAX_ATTACHMENTS) return invalid();
+          pruneUploads();
+          const seen = new Set();
+          for (const id of attachments) {
+            if (typeof id !== "string" || !UPLOAD_ID_RE.test(id) || seen.has(id)) return invalid();
+            seen.add(id);
+            const file = files.get(id);
+            // Unknown, foreign, expired or already used: the whole send fails.
+            if (!file || file.token !== token || file.used) return invalid();
+          }
+          info = attachments.map((id) => {
+            const file = files.get(id);
+            file.used = true;
+            return { id, name: file.name, type: file.type, size: file.size, kind: kindOf(file.type) };
+          });
+        }
+        admitted.set(key, { text, attachments: info ?? [] });
         reply(ws, frame.id, true, { duplicate: false });
-        emit(thread, "message", { id: `u-${key}`, role: "user", text, at: iso(), key });
+        emit(thread, "message", {
+          id: `u-${key}`, role: "user", text, at: iso(), key,
+          ...(info?.length ? { attachments: info } : {}),
+        });
         thread.queue.push(key);
         if (!thread.running) startTurn(thread);
         break;
