@@ -389,6 +389,9 @@ input#pair-code {
 .app {
   display: flex;
   flex-direction: column;
+  /* Opaque: iOS 26+ takes the status bar from fixed elements at the top edge and blurs it
+     over a transparent one. This shell is fixed at top 0 (keyboard handling). */
+  background: var(--bg);
 }
 
 .top {
