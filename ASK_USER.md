@@ -98,10 +98,12 @@ reset) cancels every pending question in that conversation, because an answer wo
 otherwise start a turn whose context no longer contains the question. A delivery mark lost
 in a crash is repaired before that cancellation, so a quarantined question whose `open`
 event is still in the log is cancelled by the reset rather than reopened by the repair. The plain
-native reset commits the reset and the cancellation together; when the host owns the
+native reset commits the cancellation immediately after the reset (two commits; a crash between
+them can leave one pending question in the new context until it is answered or expires); when
+the host owns the
 reset as a paired operation, the repair runs first, the reset commits, and the cancellation
 immediately after, so a rendered card is retracted a moment later rather than
-atomically. `/abort` and a host restart do not cancel questions: the answer is still a
+atomically; if the repair fails, the reset is refused and nothing changes. `/abort` and a host restart do not cancel questions: the answer is still a
 meaningful next turn, and an expired or cancelled button is refused with fixed text.
 
 ## Retention and limits

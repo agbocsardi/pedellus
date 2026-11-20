@@ -622,6 +622,7 @@ const CALLBACK_REFUSED_TEXT =
   "This looks like an OAuth callback URL. MCP login cannot be initiated from the app channel, so " +
   "it was not stored and was not sent to the assistant.";
 const RESET_BUSY = "Reset refused: chat busy. Abort or retry when idle.";
+const RESET_UNREPAIRED = "Reset refused: open questions could not be checked. Nothing changed; try again.";
 const ARCHIVED_CONTROL_TEXT =
   "That command was not applied: its thread is archived. Restore the thread first.";
 
@@ -2287,10 +2288,14 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       // The host's reset cancels pending questions in its own commit, so repair a quarantined question
       // whose card is still live before that commit reads the record. Otherwise the repair below would
       // reopen a question the reset had already skipped, and a tap could answer into the new context.
+      // If that repair fails, the reset is refused: proceeding would let the repair after it reopen a
+      // question the reset skipped.
       if (gateway.askSurfaces !== undefined) {
-        await reconcileThreadQuestions(thread).catch((error: unknown) => {
+        const repaired = await reconcileThreadQuestions(thread).then(() => true, (error: unknown) => {
           if (!signal?.aborted) journalEvent("app.question.reconcile_failed", {}, error);
+          return false;
         });
+        if (!repaired) return { kind: "refused", text: RESET_UNREPAIRED };
       }
       const result = await resetSession(sessionForThread(thread), adapterContext);
       if (result.status === "busy") return { kind: "refused", text: RESET_BUSY };
