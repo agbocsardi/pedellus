@@ -352,5 +352,7 @@ test('the app command parses shortcut add, list and revoke', async () => {
   ]) {
     assert.throws(() => parseAppInvocation(args), AppUsageError, `usage: ${JSON.stringify(args)}`);
   }
-  assert.throws(() => parseAppInvocation(['shortcut', 'add', '--label', 'bad label']), AppCommandError);
+  assert.throws(() => parseAppInvocation(['shortcut', 'add', '--label', ' padded']), AppCommandError);
+  // Labels follow the gateway's own rule: inner spaces are fine.
+  assert.deepEqual(parseAppInvocation(['shortcut', 'add', '--label', 'morning run']).command, { kind: 'shortcut-add', label: 'morning run' });
 });

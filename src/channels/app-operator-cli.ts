@@ -12,6 +12,7 @@ import type { Context } from "@earendil-works/chord";
 import type { LocalGatewayClient } from "../local/client.js";
 import { commandUsage, findCommandHelp, renderCommandHelp } from "../help/cli.js";
 import { generatePushKeys } from "./app-push.js";
+import { validAppLabel } from "./app-protocol.js";
 
 /** A refusal or failure to report as `durable-nanobot app: <message>`; exit status 1. */
 export class AppCommandError extends Error {
@@ -42,9 +43,9 @@ export interface AppInvocation {
 
 const ACTIONS = new Set(["pair", "devices", "revoke", "push-keys", "shortcut"]);
 
-/** The console's own label check: the same printable 1–40 characters a device label uses. */
+/** The console's label check is the gateway's own, so any label a device can have can be revoked. */
 function validLabelArg(label: string): boolean {
-  return label.length > 0 && label.length <= 40 && /^[\x21-\x7e]+$/.test(label);
+  return validAppLabel(label);
 }
 
 /** `app shortcut <add --label <label>|list|revoke <label>> [--config <path>]`. */

@@ -3133,7 +3133,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         refused = "pairing-limit";
       });
       if (refused !== undefined) return { refused };
-      journalEvent("app.pairing.created", { "pairing.label": chosenLabel });
+      journalEvent("app.pairing.created", chosenLabel === "" ? {} : { "pairing.label": chosenLabel });
       return created!;
     },
     async devices() {
@@ -3247,6 +3247,8 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       if (pairing === undefined) return;
       if (pairing.label !== undefined && pairing.label !== label) return;
       if (doc.devices.some((device) => device.revokedAtMs === undefined && device.label === label)) return;
+      // An unlabelled code cannot take a label another outstanding code was created for.
+      if (pairing.label === undefined && doc.pairings.some((entry) => entry !== pairing && entry.label === label)) return;
       if (doc.devices.filter((device) => device.revokedAtMs === undefined).length >= APP_LIMITS.maxDevices) return;
       // Single use: the code is consumed exactly when the device record is created.
       doc.pairings = doc.pairings.filter((entry) => !sameDigest(code.toUpperCase(), entry.codeHash));
