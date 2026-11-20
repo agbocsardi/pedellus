@@ -145,12 +145,14 @@ Lifecycle changes append durable `thread` events.
 The adapter grants no tool: coding tools, MCP, web, cron, memory and worker authority are whatever
 the configuration already gives that mapped chat. Its one model-facing tool is the `app` file
 capability above (*Files*), which grants no coding authority, returns no file content to the
-model, and reaches only the thread the model is already answering. The app chat is **not** an MCP login or
-`ask_user` owner surface in this phase: protocol v2 has no event that could carry a one-time
-authorization URL or an owner question without persisting it in the durable event log, and
-persisting such a URL in channel state is forbidden by the channels' binding contract (see
-*Known gaps*). A callback-shaped `send` is still intercepted before transcript admission, refused
-with one fixed notice, and its text is never stored.
+model, and reaches only the thread the model is already answering. The app chat **is** an MCP
+login owner surface for its own open threads: the one-time authorization URL goes to the devices
+streaming at that moment as a non-durable `login` event, never into the durable log, channel
+state or a push, and a completion is one fixed notice in that thread (protocol v2, *MCP login*).
+A callback-shaped `send` is intercepted before admission and offered to the login lifecycle; only
+the lifecycle's fixed notice is stored, and the callback text itself is never stored. `ask_user`
+remains unavailable because protocol v2 defines no owner-only event that could carry a question
+without persisting it (*Known gaps*).
 
 ## Fork admission
 
@@ -460,10 +462,10 @@ with a fixed reason and a durable fault entry; no raw record contents are logged
 
 ## Known gaps (phase 1)
 
-* **No MCP login or `ask_user` surface.** A mapped app chat cannot start an MCP login (no owner
-  surface is registered, so the login is refused before delivery) and cannot receive an
-  `ask_user` question. Protocol v2 defines no owner-only non-durable event; a later protocol
-  revision must add one before this channel can carry URLs or questions.
+* **No `ask_user` surface.** A mapped app chat cannot receive an `ask_user` question. Protocol v2
+  defines no owner-only non-durable event for it; the MCP login `login` event carries only its own
+  fields (see `pwa/protocol/v2.md`, *MCP login*), so this channel still needs a protocol revision
+  for questions.
 * **No history or cards.** The protocol marks them *later*; `history` still replies
   `unsupported`. The Tasks view is implemented (see *Tasks*). Files are implemented (see *Files*),
   including agent-sent files and sandboxed artifacts, but with no thumbnails, resumable or
@@ -525,7 +527,11 @@ key, reconnect without loss, controls with their replay reporting, the `hello.co
 catalogue with `model`/`help`/`digest`/`restart` arguments, usage notices and `unsupported`, a seeded reopen (interrupted
 command reported, held acknowledgement released, a pre-restart turn still answered), a failed run
 (`settled{failed}` with the error presence state), revocation, oversize frames and callback
-interception. v2 coverage includes thread lifecycle, search and list limits, concurrent turns and
+interception. `tests/app-mcp-login.behavior.test.mjs` covers the login surface with the loopback
+OAuth fixture: the URL reaching every hello'd device as a `login` frame and no durable event,
+channel state, push payload or transcript, the no-device cancellation, a pasted callback's fixed
+notice and completion, and stale, foreign, replayed and cross-thread callbacks refused with fixed
+text. v2 coverage includes thread lifecycle, search and list limits, concurrent turns and
 replay, fork context and scope checks after reopen, idle archive, interruption recovery, and cron restore.
 Files coverage: the opt-in (upload and `send.attachments` refused without `media`, `hello.uploads`),
 a durable upload record with byte-for-byte storage, the advertised and streamed `413` with nothing
