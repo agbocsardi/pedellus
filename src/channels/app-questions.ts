@@ -7,10 +7,13 @@
  * Every later change of that record (answered, expired on read, cancelled by `/new`, unknown
  * delivery outcome) is another `question` event for the same id, and the app keeps the latest one.
  *
- * The projection here is deliberately pure: it reads the question document and the channel's own
- * durable log and returns the events that are missing. The adapter appends them in the same commit
- * that changed the record, so a crash either publishes the change or leaves the record untouched
- * for the next read to reconcile.
+ * The projection here is deliberately pure: it reads the question document, the channel's own
+ * durable log and the marks of what this channel already published, and returns the events that
+ * are missing plus the marks they produce. The marks matter because the log is trimmed by
+ * retention: without them a terminal state whose event was pruned would be re-published on every
+ * later read. The adapter appends the events and stores the marks in the same commit that changed
+ * the record, so a crash either publishes the change or leaves the record untouched for the next
+ * read to reconcile.
  */
 import type { Draft } from "@earendil-works/chord";
 import {
@@ -32,11 +35,25 @@ type WireQuestionEvent = Extract<AppDurableEvent, { event: "question" }>;
 /** One `question` event as the adapter appends it, before its cursor is assigned. */
 export type AppQuestionEventInput = Omit<WireQuestionEvent, "cursor" | "thread"> & { readonly thread: string };
 
-/** The latest state the app already knows per question id; the log is ordered by cursor. */
-type KnownQuestion = { readonly state: AppQuestionState; readonly answer?: AskOptionId };
+/** What this channel last published for one question id; the durable log may be trimmed. */
+export type AppQuestionMark = { readonly state: AppQuestionState; readonly answer?: AskOptionId };
+/**
+ * Marks by question id for one thread. Each thread has its own question document, so a reconcile
+ * rebuilds only its own thread's map and the threads never overwrite each other's.
+ */
+export type AppQuestionMarks = Record<string, AppQuestionMark>;
+/** Marks per thread, held in the app channel state and bounded by the question records. */
+export type AppQuestionMarksByThread = Record<string, AppQuestionMarks>;
 
-function knownQuestions(events: readonly AppDurableEvent[]): Map<string, KnownQuestion> {
+/** The latest state the app already knows per question id; later log events win over the marks. */
+type KnownQuestion = AppQuestionMark;
+
+function knownQuestions(
+  events: readonly AppDurableEvent[],
+  marks: AppQuestionMarks | undefined,
+): Map<string, KnownQuestion> {
   const known = new Map<string, KnownQuestion>();
+  for (const [id, mark] of Object.entries(marks ?? {})) known.set(id, mark);
   for (const event of events) {
     if (event.event !== "question") continue;
     known.set(event.id, {
@@ -106,35 +123,46 @@ export function openQuestionEvent(thread: string, view: AskQuestionView): AppQue
   };
 }
 
+/** The mark one published event leaves; the caller stores it with the command that appended it. */
+export function questionMarkOf(event: AppQuestionEventInput): AppQuestionMark {
+  return event.answer === undefined
+    ? { state: event.state }
+    : { state: event.state, answer: event.answer };
+}
+
 /**
  * Settle overdue and crashed-delivery records (expiry on read, never a timer), then return the
- * `question` events the app's log is missing. A live `open` event is proof the append reached this
- * channel, so a delivery mark lost in a crash is upgraded here instead of being quarantined as an
- * unknown outcome. Records the app already shows in their current state add nothing.
+ * `question` events the app's log is missing and the marks they leave. A live `open` event is proof
+ * the append reached this channel, so a delivery mark lost in a crash is repaired here instead of
+ * being quarantined. Records the app already shows in their current state add nothing.
  */
 export function reconcileQuestionEvents(
   questions: Draft<AskQuestionsDocument>,
   events: readonly AppDurableEvent[],
+  marks: AppQuestionMarks | undefined,
   thread: string,
   nowMs: number,
-): AppQuestionEventInput[] {
-  if (!Array.isArray(questions.questions)) return [];
-  const known = knownQuestions(events);
+): { readonly events: AppQuestionEventInput[]; readonly marks: AppQuestionMarks } {
+  if (!Array.isArray(questions.questions)) return { events: [], marks: {} };
+  const known = knownQuestions(events, marks);
   for (const record of questions.questions) {
-    if (record.status === "pending" && record.delivery === "sending" && known.get(record.id)?.state === "open") {
-      record.delivery = "delivered";
-    }
+    if (!validQuestionRecord(record) || known.get(record.id)?.state !== "open") continue;
+    if (record.status === "pending" && record.delivery === "sending") record.delivery = "delivered";
   }
   pendingQuestionViews(questions, nowMs);
   const out: AppQuestionEventInput[] = [];
+  // Marks follow the records exactly: an entry exists while its record does, so the map stays bounded
+  // by the question document and a pruned record can never re-publish a stale state.
+  const next: AppQuestionMarks = {};
   for (const record of questions.questions) {
     if (!validQuestionRecord(record)) continue;
     const state = projectedState(record);
     if (state === undefined) continue;
-    const previous = known.get(record.id);
     const answer = state === "answered" ? record.optionId : undefined;
+    next[record.id] = answer === undefined ? { state } : { state, answer };
+    const previous = known.get(record.id);
     if (previous !== undefined && previous.state === state && previous.answer === answer) continue;
     out.push(questionEvent(thread, record, state));
   }
-  return out;
+  return { events: out, marks: next };
 }

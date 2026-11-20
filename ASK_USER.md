@@ -63,7 +63,8 @@ follow-up inputs over time, never a combined fabricated answer).
 - **App** (protocol v2, `question` event) appends one durable event with
   `state: "open"` in the thread's log; every later change (`answered`, `expired`,
   `cancelled`, `unknown`) is another event for the same id and the app keeps the
-  latest. Tapping sends `answer {thread, question, option}`; the gateway claims
+  latest. The channel also remembers the last state it published per id, so an
+  event trimmed by retention is never published again. Tapping sends `answer {thread, question, option}`; the gateway claims
   the record against that exact thread session and admits the stored label
   (`Answered question <id>: <label>`) as the follow-up turn in one commit, replies
   `accepted: true`, then publishes the `answered` event. A refused tap replies

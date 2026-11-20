@@ -56,8 +56,13 @@ import {
   offeredConversationCommands,
 } from "../help/commands.js";
 import { renderMemoryDigestStart, renderMemoryDigestStatus } from "../history/memory-digest.js";
-import { AskQuestionsDoc, cancelPendingQuestions, claimOutcomeText, claimQuestionAnswer, claimTypedQuestionAnswer, type AskSurfaceRegistry } from "../questions/index.js";
-import { openQuestionEvent, reconcileQuestionEvents } from "./app-questions.js";
+import { AskQuestionsDoc, cancelPendingQuestions, claimOutcomeText, claimQuestionAnswer, claimTypedQuestionAnswer, type AskQuestionsDocument, type AskSurfaceRegistry } from "../questions/index.js";
+import {
+  openQuestionEvent,
+  questionMarkOf,
+  reconcileQuestionEvents,
+  type AppQuestionMarksByThread,
+} from "./app-questions.js";
 import { RESTART_BUSY_MESSAGE, RestartBusyError } from "../restart.js";
 import type { GatewayMemoryDigest, GatewayModelList, GatewayModelPresets, GatewayModelSelection } from "../runtime.js";
 import {
@@ -142,6 +147,13 @@ export type AppChannelState = {
   sideOrigins?: Record<string, { readonly admittedAtMs: number }>;
   /** Threads owed a confirmation once the process that recorded an applied `restart` is replaced. */
   restart?: string[];
+  /**
+   * The last `question` state published per thread and question id. The durable log is trimmed by
+   * retention, so this is what keeps a terminal state from being re-published after its event was
+   * pruned. Bounded by the question records of each thread: an entry goes away with the record that
+   * owns it, and a thread's map is rebuilt only by that thread's own reconcile.
+   */
+  questionMarks?: AppQuestionMarksByThread;
 };
 
 export const AppState = defineDoc<AppChannelState>({
@@ -537,6 +549,24 @@ function rememberAnswer(doc: Draft<AppChannelState>, id: string, thread: string,
 
 function hasEventId(doc: Draft<AppChannelState>, id: string): boolean {
   return doc.events.some((event) => event.event === "message" && event.id === id);
+}
+
+/**
+ * Append this thread's missing `question` events and keep the marks they leave, in the caller's own
+ * commit. Returns true when the app has new question state to replay.
+ */
+function publishQuestionEvents(
+  doc: Draft<AppChannelState>,
+  questions: Draft<AskQuestionsDocument>,
+  thread: string,
+  nowMs: number,
+): boolean {
+  const byThread = doc.questionMarks ?? {};
+  const reconciled = reconcileQuestionEvents(questions, doc.events, byThread[thread], thread, nowMs);
+  // Only this thread's map is rebuilt: another thread's marks belong to its own question document.
+  doc.questionMarks = { ...byThread, [thread]: reconciled.marks };
+  for (const event of reconciled.events) appendEvent(doc, event);
+  return reconciled.events.length > 0;
 }
 
 /**
@@ -1338,9 +1368,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
             // thread does not reopen them.
             const questions = await tx.doc(AskQuestionsDoc, conversation.id);
             cancelPendingQuestions(questions);
-            for (const event of reconcileQuestionEvents(questions, doc.events, thread, now())) {
-              appendEvent(doc, event);
-            }
+            publishQuestionEvents(doc, questions, thread, now());
           }
           const entry = threadInfo(doc, thread)!;
           setArchived(doc, entry, new Date(now()).toISOString(), archived ? "manual" : undefined);
@@ -1407,13 +1435,14 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         if (!openThread(doc, thread)) { blocked = "bad_request"; return; }
         if (archiving.has(thread)) { blocked = "not_ready"; return; }
         const questions = await tx.doc(AskQuestionsDoc, conversation.id);
+        // Repair a delivery mark lost in a crash before the claim reads the record, so a live open
+        // card is answerable even when a read already quarantined it.
+        publishQuestionEvents(doc, questions, thread, now());
         const claim = claimQuestionAnswer(questions, {
           questionId, optionId: option, sessionKey, nowMs: now(),
         });
         // Expiry, and every other settled record, becomes durable before this reply leaves.
-        for (const event of reconcileQuestionEvents(questions, doc.events, thread, now())) {
-          appendEvent(doc, event);
-        }
+        publishQuestionEvents(doc, questions, thread, now());
         if (claim.result.status !== "accepted") {
           // Nothing is admitted. A retried request id explains once; a fresh tap explains again.
           const noticeId = `notice:answer:${questionId}:${frame.id as string}`;
@@ -1545,13 +1574,9 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           const questions = await tx.doc(AskQuestionsDoc, answerConversation.id);
           // The read repairs a delivery mark lost in a crash before the claim, so a live open card
           // can be answered by typing as well as by tapping.
-          for (const event of reconcileQuestionEvents(questions, doc.events, thread, atMs)) {
-            appendEvent(doc, event);
-          }
+          publishQuestionEvents(doc, questions, thread, atMs);
           claimTypedQuestionAnswer(questions, sessionForThread(thread), text, atMs);
-          for (const event of reconcileQuestionEvents(questions, doc.events, thread, atMs)) {
-            appendEvent(doc, event);
-          }
+          publishQuestionEvents(doc, questions, thread, atMs);
         }
       });
     } catch (error) {
@@ -2684,11 +2709,8 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     const conversation = await gateway.conversationFor(sessionForThread(thread), adapterContext);
     let changed = false;
     await mutateState(async (doc, tx) => {
-      const events = reconcileQuestionEvents(
-        await tx.doc(AskQuestionsDoc, conversation.id), doc.events, thread, now());
-      if (events.length === 0) return;
-      changed = true;
-      for (const event of events) appendEvent(doc, event);
+      changed = publishQuestionEvents(
+        doc, await tx.doc(AskQuestionsDoc, conversation.id), thread, now());
     });
     if (changed) pushEventsToSockets();
   };
@@ -2977,7 +2999,14 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       }
       await mutateState((doc) => {
         if (!openThread(doc, target)) throw new Error("the app thread is not open");
-        appendEvent(doc, openQuestionEvent(target, question));
+        const event = openQuestionEvent(target, question);
+        appendEvent(doc, event);
+        // Recorded now so the append stays known even after retention trims this event.
+        const byThread = doc.questionMarks ?? {};
+        doc.questionMarks = {
+          ...byThread,
+          [target]: { ...(byThread[target] ?? {}), [event.id]: questionMarkOf(event) },
+        };
       });
       // The commit above is the delivery. A failing live push must not report it as failed: every
       // device replays the same durable event after `hello`.

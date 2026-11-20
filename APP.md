@@ -258,10 +258,13 @@ refuses without admitting anything.
 Every later change is another `question` event for the same `id`, and the app keeps the latest one:
 `answered` (with the chosen option id for a tapped answer; a typed answer carries none), `expired`,
 `cancelled` by `/new`, and `unknown` for a delivery interrupted in a way the gateway cannot prove.
-A live `open` event itself proves the append happened, so a delivery mark lost in a crash is
-repaired on the next read instead of being quarantined. Expiry and quarantine are enforced when a
-question is read or claimed — on `answer`, a typed message, `/new`, or adapter start — never by an
-adapter timer, so an open card can outlive its answer window until one of those reads.
+Alongside the log the channel keeps the last state it published per question id, because retention
+trims events: a terminal state whose event was trimmed is never published again, and that memory
+goes away with the question record, so it stays bounded by the record set. A live `open` event
+itself proves the append happened, so a delivery mark lost in a crash is repaired on the next read
+instead of being quarantined. Expiry and quarantine are enforced when a question is read or claimed
+— on `answer`, a typed message, `/new`, archiving, or adapter start — never by an adapter timer, so
+an open card can outlive its answer window until one of those reads.
 
 `answer {thread, question, option}` claims the durable record against that exact thread session and
 admits the follow-up input in one commit. Only the stored record's own label is admitted

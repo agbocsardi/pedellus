@@ -1808,3 +1808,48 @@ test('archiving a thread cancels its open question and a restore does not reopen
     await device.close();
   });
 });
+test('an answered question is not re-published after retention trims its event', { timeout: 30_000 }, async () => {
+  await withChannel('pruned-question', {}, async ({ store, base }) => {
+    const device = await questionDevice(store, base);
+    scriptAsk(store, 'SYNTHETIC-PRUNED-ANSWER');
+    device.send({ type: 'req', id: 's1', op: 'send', key: 'k1', text: 'ask me about the deploy' });
+    await device.wait(() => device.events('question').some((event) => event.state === 'open'), 'the open question');
+    const open = device.events('question').find((event) => event.state === 'open');
+    await device.wait(() => device.events('settled').some((event) => event.key === 'k1'), 'the asking turn settled');
+    assert.equal((await request(device, 'a1', 'answer', { thread: 'main', question: open.id, option: 'a' })).accepted, true);
+    await device.wait(() => device.events('question').some((event) => event.id === open.id && event.state === 'answered'),
+      'the answered question event');
+
+    // Ack the current head: every durable event, including the question's own, is trimmed.
+    device.send({ type: 'req', id: 'h2', op: 'hello', v: 2, cursor: null });
+    await device.wait(() => device.response('h2') !== undefined, 'second hello');
+    assert.equal((await request(device, 'ack1', 'ack', { cursor: device.response('h2').head })).ok, true);
+    const trimmed = await appState(store.gateway);
+    assert.equal(trimmed.events.filter((event) => event.event === 'question').length, 0, 'the question events were trimmed');
+    assert.equal(trimmed.questionMarks.main[open.id].state, 'answered', 'the published state is remembered');
+
+    // A later reconcile (this typed input) sees the record settled and publishes nothing again.
+    assert.equal((await request(device, 's2', 'send', { key: 'k2', text: 'anything else' })).duplicate, false);
+    await device.wait(() => device.events('message').some((event) => event.role === 'user' && event.key === 'k2'),
+      'the typed input echoed');
+    const after = await appState(store.gateway);
+    assert.deepEqual(after.events.filter((event) => event.event === 'question'), [], 'no terminal state was re-published');
+
+    // Another thread's reconcile rebuilds only its own marks, so main's answered state stays known
+    // and is still never re-published.
+    const side = await createSide(device, 'pruned-side');
+    scriptAsk(store, 'side done');
+    device.send({ type: 'req', id: 's3', op: 'send', thread: side, key: 'k3', text: 'ask in the side thread' });
+    await device.wait(() => device.events('question').some((event) => event.thread === side && event.state === 'open'),
+      'the side thread question');
+    const sideOpen = device.events('question').find((event) => event.thread === side && event.state === 'open');
+    assert.equal((await request(device, 'a3', 'answer', { thread: side, question: sideOpen.id, option: 'a' })).accepted, true);
+    await device.wait(() => device.events('question').some((event) => event.id === sideOpen.id && event.state === 'answered'),
+      'the side thread answered');
+    const marks = (await appState(store.gateway)).questionMarks;
+    assert.equal(marks.main[open.id].state, 'answered', 'the side thread left main\'s entry alone');
+    assert.equal((await appState(store.gateway)).events.some((event) => event.id === open.id), false,
+      'main\'s trimmed terminal state is still not re-published');
+    await device.close();
+  });
+});
