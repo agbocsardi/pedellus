@@ -224,8 +224,8 @@ Login delivery is channel-neutral and direct:
 
 1. the assistant starts the login in the request's authenticated foreground
    chat. The one-time authorization URL is delivered to that surface only, as a
-   direct owner message or terminal output — never a tool result, transcript
-   entry or durable channel outbox record.
+   direct owner message, an app `login` frame or terminal output — never a tool
+   result, transcript entry or durable channel outbox record.
 2. the owner opens it on a phone or another device. A same-host browser still
    completes the normal loopback callback. When the browser cannot reach this
    host, the owner pastes the callback URL back into the same chat.
