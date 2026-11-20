@@ -355,6 +355,21 @@ class LocalConnection {
         onlyKeys(params, ["label"]);
         return { result: await this.appConsole().revoke(requireString(params, "label", 40)) };
       }
+      case "appShortcutAdd": {
+        const params = requireObject(request.params ?? {});
+        onlyKeys(params, ["label"]);
+        return this.appConsole().shortcutAdd(requireString(params, "label", 40));
+      }
+      case "appShortcutList": {
+        const params = requireObject(request.params ?? {});
+        onlyKeys(params, []);
+        return { shortcuts: await this.appConsole().shortcuts() };
+      }
+      case "appShortcutRevoke": {
+        const params = requireObject(request.params);
+        onlyKeys(params, ["label"]);
+        return { result: await this.appConsole().shortcutRevoke(requireString(params, "label", 40)) };
+      }
     }
     if (this.surface === undefined || this.sessionKey === undefined || this.gatewayConversation === undefined) {
       throw new LocalRequestError("unavailable", "attach must be the first request");

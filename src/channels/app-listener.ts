@@ -22,6 +22,7 @@ import {
   resolveStaticPath,
   staticMimeType,
 } from "./app-protocol.js";
+import { askHttpResponse, type AppAskOutcome } from "./app-shortcuts.js";
 import type { AttachmentInfo } from "./generated/protocol-v2.js";
 
 /** A refused upload body is read at most this far before the connection is dropped. */
@@ -85,6 +86,12 @@ export interface AppListenerHost {
   upload(device: AppUploadDevice, request: AppUploadStream): Promise<AppUploadOutcome>;
   /** Resolve one file a durable message references, for `GET /v1/files/<id>`. */
   download(device: AppUploadDevice, id: string): Promise<AppDownloadTarget | undefined>;
+  /**
+   * `POST /v1/ask` for one shortcut token: admit the request like an owner `send` and wait briefly
+   * for its outcome. A shortcut token authenticates nothing else, so it never reaches the methods
+   * above.
+   */
+  ask(token: string, request: unknown, signal: AbortSignal): Promise<AppAskOutcome>;
 }
 
 /** Fixed per-upload outcomes; every one is a wire status the protocol already defines. */
@@ -139,6 +146,12 @@ function frameBytes(data: import("ws").RawData): number {
   if (typeof data === "string") return Buffer.byteLength(data);
   if (Array.isArray(data)) return data.reduce((total, chunk) => total + chunk.length, 0);
   return data.byteLength;
+}
+
+/** The `Authorization: Bearer <token>` value; the scheme is case-insensitive. */
+function bearerToken(header: string | undefined): string | undefined {
+  if (header === undefined) return undefined;
+  return /^Bearer +(\S+) *$/iu.exec(header)?.[1];
 }
 
 /** Fixed-cookie extraction: the only header that authenticates a stream. */
@@ -254,6 +267,10 @@ export async function startAppListener(options: {
       await uploadEndpoint(request, response);
       return;
     }
+    if (request.method === "POST" && path === "/v1/ask") {
+      await askEndpoint(request, response);
+      return;
+    }
     if (request.method !== "GET" && request.method !== "HEAD") {
       response.writeHead(405, { "content-type": "application/json", allow: "GET, HEAD" });
       response.end(JSON.stringify({ error: "method_not_allowed" }));
@@ -315,6 +332,18 @@ export async function startAppListener(options: {
       });
       request.resume();
     } else response.once("finish", () => request.destroy());
+  }
+
+  /** A refused JSON request: answer at once and drop any unread body instead of buffering it. */
+  function refuseJson(
+    request: IncomingMessage,
+    response: ServerResponse,
+    status: number,
+    body: string,
+  ): void {
+    response.writeHead(status, { "content-type": "application/json" });
+    response.end(body);
+    response.once("finish", () => request.destroy());
   }
 
   async function uploadEndpoint(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -380,6 +409,46 @@ export async function startAppListener(options: {
     }
     // A refusal made before the body was read leaves it unread; drain it, or close if too big.
     refuseUpload(request, response, ...UPLOAD_ERRORS[outcome.status], outcome.status !== "too-large");
+  }
+
+  /**
+   * The shortcut endpoint: one bearer token, one bounded JSON body, one owner message. The token is
+   * read from `Authorization` only — never a cookie — so a shortcut credential cannot be mistaken
+   * for a device anywhere in this listener.
+   */
+  async function askEndpoint(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    const token = bearerToken(request.headers.authorization);
+    if (token === undefined) {
+      refuseJson(request, response, 401, JSON.stringify({ error: "unauthorized" }));
+      return;
+    }
+    // The body is bounded exactly like a stream frame before anything parses it.
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for await (const chunk of request) {
+      total += chunk.length;
+      if (total > APP_LIMITS.frameBytes) {
+        refuseJson(request, response, 413, JSON.stringify({ error: "too_large" }));
+        return;
+      }
+      chunks.push(Buffer.from(chunk));
+    }
+    let body: unknown;
+    try {
+      body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
+    } catch {
+      refuseJson(request, response, 400, JSON.stringify({ error: "bad_request" }));
+      return;
+    }
+    // A client that gives up while the turn runs stops its wait; nothing else changes.
+    const controller = new AbortController();
+    response.on("close", () => {
+      if (!response.writableEnded) controller.abort(new DOMException("ask closed", "AbortError"));
+    });
+    const outcome = await options.host.ask(token, body, controller.signal);
+    const reply = askHttpResponse(outcome);
+    response.writeHead(reply.status, { "content-type": "application/json" });
+    response.end(reply.body);
   }
 
   /** One file a durable message references; every other id is a plain 404. */

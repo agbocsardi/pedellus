@@ -110,6 +110,22 @@ import { createAppPushDispatcher, pushPayload, type AppPushDispatcher, type AppP
 import { absorbActivity, activityForWire, emptyActivity, type ActivityTally } from "./app-activity.js";
 import { startAppListener, type AppDeviceSession, type AppSessionHooks } from "./app-listener.js";
 import {
+  APP_SHORTCUT_LIMITS,
+  activeShortcut,
+  askOutcomeForAdmissionError,
+  createAskWaiters,
+  createShortcutRateLimiter,
+  hashShortcutToken,
+  newAskKey,
+  newShortcutToken,
+  parseAskRequest,
+  type AppAskOutcome,
+  type AppShortcutCreated,
+  type AppShortcutListing,
+  type AppShortcutRecord,
+  type AppShortcutRefusal,
+} from "./app-shortcuts.js";
+import {
   AppFileRejected,
   createAppFiles,
   APP_DEFAULT_TYPE,
@@ -161,6 +177,8 @@ export type AppChannelState = {
   controls: AppControlRecord[];
   devices: AppDeviceRecord[];
   pairings: AppPairingRecord[];
+  /** Shortcut credentials: a label and a token hash, never a device and never a token. */
+  shortcuts?: AppShortcutRecord[];
   /** Highest acknowledged durable cursor per device id. */
   acks: Record<string, number>;
   /** Monotonic admission stamp for notice event ids; time alone can repeat within a millisecond. */
@@ -295,6 +313,10 @@ export interface AppConsole {
   pair(label?: string): Promise<AppPairingCreated | { readonly refused: AppPairingRefusal }>;
   devices(): Promise<readonly AppDeviceListing[]>;
   revoke(label: string): Promise<"revoked" | "missing" | "invalid-label">;
+  /** Create one shortcut token; it is returned once and only its hash is stored. */
+  shortcutAdd(label: string): Promise<AppShortcutCreated | { readonly refused: AppShortcutRefusal }>;
+  shortcuts(): Promise<readonly AppShortcutListing[]>;
+  shortcutRevoke(label: string): Promise<"revoked" | "missing" | "invalid-label">;
 }
 
 export interface AppConsoleRegistry {
@@ -345,6 +367,8 @@ export type AppOptions = {
   readonly now?: () => number;
   /** Adapter scan cadence; tests may shorten it. Default 2s, bounds 50ms–60s. */
   readonly scanIntervalMs?: number;
+  /** How long `POST /v1/ask` waits for its answer; tests may shorten it. Bounds 50ms–120s. */
+  readonly askWaitMs?: number;
   /** Optional host/test hook with the bound port, fired once when the listener is serving. */
   readonly onListening?: (port: number) => void;
 };
@@ -927,6 +951,10 @@ export function validateOptions(options: AppOptions): void {
       options.scanIntervalMs < 50 || options.scanIntervalMs > 60_000)) {
     throw new Error("App scanIntervalMs must be an integer from 50 to 60000");
   }
+  if (options.askWaitMs !== undefined && (!Number.isSafeInteger(options.askWaitMs) ||
+      options.askWaitMs < 50 || options.askWaitMs > 120_000)) {
+    throw new Error("App askWaitMs must be an integer from 50 to 120000");
+  }
   if (options.agentName !== undefined && !validAppAgentName(options.agentName)) {
     throw new Error("App agentName must be 1 to 40 printable characters");
   }
@@ -973,6 +1001,8 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   const now = options.now ?? (() => Date.now());
   const agentName = options.agentName ?? "Durable";
   const scanIntervalMs = options.scanIntervalMs ?? SCHEDULED_SCAN_INTERVAL_MS;
+  /** How long a shortcut waits for its turn before the endpoint answers `pending`. */
+  const askWaitMs = options.askWaitMs ?? APP_LIMITS.askWaitMs;
   const archiveAfterMs = (options.autoArchiveDays ?? 14) * DAY_MS;
   const scope = withCancel(context);
   const adapterContext = scope.context;
@@ -1023,6 +1053,10 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   const pendingControls = new Set<Promise<void>>();
   /** Pairing failures inside the rolling one-minute window; in-memory, so a restart clears it. */
   const pairingFailures: number[] = [];
+  /** Shortcut ask windows, per token hash; in-memory like the pairing failures. */
+  const shortcutRate = createShortcutRateLimiter(now);
+  /** Shortcut asks waiting for their durable `settled`; woken by every state commit. */
+  const askWaiters = createAskWaiters(() => state.events);
   const active = new Set<Promise<void>>();
   const activeReplies = new Map<string, number>();
   let activeNotices = 0;
@@ -1124,6 +1158,9 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   };
 
   const pushEventsToSockets = (): void => {
+    // Every commit that appends events funnels through here; a settled shortcut ask resolves from
+    // the log before the sockets are pushed, so an ask never polls.
+    askWaiters.wake();
     for (const socket of sockets.values()) pushEvents(socket);
   };
 
@@ -1708,6 +1745,26 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     }
   }
 
+  /** One `send` admission's result, whether it came from a device socket or a shortcut request. */
+  type SendAdmission =
+    | { readonly kind: "admitted"; readonly duplicate: boolean }
+    | { readonly kind: "error"; readonly error: AppErrorCode }
+    | { readonly kind: "stopped" };
+
+  /**
+   * A `send`'s attachment ids: `undefined` for none, `"bad"` for a list that refuses the request.
+   * Upload ids are the only attachment authority: this device's, unexpired, unused, bounded. An
+   * empty list is indistinguishable from no attachments at all, and without media storage no
+   * upload can exist, so every id is unknown. A shortcut request has no attachments field at all.
+   */
+  const attachmentIdsFor = (raw: unknown): string[] | "bad" | undefined => {
+    if (raw === undefined) return undefined;
+    if (!Array.isArray(raw) || raw.length > APP_LIMITS.maxAttachments ||
+        raw.some((id) => typeof id !== "string" || !APP_LIMITS.uploadIdPattern.test(id))) return "bad";
+    if (raw.length > 0 && !files.available) return "bad";
+    return raw.length === 0 ? undefined : raw as string[];
+  };
+
   /**
    * One callback-shaped `send`: consumed before admission and offered to the MCP login lifecycle.
    *
@@ -1778,67 +1835,47 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     sendOk({ duplicate: false });
   }
 
-  async function handleSendFrame(
-    deviceId: string,
-    frame: Record<string, unknown>,
-    sendOk: (body?: Record<string, unknown>) => void,
-    sendError: (error: AppErrorCode) => void,
-  ): Promise<void> {
+  /**
+   * The one owner-message admission path: `send` frames and `POST /v1/ask` both come through here,
+   * so a shortcut gets exactly a device send's bounds, idempotency by key, echo event, pending
+   * record and question settlement. `deviceId` is absent only for a shortcut, which can never name
+   * an upload (its request has no attachments field).
+   */
+  async function admitSend(deviceId: string | undefined, frame: Record<string, unknown>): Promise<SendAdmission> {
     const thread = parseThreadId(frame.thread === undefined ? APP_MAIN_THREAD : frame.thread);
-    if (thread === undefined || !openThread(state, thread)) return sendError("bad_request");
-    if (archiving.has(thread)) return sendError("not_ready");
+    if (thread === undefined || !openThread(state, thread)) return { kind: "error", error: "bad_request" };
+    if (archiving.has(thread)) return { kind: "error", error: "not_ready" };
     const key = frame.key;
     const text = frame.text;
-    // Upload ids are the only attachment authority: this device's, unexpired, unused, bounded.
-    const rawAttachments = frame.attachments;
-    let attachmentIds: string[] | undefined;
-    if (rawAttachments !== undefined) {
-      if (!Array.isArray(rawAttachments) || rawAttachments.length > APP_LIMITS.maxAttachments ||
-          rawAttachments.some((id) => typeof id !== "string" || !APP_LIMITS.uploadIdPattern.test(id))) {
-        return sendError("bad_request");
-      }
-      attachmentIds = rawAttachments as string[];
-      // Without media storage no upload can exist, so every id is unknown. An empty list is
-      // indistinguishable from no attachments at all.
-      if (attachmentIds.length > 0 && !files.available) return sendError("bad_request");
-      if (attachmentIds.length === 0) attachmentIds = undefined;
-    }
+    const attachmentIds = attachmentIdsFor(frame.attachments);
+    if (attachmentIds === "bad") return { kind: "error", error: "bad_request" };
     if (typeof key !== "string" || !APP_LIMITS.idPattern.test(key) || typeof text !== "string" ||
         (text.length === 0 && (attachmentIds === undefined || attachmentIds.length === 0))) {
-      sendError("bad_request");
-      return;
+      return { kind: "error", error: "bad_request" };
     }
     if (text.length > APP_LIMITS.sendTextChars) {
-      sendError("too_large");
-      return;
-    }
-    // A callback-shaped line is never admitted or stored; the login lifecycle consumes it first.
-    if (looksLikeOAuthCallback(text)) {
-      await handleCallbackSend(thread, key, text, sendOk, sendError);
-      return;
+      return { kind: "error", error: "too_large" };
     }
     // The first send into a thread creates its mapping and snapshot: reserve that before the
     // admission is acked, so nothing is admitted that the host cannot hold.
     if (state.sendKeys.some((item) => item.key === key) || hasEventId(state, `send:${key}`)) {
-      return sendOk({ duplicate: true });
+      return { kind: "admitted", duplicate: true };
     }
     if (gateway.reserveAppThread !== undefined) {
       // Rechecked here, immediately before the reservation, so an archived thread is refused
       // before its snapshot can be reinstalled, whatever awaits are added above this point.
-      if (!openThread(state, thread)) return sendError("bad_request");
+      if (!openThread(state, thread)) return { kind: "error", error: "bad_request" };
       let reserved: "ok" | "full";
       try {
         reserved = await gateway.reserveAppThread(thread, adapterContext);
       } catch (error) {
-        if (stopping || signal?.aborted) return;
+        if (stopping || signal?.aborted) return { kind: "stopped" };
         journalEvent("app.reserve.failed", {}, error);
-        sendError("internal");
-        return;
+        return { kind: "error", error: "internal" };
       }
       if (reserved === "full") {
         journalEvent("app.send.refused", { reason: "capacity" });
-        sendError("not_ready");
-        return;
+        return { kind: "error", error: "not_ready" };
       }
     }
     // A typed ordinary message settles the oldest delivered question in this thread in the same
@@ -1869,6 +1906,8 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         // whole send and the commit admits nothing, not even the idempotency key.
         let claimed: AppUploadRecord[] | undefined;
         if (attachmentIds !== undefined) {
+          // Only a paired device owns uploads; a shortcut caller has no device to claim with.
+          if (deviceId === undefined) { blocked = "bad_request"; return; }
           try {
             claimed = await files.claim(tx, { deviceId, ids: attachmentIds, atMs, messageId: eventId });
           } catch (error) {
@@ -1910,24 +1949,49 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         }
       });
     } catch (error) {
-      if (stopping || signal?.aborted) return;
+      if (stopping || signal?.aborted) return { kind: "stopped" };
       if (error instanceof Error && error.message === QUEUE_FULL) {
         journalEvent("app.send.refused", { reason: "queue-full" });
-        sendError("not_ready");
-        return;
+        return { kind: "error", error: "not_ready" };
       }
       journalEvent("app.send.failed", {}, error);
-      sendError("internal");
-      return;
+      return { kind: "error", error: "internal" };
     }
-    if (blocked !== undefined) return sendError(blocked);
+    if (blocked !== undefined) return { kind: "error", error: blocked };
     pushEventsToSockets();
-    sendOk({ duplicate });
     if (!duplicate) {
       journalEvent("app.admitted", { "send.key": key, "queue.depth": state.pending.length });
       void releaseWithheld(thread);
       drain();
     }
+    return { kind: "admitted", duplicate };
+  }
+
+  async function handleSendFrame(
+    deviceId: string,
+    frame: Record<string, unknown>,
+    sendOk: (body?: Record<string, unknown>) => void,
+    sendError: (error: AppErrorCode) => void,
+  ): Promise<void> {
+    // A callback-shaped line is consumed before admission and offered to the MCP login lifecycle: it
+    // never becomes a turn, so there is nothing to admit. Its send key keeps its own idempotency.
+    // Only the frame's own preconditions are checked here; everything else takes `admitSend`.
+    const callback = frame.text;
+    if (typeof callback === "string" && looksLikeOAuthCallback(callback)) {
+      const thread = parseThreadId(frame.thread === undefined ? APP_MAIN_THREAD : frame.thread);
+      if (thread === undefined || !openThread(state, thread)) return sendError("bad_request");
+      if (archiving.has(thread)) return sendError("not_ready");
+      if (attachmentIdsFor(frame.attachments) === "bad") return sendError("bad_request");
+      const key = frame.key;
+      if (typeof key !== "string" || !APP_LIMITS.idPattern.test(key)) return sendError("bad_request");
+      if (callback.length > APP_LIMITS.sendTextChars) return sendError("too_large");
+      await handleCallbackSend(thread, key, callback, sendOk, sendError);
+      return;
+    }
+    const admission = await admitSend(deviceId, frame);
+    if (admission.kind === "stopped") return;
+    if (admission.kind === "error") return sendError(admission.error);
+    sendOk({ duplicate: admission.duplicate });
   }
 
   // ── Reactions ──────────────────────────────────────────────────────────
@@ -3100,6 +3164,54 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       journalEvent("app.device.revoked", { "device.label": label });
       return "revoked";
     },
+    async shortcutAdd(label) {
+      const trimmed = label.trim();
+      if (!validAppLabel(trimmed)) return { refused: "invalid-label" };
+      let created: AppShortcutCreated | undefined;
+      let refused: AppShortcutRefusal | undefined;
+      await mutateState((doc) => {
+        const current = doc.shortcuts ?? [];
+        if (current.filter((entry) => entry.revokedAtMs === undefined).length >= APP_SHORTCUT_LIMITS.maxShortcuts) {
+          refused = "shortcut-limit";
+          return;
+        }
+        if (current.some((entry) => entry.revokedAtMs === undefined && entry.label === trimmed)) {
+          refused = "label-in-use";
+          return;
+        }
+        const token = newShortcutToken();
+        const createdAtMs = now();
+        // The token is returned once to the console and never stored: only its hash joins the state.
+        doc.shortcuts = [...current, { label: trimmed, tokenHash: hashShortcutToken(token), createdAtMs }];
+        created = { label: trimmed, token, createdAtMs };
+      });
+      if (refused !== undefined) return { refused };
+      // The token is never journalled; the journal's projection does not carry labels either.
+      journalEvent("app.shortcut.created");
+      return created!;
+    },
+    async shortcuts() {
+      return (state.shortcuts ?? [])
+        .map((entry) => ({
+          label: entry.label,
+          createdAtMs: entry.createdAtMs,
+          ...(entry.revokedAtMs === undefined ? {} : { revokedAtMs: entry.revokedAtMs }),
+        }))
+        .sort((left, right) => left.createdAtMs - right.createdAtMs);
+    },
+    async shortcutRevoke(label) {
+      if (!validAppLabel(label)) return "invalid-label";
+      let revoked = false;
+      await mutateState((doc) => {
+        const entry = (doc.shortcuts ?? []).find((item) => item.revokedAtMs === undefined && item.label === label);
+        if (entry === undefined) return;
+        entry.revokedAtMs = now();
+        revoked = true;
+      });
+      if (!revoked) return "missing";
+      journalEvent("app.shortcut.revoked");
+      return "revoked";
+    },
   };
 
   /** Rolling failure window for `POST /v1/pair`; in-memory, so a restart clears it. */
@@ -3162,6 +3274,42 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       entry.revokedAtMs === undefined && sameDigest(token, entry.tokenHash));
     return device === undefined ? undefined : { deviceId: device.id, label: device.label };
   };
+
+  /**
+   * `POST /v1/ask`: one shortcut token admits one owner message through the same `admitSend` path
+   * as a device `send` (same bounds, idempotency by key, echo event and pending record, so every
+   * paired device sees the message and its answer), then waits up to `askWaitMs` for that key's
+   * durable `settled`. A shortcut token reaches nothing else: not the stream, files, pairing, push
+   * or controls.
+   */
+  async function askShortcut(
+    token: string,
+    request: unknown,
+    requestSignal: AbortSignal | undefined,
+  ): Promise<AppAskOutcome> {
+    // Unknown and revoked tokens are indistinguishable: both are simply not an active shortcut.
+    const shortcut = activeShortcut(state.shortcuts, token);
+    if (shortcut === undefined) return { status: "unauthorized" };
+    // Only an authenticated token spends its own window; an unknown one never reaches this point.
+    if (!shortcutRate.allow(shortcut.tokenHash)) return { status: "rate-limited" };
+    const parsed = parseAskRequest(request);
+    if (parsed.kind !== "ok") return { status: parsed.kind };
+    // Callback-shaped text is taken by a device `send` before admission and offered to the MCP
+    // login lifecycle; it never becomes a turn, so no `settled` could ever arrive for it. An ask
+    // cannot start a login exchange either, so it is refused up front as a bad request.
+    if (looksLikeOAuthCallback(parsed.request.text)) return { status: "bad-request" };
+    if (stopping || signal?.aborted) return { status: "internal" };
+    const thread = parsed.request.thread ?? APP_MAIN_THREAD;
+    const key = parsed.request.key ?? newAskKey();
+    const admission = await admitSend(undefined, { thread, key, text: parsed.request.text });
+    if (admission.kind === "stopped") return { status: "internal" };
+    if (admission.kind === "error") return askOutcomeForAdmissionError(admission.error);
+    const waited = await askWaiters.wait(thread, key, askWaitMs, requestSignal);
+    if (waited.outcome === "answered") return { status: "answered", text: waited.text };
+    // Still running: the answer arrives in the app as usual, and the caller gets the admitted key.
+    if (waited.outcome === "timeout") return { status: "pending", key };
+    return { status: waited.outcome };
+  }
 
   // ── Scheduled results and interruption notices ────────────────────────────
 
@@ -3568,6 +3716,8 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       authenticate: (token) => authenticate(token),
       onSocket: (session, hooks) => onSocket(session, hooks),
       upload: (device, request) => files.upload({ deviceId: device.deviceId, ...request }),
+      // A shortcut token is its own credential class: only `POST /v1/ask` resolves it.
+      ask: (token, request, requestSignal) => askShortcut(token, request, requestSignal),
       // Any paired device may fetch a file once a durable message references it; nothing else.
       download: async (_device, id) => {
         const file = await files.download(id);

@@ -422,6 +422,69 @@ reopen them; an open question would otherwise leave a card that can never be ans
 that blocks every later ask. The idle auto-archive performs the same repair, cancellation and
 `cancelled` append in its own archive commit. `abort` and a restart cancel nothing.
 
+## Shortcuts
+
+`POST /v1/ask` lets an iOS Shortcut (or any automation that cannot hold the app's cookie) ask the
+agent one question and read the answer back. It is off until the owner creates a token on the host,
+over the same private local socket as `app pair`:
+
+```bash
+durable-nanobot app shortcut add --label morning   # prints the token once
+durable-nanobot app shortcut list                  # labels, created, revoked
+durable-nanobot app shortcut revoke morning        # immediate
+```
+
+The token is 32 random bytes (base64url), printed exactly once and stored durably only as its
+SHA-256 hash beside its label, like a device hash. Labels follow the device rules (printable,
+1–40 characters); at most 8 shortcut tokens are active, and a revoked label is free again.
+Comparison is constant-time, and revocation is immediate because every ask re-reads the state:
+a revoked token stops every *new* ask. An ask already admitted is not cancelled by revocation —
+its turn still runs and its answer still arrives, as it would if the token had never been revoked.
+
+A shortcut token is **not a device**. It is read only from the `Authorization: Bearer` header of
+`/v1/ask`; it never authenticates the stream (it is never the `durable_device` cookie), and it
+cannot upload, download, pair, subscribe to Web Push or run a control. The listener has no path
+that resolves a shortcut token to a device, and the adapter has none that grants it thread or
+file authority.
+
+- Request: JSON `{"text": "...", "thread"?: "<id>", "key"?: "<send key>"}`. `text` and `key`
+  are bounded exactly like `send` (`16 000` characters, `[A-Za-z0-9_-]{1,64}`); the body is bounded
+  like a stream frame. `thread` defaults to `main` and must be open (an archived or unknown thread
+  is `400 bad_request`). A missing `key` gets a fresh one.
+- Admission is the **same commit** a device `send` uses: the same idempotency by `key`, the same
+  durable `message{role:"user"}` echo and pending record, the same typed-answer settlement of an
+  open question. Every paired device therefore sees the message and its answer in that thread. The
+  journal records creation and revocation events without the token (its projection carries no
+  labels either).
+- After admission the endpoint waits up to `LIMITS.askWaitMs` (25 s) for that key's durable
+  `settled`, event-driven rather than polled: `200 {"outcome":"answered","text":"<final answer>"}`
+  (a split answer is joined by part), `200 {"outcome":"failed"}` or `{"outcome":"aborted"}`, or
+  `202 {"outcome":"pending","key":"<key>"}` when the turn is still running — the answer then
+  arrives in the app as usual. A repeated `key` admits nothing and reports that key's existing
+  outcome, so a retried Shortcut is safe. A duplicate whose `settled` event has already been
+  trimmed out of the capped log cannot be told from a running turn: it waits out the window and
+  answers `202 {"outcome":"pending","key":"<key>"}` too, still admitting nothing.
+- Errors are fixed and carry nothing else: `401 {"error":"unauthorized"}` (missing, unknown or
+  revoked token), `400 {"error":"bad_request"}`, `413 {"error":"too_large"}`, `429
+  {"error":"rate_limited"}` (more than `LIMITS.asksPerMinute` = 10 asks per token in a rolling
+  minute; in-memory, so a restart clears it). No free text, no stack, no token echo.
+
+### Example: iOS Shortcut ("Get contents of URL")
+
+One action is enough; a Dictate or Ask-for-Input action fills the question.
+
+| Field | Value |
+|---|---|
+| URL | `https://<tailnet-host>/v1/ask` |
+| Method | POST |
+| Headers | `Authorization` = `Bearer <token>` (the value `app shortcut add` printed once) |
+| Request Body | JSON: `text` = the dictated question (optionally `thread`, `key`) |
+
+The reply is a dictionary. `outcome` is `answered`, `failed`, `aborted` or `pending`; when
+`answered`, `text` holds the final answer; when `pending`, `key` names the admitted message and
+its answer appears in the installed app. A `401` means the token was revoked or mistyped; create a
+new one on the host.
+
 ## Notifications (Web Push)
 
 Optional and off unless `app.push` is configured and its private key variable is set. The wire
@@ -498,6 +561,9 @@ with a fixed reason and a durable fault entry; no raw record contents are logged
 * A delivery that keeps failing is held after ten attempts (`held: true`), never resent
   automatically.
 * Device sockets are bounded by the 16-device pairing limit; the pairing rate window is one minute.
+* Shortcut credentials are bounded at 8 active tokens and 10 asks per token per rolling minute.
+  A shortcut ask waits at most `LIMITS.askWaitMs`; past that it answers `pending` and the turn
+  keeps running, so a slow answer is never guessed or retried.
 * Upload records are bounded (200 unreferenced per device, 4 000 total) and uploads are rate limited
   per device and minute; a refused upload stores no bytes. Referenced originals are never deleted by
   the adapter and there is no total-disk cap — keeping the workspace media directory bounded is the
@@ -513,6 +579,8 @@ with a fixed reason and a durable fault entry; no raw record contents are logged
   multipart uploads and no per-file deletion.
 * **The upload rate window is in-memory.** A restart clears it, like the pairing window; the durable
   per-device and total record bounds still apply.
+* **The shortcut ask window is in-memory.** A restart clears it, like the pairing and upload
+  windows; the durable per-token record and its hash remain.
 * **Web Push is offline-verified only.** No real push service, browser subscription or service
   worker has been exercised; a failed (non-404/410) send is only retried by the next message, as
   specified. The app side (permission, service worker, badge) lives in `pwa/app`.
@@ -553,6 +621,12 @@ from the listener; a gateway without `app.push` never loads it. It ships no type
 
 ## Checks
 
+`tests/app-shortcuts.behavior.test.mjs` covers the shortcut endpoint offline: token creation,
+listing and revocation through the console host, the token's inability to authenticate the stream,
+uploads or files, an ask that answers and appears on a connected device, duplicate keys, a slow
+turn's `pending` and its later streamed answer, `failed`/`aborted` outcomes, the per-token rate
+window, bounded bodies, and archived-thread refusal.
+
 `tests/app-channel.behavior.test.mjs` runs offline in `npm run test:behavior`: a real gateway over
 a temporary store with a faux provider, the real listener on an ephemeral loopback port, a
 synthetic WebSocket client and a controllable clock. It covers config strictness, static paths and
@@ -582,9 +656,9 @@ refusing the whole send without consuming anything, and download headers (`inlin
 `filename*` for documents) with `401` for an unpaired request and `404` for pending, malformed or
 unreferenced ids.
 No tailnet, device, credential or paid inference is
-used. The `app pair`/`devices`/`revoke` local-socket dispatch is exercised through the same console
-host the running adapter exports; the thin socket layer itself follows the `cron` console's
-existing tests.
+used. The `app pair`/`devices`/`revoke` and `app shortcut add`/`list`/`revoke` local-socket dispatch
+is exercised through the same console host the running adapter exports; the thin socket layer
+itself follows the `cron` console's existing tests.
 
 `tests/app-agent-files.behavior.test.mjs` covers agent file delivery offline: `send` appends one
 durable assistant message with an attachment record in one commit and the file downloads unchanged
