@@ -69,6 +69,7 @@ import {
   type AppConsoleRegistry, type AppGateway,
 } from "./channels/app.js";
 import { APP_MAIN_THREAD, parseThreadId } from "./channels/app-protocol.js";
+import { selectTasks, type AppTaskList } from "./channels/app-tasks.js";
 import type { CronOwner } from "./automation/cron.js";
 import {
   ASK_USER_TOOL_NAME,
@@ -467,6 +468,13 @@ export interface Gateway {
   readonly appSnapshotRoom?: NonNullable<AppGateway["appSnapshotRoom"]>;
   readonly createAppThread?: NonNullable<AppGateway["createAppThread"]>;
   readonly reserveAppThread?: NonNullable<AppGateway["reserveAppThread"]>;
+  /**
+   * The app channel's bounded Tasks view for one already-mapped thread. Read-only: it lists that
+   * thread's own workers and scheduled jobs through the same owner-scoped readers the model tools
+   * use, bounds the result to `LIMITS.maxListedTasks`, and maps it display-only. Nothing else is
+   * read, started, retried or cancelled; an unmapped session key reads nothing.
+   */
+  readonly appTasks?: NonNullable<AppGateway["appTasks"]>;
   /**
    * MCP server connection state; absent when MCP is not configured and enabled. A failed server has
    * no tools; its status carries a fixed failure code, never a transport message or configured value.
@@ -4204,6 +4212,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       },
       backgroundStatus: (sessionKey, ctx) => backgroundStatusFor(sessionKey, ctx),
       activeWork: (ctx) => activeWorkFor(ctx),
+      appTasks: (sessionKey, ctx) => appTasksFor(sessionKey, ctx),
       ...(config.app === undefined ? {} : {
         async createAppThread(stateId, thread, register, ctx) {
           await root.commit(async (tx) => {
@@ -4647,6 +4656,24 @@ export async function openGateway(config: PortConfig, context: Context, options:
         digest: { live: digestLive, parked: digestParked },
         active,
       };
+    }
+    /**
+     * The Tasks view of one mapped thread. The owner-scoped list functions decide what exists; this
+     * function only reads them, once each, and never creates, retries or changes anything. An
+     * unmapped session key has no conversation to read, so it answers an empty list rather than
+     * mapping (and thereby creating) one.
+     */
+    async function appTasksFor(sessionKey: string, ctx: Context): Promise<AppTaskList> {
+      const conversationId = await mappedConversationId(sessionKey, ctx);
+      if (conversationId === undefined) return { tasks: [] };
+      const workers = workerFoundation !== undefined && workerSpawners.has(conversationId)
+        ? await workerFoundation.list(harness!, conversationId, ctx)
+        : [];
+      const cronOwner = cronOwners.get(conversationId);
+      const jobs = cronFoundation !== undefined && cronOwner !== undefined
+        ? await cronFoundation.list(harness!, conversationId, { owner: cronOwner }, ctx)
+        : [];
+      return { tasks: selectTasks(workers, jobs) };
     }
     /**
      * One read of the native task inspection. Sleeping is an armed timer and blocked is parked work,

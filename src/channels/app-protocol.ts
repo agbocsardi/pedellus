@@ -60,7 +60,7 @@ export type AppErrorCode = ErrorCode;
 export type AppCommandInfo = CommandInfo;
 /** One `hello.presets` entry; `model` is `provider/model`. */
 export type AppPresetInfo = PresetInfo;
-/** Accepted ops; `history`/`tasks` are declared in v2.md as later work. */
+/** Accepted ops; `history` is declared in v2.md as later work. */
 export const APP_REQUEST_OPS: readonly string[] = [
   "hello", "send", "ack", "control", "ping", "history", "tasks",
   "threads", "thread.create", "thread.rename", "thread.archive",

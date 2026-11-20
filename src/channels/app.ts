@@ -57,6 +57,7 @@ import {
 import { renderMemoryDigestStart, renderMemoryDigestStatus } from "../history/memory-digest.js";
 import { RESTART_BUSY_MESSAGE, RestartBusyError } from "../restart.js";
 import type { GatewayMemoryDigest, GatewayModelList, GatewayModelPresets, GatewayModelSelection } from "../runtime.js";
+import type { AppTaskList } from "./app-tasks.js";
 import {
   APP_CLOSE,
   APP_LIMITS,
@@ -189,6 +190,11 @@ export interface AppGateway {
   memoryDigest?: GatewayMemoryDigest;
   /** Optional bounded background snapshot for the `status` control. */
   backgroundStatus?(sessionKey: string, context: Context): Promise<BackgroundStatus>;
+  /**
+   * The Tasks view (`tasks`): that thread's own workers and scheduled jobs, newest first and
+   * bounded. Read-only; an unmapped thread lists nothing and creates nothing.
+   */
+  appTasks?(sessionKey: string, context: Context): Promise<AppTaskList>;
   /**
    * Paired reset for `new`: a native reset plus the host's prompt-snapshot rebuild in one
    * operation, refused atomically while a run is live. Absent keeps the plain native reset.
@@ -1086,9 +1092,17 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           sendOk();
           return;
         case "history":
-        case "tasks":
           sendError("unsupported");
           return;
+        case "tasks": {
+          const thread = parseThreadId(frame.thread === undefined ? APP_MAIN_THREAD : frame.thread);
+          if (thread === undefined) return sendError("bad_request");
+          if (gateway.appTasks === undefined) return sendError("unsupported");
+          // Read-only expansion: listing never maps a thread, so an unknown thread lists nothing.
+          const listed = await gateway.appTasks(sessionForThread(thread), adapterContext);
+          sendOk({ tasks: [...listed.tasks] });
+          return;
+        }
         default:
           socket.session.close(APP_CLOSE.protocol, "unknown op");
       }
