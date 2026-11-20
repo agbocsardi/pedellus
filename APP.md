@@ -33,6 +33,7 @@ listener is loaded.
 | `staticRoot` | Required absolute directory holding the built PWA. Files are served with safe path resolution (no traversal, no directory listing, encoded separators are not structure), correct MIME types and `index.html` for the root; `sw.js` is always served `no-store`. |
 | `autoArchiveDays` | Optional integer ≥1, default 14. Automatically archive inactive side threads, but never while they have running or queued work. |
 | `agentName` | Optional agent display name, 1–40 printable characters, default `Durable`. Sent as `agent` in every `hello` reply; display only, no authority. |
+| `push` | Optional Web Push block: `{subject, publicKey, privateKeyEnv}`. Absent (or a private key variable that is unset at start) leaves every `push.*` request `unsupported` and sends nothing. `subject` is a `mailto:` or `https:` contact, `publicKey` is the base64url uncompressed P-256 VAPID public key, and `privateKeyEnv` names the environment variable holding the private key — the key itself is never in config. |
 
 The block is strict: an unrecognized key is refused at startup instead of being ignored, like the
 Discord block. The listener ignores Tailscale identity headers by construction: any local process
@@ -48,6 +49,33 @@ tailscale serve --bg 43190
 
 `tailscale serve` terminates TLS and proxies to `127.0.0.1:43190`; HTTPS is required for service
 workers and Web Push on the device. The app and the API share that origin, so no CORS exists.
+
+Web Push is optional. Generate one VAPID key pair from the owner's terminal (no gateway, config or
+file is involved; the pair is printed once and written nowhere):
+
+```sh
+durable-nanobot app push-keys
+```
+
+Put the private key in the gateway's environment file (never the repository) and reference it by
+name in the config:
+
+```json
+{
+  "app": {
+    "port": 43190,
+    "staticRoot": "/home/owner/deploy/durable-pwa/dist",
+    "push": {
+      "subject": "mailto:owner@example.org",
+      "publicKey": "<the printed public key>",
+      "privateKeyEnv": "NANOBOT_APP_PUSH_PRIVATE_KEY"
+    }
+  }
+}
+```
+
+The private key is read once at gateway start. A missing or malformed variable disables push with
+one terse startup diagnostic naming only the variable; the rest of the gateway starts normally.
 
 Pair a device from the owner's terminal:
 
@@ -208,6 +236,30 @@ unprintable, contains whitespace or is too long is dropped) and a `model` event 
 listed preset, otherwise `null`. Known gap: a CLI `/reload` that changes presets or resets
 selections is not pushed to connected apps; they see it on their next `hello`.
 
+## Notifications (Web Push)
+
+Optional and off unless `app.push` is configured and its private key variable is set. The wire
+contract is in `pwa/protocol/v2.md`; this section is the gateway's behavior.
+
+- `push.key` returns the configured VAPID public key. `push.subscribe` validates the browser's
+  `PushSubscription.toJSON()` bounds and stores exactly one subscription per device, replacing the
+  previous one; `push.unsubscribe` removes it and is idempotent. All three reply `unsupported` when
+  push is not configured. Subscriptions live in the device record of the app channel state, never in
+  a transcript, model context or log line; revoking a device drops its subscription with its token.
+- After a durable `message` with role `assistant` or `notice` is appended, each subscribed device
+  without an open, `hello`'d stream is sent one push. The payload is content-free JSON
+  `{"v":2,"thread":"<id>","unread":<n>}` — never message text. `unread` counts that device's
+  durable `assistant`/`notice` messages above its acked cursor, capped at 99.
+- The `Topic` header is a 22-character base64url hash of the thread id, so a newer push for the same
+  thread replaces an undelivered older one; TTL is 24 hours and urgency `normal`.
+- Sends are bounded: a request timeout, at most one in flight per device, and one coalesced follow-up
+  that re-reads the latest unread count when notifications arrived during a send. A 404 or 410
+  answer removes that subscription (unless it was already replaced). Any other failure is not
+  retried; the next message tries again.
+
+The sender uses the pinned `web-push` library (the same one the phase-0 probe used), imported
+lazily so a gateway without `app.push` never loads it.
+
 ## Scheduled results and interruption notices
 
 The adapter consumes the channel-neutral durable outbox (`nanobot.cron.deliveries`) for each
@@ -236,8 +288,11 @@ with a fixed reason and a durable fault entry; no raw record contents are logged
   surface is registered, so the login is refused before delivery) and cannot receive an
   `ask_user` question. Protocol v2 defines no owner-only non-durable event; a later protocol
   revision must add one before this channel can carry URLs or questions.
-* **No uploads, media, history, tasks, cards or Web Push.** The protocol marks them *later*;
-  `history` and `tasks` reply `unsupported`; a `send` with `attachments` replies `unsupported`.
+* **No uploads, media, history, tasks or cards.** The protocol marks them *later*; `history` and
+  `tasks` reply `unsupported`; a `send` with `attachments` replies `unsupported`.
+* **Web Push is offline-verified only.** No real push service, browser subscription or service
+  worker has been exercised; a failed (non-404/410) send is only retried by the next message, as
+  specified. The app side (permission, service worker, badge) lives in `pwa/app`.
 * **The event log is capped at 2 000.** Beyond it the oldest events are dropped even if
   unacknowledged; a returning device below the floor replays from the floor with a visible cursor
   gap.
@@ -264,6 +319,10 @@ with a fixed reason and a durable fault entry; no raw record contents are logged
 without an `app` block never loads the listener; `npm ci` installs it because the lockfile includes
 it. `@types/ws` 8.18.2 is a dev dependency for typechecking only.
 
+`web-push` 4.0.0 (MPL-2.0) is pinned for Web Push and imported lazily from `app-push.ts`, like `ws`
+from the listener; a gateway without `app.push` never loads it. It ships no type declarations, so
+`src/types/web-push.d.ts` declares exactly the surface used.
+
 ## Checks
 
 `tests/app-channel.behavior.test.mjs` runs offline in `npm run test:behavior`: a real gateway over
@@ -283,3 +342,8 @@ No tailnet, device, credential or paid inference is
 used. The `app pair`/`devices`/`revoke` local-socket dispatch is exercised through the same console
 host the running adapter exports; the thin socket layer itself follows the `cron` console's
 existing tests.
+
+`tests/app-push.behavior.test.mjs` covers Web Push offline: config strictness, local key generation,
+the unconfigured `unsupported` replies, subscription validation/replacement/unsubscription, a
+content-free push only to a disconnected device, 410 removal without later sends, and coalescing
+with a synthetic push endpoint on an ephemeral loopback port.
