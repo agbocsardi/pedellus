@@ -21,6 +21,8 @@ type AttachmentView = { id: string; name: string; type: string; size: number; ki
 type Pick = {
   id: string; file: File; name: string; type: string; size: number;
   state: "waiting" | "uploading" | "done" | "failed"; uploadId?: string; note?: string; preview?: string;
+  /** Seconds, for a pick that came from the recorder: its chip names it by length, not by file. */
+  voice?: number;
 };
 type Sheet = { kind: "list" | "menu" | "tools" | "confirm-new" | "model" } | { kind: "rename"; title: string }
   | { kind: "create"; title: string; from?: ThreadOrigin }
@@ -278,7 +280,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   const layoutWidth = useRef(0);
   const reflowedAt = useRef(0);
   const fileRef = useRef<HTMLInputElement>(null);
-  const voiceRef = useRef<{ recording: Recording; cap: ReturnType<typeof setTimeout> } | null>(null);
+  const voiceRef = useRef<{ recording: Recording; cap: ReturnType<typeof setTimeout>; startedAt: number } | null>(null);
   const uploading = useRef(new Set<string>());
   const previews = useRef(new Set<string>());
   const press = useRef<{ x: number; y: number; timer: ReturnType<typeof setTimeout> } | null>(null);
@@ -605,7 +607,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   }
 
   /** Picked or recorded files: limit checks first, then upload what the gateway will take. */
-  function addFiles(chosen: File[], threadId: string = thread) {
+  function addFiles(chosen: File[], threadId: string = thread, voiceSecs?: number) {
     if (!chosen.length) return;
     const problems: string[] = [];
     const room = Math.max(0, LIMITS.maxAttachments - (picks[threadId] ?? []).length);
@@ -629,6 +631,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
         id: crypto.randomUUID().replaceAll("-", ""), file, name: file.name,
         type: file.type || "application/octet-stream", size: file.size,
         state: online && store.uploads ? "uploading" : "waiting", preview,
+        ...(voiceSecs === undefined ? {} : { voice: voiceSecs }),
       });
     }
     setError(problems.join(" "));
@@ -673,7 +676,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
       return;
     }
     const cap = setTimeout(() => void sendVoice(), VOICE_MAX_MS);
-    voiceRef.current = { recording, cap };
+    voiceRef.current = { recording, cap, startedAt: Date.now() };
     setVoice({ startedAt: Date.now(), thread });
     setVoiceSecs(0);
   }
@@ -715,6 +718,9 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
 
   /** The composer can no longer show this recording: stop it and keep what it captured. */
   async function keepVoice(threadId: string, why: string) {
+    // Read the clock before `takeVoice` drops the ref: the chip shows this length.
+    const started = voiceRef.current?.startedAt;
+    const secs = started === undefined ? undefined : Math.round((Date.now() - started) / 1000);
     const result = await takeVoice();
     if (!result) return;
     if (result.stopped === "size") {
@@ -722,7 +728,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
       return;
     }
     setHint(why);
-    addFiles([result.file], threadId);
+    addFiles([result.file], threadId, secs);
   }
 
   async function discardMessage(key: string) {
@@ -1082,7 +1088,9 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
             : "Reconnect to restore"}</p>
         ) : !writable ? <p className="archived-hint">Read-only until thread details are available.</p> : <>
           {files.length > 0 && <ul className="picks" aria-label={`${files.length} ${files.length === 1 ? "file" : "files"} to send`}>
-            {files.map((pick) => (
+            {files.map((pick) => {
+            const voice = pick.voice !== undefined;
+            return (
               <li key={pick.id} className="pick" data-state={pick.state}>
                 {pick.preview ? (
                   <img className="pick-thumb" src={pick.preview} alt="" />
@@ -1093,8 +1101,10 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
                   </span>
                 )}
                 <span className="pick-text">
-                  <b>{pick.name}</b>
-                  <small title={pick.note}>{pickLabel(pick)} · {formatBytes(pick.size)}</small>
+                  <b>{voice ? "Voice note" : pick.name}</b>
+                  <small title={pick.note}>{voice
+                    ? (pick.state === "done" ? lengthText(pick.voice!) : pickLabel(pick))
+                    : `${pickLabel(pick)} · ${formatBytes(pick.size)}`}</small>
                 </span>
                 {(pick.state === "waiting" || pick.state === "failed") &&
                   <button className="pick-action" onClick={() => void runUpload(thread, pick)}>Retry</button>}
@@ -1103,7 +1113,8 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
                 </button>
                 {pick.state === "uploading" && <span className="pick-progress" aria-hidden="true" />}
               </li>
-            ))}
+            );
+          })}
           </ul>}
           {voice ? (
             <div className="capsule recording" role="group" aria-label="Voice note recording">
