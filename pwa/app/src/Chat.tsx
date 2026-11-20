@@ -793,9 +793,10 @@ function NotificationsItem({ store, conn, online }: { store: Store; conn: Connec
         if (res.error === "unsupported") await store.setPush({ gatewayUnsupported: true });
         return;
       }
-      if (!res.key) return;
-      // Padding is optional in base64url; comparing one form keeps this honest.
-      const gatewayKey = res.key.replace(/=+$/, "");
+      if (typeof res.key !== "string" || res.key === "") return;
+      // One form for comparing: base64url alphabet, no padding (a gateway sending plain base64
+      // must not cause a resubscribe on every menu open).
+      const gatewayKey = res.key.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
       // Compare against the key the store last saw before overwriting it.
       const rotated = store.push.key !== undefined && store.push.key !== gatewayKey;
       await store.setPush({ gatewayUnsupported: false, key: gatewayKey });
