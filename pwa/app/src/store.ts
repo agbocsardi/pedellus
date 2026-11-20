@@ -327,7 +327,7 @@ export class Store {
       if (m && (m.state === "queued" || m.state === "sent")) {
         return this.updateOutgoing(m, "admitted");
       }
-    } else if (ev.event === "settled" || (ev.event === "message" && ev.role === "assistant")) {
+    } else if (ev.event === "settled" || (ev.event === "message" && ev.role === "assistant" && this.answerEnded(ev))) {
       this.activities.delete(ev.thread);
       const unfinished = this.unfinished.get(ev.thread);
       if (ev.key && unfinished?.delete(ev.key) && !unfinished.size) this.unfinished.delete(ev.thread);
@@ -337,6 +337,18 @@ export class Store {
         if (m && !terminal(m.state)) return this.updateOutgoing(m, ev.outcome);
       }
     }
+  }
+
+  /**
+   * Whether this assistant message is the end of its turn: a message that fits one frame, or a
+   * split one with every part received (protocol v2, "Long messages"). Every part carries the
+   * same `key`, so ending the turn on an earlier one would report the thread idle, and drop its
+   * status and activity, while the rest of the answer is still on the wire. A split whose parts
+   * are not all here stays open; the `settled` that follows the last part closes it regardless.
+   */
+  private answerEnded(ev: Extract<ChatEvent, { event: "message" }>): boolean {
+    if (ev.part === undefined) return true;
+    return this.splitMessage(ev.thread, ev.id)?.complete === true;
   }
 
   /** Record one part of a split message (protocol v2, "Long messages"); a replay may repeat one. */
