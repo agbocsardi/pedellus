@@ -18,8 +18,10 @@ import {
   AppUsageError,
   parseAppInvocation,
   runAppCommand,
+  runAppPushKeys,
   type AppInvocation,
 } from "./channels/app-operator-cli.js";
+import { resolvePushOptions } from "./channels/app-push.js";
 import { runModelsCommand, type ModelsInvocation } from "./model-catalog-cli.js";
 import { workspaceContextGatewayOptions } from "./context/workspace-host.js";
 import { COMMANDS, commandUsage, findCommandHelp, renderCommandHelp, renderOverview, renderUsage } from "./help/cli.js";
@@ -318,6 +320,11 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   }
   const app = appInvocation(args);
   if (app !== undefined) {
+    // Key generation is local and writes nothing: no gateway, config or environment is read.
+    if (app.invocation.command.kind === "push-keys") {
+      await runAppPushKeys(stdout);
+      return;
+    }
     await runAppOperator(app.invocation, await readConfig(app.config));
     return;
   }

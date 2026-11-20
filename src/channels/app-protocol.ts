@@ -165,6 +165,9 @@ export type AppControlRecord = {
   readonly status: "admitted" | "applied" | "refused" | "unconfirmed";
 };
 
+/** One validated Web Push subscription: the browser's `PushSubscription.toJSON()` fields. */
+export type AppPushSubscription = { readonly endpoint: string; readonly p256dh: string; readonly auth: string };
+
 /** One paired device: the token itself exists only in the device's cookie, never here. */
 export type AppDeviceRecord = {
   readonly id: string;
@@ -181,6 +184,64 @@ export type AppPairingRecord = {
   readonly createdAtMs: number;
   readonly expiresAtMs: number;
 };
+
+const BASE64URL = /^[A-Za-z0-9_-]+$/u;
+
+/** VAPID `sub`: an absolute `mailto:` or `https:` URI, bounded and printable. */
+export function validVapidSubject(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 200) return false;
+  if (/[\u0000-\u0020\u007f]/u.test(value)) return false;
+  if (value.startsWith("mailto:")) return value.length > "mailto:".length;
+  if (!value.startsWith("https://")) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && url.hostname !== "";
+  } catch {
+    return false;
+  }
+}
+
+/** A base64url-encoded uncompressed P-256 point: 65 bytes, leading `0x04`. */
+export function validVapidPublicKey(value: unknown): value is string {
+  if (typeof value !== "string" || value.length !== 87 || !BASE64URL.test(value)) return false;
+  const bytes = Buffer.from(value, "base64url");
+  return bytes.length === 65 && bytes[0] === 4;
+}
+
+/** A base64url-encoded P-256 private scalar: 32 bytes. */
+export function validVapidPrivateKey(value: unknown): value is string {
+  if (typeof value !== "string" || value.length !== 43 || !BASE64URL.test(value)) return false;
+  return Buffer.from(value, "base64url").length === 32;
+}
+
+/**
+ * One `push.subscribe` subscription, or `undefined` when any field is out of bounds. The endpoint
+ * is an `https:` URL within `pushEndpointChars`; both keys are non-empty base64url within their
+ * bounds. Unknown extra keys are ignored, like the browser's own `toJSON()` output.
+ */
+export function parsePushSubscription(value: unknown): AppPushSubscription | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  const endpoint = raw.endpoint;
+  if (typeof endpoint !== "string" || endpoint.length === 0 || endpoint.length > APP_LIMITS.pushEndpointChars) {
+    return undefined;
+  }
+  let url: URL;
+  try {
+    url = new URL(endpoint);
+  } catch {
+    return undefined;
+  }
+  if (url.protocol !== "https:" || url.hostname === "") return undefined;
+  const keys = raw.keys;
+  if (keys === null || typeof keys !== "object" || Array.isArray(keys)) return undefined;
+  const { p256dh, auth } = keys as Record<string, unknown>;
+  if (typeof p256dh !== "string" || p256dh.length === 0 || p256dh.length > APP_LIMITS.pushP256dhChars ||
+      !BASE64URL.test(p256dh)) return undefined;
+  if (typeof auth !== "string" || auth.length === 0 || auth.length > APP_LIMITS.pushAuthChars ||
+      !BASE64URL.test(auth)) return undefined;
+  return { endpoint, p256dh, auth };
+}
 
 export const APP_STATIC_TYPES: Readonly<Record<string, string>> = Object.freeze({
   ".css": "text/css; charset=utf-8",
