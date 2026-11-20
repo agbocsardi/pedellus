@@ -3,7 +3,7 @@ import { Streamdown } from "streamdown";
 import type { Connection } from "./conn";
 import type { AgentStatus, Outgoing, OutgoingState, Store } from "./store";
 import { LIMITS, MAIN_THREAD, type CommandInfo, type DurableEvent, type MessageEvent, type PresetInfo, type ThreadInfo, type ThreadOrigin } from "./protocol";
-import { disablePush, enablePush, hasPushSubscription, pushPermission, pushSupported, type PushPermission } from "./push";
+import { disablePush, enablePush, hasPushSubscription, pushPermission, pushSupported, clearAppBadge, type PushPermission } from "./push";
 import { Avatar, type AvatarState } from "./Avatar";
 
 const FINE_POINTER = matchMedia("(pointer: fine)").matches;
@@ -397,6 +397,36 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   }
 
   useEffect(() => { setSheet(null); setError(""); setSlashHidden(false); }, [thread]);
+
+  // A notification tap deep-links here: `/?thread=<id>` on a cold start, or a
+  // postMessage from the service worker into the window it focused.
+  useEffect(() => {
+    const open = (id: string | undefined) => {
+      if (!id || !store.threads.has(id)) return false;
+      store.selectThread(id);
+      return true;
+    };
+    const param = new URLSearchParams(location.search).get("thread") ?? undefined;
+    if (param && open(param)) history.replaceState(null, "", location.pathname);
+    // `MessageEvent` here is the protocol's message frame, hence the plain Event.
+    const onMessage = (e: Event) => {
+      const data = (e as { data?: { type?: string; thread?: string } }).data;
+      if (data?.type === "open-thread") open(data.thread);
+    };
+    navigator.serviceWorker?.addEventListener("message", onMessage);
+    return () => navigator.serviceWorker?.removeEventListener("message", onMessage);
+  }, [store, store.connState]);
+
+  // The badge counts messages this device has not acked, so it goes once the
+  // replay is applied and acked and the app is on screen.
+  useEffect(() => {
+    const clear = () => {
+      if (!document.hidden && store.connState === "open") clearAppBadge();
+    };
+    clear();
+    document.addEventListener("visibilitychange", clear);
+    return () => document.removeEventListener("visibilitychange", clear);
+  }, [store, store.connState]);
 
   return (
     <div className="app">
