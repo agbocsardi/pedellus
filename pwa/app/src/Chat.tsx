@@ -479,7 +479,8 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   // thread search, Alt+↑/↓ steps through the visible threads; the composer
   // keeps its own Enter/Shift+Enter handling (see onKeyDown).
   const shortcut = useEffectEvent((e: KeyboardEvent) => {
-    if (e.defaultPrevented) return;
+    // An IME composition owns its keys (Esc cancels the composition, not the sheet).
+    if (e.defaultPrevented || e.isComposing || e.keyCode === 229) return;
     if (e.key === "Escape") {
       if (!sheet) return;
       e.preventDefault();
@@ -488,6 +489,8 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
       return;
     }
     if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "k") {
+      // Behind another open sheet the sidebar search is not reachable; leave the sheet in charge.
+      if (sheet && sheet.kind !== "list") return;
       e.preventDefault();
       document.querySelector<HTMLInputElement>(sheet?.kind === "list" ? ".sheet-layer .thread-search" : ".sidebar .thread-search")?.focus();
       return;
@@ -502,6 +505,11 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     e.preventDefault();
     if (next !== thread) store.selectThread(next);
   });
+  // Keep the open thread visible in the sidebar when it changes (or the layout turns wide).
+  useEffect(() => {
+    if (!wide) return;
+    document.querySelector('.sidebar .thread-row[aria-current="true"]')?.scrollIntoView({ block: "nearest" });
+  }, [wide, thread]);
   useEffect(() => {
     if (!wide) return;
     const onKey = (e: KeyboardEvent) => shortcut(e);
@@ -511,12 +519,12 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
 
   return (
     <div className="app" data-wide={wide ? "" : undefined}>
-      <aside className="sidebar" aria-label="Threads">
+      {wide && <aside className="sidebar" aria-label="Threads">
         <ThreadList store={store} conn={conn} online={online} onNew={() => show({ kind: "create", title: "" })}
           onSelect={(id) => store.selectThread(id)} />
-      </aside>
+      </aside>}
       <header className="top">
-        {!main && <button className="thread-back" onClick={() => store.selectThread(back.id)}
+        {!main && !wide && <button className="thread-back" onClick={() => store.selectThread(back.id)}
           aria-label={`Back to ${back.id === MAIN_THREAD ? "Main" : back.title}`}>
           <span aria-hidden="true">‹</span><span>{back.id === MAIN_THREAD ? "Main" : back.title}</span>
         </button>}
