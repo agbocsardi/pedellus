@@ -271,7 +271,11 @@ replies `accepted: false`, appends one fixed `notice` message (once per request 
 nothing. A typed ordinary `send` settles the oldest delivered question in that thread atomically
 with its own admission — commands, callback-shaped text and attachment-only sends never count — so
 the answer is that message and the record stores no duplicate text. `/new` cancels every pending
-question in the thread in the same operation as the reset; `abort` and a restart do not.
+question in the thread in the same operation as the reset; archiving a thread cancels its open
+questions in the archive's own commit, so the archived thread and the `cancelled` card arrive
+together and restoring the thread does not reopen them — an open question would otherwise leave a
+card that can never be answered and a record that blocks every later ask. `abort` and a restart
+do not.
 
 ## Notifications (Web Push)
 

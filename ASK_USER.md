@@ -70,7 +70,8 @@ follow-up inputs over time, never a combined fabricated answer).
   `accepted: false`, appends one fixed notice and admits nothing. A typed ordinary
   message settles the oldest delivered question in that thread in the same commit
   as its admission, exactly like Telegram and the CLI, and `/new` cancels pending
-  questions with the reset.
+  questions with the reset; archiving the thread cancels them with the archive, and
+  restoring it does not reopen them.
 - **Local terminal** has no button protocol: the question is printed with numbered
   options and the owner types an answer as an ordinary message. Attaching prints
   questions that are still open in that conversation, so a gateway restart does not

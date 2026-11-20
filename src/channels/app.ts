@@ -1333,6 +1333,14 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
               retired.add(item.key);
             }
             doc.pending = doc.pending.filter((item) => !retired.has(item.key));
+            // An archived thread has no question surface, so its open cards can never be answered and
+            // the record would block every later ask. Withdraw them in this same commit; restoring the
+            // thread does not reopen them.
+            const questions = await tx.doc(AskQuestionsDoc, conversation.id);
+            cancelPendingQuestions(questions);
+            for (const event of reconcileQuestionEvents(questions, doc.events, thread, now())) {
+              appendEvent(doc, event);
+            }
           }
           const entry = threadInfo(doc, thread)!;
           setArchived(doc, entry, new Date(now()).toISOString(), archived ? "manual" : undefined);

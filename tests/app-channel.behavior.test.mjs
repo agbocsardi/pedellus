@@ -1761,3 +1761,50 @@ test('/new cancels the open question and a later tap is refused', { timeout: 30_
     await device.close();
   });
 });
+test('archiving a thread cancels its open question and a restore does not reopen it', { timeout: 30_000 }, async () => {
+  await withChannel('archive-question', {}, async ({ store, base }) => {
+    const device = await questionDevice(store, base);
+    device.send({ type: 'req', id: 'tc', op: 'thread.create', key: 'question-thread' });
+    await device.wait(() => device.response('tc') !== undefined, 'side thread created');
+    const side = device.response('tc').thread;
+    scriptAsk(store, 'must not answer an archived question');
+    device.send({ type: 'req', id: 's1', op: 'send', thread: side, key: 'k1', text: 'ask me in the side thread' });
+    await device.wait(() => device.events('question').some((event) => event.thread === side && event.state === 'open'),
+      'the side thread open question');
+    const open = device.events('question').find((event) => event.thread === side);
+    await device.wait(() => device.events('settled').some((event) => event.key === 'k1'), 'the asking turn settled');
+
+    // The archive commit withdraws the thread's surface, so it also cancels the open card: the reply
+    // is sent after that same commit.
+    device.send({ type: 'req', id: 'ar', op: 'thread.archive', thread: side, archived: true });
+    await device.wait(() => device.response('ar') !== undefined, 'archive reply');
+    assert.equal(device.response('ar').ok, true);
+    const questions = await store.gateway.conversationFor(`app:chat:${side}`, context);
+    const stored = await questions.commit(async (tx) => {
+      const doc = await tx.doc(AskQuestionsDoc, questions.id);
+      return doc.questions.find((record) => record.id === open.id)?.status;
+    }, context);
+    assert.equal(stored, 'cancelled', 'the archived question is settled in the archive commit');
+    const cancelled = device.events('question').find((event) => event.id === open.id && event.state === 'cancelled');
+    assert.ok(cancelled !== undefined, 'the cancelled card was published with the archive');
+    const archivedEvent = device.events('thread').find((event) => event.thread.id === side && event.thread.archived);
+    assert.ok(cancelled.cursor < archivedEvent.cursor, 'both were appended by the one archive commit');
+
+    // Restoring does not reopen it, and the settled record no longer blocks a new ask.
+    assert.equal((await request(device, 'rs', 'thread.archive', { thread: side, archived: false })).ok, true);
+    scriptAsk(store, 'answered after the restore');
+    device.send({ type: 'req', id: 's2', op: 'send', thread: side, key: 'k2', text: 'ask again' });
+    await device.wait(() => device.events('question').some((event) => event.thread === side &&
+      event.state === 'open' && event.id !== open.id), 'the second question was delivered');
+    const second = device.events('question').find((event) => event.thread === side &&
+      event.state === 'open' && event.id !== open.id);
+
+    // A later reconcile (this tap) re-publishes nothing for the cancelled question.
+    assert.equal((await request(device, 'a1', 'answer', { thread: side, question: second.id, option: 'b' })).accepted, true);
+    await device.wait(() => device.events('question').some((event) => event.id === second.id && event.state === 'answered'),
+      'the second question answered');
+    assert.deepEqual(device.events('question').filter((event) => event.id === open.id).map((event) => event.state),
+      ['open', 'cancelled']);
+    await device.close();
+  });
+});
