@@ -28,6 +28,12 @@ function span(step: ActivityStep): string {
   return `${minutes}m ${Math.round((ms % 60_000) / 1_000)}s`;
 }
 
+/** Present tense only while a step still runs; a finished list says what was used. */
+function label(total: number, running: boolean): string {
+  const tools = total === 1 ? "1 tool" : `${total} tools`;
+  return running ? `Using ${tools}…` : `Used ${tools}`;
+}
+
 export function ActivitySteps({ steps, omitted, live }: {
   steps: ActivityStep[]; omitted?: number; live?: boolean;
 }) {
@@ -41,7 +47,7 @@ export function ActivitySteps({ steps, omitted, live }: {
           setOpen((value) => !value);
           setDetail(undefined);
         }}>
-        <span className="activity-count">{total === 1 ? "Used 1 tool" : `Used ${total} tools`}</span>
+        <span className="activity-count">{label(total, live === true && steps.some((step) => step.state === "running"))}</span>
         {omitted !== undefined && omitted > 0 && <span className="activity-omitted">· {omitted} not shown</span>}
         <span className="activity-chevron" aria-hidden="true">›</span>
       </button>
@@ -61,11 +67,9 @@ export function ActivitySteps({ steps, omitted, live }: {
                 </button>
                 {shown && (
                   <dl className="activity-detail">
-                    <div><dt>Tool</dt><dd>{step.tool}</dd></div>
                     <div><dt>Outcome</dt><dd>{OUTCOME[step.state]}</dd></div>
                     <div><dt>Started</dt><dd>{stamp(step.startedAt)}</dd></div>
                     <div><dt>Ended</dt><dd>{step.endedAt === undefined ? "—" : stamp(step.endedAt)}</dd></div>
-                    <div><dt>Duration</dt><dd>{span(step) || "—"}</dd></div>
                   </dl>
                 )}
               </li>

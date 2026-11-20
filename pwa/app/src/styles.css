@@ -1319,13 +1319,12 @@ input#pair-code {
   opacity: 0.7;
 }
 .activity-count {
-  font-weight: 600;
+  font-weight: 500;
 }
 .activity-omitted {
   color: var(--muted-ink);
 }
 .activity-chevron {
-  margin-inline-start: auto;
   transition: transform 0.15s ease;
 }
 .activity-toggle[aria-expanded="true"] .activity-chevron {
