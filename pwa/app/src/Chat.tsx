@@ -1,4 +1,4 @@
-import { useEffect, useEffectEvent, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { useEffect, useEffectEvent, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { Streamdown } from "streamdown";
 import type { Connection } from "./conn";
 import type { AgentStatus, Outgoing, OutgoingState, Store } from "./store";
@@ -7,6 +7,8 @@ import { disablePush, enablePush, hasPushSubscription, pushPermission, requestPu
 import { Avatar, type AvatarState } from "./Avatar";
 
 const FINE_POINTER = matchMedia("(pointer: fine)").matches;
+/** From here the thread list is a sidebar and the chat sits beside it. */
+const WIDE = "(min-width: 900px)";
 
 type Row = { kind: "ev"; ev: DurableEvent; text?: string; partial?: boolean } | { kind: "pending"; m: Outgoing };
 type Tone = "ok" | "run" | "warn" | "bad";
@@ -93,6 +95,26 @@ function isRunning(state: AgentStatus["state"]): boolean {
   return state === "queued" || state === "thinking" || state === "tool";
 }
 
+/** Main first, then open side threads, newest activity first: the sidebar order
+ * and the order Alt+↑/↓ steps through. */
+function openThreads(store: Store): ThreadInfo[] {
+  const main = store.threads.get(MAIN_THREAD);
+  const side = [...store.threads.values()].filter((t) => t.id !== MAIN_THREAD && !t.archived)
+    .sort((a, b) => Date.parse(b.lastAt) - Date.parse(a.lastAt));
+  return main ? [main, ...side] : side;
+}
+
+function useWideLayout() {
+  const [wide, setWide] = useState(() => matchMedia(WIDE).matches);
+  useEffect(() => {
+    const mq = matchMedia(WIDE);
+    const sync = () => setWide(mq.matches);
+    mq.addEventListener("change", sync);
+    return () => mq.removeEventListener("change", sync);
+  }, []);
+  return wide;
+}
+
 const TIME = new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" });
 function clock(at: string | number | undefined): string {
   if (at === undefined) return "";
@@ -103,6 +125,7 @@ function clock(at: string | number | undefined): string {
 export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [sheet, setSheet] = useState<Sheet | null>(null);
+  const wide = useWideLayout();
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [slashPick, setSlashPick] = useState(0);
@@ -114,6 +137,10 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   const jumpCursor = useRef<number | undefined>(undefined);
   const pinned = useRef(true);
   const taRef = useRef<HTMLTextAreaElement>(null);
+  /** The message at the top of the list, so a layout switch can restore it. */
+  const anchor = useRef<{ cursor: string; offset: number; width: number } | null>(null);
+  const layoutWidth = useRef(0);
+  const reflowedAt = useRef(0);
   const press = useRef<{ x: number; y: number; timer: ReturnType<typeof setTimeout> } | null>(null);
 
   const thread = store.openThread;
@@ -197,7 +224,40 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     }
   }
 
-  useLayoutEffect(() => { pinned.current = true; }, [thread]);
+  /** The message under the top edge and how far it is pushed up out of view. */
+  function rememberTop(el: HTMLDivElement) {
+    // A reflowing column fires scroll events too. Keep the anchor taken before
+    // the switch, or the restore would target the already-moved position.
+    if (el.clientWidth !== layoutWidth.current) {
+      layoutWidth.current = el.clientWidth;
+      reflowedAt.current = performance.now();
+      return;
+    }
+    if (performance.now() - reflowedAt.current < 250) return;
+    const box = el.getBoundingClientRect();
+    // Children are in flow order, so binary search the first one still visible.
+    let lo = 0;
+    let hi = el.children.length - 1;
+    let i = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (el.children[mid].getBoundingClientRect().bottom > box.top + 1) {
+        i = mid;
+        hi = mid - 1;
+      } else lo = mid + 1;
+    }
+    anchor.current = null;
+    for (let n = i; n >= 0 && n < el.children.length && n < i + 4; n++) {
+      const row = el.children[n];
+      const node = row.matches("[data-message-cursor]") ? row : row.querySelector("[data-message-cursor]");
+      if (node) {
+        anchor.current = { cursor: (node as HTMLElement).dataset.messageCursor!, offset: node.getBoundingClientRect().top - box.top, width: el.clientWidth };
+        return;
+      }
+    }
+  }
+
+  useLayoutEffect(() => { pinned.current = true; anchor.current = null; }, [thread]);
   useEffect(() => cancelPress, []);
   // Clear an unconfirmed pick after a while; a `model` event clears it sooner.
   useEffect(() => {
@@ -234,6 +294,19 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     if (pinned.current) el.scrollTop = el.scrollHeight;
     markAtBottom(el);
   });
+  useLayoutEffect(() => {
+    const el = scroller.current;
+    const a = anchor.current;
+    if (!el || !a || pinned.current || a.width === el.clientWidth) return;
+    const node = el.querySelector<HTMLElement>(`[data-message-cursor="${a.cursor}"]`);
+    // Phone ↔ wide reflows the column; keep the message that was at the top
+    // where it was. Browsers only anchor across a container resize sometimes.
+    if (!node) return;
+    el.scrollTop += node.getBoundingClientRect().top - el.getBoundingClientRect().top - a.offset;
+    a.width = el.clientWidth;
+    layoutWidth.current = el.clientWidth;
+    reflowedAt.current = performance.now();
+  }, [wide]);
   useEffect(() => {
     const el = scroller.current;
     if (!el) return;
@@ -305,7 +378,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     }
   }
 
-  function onKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
+  function onKeyDown(e: ReactKeyboardEvent<HTMLTextAreaElement>) {
     if (slashOpen && (e.key === "ArrowDown" || e.key === "ArrowUp") && args === undefined && matches.length) {
       e.preventDefault();
       const i = matches.indexOf(picked!) + (e.key === "ArrowDown" ? 1 : -1);
@@ -386,7 +459,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
           return;
         }
         const create = await store.queueCreate(name || undefined, sheet?.kind === "create" ? sheet.from : undefined);
-        setSheet({ kind: "list" });
+        setSheet(wide ? null : { kind: "list" });
         conn.sendCreate(create, online ? thread : undefined);
       }
     } catch {
@@ -451,10 +524,62 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     return () => document.removeEventListener("visibilitychange", clear);
   }, [store, store.replayReady, store.cursor, store.ackedCursor]);
 
+  // The sidebar carries the thread list on wide screens, so a list sheet left
+  // open across the switch closes instead of listing every thread twice.
+  useEffect(() => {
+    if (wide) setSheet((s) => (s?.kind === "list" ? null : s));
+  }, [wide]);
+
+  // Wide-layout keys only. Escape closes an open sheet, Ctrl/Cmd+K focuses the
+  // thread search, Alt+↑/↓ steps through the visible threads; the composer
+  // keeps its own Enter/Shift+Enter handling (see onKeyDown).
+  const shortcut = useEffectEvent((e: KeyboardEvent) => {
+    // An IME composition owns its keys (Esc cancels the composition, not the sheet).
+    if (e.defaultPrevented || e.isComposing || e.keyCode === 229) return;
+    if (e.key === "Escape") {
+      if (!sheet) return;
+      e.preventDefault();
+      setError("");
+      setSheet(null);
+      return;
+    }
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "k") {
+      // Behind another open sheet the sidebar search is not reachable; leave the sheet in charge.
+      if (sheet && sheet.kind !== "list") return;
+      e.preventDefault();
+      document.querySelector<HTMLInputElement>(sheet?.kind === "list" ? ".sheet-layer .thread-search" : ".sidebar .thread-search")?.focus();
+      return;
+    }
+    const field = e.target instanceof HTMLElement && e.target.matches("input, textarea, select, [contenteditable]");
+    if (field || e.ctrlKey || e.metaKey || sheet) return;
+    if (!e.altKey || (e.key !== "ArrowUp" && e.key !== "ArrowDown")) return;
+    const ids = openThreads(store).map((t) => t.id);
+    const i = ids.indexOf(thread);
+    if (i < 0) return;
+    const next = ids[(i + (e.key === "ArrowDown" ? 1 : -1) + ids.length) % ids.length];
+    e.preventDefault();
+    if (next !== thread) store.selectThread(next);
+  });
+  // Keep the open thread visible in the sidebar when it changes (or the layout turns wide).
+  useEffect(() => {
+    if (!wide) return;
+    document.querySelector('.sidebar .thread-row[aria-current="true"]')?.scrollIntoView({ block: "nearest" });
+  }, [wide, thread]);
+  useEffect(() => {
+    if (!wide) return;
+    const onKey = (e: KeyboardEvent) => shortcut(e);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [wide]);
+
   return (
-    <div className="app">
+    <div className="app" data-wide={wide ? "" : undefined}>
+      {wide && <aside className="sidebar" aria-label="Threads">
+        <ThreadList store={store} conn={conn} online={online} onNew={() => show({ kind: "create", title: "" })}
+          onSelect={(id) => store.selectThread(id)} />
+      </aside>}
       <header className="top">
-        {!main && <button className="thread-back" onClick={() => store.selectThread(back.id)}
+        {!main && !wide && <button className="thread-back" onClick={() => store.selectThread(back.id)}
           aria-label={`Back to ${back.id === MAIN_THREAD ? "Main" : back.title}`}>
           <span aria-hidden="true">‹</span><span>{back.id === MAIN_THREAD ? "Main" : back.title}</span>
         </button>}
@@ -463,11 +588,16 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
             <Avatar state={p.avatar} />
           </div>
           <div className="who-text">
-            <h1><button className="thread-switch" aria-label={`${title}, open threads`} aria-haspopup="dialog"
-              aria-expanded={sheet?.kind === "list"} onClick={(e) => show({ kind: "list" }, e.currentTarget)}>
-              <span className="switch-title">{title}</span><span aria-hidden="true">▾</span>
-              {hasOtherActivity && <span className="thread-dot" role="img" aria-label="Activity in another thread" />}
-            </button></h1>
+            <h1>{wide
+              ? <span className="switch-static">
+                <span className="switch-title">{title}</span>
+                {hasOtherActivity && <span className="thread-dot" role="img" aria-label="Activity in another thread" />}
+              </span>
+              : <button className="thread-switch" aria-label={`${title}, open threads`} aria-haspopup="dialog"
+                aria-expanded={sheet?.kind === "list"} onClick={(e) => show({ kind: "list" }, e.currentTarget)}>
+                <span className="switch-title">{title}</span><span aria-hidden="true">▾</span>
+                {hasOtherActivity && <span className="thread-dot" role="img" aria-label="Activity in another thread" />}
+              </button>}</h1>
             <p className="presence" data-tone={p.tone} aria-live="polite">
               {p.text}
             </p>
@@ -499,6 +629,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
           if (sheet || document.hidden) return;
           pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight <= 2;
           if (pinned.current) markAtBottom(el);
+          rememberTop(el);
         }}
         onContextMenu={(e) => {
           const action = forkAction(e.target, thread);
@@ -625,7 +756,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
             sheet.kind === "rename" ? "Rename thread" : "New thread"}
           dismiss={() => { setError(""); setSheet(null); }}>
             <div className="sheet-grip" aria-hidden="true" />
-            {sheet.kind === "list" && <ThreadList store={store} conn={conn} online={online} onNew={() => show({ kind: "create", title: "" })}
+            {sheet.kind === "list" && !wide && <ThreadList store={store} conn={conn} online={online} onNew={() => show({ kind: "create", title: "" })}
               onSelect={(id) => { setSheet(null); store.selectThread(id); }} />}
             {sheet.kind === "menu" && <>
               {writable && <>
@@ -742,9 +873,9 @@ function ThreadList({ store, conn, online, onNew, onSelect }: {
     return () => { current = false; clearTimeout(timer); };
   }, [conn, online, query]);
 
-  const main = store.threads.get(MAIN_THREAD)!;
   const side = [...store.threads.values()].filter((t) => t.id !== MAIN_THREAD)
     .sort((a, b) => Date.parse(b.lastAt) - Date.parse(a.lastAt));
+  const open = openThreads(store);
   const archived = side.filter((t) => t.archived);
   const results = query ? store.searchThreads(query, remote?.query === query ? remote.ids : undefined) : [];
   const row = (t: ThreadInfo, snippet?: string) => (
@@ -763,21 +894,22 @@ function ThreadList({ store, conn, online, onNew, onSelect }: {
     <input className="thread-search" type="search" aria-label="Search threads" placeholder="Search titles and messages"
       maxLength={LIMITS.threadTitleChars} value={input} onChange={(e) => setInput(e.target.value)} />
     {store.threadListUnavailable && <p className="sheet-help">Could not refresh the thread list. Showing known threads.</p>}
-    {query ? (
-      results.length ? results.map(({ thread, snippet }) => row(thread, snippet)) : <p className="sheet-help">No matching threads.</p>
-    ) : <>
-      <SheetItem icon="M12 5v14M5 12h14" title="New thread" sub="Start an empty conversation" onClick={onNew} />
-      {[...store.creates.values()].map((c) => <p className="sheet-help" key={c.key}>
-        {c.title || "New thread"} · {c.failed ? "Could not create" : "Waits for connection"}
-      </p>)}
-      {row(main)}
-      {side.filter((t) => !t.archived).map((t) => row(t))}
-      {archived.length > 0 && <details className="thread-archive">
-        <summary>Archived ({archived.length}){archived.some((t) => store.isUnread(t.id)) &&
-          <span className="thread-dot" role="img" aria-label="Unread" />}</summary>
-        {archived.map((t) => row(t))}
-      </details>}
-    </>}
+    <div className="thread-list-body">
+      {query ? (
+        results.length ? results.map(({ thread, snippet }) => row(thread, snippet)) : <p className="sheet-help">No matching threads.</p>
+      ) : <>
+        <SheetItem icon="M12 5v14M5 12h14" title="New thread" sub="Start an empty conversation" onClick={onNew} />
+        {[...store.creates.values()].map((c) => <p className="sheet-help" key={c.key}>
+          {c.title || "New thread"} · {c.failed ? "Could not create" : "Waits for connection"}
+        </p>)}
+        {open.map((t) => row(t))}
+        {archived.length > 0 && <details className="thread-archive">
+          <summary>Archived ({archived.length}){archived.some((t) => store.isUnread(t.id)) &&
+            <span className="thread-dot" role="img" aria-label="Unread" />}</summary>
+          {archived.map((t) => row(t))}
+        </details>}
+      </>}
+    </div>
   </>;
 }
 

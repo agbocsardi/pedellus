@@ -166,6 +166,11 @@ Details that matter:
 - Code blocks scroll horizontally with a copy button; long tool output collapsed.
 - Safe-area insets, `100dvh`, keyboard-aware composer: the usual iOS standalone
   web app pitfalls.
+- Wide screens (900px and up): the thread list is a persistent left sidebar with
+  the same rows and actions as the phone sheet, the conversation keeps a centred
+  reading column, and the header's list control is gone. Below the breakpoint the
+  layout is the phone one, unchanged; switching keeps the open thread, the draft
+  and the reading position.
 
 ### Local store
 

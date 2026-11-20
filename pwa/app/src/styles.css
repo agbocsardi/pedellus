@@ -1231,3 +1231,63 @@ input#pair-code {
     height: 76px;
   }
 }
+
+/* Wide layout (from 900px): the thread list stops being a sheet and becomes a
+ * persistent sidebar, the conversation takes the rest of the width and stays a
+ * centred reading column. The element order never changes between layouts, so
+ * resizing keeps the open thread, the draft and the scroll position. */
+.app[data-wide] {
+  display: grid;
+  grid-template-columns: 288px minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-areas:
+    "side top"
+    "side msgs"
+    "side comp";
+}
+.sidebar {
+  display: none;
+  grid-area: side;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  padding-top: env(safe-area-inset-top);
+  border-inline-end: 1px solid var(--line);
+  background: color-mix(in oklab, var(--muted) 40%, var(--bg));
+}
+.app[data-wide] .sidebar {
+  display: flex;
+}
+.app[data-wide] .top {
+  grid-area: top;
+}
+.app[data-wide] .messages {
+  grid-area: msgs;
+  min-height: 0;
+}
+.app[data-wide] .composer {
+  grid-area: comp;
+}
+.sidebar .sheet-heading {
+  margin: 14px 14px 6px;
+}
+.sidebar .thread-search {
+  width: calc(100% - 28px);
+  margin: 0 14px 8px;
+}
+/* Only the sidebar scrolls its own list; in the sheet the sheet scrolls. */
+.sidebar .thread-list-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0 6px 14px;
+}
+/* On wide screens the title is a label, not the control that opens the list. */
+.switch-static {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
