@@ -63,6 +63,7 @@ export type AppPresetInfo = PresetInfo;
 export const APP_REQUEST_OPS: readonly string[] = [
   "hello", "send", "ack", "control", "ping", "history", "tasks",
   "threads", "thread.create", "thread.rename", "thread.archive",
+  "push.key", "push.subscribe", "push.unsubscribe",
 ];
 
 export type AppThreadOrigin = ThreadOrigin;
@@ -175,6 +176,8 @@ export type AppDeviceRecord = {
   readonly tokenHash: string;
   readonly createdAtMs: number;
   readonly revokedAtMs?: number;
+  /** Its one Web Push subscription; absent when it never subscribed or unsubscribed. */
+  readonly pushSubscription?: AppPushSubscription;
 };
 
 /** One outstanding pairing code: hashed, single-use, expiring. */

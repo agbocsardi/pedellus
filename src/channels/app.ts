@@ -66,10 +66,14 @@ import {
   APP_REQUEST_OPS,
   parseHelloCursor,
   validAppAgentName,
+  validVapidPrivateKey,
+  validVapidPublicKey,
+  validVapidSubject,
   appPresetInfos,
   validAppLabel,
   validThreadTitle,
   parseThreadId,
+  parsePushSubscription,
   type AppCommandInfo,
   type AppControlRecord,
   type AppMutation,
@@ -81,6 +85,7 @@ import {
   type AppThreadInfo,
   type AppThreadOrigin,
 } from "./app-protocol.js";
+import { createAppPushDispatcher, pushPayload, type AppPushDispatcher, type AppPushOptions } from "./app-push.js";
 import { startAppListener, type AppDeviceSession, type AppSessionHooks } from "./app-listener.js";
 
 /** Preserve the original mapped chat and its history. */
@@ -246,6 +251,8 @@ export type AppOptions = {
   readonly autoArchiveDays?: number;
   /** Agent display name sent in every hello reply; 1–40 printable characters. */
   readonly agentName?: string;
+  /** Resolved Web Push configuration; absent leaves every push op `unsupported` and sends nothing. */
+  readonly push?: AppPushOptions;
   /** Configured owner busy-mode, written onto each admitted input. */
   readonly followUpMode?: FollowUpMode;
   /** Host process replacement for the `restart` control; absent leaves it unoffered. */
@@ -656,6 +663,11 @@ export function validateOptions(options: AppOptions): void {
   if (options.agentName !== undefined && !validAppAgentName(options.agentName)) {
     throw new Error("App agentName must be 1 to 40 printable characters");
   }
+  if (options.push !== undefined &&
+      (!validVapidSubject(options.push.subject) || !validVapidPublicKey(options.push.publicKey) ||
+       !validVapidPrivateKey(options.push.privateKey))) {
+    throw new Error("App push configuration is not a valid VAPID key pair");
+  }
 }
 
 // ── The adapter ──────────────────────────────────────────────────────────────
@@ -919,6 +931,14 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         case "thread.archive":
           await archiveThread(frame, sendOk, sendError);
           return;
+        case "push.key":
+          if (options.push === undefined) return sendError("unsupported");
+          sendOk({ key: options.push.publicKey });
+          return;
+        case "push.subscribe":
+          return await handlePushSubscribe(socket, frame, sendOk, sendError);
+        case "push.unsubscribe":
+          return await handlePushUnsubscribe(socket, sendOk, sendError);
         case "ping":
           sendOk();
           return;
@@ -1005,6 +1025,48 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       doc.acks[deviceId] = clamped;
       pruneEvents(doc);
     });
+    sendOk();
+  }
+
+  async function handlePushSubscribe(
+    socket: LiveSocket,
+    frame: Record<string, unknown>,
+    sendOk: (body?: Record<string, unknown>) => void,
+    sendError: (error: AppErrorCode) => void,
+  ): Promise<void> {
+    if (options.push === undefined) {
+      sendError("unsupported");
+      return;
+    }
+    const subscription = parsePushSubscription(frame.subscription);
+    if (subscription === undefined) {
+      sendError("bad_request");
+      return;
+    }
+    const deviceId = socket.session.deviceId;
+    await mutateState((doc) => {
+      const device = doc.devices.find((entry) => entry.id === deviceId && entry.revokedAtMs === undefined);
+      // One subscription per device: a new one replaces the old, endpoints and keys included.
+      if (device !== undefined) device.pushSubscription = subscription;
+    });
+    sendOk();
+  }
+
+  async function handlePushUnsubscribe(
+    socket: LiveSocket,
+    sendOk: (body?: Record<string, unknown>) => void,
+    sendError: (error: AppErrorCode) => void,
+  ): Promise<void> {
+    if (options.push === undefined) {
+      sendError("unsupported");
+      return;
+    }
+    const deviceId = socket.session.deviceId;
+    await mutateState((doc) => {
+      const device = doc.devices.find((entry) => entry.id === deviceId);
+      if (device !== undefined) delete device.pushSubscription;
+    });
+    // Idempotent: a device that never subscribed is simply already unsubscribed.
     sendOk();
   }
 
@@ -2263,6 +2325,8 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         const entry = doc.devices.find((device) => device.revokedAtMs === undefined && device.label === label);
         if (entry === undefined) return;
         entry.revokedAtMs = now();
+        // The subscription is device authority: revoking the device drops it with the token.
+        delete entry.pushSubscription;
         revokedId = entry.id;
       });
       if (revokedId === undefined) return "missing";
