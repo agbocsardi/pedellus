@@ -164,10 +164,12 @@ export type ActivityEvent = {
   type: "event"; event: "activity"; thread: ThreadId; key: string; steps: ActivityStep[]; omitted?: number;
 };
 
+export type LoginEvent = { type: "event"; event: "login"; thread: ThreadId; server: string; url: string; expiresAt: string };
+
 export type ModelEvent = { type: "event"; event: "model"; thread: ThreadId; preset: string | null };
 
 export type DurableEvent = MessageEvent | SettledEvent | DividerEvent | ThreadEvent | QuestionEvent | ReactionEvent;
-export type Event = DurableEvent | PreviewEvent | StatusEvent | ModelEvent | ActivityEvent;
+export type Event = DurableEvent | PreviewEvent | StatusEvent | ModelEvent | ActivityEvent | LoginEvent;
 export type ServerFrame = Response | Event;
 
 export type AttachmentInfo = { id: string; name: string; type: string; size: number; kind: "image" | "audio" | "file" | "artifact" };
