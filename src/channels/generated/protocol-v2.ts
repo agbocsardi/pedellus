@@ -89,6 +89,7 @@ export type Request =
   | { type: "req"; id: string; op: "push.subscribe"; subscription: PushSubscriptionInfo }
   | { type: "req"; id: string; op: "push.unsubscribe" }
   | { type: "req"; id: string; op: "answer"; thread: ThreadId; question: string; option: QuestionOptionId }
+  | { type: "req"; id: string; op: "react"; thread?: ThreadId; message: string; emoji: Reaction | null }
   | { type: "req"; id: string; op: "tasks"; thread?: ThreadId }
   | { type: "req"; id: string; op: "task.cancel"; thread?: ThreadId; task: string };
 
@@ -139,6 +140,13 @@ export type QuestionEvent = {
 };
 export type AnswerResult = { accepted: boolean };
 
+/** The owner's reaction palette (protocol v2, Reactions). */
+export const REACTIONS = ["👍", "👎", "❤️", "😂", "🤔", "🎉"] as const;
+export type Reaction = (typeof REACTIONS)[number];
+export type ReactionEvent = {
+  type: "event"; event: "reaction"; cursor: number; thread: ThreadId; message: string; by: "owner"; emoji: Reaction | null;
+};
+
 export type TaskInfo = {
   id: string; kind: "worker" | "cron"; title: string;
   state: "running" | "queued" | "scheduled" | "done" | "failed" | "cancelled";
@@ -156,7 +164,7 @@ export type ActivityEvent = {
 
 export type ModelEvent = { type: "event"; event: "model"; thread: ThreadId; preset: string | null };
 
-export type DurableEvent = MessageEvent | SettledEvent | DividerEvent | ThreadEvent | QuestionEvent;
+export type DurableEvent = MessageEvent | SettledEvent | DividerEvent | ThreadEvent | QuestionEvent | ReactionEvent;
 export type Event = DurableEvent | PreviewEvent | StatusEvent | ModelEvent | ActivityEvent;
 export type ServerFrame = Response | Event;
 
