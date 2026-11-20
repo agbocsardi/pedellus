@@ -1,6 +1,6 @@
 /**
  * The `app` channel's loopback HTTP+WebSocket listener: static file serving, the one-time pairing
- * endpoint and the authenticated device stream.
+ * endpoint, the upload endpoint, the download endpoint and the authenticated device stream.
  *
  * This module owns transport mechanics only — sockets, bodies, cookies, MIME types and path safety.
  * Every authority decision (pairing redemption, token authentication, frame semantics) is delegated
@@ -16,7 +16,6 @@ import { realpath, stat, open } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import { WebSocketServer, WebSocket, type WebSocket as WebSocketType } from "ws";
 import { journalEvent } from "../observability.js";
-import { AppUploadTooLarge, type AppUploadOutcome } from "./app-files.js";
 import {
   APP_CLOSE,
   APP_LIMITS,
@@ -74,6 +73,19 @@ export interface AppListenerHost {
   upload(device: AppUploadDevice, request: AppUploadStream): Promise<AppUploadOutcome>;
   /** Resolve one file a durable message references, for `GET /v1/files/<id>`. */
   download(device: AppUploadDevice, id: string): Promise<AppDownloadTarget | undefined>;
+}
+
+/** Fixed per-upload outcomes; every one is a wire status the protocol already defines. */
+export type AppUploadOutcome =
+  | { readonly status: "created"; readonly id: string }
+  | { readonly status: "bad-request" | "unsupported" | "rate-limited" | "too-large" | "internal" };
+
+/** The listener's hard byte cap was exceeded while streaming one upload body. */
+export class AppUploadTooLarge extends Error {
+  constructor() {
+    super("app upload exceeds the size bound");
+    this.name = "AppUploadTooLarge";
+  }
 }
 
 /** The authenticated device an upload or download is attributed to. */

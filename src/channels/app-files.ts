@@ -35,6 +35,9 @@ import {
   type TranscriberOptions,
 } from "../media/transcription.js";
 import { APP_LIMITS, type AppUploadRecord } from "./app-protocol.js";
+// The listener owns the transport bounds and the host contract they hand over; this module
+// implements that contract for the app adapter.
+import { AppUploadTooLarge, type AppUploadOutcome } from "./app-listener.js";
 import type { AttachmentInfo } from "./generated/protocol-v2.js";
 
 /** Gateway-only bounds the app never sees; the wire bounds come from the generated protocol. */
@@ -90,11 +93,6 @@ export type AppUploadRequest = {
   readonly signal?: AbortSignal;
 };
 
-/** Fixed per-upload outcomes; every one is a wire status the protocol already defines. */
-export type AppUploadOutcome =
-  | { readonly status: "created"; readonly id: string }
-  | { readonly status: "bad-request" | "unsupported" | "rate-limited" | "too-large" | "internal" };
-
 /** One download target: resolved by the store, so no path is ever built from request input. */
 export type AppDownloadFile = {
   readonly absolutePath: string;
@@ -109,14 +107,6 @@ export class AppFileRejected extends Error {
   constructor() {
     super("app attachment reference refused");
     this.name = "AppFileRejected";
-  }
-}
-
-/** The listener's hard byte cap was exceeded while streaming one upload body. */
-export class AppUploadTooLarge extends Error {
-  constructor() {
-    super("app upload exceeds the size bound");
-    this.name = "AppUploadTooLarge";
   }
 }
 
