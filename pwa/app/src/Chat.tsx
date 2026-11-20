@@ -11,6 +11,7 @@ import { canRecord, startVoiceNote, VOICE_MAX_MS, type Recording, type VoiceStop
 import { ActivitySteps } from "./ActivitySteps";
 import { TasksSheet } from "./TasksSheet";
 import { QuestionCard } from "./Question";
+import { LoginCard } from "./LoginCard";
 
 const FINE_POINTER = matchMedia("(pointer: fine)").matches;
 /** From here the thread list is a sidebar and the chat sits beside it. */
@@ -313,6 +314,8 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   const canSendFiles = files.every((f) => f.state !== "failed");
   const canVoice = store.uploads && canRecord();
   const liveActivity = store.activity(thread);
+  // A live MCP login offer for this thread; memory-only, so a reload drops it.
+  const login = store.login(thread);
   const p = presence(store);
   const latest = store.latestViewable(thread);
   const origin = info?.origin;
@@ -1113,6 +1116,11 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
               note={r.m.note}
               onDiscard={!writable || r.m.state === "failed" ? () => void discardMessage(r.m.key) : undefined} />
           ),
+        )}
+        {login !== undefined && (
+          <div className="msg login-card-wrap">
+            <LoginCard login={login} />
+          </div>
         )}
         {running && (
           <div className="typing" role="status" aria-label={p.text}>

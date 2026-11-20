@@ -773,6 +773,15 @@ function onStream(ws, token) {
         }
         admitted.set(key, { text, attachments: info ?? [] });
         reply(ws, frame.id, true, { duplicate: false });
+        // Dev affordance: "mcp login" offers a fake one-time authorization URL as a non-durable
+        // `login` frame, the same shape the gateway's app login surface sends. It is never stored.
+        if (/mcp login/i.test(text)) {
+          emit(thread, "login", {
+            server: "mock-remote",
+            url: "https://example.com/oauth/authorize?state=mock-login&code=mock-login",
+            expiresAt: new Date(Date.now() + 5 * 60_000).toISOString(),
+          });
+        }
         // Dev affordance: a message asking to start work seeds the Tasks sheet with one worker and
         // one scheduled job in this thread.
         if (/start task/i.test(text) && thread.tasks.length === 0) addFakeTasks(thread);

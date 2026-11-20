@@ -885,6 +885,53 @@ input#pair-code {
 .origin-card:disabled {
   cursor: default;
 }
+/* A live MCP login offer (protocol v2, MCP login). It sits in the message column like an origin
+   card; the Open button is a 44px tap target and the text wraps instead of widening the page. */
+.login-card-wrap {
+  margin: 10px 0;
+}
+.login-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  max-width: 28rem;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--card);
+  /* A straight accent bar (a thick start border bends with the radius). */
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.login-text {
+  display: grid;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+.login-text b {
+  font-size: 0.9rem;
+  font-weight: 650;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.login-text small {
+  font-size: 0.72rem;
+  color: var(--muted-ink);
+  overflow-wrap: anywhere;
+}
+.login-open {
+  flex: none;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: 12px;
+  background: var(--accent);
+  color: var(--color-primary-foreground);
+  font-weight: 600;
+  font-size: 1rem;
+}
 .fork-links {
   display: flex;
   flex-wrap: wrap;

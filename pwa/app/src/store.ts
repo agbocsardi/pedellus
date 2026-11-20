@@ -1,5 +1,5 @@
 import { openDB, type DBSchema, type IDBPDatabase } from "idb";
-import { MAIN_THREAD, type ActivityEvent, type CommandInfo, type DurableEvent, type ModelEvent, type PresetInfo, type Reaction, type StatusEvent, type ThreadId, type ThreadInfo, type ThreadOrigin } from "./protocol";
+import { MAIN_THREAD, type ActivityEvent, type CommandInfo, type DurableEvent, type LoginEvent, type ModelEvent, type PresetInfo, type Reaction, type StatusEvent, type ThreadId, type ThreadInfo, type ThreadOrigin } from "./protocol";
 
 export type ConnState = "offline" | "connecting" | "replaying" | "open";
 export type Mode = "boot" | "chat" | "pair" | "update";
@@ -51,6 +51,22 @@ const MAIN: ThreadInfo = { id: MAIN_THREAD, title: "Main", archived: false, crea
 const terminal = (state: OutgoingState) => state === "failed" || state === "answered" || state === "aborted";
 const normalize = (text: string) => text.trim().replace(/\s+/g, " ");
 
+/**
+ * The only URLs a login card may open: an `https:` page, or a loopback `http:` one (local testing).
+ * A stored or replayed frame is untrusted input; anything else is never handed to `window.open`.
+ */
+export function openableLoginUrl(url: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol === "https:") return true;
+  if (parsed.protocol !== "http:") return false;
+  return parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1";
+}
+
 /** Same key alphabet as the protocol's request ids. */
 function newKey(): string {
   return crypto.randomUUID().replaceAll("-", "");
@@ -84,6 +100,12 @@ export class Store {
   // A running turn's tool steps are live as well: `activity` replaces them per thread and
   // `settled` (or the answer that carries the same list) ends them.
   private activities = new Map<ThreadId, ActivityEvent>();
+  /**
+   * Live MCP login offers per thread. Memory only and never persisted: a reload drops the one-time
+   * URL, and so does its expiry or the next durable notice in that thread.
+   */
+  private logins = new Map<ThreadId, LoginEvent>();
+  private loginTimers = new Map<ThreadId, ReturnType<typeof setTimeout>>();
   private pendingModels = new Map<ThreadId, string>();
   private unfinished = new Map<ThreadId, Set<string>>();
   private viewed = new Map<ThreadId, number>();
@@ -293,6 +315,7 @@ export class Store {
     let i = events.length;
     while (i > 0 && events[i - 1].cursor > ev.cursor) i--;
     events.splice(i, 0, ev);
+    if (ev.event === "message" && ev.role === "notice") this.clearLogin(ev.thread);
     if (ev.event === "message" && ev.role === "user" && ev.key) {
       let keys = this.echoedKeys.get(ev.thread);
       if (!keys) this.echoedKeys.set(ev.thread, keys = new Set());
@@ -492,6 +515,48 @@ export class Store {
 
   /** The live tool steps of this thread's running turn; `settled` clears them. */
   activity(thread: ThreadId): ActivityEvent | undefined { return this.activities.get(thread); }
+
+  /** The thread's offered MCP login, if one is live and unexpired. Never read from storage. */
+  login(thread: ThreadId): LoginEvent | undefined {
+    const login = this.logins.get(thread);
+    if (login === undefined) return undefined;
+    if (Date.parse(login.expiresAt) <= Date.now()) {
+      const timer = this.loginTimers.get(thread);
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        this.loginTimers.delete(thread);
+      }
+      // Not `clearLogin`: a render may call this, and a render must not notify listeners.
+      this.logins.delete(thread);
+      return undefined;
+    }
+    return login;
+  }
+
+  setLogin(ev: LoginEvent) {
+    const expiresAtMs = Date.parse(ev.expiresAt);
+    if (!openableLoginUrl(ev.url) || !Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) return;
+    this.clearLogin(ev.thread);
+    this.logins.set(ev.thread, ev);
+    const timer = setTimeout(() => {
+      this.loginTimers.delete(ev.thread);
+      if (this.logins.get(ev.thread) === ev) {
+        this.logins.delete(ev.thread);
+        this.changed();
+      }
+    }, Math.max(0, Math.min(expiresAtMs - Date.now(), 2_147_483_647)));
+    this.loginTimers.set(ev.thread, timer);
+    this.changed();
+  }
+
+  private clearLogin(thread: ThreadId) {
+    const timer = this.loginTimers.get(thread);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      this.loginTimers.delete(thread);
+    }
+    if (this.logins.delete(thread)) this.changed();
+  }
 
   resetActivities() {
     this.activities.clear();

@@ -224,8 +224,8 @@ Login delivery is channel-neutral and direct:
 
 1. the assistant starts the login in the request's authenticated foreground
    chat. The one-time authorization URL is delivered to that surface only, as a
-   direct owner message or terminal output — never a tool result, transcript
-   entry or durable channel outbox record.
+   direct owner message, an app `login` frame or terminal output — never a tool
+   result, transcript entry or durable channel outbox record.
 2. the owner opens it on a phone or another device. A same-host browser still
    completes the normal loopback callback. When the browser cannot reach this
    host, the owner pastes the callback URL back into the same chat.
@@ -346,8 +346,15 @@ stored in channel state; a pasted callback is accepted only from the current
 authenticated sender binding of that exact chat, before transcript admission. In
 the attached CLI, the URL is one transient terminal line over the private local
 socket and a callback-shaped line is offered to the login lifecycle before it
-becomes model input; neither the URL nor the callback is persisted. If delivery
-fails (including a URL too long for one message), the just-started login is
+becomes model input; neither the URL nor the callback is persisted. On the app
+channel, the URL is one non-durable `login` frame to every device whose stream
+is `hello`'d right now — never the durable event log, channel state, a Web Push
+payload or a log line — and a callback-shaped `send` is offered to the lifecycle
+before admission with the attempt bound to that thread's exact session; only the
+lifecycle's fixed notice is stored (APP.md and `pwa/protocol/v2.md`, *MCP
+login*). If delivery
+fails (including a URL too long for one message, or no app device streaming),
+the just-started login is
 canceled rather than left waiting for nobody. Ambiguous delivery is not blindly
 retried.
 
