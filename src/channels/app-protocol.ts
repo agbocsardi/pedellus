@@ -1,27 +1,35 @@
 /**
- * Wire protocol v2 for the `app` channel: limits, close codes, fixed error texts and the pure
- * frame/field validation both the listener and the adapter share.
+ * Wire protocol v2 for the `app` channel: the gateway's frame/field validation, its gateway-only
+ * bounds and its persisted records.
  *
- * The contract is normative in the sibling `durable-app` repository (`protocol/v2.md` and `v2.ts`). Tailscale identity headers are never read:
- * the device token is the only authority.
+ * The wire contract itself — limits, close codes, frame and field shapes — is normative in
+ * `pwa/protocol/v2.md` + `pwa/protocol/v2.ts`; the gateway imports the generated copy in
+ * `./generated/protocol-v2.js` rather than restating it. Only bounds the app never sees and
+ * gateway-side checks live here. Tailscale identity headers are never read: the device token is
+ * the only authority.
  */
+import {
+  CLOSE,
+  LIMITS,
+  MAIN_THREAD,
+  PROTOCOL_VERSION,
+  type CommandInfo,
+  type ErrorCode,
+  type PresetInfo,
+  type ThreadInfo,
+  type ThreadOrigin,
+} from "./generated/protocol-v2.js";
 
-export const APP_PROTOCOL_VERSION = 2;
-export const APP_MAIN_THREAD = "main";
+export const APP_PROTOCOL_VERSION = PROTOCOL_VERSION;
+export const APP_MAIN_THREAD = MAIN_THREAD;
+/** `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`: no `I`/`O`, case-insensitive input. */
+export const APP_PAIR_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
-/** Every bound the gateway enforces; the app enforces the same values before sending. */
+/** The wire bounds, then the gateway-only ones; the app never sees the latter. */
 export const APP_LIMITS = Object.freeze({
-  /** One WebSocket frame, either direction, and one HTTP request body. */
-  frameBytes: 262_144,
-  sendTextChars: 16_000,
-  /** Request ids and `send` keys. */
-  idPattern: /^[A-Za-z0-9_-]{1,64}$/,
-  replayBatch: 500,
-  threadTitleChars: 80,
-  maxOpenThreads: 50,
+  ...LIMITS,
   /** Maximum archived threads in a `threads` reply, not a storage cap. */
   maxListedArchivedThreads: 200,
-  threadIdPattern: /^(main|t_[A-Za-z0-9_-]{1,40})$/,
   /** One-time pairing code: single use, ten minutes. */
   pairCodeChars: 8,
   pairTtlMs: 10 * 60_000,
@@ -52,33 +60,23 @@ export const APP_LIMITS = Object.freeze({
   controlArgsChars: 1_000,
 } as const);
 
-/** `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`: 8 characters, no `I`/`O`, case-insensitive input. */
-export const APP_PAIR_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-
 /** Fixed WebSocket close codes; the upgrade is always completed first. */
-export const APP_CLOSE = Object.freeze({
-  unauthorized: 4401,
-  protocol: 4400,
-  version: 4426,
-  replaced: 4409,
-} as const);
+export const APP_CLOSE = Object.freeze({ ...CLOSE } as const);
 
 /** Fixed reply error codes; no free text ever leaves the gateway on a response. */
-export type AppErrorCode = "bad_request" | "too_large" | "unsupported" | "not_ready" | "internal";
+export type AppErrorCode = ErrorCode;
 /** One `hello.commands` entry, rendered from the shared catalogue's `app` surface. */
-export type AppCommandInfo = { name: string; args?: string; summary: string; usage: string };
+export type AppCommandInfo = CommandInfo;
 /** One `hello.presets` entry; `model` is `provider/model`. */
-export type AppPresetInfo = { name: string; model: string; thinking?: string };
+export type AppPresetInfo = PresetInfo;
+/** Accepted ops; `history`/`tasks` are declared in v2.md as later work. */
 export const APP_REQUEST_OPS: readonly string[] = [
   "hello", "send", "ack", "control", "ping", "history", "tasks",
   "threads", "thread.create", "thread.rename", "thread.archive",
 ];
 
-export type AppThreadOrigin = { thread: string; messageId: string };
-export type AppThreadInfo = {
-  id: string; title: string; archived: boolean; archivedReason?: "manual" | "idle";
-  origin?: AppThreadOrigin; createdAt: string; lastAt: string;
-};
+export type AppThreadOrigin = ThreadOrigin;
+export type AppThreadInfo = ThreadInfo;
 
 export function validThreadTitle(value: unknown): value is string {
   return typeof value === "string" && Array.from(value).length <= APP_LIMITS.threadTitleChars &&
