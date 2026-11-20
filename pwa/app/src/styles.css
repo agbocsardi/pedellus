@@ -805,9 +805,10 @@ input#pair-code {
   max-width: 28rem;
   padding: 10px 12px;
   border: 1px solid var(--line);
-  border-inline-start: 3px solid var(--accent);
   border-radius: 12px;
   background: var(--card);
+  /* A straight accent bar (a thick start border bends with the radius). */
+  box-shadow: inset 3px 0 0 var(--accent);
 }
 .login-text {
   display: grid;

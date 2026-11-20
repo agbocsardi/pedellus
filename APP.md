@@ -148,7 +148,10 @@ capability above (*Files*), which grants no coding authority, returns no file co
 model, and reaches only the thread the model is already answering. The app chat **is** an MCP
 login owner surface for its own open threads: the one-time authorization URL goes to the devices
 streaming at that moment as a non-durable `login` event, never into the durable log, channel
-state or a push, and a completion is one fixed notice in that thread (protocol v2, *MCP login*).
+state or a push, and a completion is one fixed notice in that thread (protocol v2, *MCP login*). A login
+attempt stays bound to the adapter instance that delivered it: after an app adapter restart, a
+pasted callback for it is refused with fixed text and its completion notice is dropped (the
+browser's loopback callback still completes it, and `/mcp` shows the result).
 A callback-shaped `send` is intercepted before admission and offered to the login lifecycle; only
 the lifecycle's fixed notice is stored, and the callback text itself is never stored. `ask_user`
 remains unavailable because protocol v2 defines no owner-only event that could carry a question
