@@ -17,6 +17,7 @@ import {
   type CommandInfo,
   type ErrorCode,
   type PresetInfo,
+  type QuestionEvent,
   type ThreadInfo,
   type ThreadOrigin,
 } from "./generated/protocol-v2.js";
@@ -135,6 +136,7 @@ export type AppDurableEvent =
   }
   | { event: "settled"; cursor: number; thread?: string; key: string; outcome: "answered" | "failed" | "aborted" }
   | { event: "divider"; cursor: number; thread?: string; at: string; reason: "new" }
+  | (Omit<QuestionEvent, "type" | "thread"> & { thread?: string })
   | { event: "thread"; cursor: number; thread: AppThreadInfo };
 
 /** One pending model input (an admitted `send`) or held host notice. */

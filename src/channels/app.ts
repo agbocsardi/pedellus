@@ -55,6 +55,8 @@ import {
   offeredConversationCommands,
 } from "../help/commands.js";
 import { renderMemoryDigestStart, renderMemoryDigestStatus } from "../history/memory-digest.js";
+import { AskQuestionsDoc, type AskSurfaceRegistry } from "../questions/index.js";
+import { openQuestionEvent, reconcileQuestionEvents } from "./app-questions.js";
 import { RESTART_BUSY_MESSAGE, RestartBusyError } from "../restart.js";
 import type { GatewayMemoryDigest, GatewayModelList, GatewayModelPresets, GatewayModelSelection } from "../runtime.js";
 import {
@@ -197,6 +199,11 @@ export interface AppGateway {
   ): Promise<import("../runtime.js").GatewaySessionReset>;
   /** Live operator console registry; the running adapter attaches its pairing host here. */
   appConsole?: AppConsoleRegistry;
+  /**
+   * Live owner-question surfaces. The running adapter attaches one host for the mapped threads of
+   * this channel; `ask_user` delivers only to the exact session that host owns.
+   */
+  askSurfaces?: AskSurfaceRegistry;
 }
 
 /** Terminal pairing console results, rendered by `src/channels/app-operator-cli.ts`. */
@@ -842,12 +849,12 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   const statuses = new Map<string, string>();
 
   const mutateState = async (
-    change: (doc: Draft<AppChannelState>) => void | Promise<void>,
+    change: (doc: Draft<AppChannelState>, tx: Tx) => void | Promise<void>,
     commitContext: Context = adapterContext,
   ): Promise<AppChannelState> => {
     state = await stateConversation.commit(async (tx) => {
       const doc = await tx.doc(AppState, stateConversation.id);
-      await change(doc);
+      await change(doc, tx);
       return copyJson(doc) as unknown as AppChannelState;
     }, commitContext);
     return state;
@@ -2543,6 +2550,24 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   const hasOrigin = (thread: string): boolean =>
     (thread === APP_MAIN_THREAD ? state.origin : state.sideOrigins?.[thread]) !== undefined;
 
+  /**
+   * Publish this thread's question changes the app has not seen yet. The read is where expiry and a
+   * crashed delivery settle, so nothing here runs on a timer; the append and the record change share
+   * one commit and the durable log (not a live socket) is what the app replays.
+   */
+  const reconcileThreadQuestions = async (thread: string): Promise<void> => {
+    const conversation = await gateway.conversationFor(sessionForThread(thread), adapterContext);
+    let changed = false;
+    await mutateState(async (doc, tx) => {
+      const events = reconcileQuestionEvents(
+        await tx.doc(AskQuestionsDoc, conversation.id), doc.events, thread, now());
+      if (events.length === 0) return;
+      changed = true;
+      for (const event of events) appendEvent(doc, event);
+    });
+    if (changed) pushEventsToSockets();
+  };
+
   const updateScheduled = async (
     sessionKey: string,
     id: string,
@@ -2799,7 +2824,42 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       scope.cancel(fatal as Error);
     },
   });
+  // Questions admitted before this process started, or whose delivery mark did not survive a
+  // crash, are projected once here. Only a thread with durable admission evidence can have asked.
+  if (gateway.askSurfaces !== undefined) {
+    for (const thread of [APP_MAIN_THREAD, ...(state.threads ?? [])
+      .filter((entry) => entry.id !== APP_MAIN_THREAD && !entry.archived).map((entry) => entry.id)]) {
+      if (!hasOrigin(thread)) continue;
+      await reconcileThreadQuestions(thread);
+    }
+  }
   const detachConsole = gateway.appConsole?.attach(consoleHost);
+  // A question is delivered by appending its `open` event: this log is the channel's delivery path,
+  // so the append is definite and needs none of Telegram's external-send fencing. Only a mapped,
+  // open thread is owned; an archived thread has no surface, and the tool then admits nothing.
+  const detachAskSurface = gateway.askSurfaces?.attach({
+    owns(sessionKey) {
+      const target = threadForSession(sessionKey);
+      return target !== undefined && openThread(state, target);
+    },
+    async deliverQuestion(sessionKey, question) {
+      const target = threadForSession(sessionKey);
+      if (target === undefined || !openThread(state, target)) {
+        throw new Error("the app thread is not open");
+      }
+      await mutateState((doc) => {
+        if (!openThread(doc, target)) throw new Error("the app thread is not open");
+        appendEvent(doc, openQuestionEvent(target, question));
+      });
+      // The commit above is the delivery. A failing live push must not report it as failed: every
+      // device replays the same durable event after `hello`.
+      try {
+        pushEventsToSockets();
+      } catch {
+        // A closed socket is replaced by its own reconnect and replay.
+      }
+    },
+  });
   recoveryComplete = true;
   journalEvent("app.serving", { port: listener.port, "queue.depth": state.pending.length });
   options.onListening?.(listener.port);
@@ -2819,6 +2879,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     stopping = true;
     if (scanTimer !== undefined) clearInterval(scanTimer);
     detachConsole?.();
+    detachAskSurface?.();
     for (const socket of sockets.values()) socket.session.close(1001, "stopping");
     sockets.clear();
     scope.cancel(new DOMException("App adapter stopped", "AbortError"));
