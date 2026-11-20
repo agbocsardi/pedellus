@@ -93,6 +93,7 @@ import {
   isReaction,
   reactionChangeSummary,
   retainReactionNote,
+  takeReactionContextText,
   type AppReactionNote,
 } from "./app-reactions.js";
 
@@ -1511,8 +1512,18 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           event: "message", thread, id: eventId, role: "user", text, at, key,
           ...(claimed === undefined || claimed.length === 0 ? {} : { attachments: files.infos(claimed) }),
         });
+        // This thread's retained reaction notes are passive context for the model-facing input only:
+        // the echo above keeps the owner's exact text, and the notes are cleared in this same commit
+        // so a replay cannot attach them twice.
+        const retained = doc.reactions?.[thread];
+        let notes: string | undefined;
+        if (retained !== undefined) {
+          notes = takeReactionContextText(retained, atMs);
+          // Written back even when empty: the consumption is the commit's own record of it.
+          doc.reactions![thread] = retained;
+        }
         doc.pending.push({
-          key, thread, text, admittedAtMs: atMs,
+          key, thread, text: notes === undefined ? text : `${notes}\n${text}`, admittedAtMs: atMs,
           ...(claimed === undefined ? {} : { attachments: claimed }),
           ...(admittedWhenBusy === undefined ? {} : { whenBusy: admittedWhenBusy }),
         });
@@ -1571,13 +1582,16 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         const previous = latestReaction(doc, thread, message)?.emoji ?? null;
         const atMs = now();
         if (doc.reactions === undefined) doc.reactions = {};
-        const notes = doc.reactions[thread] ?? (doc.reactions[thread] = []);
+        // Build the next list before assigning it: a draft stores the assigned value, so an array
+        // created by a property write is not the one the commit keeps.
+        const notes = [...(doc.reactions[thread] ?? [])];
         retainReactionNote(notes, {
           messageId: message,
           emoji,
           text: reactionChangeSummary({ messageId: message, role: target.role, text: target.text, previous, emoji }),
           observedAtMs: atMs,
         });
+        doc.reactions[thread] = notes;
         appendEvent(doc, { event: "reaction", thread, message, by: "owner", emoji });
       });
     } catch (error) {

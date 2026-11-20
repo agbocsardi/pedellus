@@ -271,6 +271,33 @@ upload is the fixed `400 unsupported`, and a send naming ids (which cannot exist
   read. The served path is the one the store resolved inside its media root; it is never built from
   request input. `HEAD` answers the same headers without the body.
 
+## Reactions
+
+The owner can react to one message of a thread with one emoji from protocol v2's fixed `REACTIONS`
+palette, or clear it: `react {thread?, message, emoji|null}`. `message` must be a durable `message`
+id in that thread (any role). An unknown id, an emoji outside the palette, a `emoji` that is
+neither the palette nor `null`, a malformed thread and an archived thread are all `bad_request`, and
+nothing is appended. The reply is a bare `ok`; the visible result is the durable
+`reaction {cursor, thread, message, by:"owner", emoji}` event every device replays, and the latest
+event per (`message`, `by`) is the current state — clearing appends `emoji: null` instead of
+deleting the earlier event.
+
+A reaction never admits input and never starts a turn. It is retained only as bounded passive
+context for that thread's next ordinary (non-callback) owner `send`: at most 8 notes per thread, at
+most one per message (a later change replaces that message's note), and the oldest evicted beyond
+the bound. Each note names the target, the target's role and a bounded excerpt, and spells out the
+old/new/added/removed reaction. The notes are prefixed to the model-facing input — the durable echo
+keeps the owner's exact text — and are consumed in the same commit that admits that send, so a
+replay cannot attach them twice and a crash cannot lose them. A note older than one hour is dropped
+rather than attached to a much later input, and an expired note is consumed all the same. Notes
+grant no tool authority and are never host commands. A message id the event log no longer retains
+(trimmed below the gateway's floor) cannot be reacted to, because its target could not be named.
+
+The PWA offers the palette from a small reaction button on each user and assistant message (a
+quiet always-present button on touch, hover-visible with a fine pointer; no long-press, no swipe).
+A badge appears only once the durable `reaction` event arrives — there is no optimistic local state
+— and tapping the emoji already shown sends `emoji: null`.
+
 ## Controls
 
 The `control` op takes `command` (a name from `hello.commands`) and optional `args` (≤ 1 000
@@ -396,6 +423,9 @@ escaped text) has its last part truncated and marked `[truncated]`, and is repor
   The gateway reserves snapshot capacity before acknowledging a new thread or send.
 * **Legacy fork anchors.** For assistant replies written before fork support, the gateway needs the
   retained app event to identify the native entry. New replies keep that link after replay trimming.
+* **No agent-side reactions.** Protocol v2 marks them *later*: the gateway stores and replays owner
+  reactions only, and the transcript carries no reaction state for the model beyond the bounded
+  passive note.
 * **Not covered offline:** a real `tailscale serve` proxy, an installed PWA's cookie jar, iOS
   suspension and reconnect backoff, `sw.js` update semantics, or native process replacement with
   a real device. Offline checks reopen a gateway mid-turn and verify side-thread recovery.
