@@ -145,16 +145,17 @@ export const COMMANDS: readonly CommandHelp[] = [
   },
   {
     name: "app",
-    synopsis: "durable-nanobot app <pair [--label <label>]|devices|revoke <label>> [--config <path>] | app push-keys",
-    summary: "Pair, list or revoke devices of the installable web app channel, or generate its Web Push keys",
+    synopsis: "durable-nanobot app <pair [--label <label>]|devices|revoke <label>|shortcut <add --label <label>|list|revoke <label>>> [--config <path>] | app push-keys",
+    summary: "Pair, list or revoke devices of the installable web app channel, manage its shortcut tokens, or generate its Web Push keys",
     options: [
       CONFIG_OPTION,
-      { flags: "--label <label>", text: "pair: optional printable device label (1-40); a default is chosen when omitted." },
-      { flags: "<label>", text: "revoke: one exact paired device label; its live stream is closed." },
+      { flags: "--label <label>", text: "pair or shortcut add: optional printable device label (1-40); required for shortcut add." },
+      { flags: "<label>", text: "revoke and shortcut revoke: one exact label; a revoked device stream is closed at once." },
     ],
     details: [
       "Needs the app channel configured and the gateway running; every decision is the running adapter's.",
       "A pairing code is single-use and expires after ten minutes; only its hash is stored.",
+      "A shortcut token is printed once by `app shortcut add --label <name>` and stored only as a hash; it authenticates exactly POST /v1/ask and never the stream, upload, download, pair or a control. Revocation is immediate.",
       "push-keys needs no gateway and reads no config: it prints one fresh VAPID key pair once and writes nothing.",
     ],
     examples: [
@@ -162,6 +163,9 @@ export const COMMANDS: readonly CommandHelp[] = [
       "durable-nanobot app pair --label iphone",
       "durable-nanobot app devices",
       "durable-nanobot app revoke iphone",
+      "durable-nanobot app shortcut add --label morning",
+      "durable-nanobot app shortcut list",
+      "durable-nanobot app shortcut revoke morning",
       "durable-nanobot app push-keys",
     ],
   },

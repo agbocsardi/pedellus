@@ -103,6 +103,15 @@ import { createAppPushDispatcher, pushPayload, type AppPushDispatcher, type AppP
 import { absorbActivity, activityForWire, emptyActivity, type ActivityTally } from "./app-activity.js";
 import { startAppListener, type AppDeviceSession, type AppSessionHooks } from "./app-listener.js";
 import {
+  APP_SHORTCUT_LIMITS,
+  hashShortcutToken,
+  newShortcutToken,
+  type AppShortcutCreated,
+  type AppShortcutListing,
+  type AppShortcutRecord,
+  type AppShortcutRefusal,
+} from "./app-shortcuts.js";
+import {
   AppFileRejected,
   createAppFiles,
   APP_DEFAULT_TYPE,
@@ -154,6 +163,8 @@ export type AppChannelState = {
   controls: AppControlRecord[];
   devices: AppDeviceRecord[];
   pairings: AppPairingRecord[];
+  /** Shortcut credentials: a label and a token hash, never a device and never a token. */
+  shortcuts?: AppShortcutRecord[];
   /** Highest acknowledged durable cursor per device id. */
   acks: Record<string, number>;
   /** Monotonic admission stamp for notice event ids; time alone can repeat within a millisecond. */
@@ -281,6 +292,10 @@ export interface AppConsole {
   pair(label?: string): Promise<AppPairingCreated | { readonly refused: AppPairingRefusal }>;
   devices(): Promise<readonly AppDeviceListing[]>;
   revoke(label: string): Promise<"revoked" | "missing" | "invalid-label">;
+  /** Create one shortcut token; it is returned once and only its hash is stored. */
+  shortcutAdd(label: string): Promise<AppShortcutCreated | { readonly refused: AppShortcutRefusal }>;
+  shortcuts(): Promise<readonly AppShortcutListing[]>;
+  shortcutRevoke(label: string): Promise<"revoked" | "missing" | "invalid-label">;
 }
 
 export interface AppConsoleRegistry {
@@ -3017,6 +3032,54 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       const socket = sockets.get(revokedId);
       if (socket !== undefined) socket.session.close(APP_CLOSE.unauthorized, "revoked");
       journalEvent("app.device.revoked", { "device.label": label });
+      return "revoked";
+    },
+    async shortcutAdd(label) {
+      const trimmed = label.trim();
+      if (!validAppLabel(trimmed)) return { refused: "invalid-label" };
+      let created: AppShortcutCreated | undefined;
+      let refused: AppShortcutRefusal | undefined;
+      await mutateState((doc) => {
+        const current = doc.shortcuts ?? [];
+        if (current.filter((entry) => entry.revokedAtMs === undefined).length >= APP_SHORTCUT_LIMITS.maxShortcuts) {
+          refused = "shortcut-limit";
+          return;
+        }
+        if (current.some((entry) => entry.revokedAtMs === undefined && entry.label === trimmed)) {
+          refused = "label-in-use";
+          return;
+        }
+        const token = newShortcutToken();
+        const createdAtMs = now();
+        // The token is returned once to the console and never stored: only its hash joins the state.
+        doc.shortcuts = [...current, { label: trimmed, tokenHash: hashShortcutToken(token), createdAtMs }];
+        created = { label: trimmed, token, createdAtMs };
+      });
+      if (refused !== undefined) return { refused };
+      // The label is not a credential; the token is never journalled.
+      journalEvent("app.shortcut.created", { "shortcut.label": trimmed });
+      return created!;
+    },
+    async shortcuts() {
+      return (state.shortcuts ?? [])
+        .map((entry) => ({
+          label: entry.label,
+          createdAtMs: entry.createdAtMs,
+          ...(entry.revokedAtMs === undefined ? {} : { revokedAtMs: entry.revokedAtMs }),
+        }))
+        .sort((left, right) => left.createdAtMs - right.createdAtMs);
+    },
+    async shortcutRevoke(label) {
+      if (!validAppLabel(label)) return "invalid-label";
+      let revoked = false;
+      await mutateState((doc) => {
+        const entry = (doc.shortcuts ?? []).find((item) => item.revokedAtMs === undefined && item.label === label);
+        if (entry === undefined) return;
+        entry.revokedAtMs = now();
+        revoked = true;
+      });
+      if (!revoked) return "missing";
+      journalEvent("app.shortcut.revoked", { "shortcut.label": label });
       return "revoked";
     },
   };

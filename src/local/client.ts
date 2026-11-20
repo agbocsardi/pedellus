@@ -20,6 +20,11 @@ import type {
 import type { CronScheduleInput } from "../automation/cron.js";
 import type { AppDeviceListing, AppPairingCreated, AppPairingRefusal } from "../channels/app.js";
 import type {
+  AppShortcutCreated,
+  AppShortcutListing,
+  AppShortcutRefusal,
+} from "../channels/app-shortcuts.js";
+import type {
   TerminalAttachmentSubmission,
   TerminalConversation,
   TerminalEntryPage,
@@ -68,6 +73,10 @@ export interface LocalHostNotice {
 export type AppPairingResult = AppPairingCreated | { readonly refused: AppPairingRefusal };
 /** One paired device row as the terminal prints it. */
 export type AppDeviceRow = AppDeviceListing;
+/** Owner shortcut outcome: one created token (shown once), or one fixed refusal reason. */
+export type AppShortcutResult = AppShortcutCreated | { readonly refused: AppShortcutRefusal };
+/** One shortcut row as the terminal prints it; never the token. */
+export type AppShortcutRow = AppShortcutListing;
 
 export interface LocalGatewayClient extends TerminalConversation {
   readonly sessionKey: string;
@@ -118,6 +127,10 @@ export interface LocalGatewayClient extends TerminalConversation {
   appPair(label: string | undefined, context: Context): Promise<AppPairingResult>;
   appDevices(context: Context): Promise<readonly AppDeviceRow[]>;
   appRevoke(label: string, context: Context): Promise<"revoked" | "missing">;
+  /** Shortcut credentials: create one (token answered once), list and revoke by exact label. */
+  appShortcutAdd(label: string, context: Context): Promise<AppShortcutResult>;
+  appShortcutList(context: Context): Promise<readonly AppShortcutRow[]>;
+  appShortcutRevoke(label: string, context: Context): Promise<"revoked" | "missing">;
   historySearch(query: HistoryQuery, context: Context): Promise<HistoryPage>;
   listEpisodes(sessionKey: string, query: HistoryEpisodeQuery, context: Context): Promise<HistoryEpisodePage>;
   episode(sessionKey: string, startEntryId: number, context: Context): Promise<HistoryEpisode | undefined>;
@@ -459,6 +472,40 @@ class LocalGatewayConnection implements LocalGatewayClient {
     const result = await this.call<{ readonly result?: unknown }>("appRevoke", { label }, context);
     if (result.result !== "revoked" && result.result !== "missing") {
       throw new LocalGatewayError("unavailable", "local gateway sent an unexpected revoke result");
+    }
+    return result.result;
+  }
+
+  async appShortcutAdd(label: string, context: Context): Promise<AppShortcutResult> {
+    const result = await this.call<Record<string, unknown>>("appShortcutAdd", { label }, context);
+    if (typeof result.refused === "string") {
+      if (result.refused !== "invalid-label" && result.refused !== "label-in-use" &&
+          result.refused !== "shortcut-limit") {
+        throw new LocalGatewayError("unavailable", "local gateway sent an unexpected shortcut result");
+      }
+      return { refused: result.refused };
+    }
+    if (typeof result.token !== "string" || typeof result.label !== "string" ||
+        typeof result.createdAtMs !== "number") {
+      throw new LocalGatewayError("unavailable", "local gateway sent an unexpected shortcut result");
+    }
+    return { label: result.label, token: result.token, createdAtMs: result.createdAtMs };
+  }
+
+  async appShortcutList(context: Context): Promise<readonly AppShortcutRow[]> {
+    const result = await this.call<{ readonly shortcuts?: unknown }>("appShortcutList", {}, context);
+    if (!Array.isArray(result.shortcuts) || result.shortcuts.some((entry) =>
+      entry === null || typeof entry !== "object" || typeof (entry as Record<string, unknown>).label !== "string" ||
+      typeof (entry as Record<string, unknown>).createdAtMs !== "number")) {
+      throw new LocalGatewayError("unavailable", "local gateway sent an unexpected shortcut listing");
+    }
+    return result.shortcuts as AppShortcutRow[];
+  }
+
+  async appShortcutRevoke(label: string, context: Context): Promise<"revoked" | "missing"> {
+    const result = await this.call<{ readonly result?: unknown }>("appShortcutRevoke", { label }, context);
+    if (result.result !== "revoked" && result.result !== "missing") {
+      throw new LocalGatewayError("unavailable", "local gateway sent an unexpected shortcut revoke result");
     }
     return result.result;
   }
