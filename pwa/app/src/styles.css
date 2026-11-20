@@ -1624,11 +1624,11 @@ input#pair-code {
   flex: none;
   border-radius: 50%;
   background: var(--danger);
-  animation: voice-pulse 1.2s ease-in-out infinite;
+  animation: voice-pulse 2.6s ease-in-out infinite;
 }
 @keyframes voice-pulse {
   0%, 100% { opacity: 1; }
-  50% { opacity: 0.25; }
+  50% { opacity: 0.35; }
 }
 @media (prefers-reduced-motion: reduce) {
   .voice-dot { animation: none; }
