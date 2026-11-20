@@ -1113,7 +1113,7 @@ input#pair-code {
 .composer {
   position: relative;
   /* The home indicator's inset already leaves room; sit just above it, not a full inset higher. */
-  padding: 6px var(--gutter) max(8px, calc(var(--inset-bottom) - 12px));
+  padding: 6px var(--gutter) max(8px, calc(var(--inset-bottom) - 4px));
   background: var(--bg);
 }
 .composer::before {
