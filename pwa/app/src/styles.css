@@ -6,7 +6,7 @@
   --inset-bottom: env(safe-area-inset-bottom, 0px);
 }
 @supports (-webkit-touch-callout: none) {
-  @media (display-mode: standalone) and (orientation: portrait) {
+  @media (display-mode: standalone) {
     :root {
       --inset-top: calc(env(safe-area-inset-top, 0px) + 1rem);
       /* Installed iOS 26 draws the page only down to screen height minus the top inset (852pt
