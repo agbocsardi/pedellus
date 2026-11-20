@@ -605,8 +605,7 @@ input#pair-code {
   display: block;
   margin-top: 6px;
   color: var(--muted-ink);
-  font-size: 0.78rem;
-  font-style: italic;
+  font-size: 0.8rem;
 }
 .notice .msg-partial,
 .bubble .msg-partial {

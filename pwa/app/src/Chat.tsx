@@ -814,7 +814,7 @@ function EventRow({ ev, text, partial, store, last, forks, onActions, onRetry }:
   }
   if (ev.event !== "message") return null; // settled only drives delivery state
   const body = text ?? ev.text;
-  const incomplete = partial ? <span className="msg-partial" role="status">Incomplete</span> : null;
+  const incomplete = partial ? <span className="msg-partial">Incomplete</span> : null;
   const outgoing = ev.key ? store.outgoing(ev.thread, ev.key) : undefined;
   const anchor = Number.isSafeInteger(ev.cursor) && ev.cursor > 0 && ev.role !== "notice"
     ? { "data-message-id": ev.id, "data-message-cursor": ev.cursor, "data-thread-title": suggestedTitle(ev.text), tabIndex: -1 }
@@ -860,7 +860,7 @@ function UserBubble(props: {
     <div className="row user">
       <div className="bubble" {...props.anchor}>
         {props.text}
-        {props.partial && <span className="msg-partial" role="status">Incomplete</span>}
+        {props.partial && <span className="msg-partial">Incomplete</span>}
       </div>
       {show && d && (
         <span className="deliv" data-state={state}>
