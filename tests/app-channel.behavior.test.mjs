@@ -1603,9 +1603,31 @@ function scriptAsk(store, followUp) {
   ]);
 }
 
+/** One stored question record and, when asked, the open card an earlier process had delivered. */
+async function seedQuestion(store, thread, record, { open = false } = {}) {
+  const conversation = await store.gateway.conversationFor(record.sessionKey, context);
+  await conversation.commit(async (tx) => {
+    const doc = await tx.doc(AskQuestionsDoc, conversation.id);
+    doc.questions.push(record);
+  }, context);
+  if (!open) return record;
+  const stateConversation = await store.gateway.conversationFor('app:channel-state', context);
+  const { AppState } = await import(new URL('../dist/channels/app.js', import.meta.url).href);
+  await stateConversation.commit(async (tx) => {
+    const doc = await tx.doc(AppState, stateConversation.id);
+    const cursor = doc.nextCursor;
+    doc.nextCursor = cursor + 1;
+    doc.events.push({
+      event: 'question', cursor, thread, id: record.id, prompt: record.question,
+      options: record.options, expiresAt: new Date(record.expiresAtMs).toISOString(), state: 'open',
+    });
+  }, context);
+  return record;
+}
+
 /** Seed one already-expired pending record and the open card an earlier process delivered. */
 async function seedExpiredQuestion(store, thread, id) {
-  const record = {
+  return seedQuestion(store, thread, {
     id,
     taskId: 1,
     sessionKey: thread === 'main' ? 'app:chat' : `app:chat:${thread}`,
@@ -1615,24 +1637,7 @@ async function seedExpiredQuestion(store, thread, id) {
     expiresAtMs: Date.now() - 60_000,
     delivery: 'delivered',
     status: 'pending',
-  };
-  const conversation = await store.gateway.conversationFor(record.sessionKey, context);
-  await conversation.commit(async (tx) => {
-    const doc = await tx.doc(AskQuestionsDoc, conversation.id);
-    doc.questions.push(record);
-  }, context);
-  const stateConversation = await store.gateway.conversationFor('app:channel-state', context);
-  const { AppState } = await import(new URL('../dist/channels/app.js', import.meta.url).href);
-  await stateConversation.commit(async (tx) => {
-    const doc = await tx.doc(AppState, stateConversation.id);
-    const cursor = doc.nextCursor;
-    doc.nextCursor = cursor + 1;
-    doc.events.push({
-      event: 'question', cursor, thread, id, prompt: record.question,
-      options: record.options, expiresAt: new Date(record.expiresAtMs).toISOString(), state: 'open',
-    });
-  }, context);
-  return record;
+  }, { open: true });
 }
 
 test('ask_user delivers a durable question and one tap admits exactly one follow-up turn', { timeout: 30_000 }, async () => {
@@ -1761,6 +1766,7 @@ test('/new cancels the open question and a later tap is refused', { timeout: 30_
     await device.close();
   });
 });
+
 test('archiving a thread cancels its open question and a restore does not reopen it', { timeout: 30_000 }, async () => {
   await withChannel('archive-question', {}, async ({ store, base }) => {
     const device = await questionDevice(store, base);
@@ -1808,6 +1814,7 @@ test('archiving a thread cancels its open question and a restore does not reopen
     await device.close();
   });
 });
+
 test('an answered question is not re-published after retention trims its event', { timeout: 30_000 }, async () => {
   await withChannel('pruned-question', {}, async ({ store, base }) => {
     const device = await questionDevice(store, base);
@@ -1850,6 +1857,38 @@ test('an answered question is not re-published after retention trims its event',
     assert.equal(marks.main[open.id].state, 'answered', 'the side thread left main\'s entry alone');
     assert.equal((await appState(store.gateway)).events.some((event) => event.id === open.id), false,
       'main\'s trimmed terminal state is still not re-published');
+    await device.close();
+  });
+});
+
+test('a quarantined question is repaired by its live open event; one without stays quarantined', { timeout: 30_000 }, async () => {
+  await withChannel('unknown-question', {}, async ({ store, base }) => {
+    const device = await questionDevice(store, base);
+    const base_ = {
+      taskId: 1,
+      sessionKey: 'app:chat',
+      question: 'Still want the deploy?',
+      options: [{ id: 'a', label: 'Yes' }, { id: 'b', label: 'No' }],
+      createdAtMs: Date.now() - 600_000,
+      expiresAtMs: Date.now() + 600_000,
+      delivery: 'unknown',
+      status: 'unknown',
+    };
+    const delivered = await seedQuestion(store, 'main', { ...base_, id: 'aaaabbbb01' }, { open: true });
+    const lost = await seedQuestion(store, 'main', { ...base_, id: 'aaaabbbb02' });
+
+    // The open event proves the append happened, so the quarantined record is answerable again.
+    assert.equal((await request(device, 'a1', 'answer', { thread: 'main', question: delivered.id, option: 'a' })).accepted, true);
+    await device.wait(() => device.events('question').some((event) => event.id === delivered.id && event.state === 'answered'),
+      'the repaired question answered');
+    assert.equal(store.captured.some((entry) => entry.messages.at(-1)?.content === `Answered question ${delivered.id}: Yes`), true,
+      'only the stored label was admitted');
+
+    // No open event was ever appended, so this one stays quarantined and admits nothing.
+    assert.equal((await request(device, 'a2', 'answer', { thread: 'main', question: lost.id, option: 'b' })).accepted, false);
+    await device.wait(() => device.events('message').some((event) => event.role === 'notice' &&
+      event.text === 'This question is no longer open.'), 'the quarantined notice');
+    assert.equal(store.captured.some((entry) => JSON.stringify(entry.messages).includes(lost.id)), false);
     await device.close();
   });
 });

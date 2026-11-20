@@ -134,7 +134,9 @@ export function questionMarkOf(event: AppQuestionEventInput): AppQuestionMark {
  * Settle overdue and crashed-delivery records (expiry on read, never a timer), then return the
  * `question` events the app's log is missing and the marks they leave. A live `open` event is proof
  * the append reached this channel, so a delivery mark lost in a crash is repaired here instead of
- * being quarantined. Records the app already shows in their current state add nothing.
+ * being quarantined — including a record already quarantined `unknown` whose `open` event is still
+ * in the log; an `unknown` record with no such event stays quarantined. Records the app already
+ * shows in their current state add nothing.
  */
 export function reconcileQuestionEvents(
   questions: Draft<AskQuestionsDocument>,
@@ -147,7 +149,13 @@ export function reconcileQuestionEvents(
   const known = knownQuestions(events, marks);
   for (const record of questions.questions) {
     if (!validQuestionRecord(record) || known.get(record.id)?.state !== "open") continue;
-    if (record.status === "pending" && record.delivery === "sending") record.delivery = "delivered";
+    if (record.status === "pending" && record.delivery === "sending") {
+      record.delivery = "delivered";
+    } else if (record.status === "unknown") {
+      // The open event is in the log, so the append definitely happened: the question is live again.
+      record.status = "pending";
+      record.delivery = "delivered";
+    }
   }
   pendingQuestionViews(questions, nowMs);
   const out: AppQuestionEventInput[] = [];

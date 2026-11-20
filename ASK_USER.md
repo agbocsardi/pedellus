@@ -64,15 +64,16 @@ follow-up inputs over time, never a combined fabricated answer).
   `state: "open"` in the thread's log; every later change (`answered`, `expired`,
   `cancelled`, `unknown`) is another event for the same id and the app keeps the
   latest. The channel also remembers the last state it published per id, so an
-  event trimmed by retention is never published again. Tapping sends `answer {thread, question, option}`; the gateway claims
+  event trimmed by retention is never published again. Tapping sends
+  `answer {thread, question, option}`; the gateway claims
   the record against that exact thread session and admits the stored label
   (`Answered question <id>: <label>`) as the follow-up turn in one commit, replies
   `accepted: true`, then publishes the `answered` event. A refused tap replies
   `accepted: false`, appends one fixed notice and admits nothing. A typed ordinary
   message settles the oldest delivered question in that thread in the same commit
   as its admission, exactly like Telegram and the CLI, and `/new` cancels pending
-  questions with the reset; archiving the thread cancels them with the archive, and
-  restoring it does not reopen them.
+  questions with the reset (see below); archiving the thread cancels them with the
+  archive, and restoring it does not reopen them.
 - **Local terminal** has no button protocol: the question is printed with numbered
   options and the owner types an answer as an ordinary message. Attaching prints
   questions that are still open in that conversation, so a gateway restart does not
@@ -93,9 +94,12 @@ answers. A later button for that answered question is refused as a replay.
 Expiry is enforced when a question is read or claimed, not by a timer. An overdue
 `pending` question becomes `expired`; a foreign session, unknown id or superseded
 record answers `stale`; an already-answered one answers `replay`. `/new` (a context
-reset) cancels every pending question in that conversation in the same operation,
-because an answer would otherwise start a turn whose context no longer contains the
-question. `/abort` and a host restart do not cancel questions: the answer is still a
+reset) cancels every pending question in that conversation, because an answer would
+otherwise start a turn whose context no longer contains the question. The plain
+native reset commits the reset and the cancellation together; when the host owns the
+reset as a paired operation, the reset commits first and the cancellation
+immediately after, so a rendered card is retracted a moment later rather than
+atomically. `/abort` and a host restart do not cancel questions: the answer is still a
 meaningful next turn, and an expired or cancelled button is refused with fixed text.
 
 ## Retention and limits

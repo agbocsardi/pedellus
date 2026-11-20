@@ -262,9 +262,11 @@ Alongside the log the channel keeps the last state it published per question id,
 trims events: a terminal state whose event was trimmed is never published again, and that memory
 goes away with the question record, so it stays bounded by the record set. A live `open` event
 itself proves the append happened, so a delivery mark lost in a crash is repaired on the next read
-instead of being quarantined. Expiry and quarantine are enforced when a question is read or claimed
-— on `answer`, a typed message, `/new`, archiving, or adapter start — never by an adapter timer, so
-an open card can outlive its answer window until one of those reads.
+instead of being quarantined — including a record already quarantined `unknown` whose `open` event
+is still in the log; an `unknown` record with no such event stays quarantined. Expiry and quarantine
+are enforced when a question is read or claimed — on `answer`, a typed message, `/new`, archiving,
+or adapter start — never by an adapter timer, so an open card can outlive its answer window until
+one of those reads.
 
 `answer {thread, question, option}` claims the durable record against that exact thread session and
 admits the follow-up input in one commit. Only the stored record's own label is admitted
@@ -274,11 +276,13 @@ replies `accepted: false`, appends one fixed `notice` message (once per request 
 nothing. A typed ordinary `send` settles the oldest delivered question in that thread atomically
 with its own admission — commands, callback-shaped text and attachment-only sends never count — so
 the answer is that message and the record stores no duplicate text. `/new` cancels every pending
-question in the thread in the same operation as the reset; archiving a thread cancels its open
-questions in the archive's own commit, so the archived thread and the `cancelled` card arrive
-together and restoring the thread does not reopen them — an open question would otherwise leave a
-card that can never be answered and a record that blocks every later ask. `abort` and a restart
-do not.
+question in the thread: the plain native reset commits the reset and the cancellation together,
+while the host paired reset commits the reset first and the cancellation immediately after (two
+commits, and the `cancelled` card is published right after them) — a refused reset cancels nothing.
+Archiving a thread cancels its open questions in the archive's own commit, so the archived thread
+and the `cancelled` card arrive together and restoring the thread does not reopen them; an open
+question would otherwise leave a card that can never be answered and a record that blocks every
+later ask. `abort` and a restart cancel nothing.
 
 ## Notifications (Web Push)
 
