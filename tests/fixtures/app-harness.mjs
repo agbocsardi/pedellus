@@ -139,6 +139,7 @@ export function startApp(store, options = {}) {
     autoArchiveDays: options.autoArchiveDays ?? store.config.app.autoArchiveDays,
     agentName: options.agentName ?? store.config.app.agentName,
     ...(options.scanIntervalMs === undefined ? {} : { scanIntervalMs: options.scanIntervalMs }),
+    ...(options.askWaitMs === undefined ? {} : { askWaitMs: options.askWaitMs }),
     ...(options.restart === undefined ? {} : { restart: options.restart }),
     ...(options.push === undefined ? {} : { push: options.push }),
     ...(media === undefined ? {} : { media }),
