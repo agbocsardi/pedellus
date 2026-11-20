@@ -6,7 +6,7 @@
 // port and a synthetic WebSocket client speaking protocol v2. Every wait is event-driven; no test
 // sleeps on a schedule, and every handle is cleaned up by the test that created it.
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -18,11 +18,13 @@ const [
   { ToolResultEntry },
   { CronJobsDoc },
   { WorkerRecordsDoc },
+  { createAppFiles },
 ] = await Promise.all([
   import(new URL('../dist/config.js', import.meta.url).href),
   import(`${modules}/pi-durable/dist/index.js`),
   import(new URL('../dist/automation/cron.js', import.meta.url).href),
   import(new URL('../dist/workers/worker-task.js', import.meta.url).href),
+  import(new URL('../dist/channels/app-files.js', import.meta.url).href),
 ]);
 
 import {
@@ -389,3 +391,83 @@ test('the app tool exists only in mapped app chat conversations', { timeout: 60_
     }, 'the scheduled run to settle');
   });
 });
+
+test('a replayed app tool execution keeps its committed outcome when the file changed or vanished', { timeout: 30_000 }, async () => {
+  await withApp('agent-replay', {
+    files: { 'notes/report.txt': 'REPORT-BYTES' },
+    script: [
+      () => fauxAssistantMessage([
+        fauxToolCall('app', { action: 'send', path: 'notes/report.txt', caption: 'Here is the report' },
+          { id: 'send-call' }),
+      ], { stopReason: 'toolUse' }),
+      () => fauxAssistantMessage('SENT-AND-DONE'),
+    ],
+  }, async ({ store, send }) => {
+    await send('replay-1', 'send the report');
+
+    const message = agentFileMessages(await appState(store.gateway))[0];
+    assert.ok(message !== undefined);
+    // pi-durable replays the tool with its original task id, so the call identity is the message's.
+    const callId = message.id.slice('agent:'.length);
+    const recordsBefore = (await appFilesState(store.gateway)).uploads.length;
+    const host = store.gateway.appActions.current();
+    assert.ok(host !== undefined, 'the running adapter attached its action host');
+    const request = { action: 'send', path: 'notes/report.txt', caption: 'Here is the report' };
+
+    // The workspace file is gone, but the effect already happened: the replay reports it again
+    // without reading the file or storing another copy.
+    await rm(join(store.workspace, 'notes', 'report.txt'));
+    const deleted = await host.act(APP_CHAT_SESSION_KEY, callId, request, context);
+    assert.equal(deleted.ok, true, deleted.text);
+    assert.match(deleted.text, /Delivered the workspace file notes\/report\.txt as one attachment \(12 bytes\)/u);
+    assert.equal((await appFilesState(store.gateway)).uploads.length, recordsBefore, 'no second record');
+    assert.equal(agentFileMessages(await appState(store.gateway)).length, 1, 'no second message');
+
+    // A changed file is not the delivered file: the receipt still reports the committed copy.
+    await writeFile(join(store.workspace, 'notes', 'report.txt'), 'CHANGED-BYTES-NOT-DELIVERED');
+    const changed = await host.act(APP_CHAT_SESSION_KEY, callId, request, context);
+    assert.equal(changed.ok, true, changed.text);
+    assert.match(changed.text, /\(12 bytes\)/u, 'the receipt reports the committed size');
+    assert.equal((await appFilesState(store.gateway)).uploads.length, recordsBefore, 'no orphan copy');
+    assert.equal(agentFileMessages(await appState(store.gateway)).length, 1, 'still one message');
+  });
+});
+
+test('a replayed storage adopts its existing copy instead of deleting bytes a record references', { timeout: 30_000 }, async () => {
+  const store = await openAppStore('agent-adopt', { media: {} });
+  try {
+    const conversation = await store.gateway.conversationFor(APP_CHAT_SESSION_KEY, context);
+    const files = createAppFiles({
+      media: { workspace: store.workspace }, conversation, context, now: () => Date.now(),
+    });
+    const request = {
+      identity: 'app:agent:tool:7', messageId: 'agent:tool:7', name: 'report.txt', type: 'text/plain',
+      kind: 'file', bytes: Buffer.from('COMMITTED-BYTES'), maxBytes: 1 << 20,
+    };
+    const first = await files.storeAgent(request);
+    assert.equal(first.status, 'stored');
+    assert.equal(first.file.adopted, false, 'the first store created the bytes');
+    await conversation.commit(async (tx) => { await files.admitAgent(tx, first.file); }, context);
+
+    // The same execution runs again after a crash: it adopts the same locator, and a commit that
+    // then fails must not delete the bytes the admitted record still references.
+    const replay = await files.storeAgent(request);
+    assert.equal(replay.status, 'stored');
+    assert.equal(replay.file.adopted, true, 'the replay adopted the existing copy');
+    assert.equal(replay.file.record.path, first.file.record.path);
+    await replay.file.discard();
+
+    const kept = await files.download(first.file.record.id);
+    assert.ok(kept !== undefined, 'the committed record still downloads');
+    assert.equal(await readFile(kept.absolutePath, 'utf8'), 'COMMITTED-BYTES');
+
+    // Bytes this execution stored itself are still removed when its commit does not happen.
+    const fresh = await files.storeAgent({ ...request, identity: 'app:agent:tool:8', messageId: 'agent:tool:8' });
+    assert.equal(fresh.file.adopted, false);
+    await fresh.file.discard();
+    await assert.rejects(readFile(join(store.workspace, ...fresh.file.record.path.split('/'))), /ENOENT/u);
+  } finally {
+    await store.close();
+  }
+});
+

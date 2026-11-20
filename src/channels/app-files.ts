@@ -111,7 +111,12 @@ export type AppAgentFile = {
   readonly record: AppUploadRecord;
   /** Its wire shape, identical to an owner upload's. */
   readonly info: AttachmentInfo;
-  /** Delete the stored bytes when the caller's commit does not happen. */
+  /**
+   * True when a complete copy for this identity already existed and was reused. An adopted copy is
+   * shared: it may already be referenced, so `discard` never removes it.
+   */
+  readonly adopted: boolean;
+  /** Delete bytes this call stored; an adopted copy is left alone. */
   discard(): Promise<void>;
 };
 
@@ -164,6 +169,12 @@ export type AppFiles = {
   }): Promise<AppAgentFileOutcome>;
   /** Admit the referenced record in the caller's commit; refuses when the registry is full. */
   admitAgent(tx: Tx, file: AppAgentFile): Promise<void>;
+  /**
+   * The referenced record a finished execution of this tool task already committed, if any. It is
+   * the durable idempotency anchor for a recovered execution: referenced records are never pruned,
+   * unlike the trimmed event log.
+   */
+  agentCommit(messageId: string): Promise<AppUploadRecord | undefined>;
   /** The file one durable message references, or `undefined` when it is not downloadable. */
   download(id: string): Promise<AppDownloadFile | undefined>;
   /** Drop unreferenced uploads past their TTL: the record here, then the file. */
@@ -421,6 +432,11 @@ export function createAppFiles(options: {
       if (request.bytes.byteLength > request.maxBytes) return { status: "too-large" };
       if (request.bytes.byteLength === 0) return { status: "empty" };
       const id = newUploadId();
+      // The locator is content-stable per identity, so an existing complete copy is this same
+      // workspace file from an earlier attempt. It is shared, not ours to delete on failure.
+      const adopted = await store
+        .existingFor(request.identity, STORE_KINDS[request.kind], request.type, name)
+        .then((found) => found !== undefined, () => false);
       let stored;
       try {
         stored = await store.save({
@@ -447,7 +463,8 @@ export function createAppFiles(options: {
         file: {
           record,
           info: { id, name, type: request.type, size: stored.bytes, kind: request.kind },
-          discard: () => store.remove(record.path).catch(() => undefined),
+          adopted,
+          discard: () => (adopted ? Promise.resolve() : store.remove(record.path).catch(() => undefined)),
         },
       };
     },
@@ -458,6 +475,14 @@ export function createAppFiles(options: {
       // the record cannot be admitted, so the two never disagree.
       if (doc.uploads.length >= APP_FILE_LIMITS.maxRecords) throw new AppFileRejected();
       doc.uploads.push(file.record);
+    },
+
+    async agentCommit(messageId: string): Promise<AppUploadRecord | undefined> {
+      if (store === undefined) return undefined;
+      const { uploads } = await read();
+      const record = uploads.find((entry) =>
+        entry.deviceId === APP_AGENT_DEVICE && entry.messageId === messageId);
+      return record === undefined ? undefined : { ...record };
     },
 
     async download(id: string): Promise<AppDownloadFile | undefined> {

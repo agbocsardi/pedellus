@@ -392,6 +392,13 @@ function agentFileRefusal(action: "send" | "artifact", reason: TelegramOutboundR
   }
 }
 
+/** The model-facing receipt for one delivered agent file; bounded, workspace-relative, no bytes. */
+function agentFileReceipt(action: "send" | "artifact", path: string, size: number): string {
+  return action === "artifact"
+    ? `Delivered the workspace file ${path} as a sandboxed artifact (${size} bytes).`
+    : `Delivered the workspace file ${path} as one attachment (${size} bytes).`;
+}
+
 /** Resolve an app message, not an arbitrary entry ID, to a typed committed transcript entry. */
 export async function appForkEntry(
   tx: Tx, state: AppChannelState, source: ConversationId, from: AppThreadOrigin,
@@ -3043,8 +3050,9 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   /**
    * The model tool's live host. Every call re-derives the thread from the host-owned session key,
    * rechecks that the thread is open, reads one bounded workspace file through the same resolver
-   * the Telegram send uses, and commits the referenced record with the assistant message. Nothing
-   * the model supplied decides the thread, the device or the storage path.
+   * the Telegram send uses, and commits the referenced record with the assistant message. A call
+   * whose referenced record already exists is answered from that record without touching the file.
+   * Nothing the model supplied decides the thread, the device or the storage path.
    */
   const actionHost: AppActionHost = {
     async act(sessionKey, callId, request, ctx) {
@@ -3078,6 +3086,16 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       }
       const action = request.action;
       const maxBytes = action === "artifact" ? APP_LIMITS.artifactBytes : APP_LIMITS.uploadBytes;
+      // One identity per tool execution: a recovered run adopts its own copy instead of storing a
+      // second one, and the message id below makes the durable effect idempotent.
+      const messageId = `agent:${callId}`;
+      // A finished execution of this same tool task already committed its message and referenced
+      // record. That record is the anchor (referenced records are never pruned, unlike the trimmed
+      // event log), so report the receipt again without reading the workspace or storing anything:
+      // a file that was deleted or changed since then cannot turn a delivered file into a failure
+      // or an orphan copy.
+      const committed = await files.agentCommit(messageId);
+      if (committed !== undefined) return { ok: true, text: agentFileReceipt(action, request.path, committed.size) };
       let file;
       try {
         file = await readTelegramOutboundFile({
@@ -3095,9 +3113,6 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       if (action === "artifact" && artifactType === undefined) {
         return { ok: false, text: "The file was not delivered: an artifact must be a .html, .htm or .svg file." };
       }
-      // One identity per tool execution: a recovered run adopts its own copy instead of storing a
-      // second one, and the message id below makes the durable effect idempotent.
-      const messageId = `agent:${callId}`;
       const stored = await files.storeAgent({
         identity: `app:agent:${callId}`,
         messageId,
@@ -3143,17 +3158,15 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         }
         return { ok: false, text: "The file could not be attached, so no message was delivered." };
       }
-      if (appended) {
+      if (!appended) {
+        // The in-commit check (the authority) found the message already present, so no record of
+        // this execution was admitted; drop a copy only this execution stored.
+        await stored.file.discard();
+      } else {
         pushEventsToSockets();
         notifyPush(thread);
       }
-      const size = stored.file.record.size;
-      return {
-        ok: true,
-        text: action === "artifact"
-          ? `Delivered the workspace file ${request.path} as a sandboxed artifact (${size} bytes).`
-          : `Delivered the workspace file ${request.path} as one attachment (${size} bytes).`,
-      };
+      return { ok: true, text: agentFileReceipt(action, request.path, stored.file.record.size) };
     },
   };
 
