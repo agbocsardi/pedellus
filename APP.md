@@ -145,17 +145,16 @@ Lifecycle changes append durable `thread` events.
 The adapter grants no tool: coding tools, MCP, web, cron, memory and worker authority are whatever
 the configuration already gives that mapped chat. Its one model-facing tool is the `app` file
 capability above (*Files*), which grants no coding authority, returns no file content to the
-model, and reaches only the thread the model is already answering. The app chat is an `ask_user`
-owner surface (see *Owner questions*) but **not** yet an MCP login surface: persisting a one-time
-authorization URL in the durable log or channel state is forbidden by the channels' binding
-contract (see *Known gaps*). A callback-shaped `send` is still intercepted before transcript admission, refused
-with one fixed notice, and its text is never stored.
-the configuration already gives that mapped chat. The app chat is **not** an MCP login surface:
-protocol v2 has no event that could carry a one-time authorization URL without persisting it in
-channel state, which the channels' binding contract forbids (see *Known gaps*). It **is** an
-owner-question surface for the model's `ask_user` capability, because a question has a durable
-event of its own (see *Owner questions*). A callback-shaped `send` is still intercepted before
-transcript admission, refused with one fixed notice, and its text is never stored.
+model, and reaches only the thread the model is already answering. The app chat **is** an MCP
+login owner surface for its own open threads: the one-time authorization URL goes to the devices
+streaming at that moment as a non-durable `login` event, never into the durable log, channel
+state or a push, and a completion is one fixed notice in that thread (protocol v2, *MCP login*). A login
+attempt stays bound to the adapter instance that delivered it: after an app adapter restart, a
+pasted callback for it is refused with fixed text and its completion notice is dropped (the
+browser's loopback callback still completes it, and `/mcp` shows the result).
+A callback-shaped `send` is intercepted before admission and offered to the login lifecycle; only
+the lifecycle's fixed notice is stored, and the callback text itself is never stored. It is also an
+owner-question surface for the model's `ask_user` capability (see *Owner questions*).
 
 ## Fork admission
 
@@ -438,7 +437,9 @@ durable-nanobot app shortcut revoke morning        # immediate
 The token is 32 random bytes (base64url), printed exactly once and stored durably only as its
 SHA-256 hash beside its label, like a device hash. Labels follow the device rules (printable,
 1–40 characters); at most 8 shortcut tokens are active, and a revoked label is free again.
-Comparison is constant-time, and revocation is immediate because every ask re-reads the state.
+Comparison is constant-time, and revocation is immediate because every ask re-reads the state:
+a revoked token stops every *new* ask. An ask already admitted is not cancelled by revocation —
+its turn still runs and its answer still arrives, as it would if the token had never been revoked.
 
 A shortcut token is **not a device**. It is read only from the `Authorization: Bearer` header of
 `/v1/ask`; it never authenticates the stream (it is never the `durable_device` cookie), and it
@@ -460,7 +461,9 @@ file authority.
   (a split answer is joined by part), `200 {"outcome":"failed"}` or `{"outcome":"aborted"}`, or
   `202 {"outcome":"pending","key":"<key>"}` when the turn is still running — the answer then
   arrives in the app as usual. A repeated `key` admits nothing and reports that key's existing
-  outcome, so a retried Shortcut is safe.
+  outcome, so a retried Shortcut is safe. A duplicate whose `settled` event has already been
+  trimmed out of the capped log cannot be told from a running turn: it waits out the window and
+  answers `202 {"outcome":"pending","key":"<key>"}` too, still admitting nothing.
 - Errors are fixed and carry nothing else: `401 {"error":"unauthorized"}` (missing, unknown or
   revoked token), `400 {"error":"bad_request"}`, `413 {"error":"too_large"}`, `429
   {"error":"rate_limited"}` (more than `LIMITS.asksPerMinute` = 10 asks per token in a rolling
@@ -570,9 +573,6 @@ with a fixed reason and a durable fault entry; no raw record contents are logged
 
 ## Known gaps (phase 1)
 
-* **No MCP login surface.** A mapped app chat cannot start an MCP login (no owner surface is
-  registered, so the login is refused before delivery); the protocol's non-durable `login` event
-  (v2.md, *MCP login*) is specified but not implemented yet.
 * **No history or cards.** The protocol marks them *later*; `history` still replies
   `unsupported`. The Tasks view is implemented (see *Tasks*). Files are implemented (see *Files*),
   including agent-sent files and sandboxed artifacts, but with no thumbnails, resumable or
@@ -581,12 +581,6 @@ with a fixed reason and a durable fault entry; no raw record contents are logged
   per-device and total record bounds still apply.
 * **The shortcut ask window is in-memory.** A restart clears it, like the pairing and upload
   windows; the durable per-token record and its hash remain.
-* **No MCP login surface.** A mapped app chat cannot start an MCP login (no owner surface is
-  registered, so the login is refused before delivery). Protocol v2 defines no owner-only
-  non-durable event; a later protocol revision must add one before this channel can carry URLs.
-  `ask_user` questions are supported through their own durable event (see *Owner questions*).
-* **No uploads, media, history, tasks or cards.** The protocol marks them *later*; `history` and
-  `tasks` reply `unsupported`; a `send` with `attachments` replies `unsupported`.
 * **Web Push is offline-verified only.** No real push service, browser subscription or service
   worker has been exercised; a failed (non-404/410) send is only retried by the next message, as
   specified. The app side (permission, service worker, badge) lives in `pwa/app`.
@@ -648,7 +642,11 @@ key, reconnect without loss, controls with their replay reporting, the `hello.co
 catalogue with `model`/`help`/`digest`/`restart` arguments, usage notices and `unsupported`, a seeded reopen (interrupted
 command reported, held acknowledgement released, a pre-restart turn still answered), a failed run
 (`settled{failed}` with the error presence state), revocation, oversize frames and callback
-interception. v2 coverage includes thread lifecycle, search and list limits, concurrent turns and
+interception. `tests/app-mcp-login.behavior.test.mjs` covers the login surface with the loopback
+OAuth fixture: the URL reaching every hello'd device as a `login` frame and no durable event,
+channel state, push payload or transcript, the no-device cancellation, a pasted callback's fixed
+notice and completion, and stale, foreign, replayed and cross-thread callbacks refused with fixed
+text. v2 coverage includes thread lifecycle, search and list limits, concurrent turns and
 replay, fork context and scope checks after reopen, idle archive, interruption recovery, and cron restore.
 Files coverage: the opt-in (upload and `send.attachments` refused without `media`, `hello.uploads`),
 a durable upload record with byte-for-byte storage, the advertised and streamed `413` with nothing

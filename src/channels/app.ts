@@ -21,12 +21,12 @@
  *   durable outbox, authorized by this channel's own admission evidence and deduplicated by the
  *   outbox record id.
  *
- * No new tool authority exists: the adapter grants nothing. The app chat is denied the MCP login
- * surface because protocol v2 defines no event that could carry a one-time authorization URL
- * without persisting it, and persisting such a URL in channel state is forbidden by the other
- * channels' binding contract. It does own an `ask_user` surface: a durable `question` event is the
- * channel's delivery path, so the append is a definite delivery (app-questions.ts, APP.md). A
- * callback-shaped `send` is consumed before admission and never stored.
+ * No new tool authority exists: the adapter grants nothing. The app chat is the MCP login owner
+ * surface for its own open threads: the one-time authorization URL leaves as a non-durable `login`
+ * frame to the devices streaming right now (never durable state, a push or a log line), and a
+ * callback-shaped `send` is offered to the login lifecycle before admission, with its text never
+ * stored. The completion is one fixed notice in that thread. It also owns an `ask_user` surface: a
+ * durable `question` event is the channel's delivery path, so the append is a definite delivery.
  */
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { defineDoc, AssistantEntry, ConversationBusy, InboxDoc, LiveDoc, UserEntry } from "@earendil-works/pi-durable";
@@ -42,6 +42,7 @@ import type { CronDeliveryOutbox, CronDeliveryRecord } from "../automation/cron-
 import { CronDeliveryOutboxError } from "../automation/cron-delivery.js";
 import { originOccurrencePending } from "../automation/cron.js";
 import { looksLikeOAuthCallback } from "../mcp/surface.js";
+import { createAppLoginSurface } from "./app-login.js";
 import { isTurnInterruptionNotice } from "../recovery/interruption.js";
 import { inProcessTerminalConversation } from "../terminal/conversation.js";
 import { renderBackgroundStatus, type BackgroundStatus } from "../background-status.js";
@@ -64,7 +65,13 @@ import {
   type AppQuestionMarksByThread,
 } from "./app-questions.js";
 import { RESTART_BUSY_MESSAGE, RestartBusyError } from "../restart.js";
-import type { GatewayMemoryDigest, GatewayModelList, GatewayModelPresets, GatewayModelSelection } from "../runtime.js";
+import type {
+  GatewayMcpAdmin,
+  GatewayMemoryDigest,
+  GatewayModelList,
+  GatewayModelPresets,
+  GatewayModelSelection,
+} from "../runtime.js";
 import { taskCancelReceipt, type AppTaskCancelResult, type AppTaskList } from "./app-tasks.js";
 import {
   APP_CLOSE,
@@ -283,6 +290,13 @@ export interface AppGateway {
    * this channel; `ask_user` delivers only to the exact session that host owns.
    */
   askSurfaces?: AskSurfaceRegistry;
+  /**
+   * MCP management host: supplies the login lifecycle a callback-shaped `send` is offered to
+   * before admission. Absent when this host has no MCP management at all.
+   */
+  mcpAdmin?: GatewayMcpAdmin;
+  /** Live owner surfaces for direct MCP login delivery; the running adapter attaches here. */
+  mcpSurfaces?: import("../mcp/surface.js").McpSurfaceRegistry;
 }
 
 /** Terminal pairing console results, rendered by `src/channels/app-operator-cli.ts`. */
@@ -766,9 +780,10 @@ const MODEL_PRESETS_UNAVAILABLE =
   "Nothing was changed; /model lists the current selection read only, and this command never rewrites the configuration.";
 /** At most this many configured presets or models in one listing notice. */
 const MAX_MODEL_CHOICES = 50;
-const CALLBACK_REFUSED_TEXT =
-  "This looks like an OAuth callback URL. MCP login cannot be initiated from the app channel, so " +
-  "it was not stored and was not sent to the assistant.";
+const CALLBACK_UNAVAILABLE_TEXT =
+  "No MCP login is available in this host; the callback was not stored or sent to the assistant.";
+const CALLBACK_UNHANDLED_TEXT =
+  "This OAuth callback was not accepted. It was not sent to the assistant and was not stored.";
 const RESET_BUSY = "Reset refused: chat busy. Abort or retry when idle.";
 const RESET_UNREPAIRED = "Reset refused: open questions could not be checked. Nothing changed; try again.";
 const ARCHIVED_CONTROL_TEXT =
@@ -1737,6 +1752,90 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     | { readonly kind: "stopped" };
 
   /**
+   * A `send`'s attachment ids: `undefined` for none, `"bad"` for a list that refuses the request.
+   * Upload ids are the only attachment authority: this device's, unexpired, unused, bounded. An
+   * empty list is indistinguishable from no attachments at all, and without media storage no
+   * upload can exist, so every id is unknown. A shortcut request has no attachments field at all.
+   */
+  const attachmentIdsFor = (raw: unknown): string[] | "bad" | undefined => {
+    if (raw === undefined) return undefined;
+    if (!Array.isArray(raw) || raw.length > APP_LIMITS.maxAttachments ||
+        raw.some((id) => typeof id !== "string" || !APP_LIMITS.uploadIdPattern.test(id))) return "bad";
+    if (raw.length > 0 && !files.available) return "bad";
+    return raw.length === 0 ? undefined : raw as string[];
+  };
+
+  /**
+   * One callback-shaped `send`: consumed before admission and offered to the MCP login lifecycle.
+   *
+   * The callback text never enters channel state, a push, a log or the model. Only the lifecycle's
+   * fixed notice is appended, and the attempt is bound to this thread's exact session, so a
+   * callback pasted into another thread is refused. The send key keeps its idempotency: it is
+   * claimed in a durable commit before the lifecycle sees the text, so a re-sent key answers
+   * `duplicate` and cannot start a second exchange.
+   */
+  async function handleCallbackSend(
+    thread: string, key: string, text: string,
+    sendOk: (body?: Record<string, unknown>) => void,
+    sendError: (error: AppErrorCode) => void,
+  ): Promise<void> {
+    const noticeId = `notice:callback:${key}`;
+    let duplicate = true;
+    let blocked: AppErrorCode | undefined;
+    try {
+      await mutateState((doc) => {
+        if (!openThread(doc, thread)) { blocked = "bad_request"; return; }
+        if (archiving.has(thread)) { blocked = "not_ready"; return; }
+        // A key whose echo or notice is still in the log is a duplicate even if its window entry
+        // was pruned.
+        if (doc.sendKeys.some((entry) => entry.key === key) || hasEventId(doc, `send:${key}`) ||
+            hasEventId(doc, noticeId)) return;
+        duplicate = false;
+        doc.sendKeys = pruneKeys([...doc.sendKeys, { key, atMs: now() }], now());
+      });
+    } catch (error) {
+      if (stopping || signal?.aborted) return;
+      journalEvent("app.send.failed", {}, error);
+      sendError("internal");
+      return;
+    }
+    if (blocked !== undefined) return sendError(blocked);
+    if (duplicate) return sendOk({ duplicate: true });
+
+    let reply: string;
+    if (gateway.mcpAdmin === undefined) {
+      reply = CALLBACK_UNAVAILABLE_TEXT;
+    } else {
+      try {
+        const result = await gateway.mcpAdmin.submitCallback(sessionForThread(thread), text, adapterContext);
+        reply = result.handled ? result.text : CALLBACK_UNHANDLED_TEXT;
+      } catch {
+        // A failure to offer the callback still must not echo, store or model the text.
+        reply = CALLBACK_UNHANDLED_TEXT;
+      }
+    }
+    let appended = false;
+    try {
+      await mutateState((doc) => {
+        if (hasEventId(doc, noticeId)) return;
+        appendMessage(doc, {
+          event: "message", thread, id: noticeId, role: "notice", text: reply,
+          at: new Date(now()).toISOString(),
+        });
+        appended = true;
+      });
+    } catch (error) {
+      if (stopping || signal?.aborted) return;
+      journalEvent("app.send.failed", {}, error);
+      sendError("internal");
+      return;
+    }
+    pushEventsToSockets();
+    if (appended) notifyPush(thread);
+    sendOk({ duplicate: false });
+  }
+
+  /**
    * The one owner-message admission path: `send` frames and `POST /v1/ask` both come through here,
    * so a shortcut gets exactly a device send's bounds, idempotency by key, echo event, pending
    * record and question settlement. `deviceId` is absent only for a shortcut, which can never name
@@ -1748,22 +1847,8 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     if (archiving.has(thread)) return { kind: "error", error: "not_ready" };
     const key = frame.key;
     const text = frame.text;
-    // Upload ids are the only attachment authority: this device's, unexpired, unused, bounded.
-    const rawAttachments = frame.attachments;
-    let attachmentIds: string[] | undefined;
-    if (rawAttachments !== undefined) {
-      if (!Array.isArray(rawAttachments) || rawAttachments.length > APP_LIMITS.maxAttachments ||
-          rawAttachments.some((id) => typeof id !== "string" || !APP_LIMITS.uploadIdPattern.test(id))) {
-        return { kind: "error", error: "bad_request" };
-      }
-      attachmentIds = rawAttachments as string[];
-      // Without media storage no upload can exist, so every id is unknown. An empty list is
-      // indistinguishable from no attachments at all.
-      if (attachmentIds.length > 0 && !files.available) return { kind: "error", error: "bad_request" };
-      if (attachmentIds.length === 0) attachmentIds = undefined;
-      // Only a paired device owns uploads; a caller without one cannot reference any.
-      if (attachmentIds !== undefined && deviceId === undefined) return { kind: "error", error: "bad_request" };
-    }
+    const attachmentIds = attachmentIdsFor(frame.attachments);
+    if (attachmentIds === "bad") return { kind: "error", error: "bad_request" };
     if (typeof key !== "string" || !APP_LIMITS.idPattern.test(key) || typeof text !== "string" ||
         (text.length === 0 && (attachmentIds === undefined || attachmentIds.length === 0))) {
       return { kind: "error", error: "bad_request" };
@@ -1776,7 +1861,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     if (state.sendKeys.some((item) => item.key === key) || hasEventId(state, `send:${key}`)) {
       return { kind: "admitted", duplicate: true };
     }
-    if (!looksLikeOAuthCallback(text) && gateway.reserveAppThread !== undefined) {
+    if (gateway.reserveAppThread !== undefined) {
       // Rechecked here, immediately before the reservation, so an archived thread is refused
       // before its snapshot can be reinstalled, whatever awaits are added above this point.
       if (!openThread(state, thread)) return { kind: "error", error: "bad_request" };
@@ -1793,12 +1878,10 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         return { kind: "error", error: "not_ready" };
       }
     }
-    // Never store callback text. A refused callback still has an idempotent key.
-    const callback = looksLikeOAuthCallback(text);
     // A typed ordinary message settles the oldest delivered question in this thread in the same
-    // commit as its admission, as Telegram and the terminal do; commands and callback text never
-    // count, and an attachment-only send has no text to count with.
-    const answerConversation = callback || gateway.askSurfaces === undefined
+    // commit as its admission, as Telegram and the terminal do; commands never count (callback text
+    // never reaches here), and an attachment-only send has no text to count with.
+    const answerConversation = gateway.askSurfaces === undefined
       ? undefined
       : await gateway.conversationFor(sessionForThread(thread), adapterContext).catch((error: unknown) => {
           if (!stopping && !signal?.aborted) journalEvent("app.send.failed", {}, error);
@@ -1814,16 +1897,16 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         if (doc.pending.some((entry) => entry.key === key && entry.notice !== true)) return;
         // A key whose echo is still in the log is a duplicate even if its window entry was pruned.
         const eventId = `send:${key}`;
-        const callbackId = `notice:callback:${key}`;
-        if (hasEventId(doc, eventId) || hasEventId(doc, callbackId)) return;
-        if (!callback && doc.pending.length >= APP_LIMITS.maxPending) throw new Error(QUEUE_FULL);
+        if (hasEventId(doc, eventId)) return;
+        if (doc.pending.length >= APP_LIMITS.maxPending) throw new Error(QUEUE_FULL);
         duplicate = false;
         const atMs = now();
         const at = new Date(atMs).toISOString();
         // Claimed inside this transaction: an unknown, foreign, expired or reused id refuses the
         // whole send and the commit admits nothing, not even the idempotency key.
         let claimed: AppUploadRecord[] | undefined;
-        if (!callback && attachmentIds !== undefined) {
+        if (attachmentIds !== undefined) {
+          // Only a paired device owns uploads; a shortcut caller has no device to claim with.
           if (deviceId === undefined) { blocked = "bad_request"; return; }
           try {
             claimed = await files.claim(tx, { deviceId, ids: attachmentIds, atMs, messageId: eventId });
@@ -1834,10 +1917,6 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           }
         }
         doc.sendKeys = pruneKeys([...doc.sendKeys, { key, atMs }], atMs);
-        if (callback) {
-          appendMessage(doc, { event: "message", thread, id: callbackId, role: "notice", text: CALLBACK_REFUSED_TEXT, at });
-          return;
-        }
         appendMessage(doc, {
           event: "message", thread, id: eventId, role: "user", text, at, key,
           ...(claimed === undefined || claimed.length === 0 ? {} : { attachments: files.infos(claimed) }),
@@ -1880,9 +1959,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     }
     if (blocked !== undefined) return { kind: "error", error: blocked };
     pushEventsToSockets();
-    // Only a callback refusal appended a durable notice; a user echo or duplicate never pushes.
-    if (callback && !duplicate) notifyPush(thread);
-    if (!duplicate && !callback) {
+    if (!duplicate) {
       journalEvent("app.admitted", { "send.key": key, "queue.depth": state.pending.length });
       void releaseWithheld(thread);
       drain();
@@ -1896,6 +1973,21 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     sendOk: (body?: Record<string, unknown>) => void,
     sendError: (error: AppErrorCode) => void,
   ): Promise<void> {
+    // A callback-shaped line is consumed before admission and offered to the MCP login lifecycle: it
+    // never becomes a turn, so there is nothing to admit. Its send key keeps its own idempotency.
+    // Only the frame's own preconditions are checked here; everything else takes `admitSend`.
+    const callback = frame.text;
+    if (typeof callback === "string" && looksLikeOAuthCallback(callback)) {
+      const thread = parseThreadId(frame.thread === undefined ? APP_MAIN_THREAD : frame.thread);
+      if (thread === undefined || !openThread(state, thread)) return sendError("bad_request");
+      if (archiving.has(thread)) return sendError("not_ready");
+      if (attachmentIdsFor(frame.attachments) === "bad") return sendError("bad_request");
+      const key = frame.key;
+      if (typeof key !== "string" || !APP_LIMITS.idPattern.test(key)) return sendError("bad_request");
+      if (callback.length > APP_LIMITS.sendTextChars) return sendError("too_large");
+      await handleCallbackSend(thread, key, callback, sendOk, sendError);
+      return;
+    }
     const admission = await admitSend(deviceId, frame);
     if (admission.kind === "stopped") return;
     if (admission.kind === "error") return sendError(admission.error);
@@ -3202,8 +3294,9 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     if (!shortcutRate.allow(shortcut.tokenHash)) return { status: "rate-limited" };
     const parsed = parseAskRequest(request);
     if (parsed.kind !== "ok") return { status: parsed.kind };
-    // Callback-shaped text is consumed by `send` before admission and never starts a turn; asking
-    // for it would wait for a settlement that can never come, so it is refused as a bad request.
+    // Callback-shaped text is taken by a device `send` before admission and offered to the MCP
+    // login lifecycle; it never becomes a turn, so no `settled` could ever arrive for it. An ask
+    // cannot start a login exchange either, so it is refused up front as a bad request.
     if (looksLikeOAuthCallback(parsed.request.text)) return { status: "bad-request" };
     if (stopping || signal?.aborted) return { status: "internal" };
     const thread = parsed.request.thread ?? APP_MAIN_THREAD;
@@ -3691,6 +3784,35 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       }
     },
   });
+  // The MCP login owner surface for this adapter's open app threads. The one-time URL leaves as a
+  // non-durable `login` frame to the devices streaming right now; a completion is one durable
+  // notice. Both are pinned to this attachment, so a restarted adapter's replacement never
+  // receives an earlier attempt's URL or outcome.
+  const appLoginSurface = gateway.mcpSurfaces === undefined ? undefined : createAppLoginSurface({
+    threadFor(sessionKey) {
+      if (sessionKey === APP_CHAT_SESSION_KEY) {
+        return openThread(state, APP_MAIN_THREAD) ? APP_MAIN_THREAD : undefined;
+      }
+      const prefix = `${APP_CHAT_SESSION_KEY}:`;
+      if (!sessionKey.startsWith(prefix)) return undefined;
+      const thread = sessionKey.slice(prefix.length);
+      if (parseThreadId(thread) === undefined || thread === APP_MAIN_THREAD) return undefined;
+      return openThread(state, thread) ? thread : undefined;
+    },
+    broadcast(_thread, frame) {
+      let delivered = 0;
+      for (const socket of sockets.values()) {
+        if (!socket.hello || !socket.session.isOpen()) continue;
+        socket.session.send(frame);
+        delivered += 1;
+      }
+      return delivered;
+    },
+    async notice(thread, text) {
+      await admitNotice(thread, `mcp-login:${randomBytes(8).toString("hex")}`, text);
+    },
+  });
+  const detachMcpSurface = appLoginSurface === undefined ? undefined : gateway.mcpSurfaces!.attach(appLoginSurface);
   recoveryComplete = true;
   journalEvent("app.serving", { port: listener.port, "queue.depth": state.pending.length });
   options.onListening?.(listener.port);
@@ -3714,6 +3836,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     detachConsole?.();
     detachActions?.();
     detachAskSurface?.();
+    detachMcpSurface?.();
     for (const socket of sockets.values()) socket.session.close(1001, "stopping");
     sockets.clear();
     scope.cancel(new DOMException("App adapter stopped", "AbortError"));

@@ -2,10 +2,11 @@
 
 The installable web app (PWA) that is the chat channel of the Durable agent
 gateway. Vite + TypeScript + React 19, Streamdown for rendering answer markdown,
-`vite-plugin-pwa` (injectManifest) for the service worker, `idb` for IndexedDB.
-The wire contract is [`../protocol/v2.md`](../protocol/v2.md); the app imports
-its types from [`../protocol/v2.ts`](../protocol/v2.ts). HTTP and WebSocket
-paths still start with `/v1`.
+`vite-plugin-pwa` (injectManifest) + Workbox for the service worker, `idb` for
+IndexedDB. The normative wire contract is
+[`../protocol/v2.md`](../protocol/v2.md); the app imports its types from
+[`../protocol/v2.ts`](../protocol/v2.ts). HTTP and WebSocket paths start with
+`/v1`.
 
 ## Development
 
@@ -20,34 +21,57 @@ npm run dev    # vite on http://localhost:5173, proxying /v1 (incl. ws) to it
 `npm run mock` accepts an explicit code as an argument (`node
 dev/mock-gateway.mjs MYC2DE23`). For a different mock port, set `PORT` on the
 mock and the same value as `MOCK_PORT` on Vite (dev or preview). Set
-`AGENT_NAME` on the mock to override the default display name, “Durable”.
-Mock credentials, threads and cursors are in memory; after a mock restart use a fresh browser
-profile or clear site data before pairing again. Set `IDLE_ARCHIVE_MS=3000`
-on the mock to try automatic archiving after three seconds of idleness. Ask for
-`a long answer` to get a durable message split into `part: {i, n}` frames
-(protocol v2, *Long messages*), including while it is only partly received.
-The mock advertises `hello.uploads` and implements `POST /v1/upload` and
-`GET /v1/files/<id>` (protocol v2, *Files*) with the uploaded bytes in memory;
-`NO_UPLOADS=1` makes it advertise `uploads: false` and answer `POST
-/v1/upload` with `400 {"error":"unsupported"}`, which is what a gateway
-without media storage does. Uploads are discarded when the mock restarts.
-Ask for `use tools` to get three non-durable `activity` steps (one failing)
-before the answer, which carries the same list as `steps`.
-The mock records and validates fork origins without copying messages into
-the new thread. A message containing `start task` seeds one fake worker and
-one fake scheduled job in that thread, so the thread menu's **Tasks** sheet
-(protocol v2, *Tasks*) has something to list and to cancel. It doesn't run a
-real agent. Push is on: the mock makes
-the new thread. A message containing "ask me" makes it emit an open owner
-question (protocol v2, *Owner questions*) instead of starting a turn; tapping an
-option answers it. It doesn't run a real agent. Push is on: the mock makes
-throwaway VAPID keys at start, answers `push.key`, stores one subscription
-per device and really sends content-free pushes with `web-push` to it
-whenever an answer or notice is produced while that device has no open
-stream. A push to a made-up endpoint fails at the network, which is
-expected; the mock logs `push → …` before every send and abandons a send
-that outlives `PUSH_TIMEOUT_MS` (default 10 s). `NO_PUSH=1` makes
-push look unconfigured (`unsupported`).
+`AGENT_NAME` on the mock to override the default display name, "Durable"
+(rejected over 40 characters). Set `IDLE_ARCHIVE_MS=3000` to try automatic
+archiving after three seconds of idleness. Mock credentials, threads, cursors
+and uploads are in memory; after a mock restart use a fresh browser profile or
+clear site data before pairing again.
+
+What the mock answers, all offline and with no real agent:
+
+- Threads: create, rename, archive/restore, forks with a validated `from`
+  origin that is recorded but not copied into the new thread, and title search
+  through `threads {query}`.
+- Model presets `fast`/`smart`/`deep` as `hello.presets` plus per-thread `model`
+  events, and the command catalogue (`new`, `abort`, `status`, `model`, `digest`,
+  `compact`, `help`), so the header chip, the wrench sheet and the `/` menu all
+  have something to show.
+- `use tools` → three non-durable `activity` steps (one failing) before the
+  answer, which carries the same list as `steps`.
+- `a long answer` → one durable message split into `part: {i, n}` frames
+  (protocol v2, *Long messages*), including while it is only partly received.
+- `ask me …` → an open owner question instead of a turn (protocol v2, *Owner
+  questions*); tapping an option answers it.
+- `start task` → one fake worker and one fake scheduled job in that thread, so
+  the thread menu's **Tasks** sheet has something to list and to cancel.
+- `make artifact` → an assistant message carrying one `kind: "artifact"`
+  attachment (a small interactive HTML chart) served from
+  `GET /v1/files/<id>?view=artifact` with the v2.md artifact CSP, so the preview
+  card and the full-screen viewer have a real sandboxed document to show.
+- `mcp login` → a fake non-durable `login` frame, so the "Sign in to …" card
+  and its Open button can be exercised (protocol v2, *MCP login*).
+- Files: the mock advertises `hello.uploads` and implements `POST /v1/upload`
+  and `GET /v1/files/<id>` with the uploaded bytes in memory (protocol v2,
+  *Files*); attach from Photos, Files or the camera. `NO_UPLOADS=1` makes it
+  advertise `uploads: false` and answer `POST /v1/upload` with `400
+  {"error":"unsupported"}`, which is what a gateway without media storage does.
+- A voice note (an `audio/*` attachment with no text) is answered with
+  "(heard a voice note)"; the mock does not transcribe.
+- Reactions: the reaction button on any user or assistant message sends `react`
+  and the mock stores and echoes a durable `reaction` event.
+- Push: on by default. The mock makes throwaway VAPID keys at start, answers
+  `push.key`, stores one subscription per device and really sends content-free
+  pushes with `web-push` whenever an answer or notice is produced while that
+  device has no open stream. A push to a made-up endpoint fails at the network,
+  which is expected; the mock logs `push → …` before every send, drops a
+  subscription the push service answers `404`/`410` for, and abandons a send
+  that outlives `PUSH_TIMEOUT_MS` (default 10 s). `NO_PUSH=1` makes push look
+  unconfigured (`unsupported`).
+
+Not in the mock: agent-sent files and artifacts. There is no trigger that makes
+the mock answer with an attachment, so the app's artifact card and viewer (in
+review) and the `app` file tool's output can only be exercised against a real
+gateway.
 
 The production build, incl. the service worker and its precache manifest:
 
@@ -72,16 +96,22 @@ one origin and one cookie jar.
 - The service worker precaches the app shell and handles Web Push: a
   content-free payload (`{v:2, thread, unread}`) shows a notification titled
   with the agent name cached from `hello` and, for a side thread, "New message
-  in <cached title>", sets the app badge to `unread`, and on tap focuses the
-  app at that thread (`/?thread=<id>`). Turn it on from the "Notifications"
-  row in the thread menu; it hides itself when the gateway has no push
-  configured. Enabling needs the built app (`npm run preview`), because the
-  dev server serves no service worker.
+  in <cached title>", sets the app badge to `unread`, and on tap opens the
+  app at that thread (`/?thread=<id>`) or, when a window is already open,
+  focuses it and tells it to show that thread. Turn it on from the
+  "Notifications" row in the thread menu; it hides itself when the gateway has
+  no push configured. Enabling needs the built app (`npm run preview`), because
+  the dev server serves no service worker.
 - The store (`src/store.ts`) is a cache: IndexedDB loss means a full replay
-  on the next `hello`, nothing more.
+  on the next `hello`, nothing more. Login URLs and tool activity are never
+  persisted.
 - **Tasks** (`src/TasksSheet.tsx`) lists this thread's own workers and
   scheduled jobs and can cancel them. There is no task event stream: the sheet
   fetches when it opens and again after any durable event in the thread while
   it stays open. Cancelling asks in place first and reports the outcome the
   gateway returns, so an already-finished or foreign task never reads as a
   cancellation.
+- **Artifacts** (`ArtifactCard`/`ArtifactViewer` in `src/Chat.tsx`): a card with a
+  lazily mounted, pointer-inert preview and a full-screen viewer, both an
+  iframe with `sandbox="allow-scripts"` only, loaded from `?view=artifact`.
+- In review, not on `main`: the gateway's Shortcuts `POST /v1/ask` endpoint.

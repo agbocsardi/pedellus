@@ -12,6 +12,14 @@ export function fileUrl(id: string): string {
   return `/v1/files/${encodeURIComponent(id)}`;
 }
 
+/**
+ * The sandboxed-artifact view of a file (protocol v2, Agent files and artifacts).
+ * Only this URL is ever rendered inside a frame; without it the file downloads.
+ */
+export function artifactUrl(id: string): string {
+  return `/v1/files/${encodeURIComponent(id)}?view=artifact`;
+}
+
 const SIZE_UNITS = ["B", "KB", "MB", "GB"] as const;
 
 export function formatBytes(size: number): string {

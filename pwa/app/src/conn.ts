@@ -423,6 +423,12 @@ export class Connection {
       case "reaction":
       case "question":
       case "thread": {
+        // A durable event must carry a positive integer cursor; a malformed one from a broken
+        // gateway is dropped instead of being stored and taking the UI down.
+        if (!Number.isSafeInteger(f.cursor) || f.cursor <= 0) {
+          console.error("durable event without a valid cursor dropped", f.event);
+          break;
+        }
         if (this.replaying && this.replayHead !== null && f.cursor <= this.replayHead) {
           this.replayCount++;
           this.replayCursor = f.cursor;
@@ -459,6 +465,14 @@ export class Connection {
       case "model":
         if (typeof f.thread === "string" && (f.preset === null || typeof f.preset === "string")) {
           this.store.setModel(f);
+        }
+        break;
+      case "login":
+        // A live-only one-time URL: validated against the openable schemes in the store, kept in
+        // memory, and never written to IndexedDB or the durable event log.
+        if (typeof f.thread === "string" && typeof f.server === "string" && typeof f.url === "string" &&
+            typeof f.expiresAt === "string") {
+          this.store.setLogin(f);
         }
         break;
       case "activity": {
