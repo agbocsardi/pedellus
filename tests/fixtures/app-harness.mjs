@@ -20,6 +20,7 @@ export const { openGateway } = await import(new URL('../../dist/runtime.js', imp
 export const { runApp, AppState, APP_CHAT_SESSION_KEY, validateOptions } = await import(
   new URL('../../dist/channels/app.js', import.meta.url).href
 );
+export const { AppFilesState } = await import(new URL('../../dist/channels/app-files.js', import.meta.url).href);
 export const { APP_LIMITS, APP_CLOSE, resolveStaticPath, staticMimeType } = await import(
   new URL('../../dist/channels/app-protocol.js', import.meta.url).href
 );
@@ -71,6 +72,7 @@ export async function openAppStore(label, options = {}) {
       toolAllowlist: options.tools ?? [],
       ...(options.cron === true ? { cron: { enabled: true } } : {}),
       ...(options.followUpMode === undefined ? {} : { followUpMode: options.followUpMode }),
+      ...(options.media === undefined ? {} : { media: options.media }),
       app: { port: 43190, staticRoot, ...(options.appBlock ?? {}) },
     };
     let config;
@@ -120,6 +122,16 @@ export function startApp(store, options = {}) {
   const clock = { now: options.now ?? Date.now() };
   let portResolve;
   const port = new Promise((resolvePort) => { portResolve = resolvePort; });
+  // Mirror the shipped CLI: attachments are the top-level `media` block, absent by default.
+  const media = options.media ?? (store.config.media === undefined
+    ? undefined
+    : {
+        workspace: store.workspace,
+        directory: store.config.media.directory,
+        ...(store.config.media.transcription === undefined
+          ? {}
+          : { transcription: store.config.media.transcription }),
+      });
   const adapter = runApp(options.gateway ?? store.gateway, {
     port: options.port ?? 0,
     staticRoot: options.staticRoot ?? store.staticRoot,
@@ -129,6 +141,7 @@ export function startApp(store, options = {}) {
     ...(options.scanIntervalMs === undefined ? {} : { scanIntervalMs: options.scanIntervalMs }),
     ...(options.restart === undefined ? {} : { restart: options.restart }),
     ...(options.push === undefined ? {} : { push: options.push }),
+    ...(media === undefined ? {} : { media }),
     now: () => clock.now,
     onListening: (bound) => portResolve(bound),
   }, scope.context);
@@ -264,3 +277,21 @@ export function userTexts(captured) {
 }
 
 export { assert };
+
+/** The committed upload registry of the app state conversation, for direct assertions and seeding. */
+export async function appFilesState(gateway) {
+  const conversation = await gateway.conversationFor('app:channel-state', context);
+  return conversation.commit(async (tx) => {
+    const doc = await tx.doc(AppFilesState, conversation.id);
+    return JSON.parse(JSON.stringify(doc));
+  }, context);
+}
+
+/** Seed one upload record as an earlier session (or a lapsed TTL) would have left it. */
+export async function seedUpload(gateway, record) {
+  const conversation = await gateway.conversationFor('app:channel-state', context);
+  await conversation.commit(async (tx) => {
+    const doc = await tx.doc(AppFilesState, conversation.id);
+    doc.uploads.push(record);
+  }, context);
+}

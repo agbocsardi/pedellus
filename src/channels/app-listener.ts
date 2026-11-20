@@ -1,6 +1,6 @@
 /**
  * The `app` channel's loopback HTTP+WebSocket listener: static file serving, the one-time pairing
- * endpoint and the authenticated device stream.
+ * endpoint, the upload endpoint, the download endpoint and the authenticated device stream.
  *
  * This module owns transport mechanics only — sockets, bodies, cookies, MIME types and path safety.
  * Every authority decision (pairing redemption, token authentication, frame semantics) is delegated
@@ -11,6 +11,7 @@
  * cookie is the only authentication.
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { createReadStream } from "node:fs";
 import { realpath, stat, open } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import { WebSocketServer, WebSocket, type WebSocket as WebSocketType } from "ws";
@@ -22,12 +23,29 @@ import {
   staticMimeType,
 } from "./app-protocol.js";
 
+/** A refused upload body is read at most this far before the connection is dropped. */
+const REFUSED_BODY_DRAIN_BYTES = 64 * 1024;
+
 const HOST = "127.0.0.1";
 const NOT_FOUND_BODY = JSON.stringify({ error: "not_found" });
 const PAIR_ERRORS: Readonly<Record<string, [number, string]>> = Object.freeze({
   "bad-request": [400, JSON.stringify({ error: "bad_request" })],
   invalid: [401, JSON.stringify({ error: "invalid_code" })],
   "rate-limited": [429, JSON.stringify({ error: "rate_limited" })],
+});
+/** A downloaded original's immutable, non-executable headers (protocol v2, Files). */
+const FILE_HEADERS = Object.freeze({
+  "x-content-type-options": "nosniff",
+  "content-security-policy": "sandbox",
+  "cache-control": "private, max-age=31536000, immutable",
+});
+/** Fixed upload replies; `201` carries only the new id. */
+const UPLOAD_ERRORS: Readonly<Record<Exclude<AppUploadOutcome["status"], "created">, [number, string]>> = Object.freeze({
+  "bad-request": [400, JSON.stringify({ error: "bad_request" })],
+  unsupported: [400, JSON.stringify({ error: "unsupported" })],
+  "rate-limited": [429, JSON.stringify({ error: "rate_limited" })],
+  "too-large": [413, JSON.stringify({ error: "too_large" })],
+  internal: [500, JSON.stringify({ error: "internal" })],
 });
 
 /** One live authenticated device stream, handed to the adapter after the upgrade completed. */
@@ -54,7 +72,44 @@ export interface AppListenerHost {
   authenticate(token: string): Promise<{ readonly deviceId: string; readonly label: string } | undefined>;
   /** One authenticated stream was opened; the adapter owns its frames from here on. */
   onSocket(session: AppDeviceSession, hooks: AppSessionHooks): void;
+  /** Admit one uploaded original; transport bounds stay here, every policy decision there. */
+  upload(device: AppUploadDevice, request: AppUploadStream): Promise<AppUploadOutcome>;
+  /** Resolve one file a durable message references, for `GET /v1/files/<id>`. */
+  download(device: AppUploadDevice, id: string): Promise<AppDownloadTarget | undefined>;
 }
+
+/** Fixed per-upload outcomes; every one is a wire status the protocol already defines. */
+export type AppUploadOutcome =
+  | { readonly status: "created"; readonly id: string }
+  | { readonly status: "bad-request" | "unsupported" | "rate-limited" | "too-large" | "internal" };
+
+/** The listener's hard byte cap was exceeded while streaming one upload body. */
+export class AppUploadTooLarge extends Error {
+  constructor() {
+    super("app upload exceeds the size bound");
+    this.name = "AppUploadTooLarge";
+  }
+}
+
+/** The authenticated device an upload or download is attributed to. */
+export type AppUploadDevice = { readonly deviceId: string; readonly label: string };
+
+/** One downloadable original, already resolved inside the host's media root. */
+export type AppDownloadTarget = {
+  readonly absolutePath: string;
+  readonly bytes: number;
+  readonly mimeType: string;
+  readonly name: string;
+};
+
+/** One upload body as the listener hands it over: already hard-capped, lazily consumed. */
+export type AppUploadStream = {
+  /** The decoded `X-Filename`; untrusted display metadata, never a path. */
+  readonly name: string;
+  readonly mimeType: string | undefined;
+  readonly body: AsyncIterable<Uint8Array>;
+  readonly signal: AbortSignal;
+};
 
 /** Registration hooks the adapter attaches to one live session. */
 export interface AppSessionHooks {
@@ -177,8 +232,13 @@ export async function startAppListener(options: {
 
   async function handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const rawPath = request.url ?? "/";
-    if (request.method === "POST" && rawPath.split("?", 1)[0] === "/v1/pair") {
+    const path = rawPath.split("?", 1)[0]!;
+    if (request.method === "POST" && path === "/v1/pair") {
       await pairEndpoint(request, response);
+      return;
+    }
+    if (request.method === "POST" && path === "/v1/upload") {
+      await uploadEndpoint(request, response);
       return;
     }
     if (request.method !== "GET" && request.method !== "HEAD") {
@@ -186,13 +246,165 @@ export async function startAppListener(options: {
       response.end(JSON.stringify({ error: "method_not_allowed" }));
       return;
     }
-    if (rawPath.split("?", 1)[0] === "/v1/stream") {
+    if (path.startsWith("/v1/files/")) {
+      await fileEndpoint(request, response, path.slice("/v1/files/".length));
+      return;
+    }
+    if (path === "/v1/stream") {
       // A stream without an upgrade is not a usable endpoint; the static root is not searched.
       response.writeHead(400, { "content-type": "application/json" });
       response.end(JSON.stringify({ error: "bad_request" }));
       return;
     }
     await serveStatic(request, response);
+  }
+
+  /**
+   * One upload body, hard-capped while streaming: nothing is buffered unbounded and the cap is
+   * enforced against the byte count actually received, not only an advertised length.
+   */
+  async function* boundedUploadBody(
+    request: IncomingMessage,
+    maxBytes: number,
+    signal: AbortSignal,
+  ): AsyncIterable<Uint8Array> {
+    let total = 0;
+    for await (const chunk of request) {
+      const bytes = chunk instanceof Uint8Array ? chunk : Buffer.from(chunk as string);
+      total += bytes.byteLength;
+      if (total > maxBytes) throw new AppUploadTooLarge();
+      if (signal.aborted) throw signal.reason;
+      yield bytes;
+    }
+  }
+
+  /**
+   * Refuse an upload before its body is usable. A small refused body is drained so the connection
+   * stays healthy; an over-cap one is closed instead of being read to the end.
+   */
+  function refuseUpload(
+    request: IncomingMessage,
+    response: ServerResponse,
+    status: number,
+    body: string,
+    drain: boolean,
+  ): void {
+    response.writeHead(status, { "content-type": "application/json" });
+    response.end(body);
+    if (drain) {
+      // Read a little so the client sees the answer, but never an unbounded refused body.
+      let drained = 0;
+      request.on("data", (chunk: Buffer) => {
+        drained += chunk.length;
+        if (drained > REFUSED_BODY_DRAIN_BYTES) request.destroy();
+      });
+      request.resume();
+    } else response.once("finish", () => request.destroy());
+  }
+
+  async function uploadEndpoint(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    const token = deviceCookie(request.headers.cookie);
+    const device = token === undefined ? undefined : await options.host.authenticate(token);
+    if (device === undefined) {
+      refuseUpload(request, response, 401, JSON.stringify({ error: "unauthorized" }), false);
+      return;
+    }
+    const declared = Number(request.headers["content-length"]);
+    if (Number.isSafeInteger(declared) && declared > APP_LIMITS.uploadBytes) {
+      refuseUpload(request, response, ...UPLOAD_ERRORS["too-large"], false);
+      return;
+    }
+    // `X-Filename` is percent-encoded UTF-8 and untrusted: decoded, bounded, and never a path.
+    const rawName = request.headers["x-filename"];
+    let name: string | undefined;
+    if (typeof rawName === "string") {
+      try {
+        name = decodeURIComponent(rawName);
+      } catch {
+        name = undefined;
+      }
+    }
+    if (name === undefined) {
+      refuseUpload(request, response, ...UPLOAD_ERRORS["bad-request"], true);
+      return;
+    }
+    const characters = Array.from(name).length;
+    if (characters < 1 || characters > APP_LIMITS.uploadNameChars) {
+      refuseUpload(request, response, ...UPLOAD_ERRORS["bad-request"], true);
+      return;
+    }
+    const rawType = request.headers["content-type"];
+    // A client that gives up mid-upload must abort the store's stream too.
+    const controller = new AbortController();
+    response.on("close", () => {
+      if (!response.writableEnded) controller.abort(new DOMException("upload closed", "AbortError"));
+    });
+    let outcome: AppUploadOutcome;
+    try {
+      outcome = await options.host.upload(device, {
+        name,
+        mimeType: typeof rawType === "string" ? rawType : undefined,
+        body: boundedUploadBody(request, APP_LIMITS.uploadBytes, controller.signal),
+        signal: controller.signal,
+      });
+    } catch (error) {
+      if (error instanceof AppUploadTooLarge) {
+        refuseUpload(request, response, ...UPLOAD_ERRORS["too-large"], false);
+        return;
+      }
+      if (controller.signal.aborted) {
+        request.destroy();
+        return;
+      }
+      throw error;
+    }
+    if (outcome.status === "created") {
+      response.writeHead(201, { "content-type": "application/json" });
+      response.end(JSON.stringify({ id: outcome.id }));
+      return;
+    }
+    // A refusal made before the body was read leaves it unread; drain it, or close if too big.
+    refuseUpload(request, response, ...UPLOAD_ERRORS[outcome.status], outcome.status !== "too-large");
+  }
+
+  /** One file a durable message references; every other id is a plain 404. */
+  async function fileEndpoint(request: IncomingMessage, response: ServerResponse, rawId: string): Promise<void> {
+    const token = deviceCookie(request.headers.cookie);
+    const device = token === undefined ? undefined : await options.host.authenticate(token);
+    if (device === undefined) {
+      response.writeHead(401, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: "unauthorized" }));
+      return;
+    }
+    let id: string | undefined;
+    try {
+      id = decodeURIComponent(rawId);
+    } catch {
+      id = undefined;
+    }
+    // The shape is checked before any state is read, so a malformed id is never looked up.
+    const file = id === undefined || rawId.includes("/") || !APP_LIMITS.uploadIdPattern.test(id)
+      ? undefined
+      : await options.host.download(device, id);
+    if (file === undefined) {
+      response.writeHead(404, { "content-type": "application/json" });
+      response.end(NOT_FOUND_BODY);
+      return;
+    }
+    response.writeHead(200, {
+      ...FILE_HEADERS,
+      "content-type": file.mimeType,
+      "content-length": file.bytes,
+      "content-disposition": fileDisposition(file.mimeType, file.name),
+    });
+    if (request.method === "HEAD") {
+      response.end();
+      return;
+    }
+    // The host's store resolved this path inside the media root and refused symlinks; read only.
+    const stream = createReadStream(file.absolutePath);
+    stream.on("error", () => response.destroy());
+    stream.pipe(response);
   }
 
   async function pairEndpoint(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -239,6 +451,18 @@ export async function startAppListener(options: {
     );
     response.writeHead(204);
     response.end();
+  }
+
+  /**
+   * `inline` only for the media types a browser renders safely under the sandbox policy; every
+   * other stored type downloads, with an RFC 5987 `filename*` instead of a raw header value.
+   */
+  function fileDisposition(mimeType: string, name: string): string {
+    // SVG is markup, not a picture: it always downloads, whatever the sandbox policy does.
+    if (mimeType !== "image/svg+xml" && (mimeType.startsWith("image/") || mimeType.startsWith("audio/"))) return "inline";
+    const encoded = encodeURIComponent(name).replace(/['()*]/gu,
+      (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+    return `attachment; filename*=UTF-8''${encoded}`;
   }
 
   async function serveStatic(request: IncomingMessage, response: ServerResponse): Promise<void> {

@@ -600,6 +600,17 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
         agentName: config.app.agentName ?? "Durable",
         ...(push === undefined ? {} : { push }),
         followUpMode: config.followUpMode ?? "followUp",
+        ...(config.media === undefined
+          ? {}
+          : {
+              media: {
+                workspace: config.workspace,
+                directory: config.media.directory,
+                ...(config.media.transcription === undefined
+                  ? {}
+                  : { transcription: config.media.transcription }),
+              },
+            }),
         restart: restartHost,
       }, context));
     }
