@@ -5,7 +5,10 @@ the CLI, Telegram and Discord. It serves the built PWA from `pwa/app/dist`
 over one loopback HTTP+WebSocket listener; `tailscale serve` publishes it on the tailnet with the
 node's `*.ts.net` certificate. The wire contract is protocol v2, normative in
 `pwa/protocol/v2.md` and `pwa/protocol/v2.ts`. Ship the v2 app and gateway together: the
-unchanged `/v1/*` URLs accept wire version 2 only. `src/channels/app-protocol.ts` holds the limits, close codes and pure validation;
+unchanged `/v1/*` URLs accept wire version 2 only. `src/channels/app-protocol.ts` takes the
+shared limits, close codes and hello/thread shapes from `src/channels/generated/protocol-v2.ts`
+(a generated mirror of `pwa/protocol/v2.ts`, refreshed by `npm run build` and checked by
+`npm run typecheck`) and adds the gateway-only bounds and pure validation;
 `src/channels/app-listener.ts` owns transport mechanics (sockets, bodies, cookies, MIME types,
 path safety); `src/channels/app.ts` owns admission, the durable event log, controls, pairing and
 the operator console.

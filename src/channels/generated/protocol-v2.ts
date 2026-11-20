@@ -12,8 +12,23 @@ export const LIMITS = {
   pingTimeoutMs: 10_000,
   threadTitleChars: 80,
   maxOpenThreads: 50,
+  /** Archived threads in a `threads` reply, newest activity first; not a storage cap. */
+  maxListedArchivedThreads: 200,
   threadIdPattern: /^(main|t_[A-Za-z0-9_-]{1,40})$/,
+  /** One-time pairing code: `PAIR_ALPHABET`, single use, ten minutes. */
+  pairCodeChars: 8,
+  pairTtlMs: 10 * 60_000,
+  /** Device label: printable, 1–40 characters. */
+  labelMinChars: 1,
+  labelMaxChars: 40,
+  /** `hello.agent`, the gateway's display name: 1–40 printable characters. */
+  agentNameMaxChars: 40,
+  /** `control.args`: the text after the command name. */
+  controlArgsChars: 1_000,
 } as const;
+
+/** `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`: no `I`/`O`, case-insensitive input. */
+export const PAIR_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 export const CLOSE = {
   unauthorized: 4401,

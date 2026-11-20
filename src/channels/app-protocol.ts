@@ -12,6 +12,7 @@ import {
   CLOSE,
   LIMITS,
   MAIN_THREAD,
+  PAIR_ALPHABET,
   PROTOCOL_VERSION,
   type CommandInfo,
   type ErrorCode,
@@ -23,23 +24,14 @@ import {
 export const APP_PROTOCOL_VERSION = PROTOCOL_VERSION;
 export const APP_MAIN_THREAD = MAIN_THREAD;
 /** `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`: no `I`/`O`, case-insensitive input. */
-export const APP_PAIR_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+export const APP_PAIR_ALPHABET = PAIR_ALPHABET;
 
 /** The wire bounds, then the gateway-only ones; the app never sees the latter. */
 export const APP_LIMITS = Object.freeze({
   ...LIMITS,
-  /** Maximum archived threads in a `threads` reply, not a storage cap. */
-  maxListedArchivedThreads: 200,
-  /** One-time pairing code: single use, ten minutes. */
-  pairCodeChars: 8,
-  pairTtlMs: 10 * 60_000,
   /** More than five pairing failures per minute across all clients refuses the next attempt. */
   pairRateWindowMs: 60_000,
   pairRateMax: 5,
-  labelMinChars: 1,
-  labelMaxChars: 40,
-  /** Agent display name in the hello reply: at most 40 printable characters. */
-  agentNameMaxChars: 40,
   /** `hello.presets`: at most this many entries, each field bounded in characters. */
   maxPresets: 50,
   presetNameChars: 80,
@@ -56,8 +48,6 @@ export const APP_LIMITS = Object.freeze({
   /** `send` keys are remembered for idempotency; pruning is by age only (keys are tiny). */
   sendKeyTtlMs: 7 * 24 * 60 * 60_000,
   maxUnresolvedControls: 64,
-  /** `control.args`: the text after the command name. */
-  controlArgsChars: 1_000,
 } as const);
 
 /** Fixed WebSocket close codes; the upgrade is always completed first. */
