@@ -547,6 +547,15 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     const timer = setInterval(tick, 500);
     return () => clearInterval(timer);
   }, [voice]);
+  // Auto-lock would background the app and end the note: keep the screen on
+  // while recording. Unsupported or refused, it simply locks as before.
+  useEffect(() => {
+    if (!voice || !("wakeLock" in navigator)) return;
+    let lock: WakeLockSentinel | undefined;
+    let done = false;
+    navigator.wakeLock.request("screen").then((l) => { if (done) void l.release(); else lock = l; }, () => {});
+    return () => { done = true; void lock?.release(); };
+  }, [voice]);
   // iOS suspends media in a backgrounded app, and a recorder that no longer
   // records is a lie: end the note honestly and keep what it captured.
   const endVoice = useEffectEvent((threadId: string, why: string) => { void keepVoice(threadId, why); });
@@ -672,10 +681,6 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
 
   async function submit() {
     if (!store.canWrite(thread)) return;
-    if (running) {
-      conn.control(thread, "abort");
-      return;
-    }
     if (slash) {
       runSlash();
       return;
@@ -1340,21 +1345,23 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
                 onClick={(e) => { e.currentTarget.blur(); void startVoice(); }}>
                 <Icon d={MIC_ICON} />
               </button>
+            ) : running && !slash && text.trim() === "" && files.length === 0 ? (
+              /* An empty composer during a turn stops it; anything typed steers. */
+              <button className="send stop" aria-label="Stop" data-ready=""
+                onClick={() => { if (store.canWrite(thread)) conn.control(thread, "abort"); }}>
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor" />
+                </svg>
+              </button>
             ) : (
               <button
-                className={running ? "send stop" : "send"}
-                aria-label={running ? "Stop" : "Send"}
-                data-ready={running || (slash ? !!picked && canRun(picked, cmdState) && !argsTooLong
+                className="send"
+                aria-label="Send"
+                data-ready={(slash ? !!picked && canRun(picked, cmdState) && !argsTooLong
                   : canSendFiles && (text.trim() !== "" || files.length > 0)) ? "" : undefined}
                 onClick={() => void submit()}
               >
-                {running ? (
-                  <svg viewBox="0 0 24 24" aria-hidden="true">
-                    <rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor" />
-                  </svg>
-                ) : (
-                  <Icon d="M12 19V5M5.5 11.5 12 5l6.5 6.5" bold />
-                )}
+                <Icon d="M12 19V5M5.5 11.5 12 5l6.5 6.5" bold />
               </button>
             )}
           </div>
