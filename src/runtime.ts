@@ -4874,6 +4874,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
               { role: "user", content: rolloverPrompt(source), timestamp: now() },
             ],
           }, {
+            // Some providers (OpenCode Go) refuse a request without a session id.
+            sessionId: `nanobot-rollover:${conversationId}`,
             maxTokens: Math.min(IDLE_ROLLOVER_LIMITS.maxTokens, model.maxTokens),
             signal,
             telemetry: context.telemetry,
@@ -4883,8 +4885,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
           // An unusable handoff is retried next sweep; say why, or a stuck rollover is invisible.
           if (summary === undefined) {
             journalEvent("gateway.idleRollover.unusable", {
-              "stop.reason": String(message.stopReason),
-              "tokens.output": message.usage?.output ?? 0,
+              stop: String(message.stopReason),
+              "usage.output": message.usage?.output ?? 0,
             });
           }
           return summary;
