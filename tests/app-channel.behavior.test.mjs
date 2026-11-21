@@ -407,6 +407,22 @@ test('a reconnect replays exactly what was missed', { timeout: 30_000 }, async (
   });
 });
 
+test('an idle rollover leaves a quiet divider in its thread', { timeout: 30_000 }, async () => {
+  await withChannel('idle-divider', {}, async ({ store, base }) => {
+    const cookie = await pairedDevice(store, base);
+    const device = deviceClient(base, cookie);
+    await device.open();
+    device.send({ type: 'req', id: 'h1', op: 'hello', v: 2, cursor: null });
+    await device.wait(() => device.response('h1') !== undefined, 'hello reply');
+    await store.gateway.appRollovers.notify('app:chat');
+    await device.wait(() => device.events('divider').length === 1, 'the idle divider');
+    assert.equal(device.events('divider')[0].reason, 'idle');
+    // A session that is not an app thread is ignored.
+    await store.gateway.appRollovers.notify('telegram:1');
+    assert.equal(device.events('divider').length, 1);
+  });
+});
+
 test('controls map to the owner operations and reply with fixed results', { timeout: 30_000 }, async () => {
   await withChannel('controls', {}, async ({ store, base }) => {
     const cookie = await pairedDevice(store, base);

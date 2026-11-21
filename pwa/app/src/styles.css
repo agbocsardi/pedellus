@@ -825,6 +825,12 @@ input#pair-code {
   padding: 4px 10px;
   white-space: nowrap;
 }
+/* The idle rollover: a quieter line than a manual new context. */
+.divider.idle span {
+  font-weight: 500;
+  background: none;
+  padding: 0;
+}
 
 /* Agent is working, nothing streamed yet */
 .typing {

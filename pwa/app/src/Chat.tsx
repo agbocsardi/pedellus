@@ -1770,8 +1770,8 @@ function EventRow({ ev, text, partial, store, conn, thread, last, forks, onActio
   if (ev.event === "divider") {
     const t = clock(ev.at);
     return (
-      <div className="divider" role="separator">
-        <span>New context{t && ` · ${t}`}</span>
+      <div className={ev.reason === "idle" ? "divider idle" : "divider"} role="separator">
+        <span>{ev.reason === "idle" ? "Idle compact" : "New context"}{t && ` · ${t}`}</span>
       </div>
     );
   }

@@ -71,8 +71,8 @@ import {
 } from "./channels/app-tool.js";
 import {
   APP_CHAT_SESSION_KEY, APP_STATE_SESSION_KEY, AppState, AppThreadCapacityError, appForkEntry,
-  createAppConsoleRegistry, sessionForThread, threadInfo,
-  type AppConsoleRegistry, type AppGateway,
+  createAppConsoleRegistry, createAppRolloverRegistry, sessionForThread, threadInfo,
+  type AppConsoleRegistry, type AppGateway, type AppRolloverRegistry,
 } from "./channels/app.js";
 import { APP_MAIN_THREAD, parseThreadId } from "./channels/app-protocol.js";
 import {
@@ -476,6 +476,7 @@ export interface Gateway {
    * `app pair|devices|revoke` commands reach it over the private socket.
    */
   readonly appConsole?: AppConsoleRegistry;
+  readonly appRollovers?: AppRolloverRegistry;
   /**
    * Model-action host registry for the app channel's `app` file capability (`send`/`artifact`).
    * Present only when `config.app` is configured; the running adapter attaches here, and the
@@ -1158,6 +1159,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
   // local terminal reaches it over the private socket, and the running adapter attaches here.
   const appConsole: AppConsoleRegistry | undefined =
     config.app === undefined ? undefined : createAppConsoleRegistry();
+  const appRollovers: AppRolloverRegistry | undefined =
+    config.app === undefined ? undefined : createAppRolloverRegistry();
   const sessionKeyForConversation = new Map<ConversationId, string>();
   const telegramChatConversations = new Set<ConversationId>();
   const discordChatConversations = new Set<ConversationId>();
@@ -4167,6 +4170,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       ...(telegramActions === undefined ? {} : { telegramActions }),
       ...(discordHistory === undefined ? {} : { discordHistory }),
       ...(appConsole === undefined ? {} : { appConsole }),
+      ...(appRollovers === undefined ? {} : { appRollovers }),
       ...(appActions === undefined ? {} : { appActions }),
       askSurfaces,
       get mcp() {
@@ -4891,6 +4895,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
             if (error instanceof IdleRolloverStale || error instanceof ConversationBusy) return;
             throw error;
           }
+          // The visible marker is best-effort: the committed rollover stands either way.
+          await appRollovers?.notify(session.sessionKey)
+            .catch((error: unknown) => reportFailure(error, "gateway.idleRollover"));
         },
         report: (error) => reportFailure(error, "gateway.idleRollover"),
       });

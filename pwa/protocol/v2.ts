@@ -125,7 +125,7 @@ export type SettledEvent = {
   type: "event"; event: "settled"; cursor: number; thread: ThreadId; key: string;
   outcome: "answered" | "failed" | "aborted";
 };
-export type DividerEvent = { type: "event"; event: "divider"; cursor: number; thread: ThreadId; at: string; reason: "new" };
+export type DividerEvent = { type: "event"; event: "divider"; cursor: number; thread: ThreadId; at: string; reason: "new" | "idle" };
 export type PreviewEvent = { type: "event"; event: "preview"; thread: ThreadId; key: string; text: string };
 export type StatusEvent = {
   type: "event"; event: "status"; thread: ThreadId;

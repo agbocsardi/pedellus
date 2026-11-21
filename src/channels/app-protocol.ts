@@ -190,7 +190,7 @@ export type AppDurableEvent =
     /** The reaction, or `null` when the owner cleared it. */
     emoji: Reaction | null;
   }
-  | { event: "divider"; cursor: number; thread?: string; at: string; reason: "new" }
+  | { event: "divider"; cursor: number; thread?: string; at: string; reason: "new" | "idle" }
   | (Omit<QuestionEvent, "type" | "thread"> & { thread?: string })
   | { event: "thread"; cursor: number; thread: AppThreadInfo };
 
