@@ -55,7 +55,7 @@ export const EPISODE_SUMMARY_SOURCE_LIMITS = Object.freeze({
   /** Prompt target for the final summary text only, excluding hidden reasoning. */
   targetSummaryTokens: 1_200,
   /** Provider response allowance for one fold, including reasoning when the provider counts it. */
-  maxTokens: 4_096,
+  maxTokens: 16_384,
 });
 
 const USER_ENTRY_KINDS: ReadonlySet<string> = new Set(["pi.user", "nanobot.cron"]);

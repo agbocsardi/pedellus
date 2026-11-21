@@ -4876,9 +4876,18 @@ export async function openGateway(config: PortConfig, context: Context, options:
           }, {
             maxTokens: Math.min(IDLE_ROLLOVER_LIMITS.maxTokens, model.maxTokens),
             signal,
+            telemetry: context.telemetry,
             ...(choice.thinkingLevel === "off" ? {} : { reasoning: choice.thinkingLevel }),
           });
-          return providerSummaryText(message);
+          const summary = providerSummaryText(message);
+          // An unusable handoff is retried next sweep; say why, or a stuck rollover is invisible.
+          if (summary === undefined) {
+            journalEvent("gateway.idleRollover.unusable", {
+              "stop.reason": String(message.stopReason),
+              "tokens.output": message.usage?.output ?? 0,
+            });
+          }
+          return summary;
         },
         rollover: async (session, expectLatest, handoff, ctx) => {
           const reset: IdleRolloverReset = { expectLatest, handoff };
