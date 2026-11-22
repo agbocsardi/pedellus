@@ -71,8 +71,8 @@ import {
 } from "./channels/app-tool.js";
 import {
   APP_CHAT_SESSION_KEY, APP_STATE_SESSION_KEY, AppState, AppThreadCapacityError, appForkEntry,
-  createAppConsoleRegistry, createAppRolloverRegistry, sessionForThread, threadInfo,
-  type AppConsoleRegistry, type AppGateway, type AppRolloverRegistry,
+  createAppConsoleRegistry, sessionForThread, threadInfo,
+  type AppConsoleRegistry, type AppGateway,
 } from "./channels/app.js";
 import { APP_MAIN_THREAD, parseThreadId } from "./channels/app-protocol.js";
 import {
@@ -134,15 +134,11 @@ import { modelKey, parseToolTimeoutSeconds, type ModelReference, type PortConfig
 import { createVisionHandoffExtension } from "./media/vision-hook.js";
 import { VisionHandoff, type VisionHandoffStats } from "./media/vision.js";
 import {
-  IDLE_ROLLOVER_LIMITS,
-  IDLE_ROLLOVER_SYSTEM_PROMPT,
   renderRolloverSource,
-  rolloverPrompt,
   startIdleRollover,
   type IdleRollover,
   type OwnerInputContent,
 } from "./history/idle-rollover.js";
-import { providerSummaryText } from "./history/summary-source.js";
 import { hasPersistedNanobotContext, preparedContextReplay, preparedTaskModel } from "./recovery/prepared.js";
 import {
   addInterruptedRunReport,
@@ -272,13 +268,12 @@ const ModelPolicyRevisionDoc = defineDoc<{ revision: string }>({
   initial: () => ({ revision: "" }), checkpointWhen: () => true,
 });
 
-/** An idle rollover's guarded reset: its handoff and the newest entry it summarized. */
+/** An idle rollover's guarded reset: the newest entry when the chat went idle. */
 interface IdleRolloverReset {
   readonly expectLatest: EntryId;
-  readonly handoff: string;
 }
 
-/** New activity, a run or a waiting question appeared after the handoff was written. */
+/** New activity, a run or a waiting question appeared after the chat went idle. */
 class IdleRolloverStale extends Error {}
 
 /** Whether one stored commit carried a specific model-policy revision document. */
@@ -477,7 +472,6 @@ export interface Gateway {
    * `app pair|devices|revoke` commands reach it over the private socket.
    */
   readonly appConsole?: AppConsoleRegistry;
-  readonly appRollovers?: AppRolloverRegistry;
   /**
    * Called by every owner-input path just before it submits to a mapped chat: decides a prepared idle
    * rollover for that chat (see `src/history/idle-rollover.ts`). Never throws; a no-op without one.
@@ -937,22 +931,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
       thinkingLevel: choice.thinkingLevels.includes("off") ? "off" : choice.thinkingLevels[0]!,
     };
   }
-  // Idle rollover writes its handoff with one configured preset, never the foreground model.
-  let rolloverChoice: { readonly model: ModelReference; readonly thinkingLevel: ModelThinkingLevel } | undefined;
-  if (config.idleRollover !== undefined) {
-    const preset = presetCatalog.get(config.idleRollover.preset);
-    if (preset === undefined) {
-      throw new StartupDiagnosticError("configInvalid", { detail: "idleRollover.preset must name a configured model preset" });
-    }
-    const level = preset.thinkingLevel ?? "off";
-    rolloverChoice = {
-      model: preset.choice.native,
-      thinkingLevel: preset.choice.thinkingLevels.includes(level) ? level : preset.choice.thinkingLevels[0]!,
-    };
-    // The owner's next message is classified by the one configured classifier before a rollover commits.
-    if (classifierGrant === undefined) {
-      throw new StartupDiagnosticError("configInvalid", { detail: "idleRollover requires classifierModel" });
-    }
+  // Idle rollover classifies the owner's next message with the one configured classifier.
+  if (config.idleRollover !== undefined && classifierGrant === undefined) {
+    throw new StartupDiagnosticError("configInvalid", { detail: "idleRollover requires classifierModel" });
   }
   // A worker's model comes from the spawning conversation's current selection at launch, unless config
   // names one finite preset. Either way it is a native pair inside the configured model catalog.
@@ -1169,8 +1150,6 @@ export async function openGateway(config: PortConfig, context: Context, options:
   // local terminal reaches it over the private socket, and the running adapter attaches here.
   const appConsole: AppConsoleRegistry | undefined =
     config.app === undefined ? undefined : createAppConsoleRegistry();
-  const appRollovers: AppRolloverRegistry | undefined =
-    config.app === undefined ? undefined : createAppRolloverRegistry();
   const sessionKeyForConversation = new Map<ConversationId, string>();
   const telegramChatConversations = new Set<ConversationId>();
   const discordChatConversations = new Set<ConversationId>();
@@ -2952,19 +2931,15 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // session key.
     // The refresh registers in contextSnapshotLoads so an install for the same conversation cannot
     // build a competing snapshot; any failed commit restores the prior in-memory extension/table.
-    // The rollover reset carries its handoff and applies only while nothing was appended since the
-    // handoff was written and no question still waits for an answer; otherwise the chat is not idle.
+    // The rollover reset applies only while nothing was appended since the chat went idle and no
+    // question still waits for an answer; otherwise the chat is not idle.
     const appendIdleRollover = async (tx: Tx, conversationId: ConversationId, reset: IdleRolloverReset): Promise<void> => {
       if ((await tx.doc(LiveDoc, conversationId)).run !== undefined) throw new IdleRolloverStale();
       if (await tx.latestEntryId(conversationId) !== reset.expectLatest) throw new IdleRolloverStale();
       if (pendingQuestionViews(await tx.doc(AskQuestionsDoc, conversationId), now()).views.length > 0) {
         throw new IdleRolloverStale();
       }
-      await tx.appendEntry(conversationId, {
-        kind: ResetEntry.kind,
-        head: "self",
-        model: [{ role: "user", content: reset.handoff, timestamp: now() }],
-      });
+      await tx.appendEntry(conversationId, { kind: ResetEntry.kind, head: "self" });
     };
     const refreshContextSnapshot = async (
       sessionKey: string,
@@ -4180,7 +4155,6 @@ export async function openGateway(config: PortConfig, context: Context, options:
       ...(telegramActions === undefined ? {} : { telegramActions }),
       ...(discordHistory === undefined ? {} : { discordHistory }),
       ...(appConsole === undefined ? {} : { appConsole }),
-      ...(appRollovers === undefined ? {} : { appRollovers }),
       ...(appActions === undefined ? {} : { appActions }),
       // The rollover starts after resume; until then (and without config) there is nothing to decide.
       beforeOwnerInput: async (sessionKey, conversationId, content, ctx) =>
@@ -4857,8 +4831,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // Scheduling begins only after registry and all persisted conversation policies are ready.
     memoryServiceRef.current = memoryService;
     harness.resume();
-    if (rolloverChoice !== undefined) {
-      const choice = rolloverChoice;
+    if (config.idleRollover !== undefined) {
       idleRollover = startIdleRollover({
         afterMs: config.idleRollover!.afterMinutes * 60_000,
         now,
@@ -4875,44 +4848,18 @@ export async function openGateway(config: PortConfig, context: Context, options:
           if (latest === undefined || latest.kind === ResetEntry.kind) return undefined;
           return latest.id;
         },
-        summarize: async (conversationId, signal) => {
-          const model = models.getModel(choice.model.provider, choice.model.modelId);
-          const conversation = await harness!.conversation(conversationId, context);
-          if (model === undefined || conversation === undefined) return undefined;
-          const source = renderRolloverSource((await conversation.context(context)).messages);
-          if (source.trim().length === 0) return undefined;
-          const message = await models.completeSimple(model, {
-            messages: [
-              { role: "system", content: IDLE_ROLLOVER_SYSTEM_PROMPT, timestamp: now() },
-              { role: "user", content: rolloverPrompt(source), timestamp: now() },
-            ],
-          }, {
-            // Some providers (OpenCode Go) refuse a request without a session id.
-            sessionId: `nanobot-rollover:${conversationId}`,
-            maxTokens: Math.min(IDLE_ROLLOVER_LIMITS.maxTokens, model.maxTokens),
-            signal,
-            telemetry: context.telemetry,
-            ...(choice.thinkingLevel === "off" ? {} : { reasoning: choice.thinkingLevel }),
-          });
-          const summary = providerSummaryText(message);
-          // An unusable handoff is retried next sweep; say why, or a stuck rollover is invisible.
-          if (summary === undefined) {
-            journalEvent("gateway.idleRollover.unusable", {
-              stop: String(message.stopReason),
-              "usage.output": message.usage?.output ?? 0,
-            });
-          }
-          return summary;
-        },
-        continues: async (summary, message, idleMs, signal) => {
+        continues: async (conversationId, message, idleMs, signal) => {
           const classifier = models.getModelOfType("classifier", classifierGrant!.provider, classifierGrant!.modelId);
-          if (classifier === undefined) return undefined;
+          const conversation = await harness!.conversation(conversationId, context);
+          if (classifier === undefined || conversation === undefined) return undefined;
+          const previous = renderRolloverSource((await conversation.context(context)).messages);
+          if (previous.trim().length === 0) return undefined;
           const result = await models.classify(classifier, {
-            state: { previousConversation: summary, idleMinutes: Math.round(idleMs / 60_000), newMessage: message },
+            state: { previousConversation: previous, idleMinutes: Math.round(idleMs / 60_000), newMessage: message },
             questions: {
               continues: {
                 type: "bool",
-                instructions: "The owner's previous conversation with their assistant went idle; previousConversation summarizes it."
+                instructions: "previousConversation is the newest part of an owner's conversation with their assistant, which then went idle."
                   + " Decide whether newMessage, the owner's first message after the pause, continues that conversation.",
                 criteria: {
                   true: "newMessage follows up on, answers, or refers back to the previous conversation, or makes sense only with it.",
@@ -4926,12 +4873,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
             journalEvent("gateway.idleRollover.unclassified", { stop: String(result.stopReason) });
             return undefined;
           }
-          journalEvent("gateway.idleRollover.classified", { probability: Math.round(answer.probability * 100) / 100 });
-          return answer.probability >= 0.5;
+          const continues = answer.probability >= 0.5;
+          journalEvent("gateway.idleRollover.classified", { probability: Math.round(answer.probability * 100) / 100, continues });
+          return continues;
         },
-        continued: () => journalEvent("gateway.idleRollover.continued", {}),
-        rollover: async (session, expectLatest, handoff, ctx) => {
-          const reset: IdleRolloverReset = { expectLatest, handoff };
+        rollover: async (session, expectLatest, ctx) => {
+          const reset: IdleRolloverReset = { expectLatest };
           try {
             if (options.contextSnapshotProvider) {
               await refreshContextSnapshot(session.sessionKey, session.conversationId, ctx, reset);
@@ -4945,9 +4892,6 @@ export async function openGateway(config: PortConfig, context: Context, options:
             if (error instanceof IdleRolloverStale || error instanceof ConversationBusy) return;
             throw error;
           }
-          // The visible marker is best-effort: the committed rollover stands either way.
-          await appRollovers?.notify(session.sessionKey)
-            .catch((error: unknown) => reportFailure(error, "gateway.idleRollover"));
         },
         report: (error) => reportFailure(error, "gateway.idleRollover"),
       });

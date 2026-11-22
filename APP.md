@@ -138,10 +138,9 @@ substring matches, including older archives, newest first. `thread.create` defau
 and remembers its key for at least seven days; titles are 1–80 printable characters.
 Manual archive aborts the thread's turn and records `archivedReason: "manual"`. The idle scan
 records `"idle"` without aborting work. Archive does not delete history, cancel schedules, or reset
-the episode; the separately configured idle rollover still runs under its own safeguards. Each committed idle
-rollover of an app thread (committed when the owner's next message is classified as a new topic) appends a durable `divider{reason:"idle"}` (rendered as a quiet "Idle
-compact" line) that does not count as thread activity; one committed while the adapter is not
-running leaves no divider.
+the episode; the separately configured idle rollover still runs under its own safeguards. An idle rollover writes no divider; `divider{reason:"idle"}` events
+stored by earlier versions still render as a quiet "Idle compact" line and do not count as thread
+activity.
 An archived thread refuses `send` and `control` with `bad_request`. Restoring clears the reason
 and counts toward the 50-open-side-thread limit. `main` cannot be renamed or archived.
 Lifecycle changes append durable `thread` events.

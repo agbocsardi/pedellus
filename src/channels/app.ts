@@ -283,7 +283,6 @@ export interface AppGateway {
   /** Live operator console registry; the running adapter attaches its pairing host here. */
   appConsole?: AppConsoleRegistry;
   /** Idle-rollover notices; the running adapter attaches its divider writer here. */
-  appRollovers?: AppRolloverRegistry;
   /**
    * Model-tool host registry for agent file delivery (`send`/`artifact`). The running adapter
    * attaches here; without a live host a mapped app chat still sees the tool but every call is
@@ -343,27 +342,6 @@ export function createAppConsoleRegistry(): AppConsoleRegistry {
       };
     },
     console: () => live,
-  };
-}
-
-/**
- * Idle-rollover notices: the host reports each committed rollover of a mapped app session, and
- * the running adapter turns it into a durable `divider{reason:"idle"}`. Nothing attached (adapter
- * not running) drops the notice; the rollover itself is unaffected.
- */
-export interface AppRolloverRegistry {
-  attach(listener: (sessionKey: string) => Promise<void>): () => void;
-  notify(sessionKey: string): Promise<void>;
-}
-
-export function createAppRolloverRegistry(): AppRolloverRegistry {
-  let live: ((sessionKey: string) => Promise<void>) | undefined;
-  return {
-    attach(listener) {
-      live = listener;
-      return () => { if (live === listener) live = undefined; };
-    },
-    notify: async (sessionKey) => { await live?.(sessionKey); },
   };
 }
 
@@ -3779,19 +3757,6 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     }
   }
   const detachConsole = gateway.appConsole?.attach(consoleHost);
-  const detachRollovers = gateway.appRollovers?.attach(async (sessionKey) => {
-    const target = threadForSession(sessionKey);
-    if (target === undefined) return;
-    await mutateState((doc) => {
-      if (threadInfo(doc, target)?.archived) return;
-      appendEvent(doc, { event: "divider", thread: target, at: new Date(now()).toISOString(), reason: "idle" });
-    }, adapterContext);
-    try {
-      pushEventsToSockets();
-    } catch {
-      // Devices replay the durable event after `hello`.
-    }
-  });
   const detachActions = gateway.appActions?.attach(actionHost);
   // A question is delivered by appending its `open` event: this log is the channel's delivery path,
   // so the append is definite and needs none of Telegram's external-send fencing. Only a mapped,
@@ -3876,7 +3841,6 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     stopping = true;
     if (scanTimer !== undefined) clearInterval(scanTimer);
     detachConsole?.();
-    detachRollovers?.();
     detachActions?.();
     detachAskSurface?.();
     detachMcpSurface?.();

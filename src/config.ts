@@ -160,10 +160,8 @@ export interface CodeModeConfig {
 }
 
 export interface IdleRolloverConfig {
-  /** Minutes a mapped chat must stay fully idle before it rolls over. */
+  /** Minutes a mapped chat must stay fully idle before its next owner message is classified. */
   readonly afterMinutes: number;
-  /** Named preset that writes the handoff; usually a small, cheap model. */
-  readonly preset: string;
 }
 
 /**
@@ -666,22 +664,16 @@ function modelPresetsConfig(value: unknown): Readonly<Record<string, ModelPreset
   return Object.freeze(presets);
 }
 
-function idleRolloverConfig(
-  value: unknown,
-  modelPresets: Readonly<Record<string, ModelPreset>> | undefined,
-): IdleRolloverConfig {
+function idleRolloverConfig(value: unknown): IdleRolloverConfig {
   const raw = object(value, "idleRollover");
   for (const key of Object.keys(raw)) {
-    if (key !== "afterMinutes" && key !== "preset") throw new Error(`Unknown idleRollover field: ${key}`);
+    if (key !== "afterMinutes") throw new Error(`Unknown idleRollover field: ${key}`);
   }
   const after = raw.afterMinutes;
   if (typeof after !== "number" || !Number.isSafeInteger(after) || after < 1 || after > 7 * 24 * 60) {
     throw new Error("idleRollover.afterMinutes must be an integer from 1 to 10080");
   }
-  if (modelPresets === undefined) throw new Error("idleRollover.preset requires named modelPresets");
-  const preset = modelPresetName(raw.preset, "idleRollover.preset");
-  if (!Object.hasOwn(modelPresets, preset)) throw new Error("idleRollover.preset must name an entry in modelPresets");
-  return Object.freeze({ afterMinutes: after, preset });
+  return Object.freeze({ afterMinutes: after });
 }
 
 function visionHandoffConfig(
@@ -1220,7 +1212,7 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
     };
   }
   if (raw.idleRollover !== undefined) {
-    Object.assign(config, { idleRollover: idleRolloverConfig(raw.idleRollover, modelPresets) });
+    Object.assign(config, { idleRollover: idleRolloverConfig(raw.idleRollover) });
   }
   if (raw.visionHandoff !== undefined) {
     Object.assign(config, { visionHandoff: visionHandoffConfig(raw.visionHandoff, modelPresets) });
