@@ -173,8 +173,9 @@ for such a provider; a stored key wins and the endpoint is keyless otherwise.
 
 ## Classifiers and image generation
 
-At most one classifier model is reachable, only through native Code Mode
-`models.*` and only when configuration grants it:
+At most one classifier model is reachable, only when configuration grants it:
+model-facing only through native Code Mode `models.*`, and host-side only for the
+idle-rollover continuation check (see README):
 
 ```json
 {

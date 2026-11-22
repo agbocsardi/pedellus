@@ -36,6 +36,7 @@ import { withCancel, withoutAbortSignal, withTelemetry } from "@earendil-works/c
 import type { TelemetrySpan } from "@earendil-works/pi-telemetry";
 import { journalEvent, observeOperation } from "../observability.js";
 import type { Conversation, ConversationId, EntryId, Harness, Submission, SubmissionId, SubmissionRecord, Tx } from "@earendil-works/pi-durable";
+import type { OwnerInputContent } from "../history/idle-rollover.js";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { FollowUpMode } from "../config.js";
 import type { CronDeliveryOutbox, CronDeliveryRecord } from "../automation/cron-delivery.js";
@@ -235,6 +236,8 @@ export const AppState = defineDoc<AppChannelState>({
 export interface AppGateway {
   readonly harness?: Pick<Harness, "submission">;
   conversationFor(sessionKey: string, context: Context): Promise<Conversation>;
+  /** Decides a prepared idle rollover just before an owner input is submitted; absent means none. */
+  beforeOwnerInput?(sessionKey: string, conversationId: ConversationId, content: OwnerInputContent, context: Context): Promise<void>;
   forkAppThread?(
     stateId: ConversationId, thread: string, from: AppThreadOrigin,
     init: (doc: Draft<AppChannelState>) => void, context: Context,
@@ -2320,6 +2323,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           // The same content shape Telegram submits: text plus labeled metadata, images natively.
           const content = await observeOperation("gateway.app.attachments", {},
             () => files.prepare(item.attachments, item.text, signal), trace);
+          await gateway.beforeOwnerInput?.(sessionForThread(thread), conversation.id, content, adapterContext);
           submission = await conversation.submit({
             type: "input", content, requestId, whenBusy,
           }, withTelemetry(trace, adapterContext));
@@ -2734,6 +2738,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           const whenBusy = await submissionMode(conversation, earlier);
           if (!state.pending.some((item) => item.key === earlier.key) ||
               archiving.has(record.thread) || !openThread(state, record.thread)) return;
+          await gateway.beforeOwnerInput?.(sessionForThread(record.thread), conversation.id, earlier.text, adapterContext);
           const submission = await conversation.submit({
             type: "input", content: earlier.text, requestId: requestIdFor(earlier.key), whenBusy,
           }, adapterContext);

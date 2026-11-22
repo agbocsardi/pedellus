@@ -414,7 +414,12 @@ function projectSettlement(settled: SettledSubmissionRecord): TerminalSettlement
 export function inProcessTerminalConversation(
   conversation: Conversation,
   followUpMode: FollowUpMode = "followUp",
-  owner?: { readonly sessionKey: string; readonly harness: Pick<Harness, "submission"> },
+  owner?: {
+    readonly sessionKey: string;
+    readonly harness: Pick<Harness, "submission">;
+    /** Decides a prepared idle rollover just before the owner input is submitted. */
+    readonly beforeInput?: (content: TerminalInput, context: Context) => Promise<void>;
+  },
 ): TerminalConversation {
   /** Native submissions this surface admitted, oldest first. */
   const admitted: number[] = [];
@@ -445,6 +450,7 @@ export function inProcessTerminalConversation(
       };
     },
     async submit(content, context) {
+      await owner?.beforeInput?.(content, context);
       const draft = {
         type: "input" as const,
         content,

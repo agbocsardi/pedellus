@@ -566,6 +566,7 @@ class LocalConnection {
     this.sessionKey = sessionKey;
     this.surface = inProcessTerminalConversation(conversation, this.options.followUpMode ?? "followUp", {
       sessionKey, harness: this.options.gateway.harness,
+      beforeInput: (content, ctx) => this.options.gateway.beforeOwnerInput(sessionKey, conversation.id, content, ctx),
     });
     this.detachMcpSurface = this.options.gateway.mcpSurfaces?.attach({
       owns: (candidate) => candidate === sessionKey,

@@ -29,7 +29,8 @@ import { copyJson } from "@earendil-works/chord";
 import { withCancel, withoutAbortSignal, withTelemetry } from "@earendil-works/chord/context";
 import type { TelemetrySpan } from "@earendil-works/pi-telemetry";
 import { journalEvent, observeOperation } from "../observability.js";
-import type { Conversation, Submission, SubmissionId, SubmissionRecord } from "@earendil-works/pi-durable";
+import type { Conversation, ConversationId, Submission, SubmissionId, SubmissionRecord } from "@earendil-works/pi-durable";
+import type { OwnerInputContent } from "../history/idle-rollover.js";
 import type { AssistantMessage, ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { FollowUpMode } from "../config.js";
 import type { CronDeliveryOutbox, CronDeliveryRecord } from "../automation/cron-delivery.js";
@@ -267,6 +268,8 @@ export const DiscordState = defineDoc<DiscordChannelState>({
 
 export interface DiscordGateway {
   conversationFor(sessionKey: string, context: Context): Promise<Conversation>;
+  /** Decides a prepared idle rollover just before an owner input is submitted; absent means none. */
+  beforeOwnerInput?(sessionKey: string, conversationId: ConversationId, content: OwnerInputContent, context: Context): Promise<void>;
   /**
    * Host-authenticated durable outbox for completed background cron results and host interruption
    * notices. Optional so a host that only does inbound replies stays usable; absent means neither
@@ -1130,6 +1133,7 @@ export async function runDiscord(
       });
       const early = earlySubmissions.get(item.key);
       earlySubmissions.delete(item.key);
+      if (early === undefined) await gateway.beforeOwnerInput?.(item.sessionKey, conversation.id, content, adapterContext);
       // The admission itself decided the busy-mode, so a later configuration change cannot redefine it.
       const submission = early ?? await conversation.submit({
         type: "input",
@@ -1830,6 +1834,7 @@ export async function runDiscord(
         const earlierConversation = await gateway.conversationFor(earlier.sessionKey, adapterContext);
         await submitInOrder(record.channelId, async () => {
           const content = await prepareInputContent(earlier);
+          await gateway.beforeOwnerInput?.(earlier.sessionKey, earlierConversation.id, content, adapterContext);
           const submission = await earlierConversation.submit({
             type: "input",
             content,

@@ -140,6 +140,7 @@ import {
   rolloverPrompt,
   startIdleRollover,
   type IdleRollover,
+  type OwnerInputContent,
 } from "./history/idle-rollover.js";
 import { providerSummaryText } from "./history/summary-source.js";
 import { hasPersistedNanobotContext, preparedContextReplay, preparedTaskModel } from "./recovery/prepared.js";
@@ -477,6 +478,11 @@ export interface Gateway {
    */
   readonly appConsole?: AppConsoleRegistry;
   readonly appRollovers?: AppRolloverRegistry;
+  /**
+   * Called by every owner-input path just before it submits to a mapped chat: decides a prepared idle
+   * rollover for that chat (see `src/history/idle-rollover.ts`). Never throws; a no-op without one.
+   */
+  beforeOwnerInput(sessionKey: string, conversationId: ConversationId, content: OwnerInputContent, context: Context): Promise<void>;
   /**
    * Model-action host registry for the app channel's `app` file capability (`send`/`artifact`).
    * Present only when `config.app` is configured; the running adapter attaches here, and the
@@ -943,6 +949,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
       model: preset.choice.native,
       thinkingLevel: preset.choice.thinkingLevels.includes(level) ? level : preset.choice.thinkingLevels[0]!,
     };
+    // The owner's next message is classified by the one configured classifier before a rollover commits.
+    if (classifierGrant === undefined) {
+      throw new StartupDiagnosticError("configInvalid", { detail: "idleRollover requires classifierModel" });
+    }
   }
   // A worker's model comes from the spawning conversation's current selection at launch, unless config
   // names one finite preset. Either way it is a native pair inside the configured model catalog.
@@ -4172,6 +4182,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
       ...(appConsole === undefined ? {} : { appConsole }),
       ...(appRollovers === undefined ? {} : { appRollovers }),
       ...(appActions === undefined ? {} : { appActions }),
+      // The rollover starts after resume; until then (and without config) there is nothing to decide.
+      beforeOwnerInput: async (sessionKey, conversationId, content, ctx) =>
+        idleRollover?.beforeOwnerInput(sessionKey, conversationId, content, ctx),
       askSurfaces,
       get mcp() {
         return mcpRef.current === undefined ? undefined : { servers: mcpRef.current.status };
@@ -4891,6 +4904,32 @@ export async function openGateway(config: PortConfig, context: Context, options:
           }
           return summary;
         },
+        continues: async (summary, message, idleMs, signal) => {
+          const classifier = models.getModelOfType("classifier", classifierGrant!.provider, classifierGrant!.modelId);
+          if (classifier === undefined) return undefined;
+          const result = await models.classify(classifier, {
+            state: { previousConversation: summary, idleMinutes: Math.round(idleMs / 60_000), newMessage: message },
+            questions: {
+              continues: {
+                type: "bool",
+                instructions: "The owner's previous conversation with their assistant went idle; previousConversation summarizes it."
+                  + " Decide whether newMessage, the owner's first message after the pause, continues that conversation.",
+                criteria: {
+                  true: "newMessage follows up on, answers, or refers back to the previous conversation, or makes sense only with it.",
+                  false: "newMessage starts a different topic that does not need the previous conversation.",
+                },
+              },
+            },
+          }, { signal, telemetry: context.telemetry });
+          const answer = result.answers.continues;
+          if (result.stopReason !== "stop" || answer?.type !== "bool") {
+            journalEvent("gateway.idleRollover.unclassified", { stop: String(result.stopReason) });
+            return undefined;
+          }
+          journalEvent("gateway.idleRollover.classified", { probability: Math.round(answer.probability * 100) / 100 });
+          return answer.probability >= 0.5;
+        },
+        continued: () => journalEvent("gateway.idleRollover.continued", {}),
         rollover: async (session, expectLatest, handoff, ctx) => {
           const reset: IdleRolloverReset = { expectLatest, handoff };
           try {

@@ -139,7 +139,7 @@ and remembers its key for at least seven days; titles are 1–80 printable chara
 Manual archive aborts the thread's turn and records `archivedReason: "manual"`. The idle scan
 records `"idle"` without aborting work. Archive does not delete history, cancel schedules, or reset
 the episode; the separately configured idle rollover still runs under its own safeguards. Each committed idle
-rollover of an app thread appends a durable `divider{reason:"idle"}` (rendered as a quiet "Idle
+rollover of an app thread (committed when the owner's next message is classified as a new topic) appends a durable `divider{reason:"idle"}` (rendered as a quiet "Idle
 compact" line) that does not count as thread activity; one committed while the adapter is not
 running leaves no divider.
 An archived thread refuses `send` and `control` with `bad_request`. Restoring clears the reason

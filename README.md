@@ -103,13 +103,17 @@ set `episodeSummary.enabled` to `false` to disable summaries. Already-closed epi
 backfilled automatically. Short cache retention is requested, but cache reuse is not guaranteed;
 see [episode summaries](./HISTORY.md#episode-summaries).
 
-Idle rollover is off by default. With `"idleRollover": { "afterMinutes": 30, "preset": "small" }`,
-an authenticated mapped chat that stays fully idle that long (no run, no gateway work, no
-pending `ask_user` question) gets a short handoff note from the named preset, usually a cheap
-model, and starts a new episode exactly like `/new`, with the note as its first message. The note
-tells the agent the owner may or may not continue and points it at the memory tools for detail.
-The closed episode is digested and summarized like any other. It makes one provider call per
-rollover, sends no channel message, and the idle clock is in memory, so a restart restarts it.
+Idle rollover is off by default. With `"idleRollover": { "afterMinutes": 30, "preset": "small" }`
+(it requires `classifierModel`), an authenticated mapped chat that stays fully idle that long (no
+run, no gateway work, no pending `ask_user` question) gets a short handoff note prepared by the
+named preset, usually a cheap model. Nothing is committed yet. When the owner's next message
+arrives, the configured classifier decides whether it continues the conversation: if it does, the
+note is dropped and the chat goes on in the same episode; if it is a new topic, or the classifier
+fails or takes longer than 10 seconds, a new episode starts exactly like `/new`, with the note as its first
+message, just before that message. A closed episode is digested and summarized like any other; a
+chat the owner keeps continuing stays one open episode until `/new`. It costs one provider call
+per idle period plus one classifier call on the next message, sends no channel message, and the
+clock and prepared note are in memory, so a restart drops them and the next message continues.
 
 ## Busy owner messages
 
