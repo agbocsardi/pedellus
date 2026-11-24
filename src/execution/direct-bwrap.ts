@@ -40,7 +40,21 @@ const OPTIONAL_SYSTEM_RO_BINDS = [
 	"/etc/localtime",
 ] as const;
 
-const validatedBwrap = new Set<string>();
+/**
+ * Identity of one validated executable: the inode plus size and mtime, so both a replacement at
+ * the same path and an in-place overwrite are detected. A pathname alone is not identity, because
+ * the file at a validated path can be replaced between validation and a later spawn; a capable
+ * attacker who can preserve inode, size and mtime while changing content is outside this
+ * defensive boundary (and has already defeated the host it runs on).
+ */
+interface BwrapIdentity {
+	readonly dev: number;
+	readonly ino: number;
+	readonly size: number;
+	readonly mtimeMs: number;
+}
+
+const validatedBwrap = new Map<string, BwrapIdentity>();
 
 function requireAbsolute(path: string, label: string): string {
 	if (typeof path !== "string" || !isAbsolute(path) || path.includes("\0")) {
@@ -59,9 +73,13 @@ function isExecutableFile(path: string): boolean {
 	}
 }
 
-/** Validate identity and version once per canonical binary path; never fall back to another executable. */
-function validateBwrapBinary(binary: string, label: string): string {
-	if (validatedBwrap.has(binary)) return binary;
+/**
+ * Validate identity and version once per canonical binary path; never fall back to another
+ * executable. `force` re-runs the version check when the path now names a different file, so the
+ * cached validation is never trusted across an executable swap.
+ */
+function validateBwrapBinary(binary: string, label: string, force = false): string {
+	if (!force && validatedBwrap.has(binary)) return binary;
 	if (!isExecutableFile(binary)) throw new Error(`${label} is not an executable file: ${binary}`);
 	const result = spawnSync(binary, ["--version"], {
 		encoding: "utf8",
@@ -77,8 +95,29 @@ function validateBwrapBinary(binary: string, label: string): string {
 	if (Number(match[1]) === 0 && Number(match[2]) < 9) {
 		throw new Error(`Bubblewrap ${match[0].replace("bubblewrap ", "")} at ${binary} is too old; 0.9 or newer is required`);
 	}
-	validatedBwrap.add(binary);
+	const info = statSync(binary);
+	validatedBwrap.set(binary, { dev: info.dev, ino: info.ino, size: info.size, mtimeMs: info.mtimeMs });
 	return binary;
+}
+
+/**
+ * Revalidate the executable target before one launch. The workspace, cwd and media paths are
+ * re-resolved by the argv builder on every call, but bind-path revalidation cannot cover the
+ * executable itself: this check compares the launch-time file against the inode/size/mtime
+ * identity pinned at validation time, and a mismatch (a replaced, hard-linked-over or
+ * overwritten binary) re-runs the full version validation against the file that is actually
+ * there instead of trusting the pathname cache. Failure semantics stay the established ones: a binary that cannot be revalidated throws,
+ * and a configured value never falls back to another executable.
+ */
+export function revalidateBwrapBinary(binary: string): string {
+	requireAbsolute(binary, "bwrap");
+	if (!isExecutableFile(binary)) throw new Error(`Bubblewrap is not an executable file: ${binary}`);
+	const pinned = validatedBwrap.get(binary);
+	if (pinned === undefined) return validateBwrapBinary(binary, "Bubblewrap");
+	const info = statSync(binary);
+	const sameFile = info.dev === pinned.dev && info.ino === pinned.ino
+		&& info.size === pinned.size && info.mtimeMs === pinned.mtimeMs;
+	return sameFile ? binary : validateBwrapBinary(binary, "Bubblewrap", true);
 }
 
 /**
@@ -176,15 +215,19 @@ export function buildDirectBwrapArgs(options: DirectBwrapOptions): string[] {
  * The same argv with a binary the caller already resolved through `resolveDirectBwrapPath` (for
  * example once per environment), so a long-lived shell does not re-resolve it on every command.
  *
- * Only the executable is reused: the workspace, cwd and media paths are revalidated on every call —
- * each is re-resolved through `realpath` and re-checked immediately before the argv is built — so
- * launching still revalidates the paths it binds even though the binary resolution happened earlier.
+ * Only the executable's resolution is reused: the workspace, cwd and media paths are revalidated on
+ * every call — each is re-resolved through `realpath` and re-checked immediately before the argv is
+ * built — and the executable itself is rechecked against the (dev, ino) identity pinned at
+ * validation time (`revalidateBwrapBinary`), so launching still revalidates everything it binds
+ * and executes even though the binary resolution happened earlier.
  */
 export function buildDirectBwrapArgsWithBinary(
 	bwrap: string,
 	options: Omit<DirectBwrapOptions, "bwrapPath">,
 ): string[] {
-	requireAbsolute(bwrap, "bwrap");
+	// The executable target is revalidated here on every launch: the caller's resolved path is a
+	// pathname, and only the identity check above proves the same file still answers to it.
+	revalidateBwrapBinary(bwrap);
 	const workspaceInput = requireAbsolute(options.workspace, "workspace");
 	if (workspaceInput === sep) throw new Error("workspace must not be the host filesystem root");
 	const workspace = canonicalDirectory(workspaceInput, "workspace");

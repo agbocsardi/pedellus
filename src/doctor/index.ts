@@ -18,7 +18,7 @@ import { loadWorkspaceContextSnapshot, WorkspaceContextFileError, WorkspaceConte
 import { probeSocket, type SocketProbeState } from "../local/server.js";
 import { createAuthModels, nativeProviderId } from "../providers.js";
 import { startupDiagnostic } from "../startup-diagnostics.js";
-import { canonicalFuturePath, inside } from "../store.js";
+import { canonicalFuturePath, inside, ownerPrivateDirectoryReason } from "../store.js";
 
 export interface DoctorOptions {
   /** Explicit `--config`; absent checks the default primary file. */
@@ -384,16 +384,25 @@ async function checkDirectories(
   } else {
     try {
       const entry = await lstat(dataDir);
-      if (entry.isDirectory()) {
-        report.check("ok", "dataDir", "exists and is disjoint from workspace");
-        existingDataDir = dataDir;
-        dataDirValid = allRootsValid;
-      } else {
+      if (!entry.isDirectory()) {
         report.check("fail", "dataDir", "configured dataDir is not a directory");
+      } else {
+        // The same owner-private contract the CLI's read-only socket lookup enforces, so doctor
+        // never probes an endpoint a client command would refuse; the gateway itself installs the
+        // mode, but an existing shared directory is reported, not used or repaired.
+        const privateReason = ownerPrivateDirectoryReason(entry);
+        if (privateReason === undefined) {
+          report.check("ok", "dataDir", "exists, is owner-private and is disjoint from workspace");
+          existingDataDir = dataDir;
+          dataDirValid = allRootsValid;
+        } else {
+          report.check("fail", "dataDir", `configured dataDir ${privateReason}`);
+          report.note("Client commands refuse a shared dataDir; fix the mode to 0700 (owner-only) before attaching.");
+        }
       }
     } catch (error) {
       if (errorCode(error) === "ENOENT") {
-        report.check("ok", "dataDir", "valid path (will be created at first gateway start)");
+        report.check("ok", "dataDir", "valid path (will be created owner-private at first gateway start)");
         dataDirValid = allRootsValid;
       } else {
         report.check("fail", "dataDir", `configured dataDir cannot be read (${errorCode(error) ?? "error"})`);
@@ -539,12 +548,10 @@ function configuredEnvName(config: PortConfig, providerId: string): string | und
   return Object.entries(config.credentials ?? {}).find(([spelling]) => nativeProviderId(spelling) === providerId || spelling === providerId)?.[1];
 }
 
-/** A provider label safe to echo: bounded and printable. Anything else prints as `provider`. */
-function providerLabel(id: string): string {
-  return /^[A-Za-z0-9._-]{1,40}$/.test(id) ? id : "provider";
-}
-
-/** An environment variable name safe to echo; a configured but unprintable reference stays unnamed. */
+/**
+ * An environment variable name safe to echo; a configured but unprintable reference stays unnamed.
+ * Env names are syntax-validated by `parseConfig` and name a shell variable, not a provider key.
+ */
 function echoableEnvName(name: string): string | undefined {
   return /^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(name) ? name : undefined;
 }
@@ -553,15 +560,14 @@ function describeAuth(auth: AuthCheck, configuredEnv: string | undefined): strin
   if (auth.type === "oauth") return "stored credential (OAuth)";
   const source = auth.source ?? "";
   if (source === "stored credential" || source === "keyless") return source;
-  const env = echoableEnvName(source);
   if (source.startsWith("credentials.")) {
     // A credential-store reference is echoed only through its already-validated env mapping.
     return configuredEnv !== undefined ? `env (${configuredEnv})` : "stored credential reference";
   }
-  if (env !== undefined && /^[A-Z][A-Z0-9_]*$/.test(env)) return `env (${env})`;
-  // Any other source text is not echoed: it may name an owner-chosen spelling, and the
-  // check has already succeeded, so the safe summary is that auth is available.
-  return "available";
+  // No raw auth source is ever echoed, even an environment-variable name: it may be derived from
+  // an owner-chosen spelling, and the check has already succeeded, so the safe summary is that a
+  // credential resolved without naming where it came from.
+  return "available (environment credential)";
 }
 
 async function checkCredentials(
@@ -571,12 +577,24 @@ async function checkCredentials(
   env: NodeJS.ProcessEnv,
 ): Promise<void> {
   const providers = referencedProviders(config);
-  const unknown = providers.filter((entry) => entry.kind === "unknown");
-  for (const entry of unknown) {
-    // Even a pre-validated spelling is echoed only after the bounded-printable guard.
-    report.check("fail", providerLabel(entry.id), "unknown provider (not a native Pi AI provider or custom providers entry)");
+  // Only native Pi AI provider IDs are independently trusted identifiers and may print verbatim.
+  // Every config-derived spelling — a custom providers ID or an unknown credentials/model key —
+  // is replaced by a stable ordinal (sorted reference order), even when it is short, printable
+  // and syntax-valid, so no configuration text reaches the report as an identifier.
+  let untrustedOrdinal = 0;
+  const labeled = providers.map((entry) => ({
+    entry,
+    trusted: entry.kind === "native",
+    label: entry.kind === "native" ? entry.id : `provider ${++untrustedOrdinal}`,
+  }));
+  const unknown = labeled.filter((item) => item.entry.kind === "unknown");
+  for (const item of unknown) {
+    report.check("fail", item.label, "unknown provider (not a native Pi AI provider or custom providers entry)");
   }
-  const known = providers.filter((entry) => entry.kind !== "unknown" && entry.authRequired);
+  if (unknown.length > 0) {
+    report.note("Provider ordinals follow the sorted references in the configuration; the spellings themselves are never echoed.");
+  }
+  const known = labeled.filter((item) => item.entry.kind !== "unknown" && item.entry.authRequired);
   if (known.length === 0) {
     if (unknown.length === 0) report.check("ok", "providers", "no providers referenced");
     return;
@@ -604,23 +622,23 @@ async function checkCredentials(
     report.check("fail", "provider configuration", startupDiagnostic(error).replace(/^pedellus: /, ""));
     return;
   }
-  for (const entry of known) {
-    // The id can be an owner-chosen custom provider spelling and the env name an owner-chosen
-    // credential reference; both are echoed only through the bounded-printable guards so a
-    // hostile value never reaches the report, even from a hand-built SDK config.
+  for (const item of known) {
+    const { entry, trusted, label } = item;
     const id = entry.id;
-    const label = providerLabel(id);
     const configuredEnv = echoableEnvName(configuredEnvName(config, id) ?? "");
+    // A trusted id names itself in the login hint; an untrusted spelling never does, so the
+    // hint points at the configuration instead of echoing the configured key or ID.
+    const loginHint = trusted ? `run \`pedellus login ${label}\`` : "run `pedellus login` with the provider spelling from the configuration";
     let auth: AuthCheck | undefined;
     try {
       auth = await models.checkAuth(id);
     } catch {
       report.check("fail", label, configuredEnv === undefined
-        ? `credential check failed (details suppressed); run \`pedellus login ${label}\``
-        : `missing — ${configuredEnv} is not set; set it or run \`pedellus login ${label}\``);
+        ? `credential check failed (details suppressed); ${loginHint}`
+        : `missing — ${configuredEnv} is not set; set it or ${loginHint}`);
       continue;
     }
-    if (auth === undefined) report.check("fail", label, `missing — run \`pedellus login ${label}\``);
+    if (auth === undefined) report.check("fail", label, `missing — ${loginHint}`);
     else report.check("ok", label, describeAuth(auth, configuredEnv));
   }
 }

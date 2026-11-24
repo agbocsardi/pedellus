@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -210,7 +210,8 @@ test("a healthy setup passes, detects env credentials and gateway probe states, 
   const { path, dataDir } = await setup();
   const idle = await doctor(path, { env: { OPENAI_API_KEY: "sk-SYNTHETIC-ENV" } });
   assert.equal(idle.ok, true, idle.text);
-  assert.match(idle.text, /^\[OK\] {3}openai: env \(OPENAI_API_KEY\)$/m);
+  // No raw auth source (not even an environment-variable name) is echoed.
+  assert.match(idle.text, /^\[OK\] {3}openai: available \(environment credential\)$/m);
   assert.match(idle.text, /^\[OK\] {3}memory\/MEMORY\.md: present$/m);
   assert.match(idle.text, /^\[WARN\] gateway: not running \(start with `pedellus gateway`\)$/m);
   assert.match(idle.text, /, 0 failures\n$/);
@@ -230,6 +231,20 @@ test("a healthy setup passes, detects env credentials and gateway probe states, 
   } finally {
     await new Promise((resolveClose) => server.close(resolveClose));
   }
+
+  // A shared dataDir is the same refusal the CLI's read-only socket lookup makes, and the
+  // gateway endpoint inside it is never probed; nothing is chmodded back by the doctor.
+  await chmod(dataDir, 0o755);
+  let probed = 0;
+  const shared = await doctor(path, {
+    env: { OPENAI_API_KEY: "sk-SYNTHETIC-ENV" },
+    socketProbe: async () => { probed += 1; return "listening"; },
+  });
+  assert.equal(shared.ok, false);
+  assert.match(shared.text, /\[FAIL\] dataDir: configured dataDir is not owner-private/);
+  assert.match(shared.text, /\[WARN\] gateway: not running/);
+  assert.equal(probed, 0, "an endpoint inside a shared dataDir is never probed");
+  assert.equal((await stat(dataDir)).mode & 0o777, 0o755, "the doctor never repairs the mode");
 });
 
 test("doctor catches missing memory files, symlinked memory dirs, unknown providers, and missing app builds", async () => {
@@ -254,12 +269,17 @@ test("doctor catches missing memory files, symlinked memory dirs, unknown provid
   const { path: typoCfg } = await setup((config) => ({ ...config, model: { provider: "bogus-provider", modelId: "m1" } }));
   const typoRes = await doctor(typoCfg);
   assert.equal(typoRes.ok, false);
-  assert.match(typoRes.text, /\[FAIL\] bogus-provider: unknown provider/);
+  // Config-derived spellings never print, not even short printable ones: only native Pi AI
+  // identifiers are echoed verbatim; everything else gets a stable ordinal.
+  assert.match(typoRes.text, /\[FAIL\] provider 1: unknown provider/);
+  assert.doesNotMatch(typoRes.text, /bogus-provider/);
 
   const { path: credTypoCfg } = await setup((config) => ({ ...config, credentials: { "openaai": "OPENAI_API_KEY" } }));
   const credTypoRes = await doctor(credTypoCfg, { env: { OPENAI_API_KEY: "x" } });
   assert.equal(credTypoRes.ok, false);
-  assert.match(credTypoRes.text, /\[FAIL\] openaai: unknown provider/);
+  assert.match(credTypoRes.text, /\[FAIL\] provider 1: unknown provider/);
+  assert.doesNotMatch(credTypoRes.text, /openaai/);
+  assert.match(credTypoRes.text, /never echoed/);
 
   // Missing app build index.html fails with build hint.
   const { path: appCfg } = await setup((config, root) => ({ ...config, app: { port: 8787, staticRoot: join(root, "pwa") } }));
@@ -277,8 +297,17 @@ test("stored credentials, configured env references and missing credentials are 
       { provider: "openai", modelId: OPENAI },
       { provider: "anthropic", modelId: ANTHROPIC },
       { provider: "google", modelId: firstChat("google") },
+      { provider: "my-endpoint", modelId: "custom-1" },
     ],
-    credentials: { anthropic: "MY_ANTHROPIC_KEY" },
+    providers: {
+      "my-endpoint": {
+        api: "openai-completions",
+        baseUrl: "http://127.0.0.1:9/v1",
+        models: [{ id: "custom-1", name: "Custom one", contextWindow: 8192, maxTokens: 4096,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
+      },
+    },
+    credentials: { anthropic: "MY_ANTHROPIC_KEY", "my-endpoint": "MY_ENDPOINT_KEY" },
   }));
   await mkdir(dataDir, { mode: 0o700 });
   await writeFile(join(dataDir, "credentials.json"), JSON.stringify({
@@ -291,10 +320,20 @@ test("stored credentials, configured env references and missing credentials are 
   assert.match(unset.text, /^\[OK\] {3}openai: stored credential$/m);
   assert.match(unset.text, /^\[FAIL\] anthropic: missing — MY_ANTHROPIC_KEY is not set; .*pedellus login anthropic/m);
   assert.match(unset.text, /^\[FAIL\] google: missing — run `pedellus login google`$/m);
+  // A custom providers ID is configuration text, so it never prints verbatim, even though it is
+  // short and syntax-valid: only its stable ordinal does, and the login hint points at the
+  // configuration instead of echoing the configured ID.
+  assert.match(unset.text, /^\[FAIL\] provider 1: missing — MY_ENDPOINT_KEY is not set; set it or run `pedellus login` with the provider spelling from the configuration$/m);
+  assert.doesNotMatch(unset.text, /my-endpoint/);
 
-  const set = await doctor(path, { env: { MY_ANTHROPIC_KEY: "sk-SYNTHETIC-ENV", GEMINI_API_KEY: "g-SYNTHETIC" } });
+  const set = await doctor(path, { env: { MY_ANTHROPIC_KEY: "sk-SYNTHETIC-ENV", GEMINI_API_KEY: "g-SYNTHETIC", MY_ENDPOINT_KEY: "e-SYNTHETIC" } });
   assert.match(set.text, /^\[OK\] {3}anthropic: env \(MY_ANTHROPIC_KEY\)$/m);
-  assert.match(set.text, /^\[OK\] {3}google: env \(GEMINI_API_KEY\)$/m);
+  // Google resolved its native ambient variable; the source name itself is never echoed.
+  assert.match(set.text, /^\[OK\] {3}google: available \(environment credential\)$/m);
+  assert.doesNotMatch(set.text, /GEMINI_API_KEY/);
+  // The custom provider is still ordinal-labeled and never echoed once its key is set.
+  assert.match(set.text, /^\[OK\] {3}provider 1: env \(MY_ENDPOINT_KEY\)$/m);
+  assert.doesNotMatch(set.text, /my-endpoint/);
   assert.equal(set.ok, true, set.text);
   for (const text of [unset.text, set.text]) assert.ok(!/SYNTHETIC/.test(text), text);
 });

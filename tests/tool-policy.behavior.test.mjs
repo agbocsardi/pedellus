@@ -200,3 +200,40 @@ test('shell commands naming managed data are refused even inside an allowed root
   assert.match(scoped.checkCommand('cat /etc/hosts'), /path outside working dir/);
   assert.doesNotMatch(scoped.checkCommand('cat /etc/hosts'), /restrict_to_workspace/);
 });
+
+test('a replaced bwrap executable is re-validated by identity, not by pathname', { timeout: 30_000 }, async () => {
+  if (process.platform !== 'linux') return; // Bubblewrap resolution is Linux-only.
+  const { mkdir, mkdtemp, rm, writeFile } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { resolveDirectBwrapPath, buildDirectBwrapArgsWithBinary, revalidateBwrapBinary } =
+    await import(new URL('../dist/execution/direct-bwrap.js', import.meta.url).href);
+  const root = await mkdtemp(join(tmpdir(), 'nanobot-bwrap-revalidate-'));
+  const fake = join(root, 'bwrap');
+  const workspace = join(root, 'ws');
+  const writeFake = (text) => writeFile(fake, `#!/bin/sh\necho ${text}\n`, { mode: 0o755 });
+  const argvFor = () => buildDirectBwrapArgsWithBinary(resolved, { workspace, command: ['/bin/sh', '-c', 'true'] });
+  let resolved;
+  try {
+    await mkdir(workspace);
+    await writeFake('"bubblewrap 0.10.0"');
+    resolved = resolveDirectBwrapPath(fake);
+    assert.equal(argvFor()[0], resolved);
+    // The pinned identity validates the same file on a later launch.
+    assert.equal(revalidateBwrapBinary(resolved), resolved);
+
+    // A different but still-valid executable replaces the file at the same path: the pathname
+    // cache is not trusted across the swap; the new file is fully re-validated.
+    await writeFake('"bubblewrap 0.10.1"');
+    assert.equal(revalidateBwrapBinary(resolved), resolved);
+    assert.equal(argvFor()[0], resolved);
+
+    // Defensive verification only: a non-bwrap executable at the validated path fails the launch
+    // closed instead of executing whatever now answers to the cached pathname.
+    await writeFake('"definitely not bubblewrap"');
+    assert.throws(() => revalidateBwrapBinary(resolved), /Bubblewrap validation failed/);
+    assert.throws(() => argvFor(), /Bubblewrap validation failed/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

@@ -417,6 +417,55 @@ test("malformed cron mutation replies are held as unknown, never rendered as suc
   );
   assert.equal(partial.text(), "");
 
+  // Same-version legal shapes are accepted: an unplaced task carries scheduledAtMs: null, and
+  // projected lines are bounded in code points (an astral-character schedule line can be twice
+  // its limit in UTF-16 units), with renderable timestamps only.
+  const astral = "\u{1F31F}".repeat(300);
+  const legalJob = {
+    id: "cron-x", origin: CLI_CHAT, name: "stretch", mode: "background", intent: "message",
+    schedule: astral, status: "scheduled", nextAtMs: Date.now(), message: "Stretch and check the build",
+    lastOutcome: null, lastSkip: null, lastFault: null, deliveryFault: null,
+    timer: { taskId: 1, status: "pending", scheduledAtMs: null, error: null, reason: null },
+    execution: null, target: null,
+  };
+  replies.push({ result: { status: "cancelled", job: legalJob, withdrawn: null, abortError: null } });
+  const cancelledOk = capture();
+  await runCronCommand({ client, command: { kind: "cancel", jobId: "cron-x" }, output: cancelledOk.output, context });
+  assert.match(cancelledOk.text(), /^Cancelled cron-x\./);
+
+  replies.push({ result: { status: "scheduled", job: legalJob, jobId: "cron-x", nextAtMs: null, deduplicated: false } });
+  const scheduled = capture();
+  await runCronCommand({
+    client,
+    command: { kind: "create", origin: CLI_CHAT, request: schedule({ idempotencyKey: "legal-1" }) },
+    output: scheduled.output,
+    context,
+  });
+  assert.match(scheduled.text(), /^Scheduled on cli:operator\./);
+  assert.match(scheduled.text(), new RegExp(astral));
+
+  // A timestamp the renderer could not print is rejected before any success receipt.
+  replies.push({ result: { status: "not_found", job: undefined, bogus: true, never: "checked" } });
+  assert.equal(
+    (await client.cronCancel("cron-x", context)).status,
+    "not_found",
+    "the status check runs before deeper field validation",
+  );
+  const nonRenderable = JSON.parse(JSON.stringify(legalJob));
+  nonRenderable.nextAtMs = 8.65e15;
+  replies.push({ result: { status: "scheduled", job: nonRenderable, jobId: "cron-x", nextAtMs: 8.65e15, deduplicated: false } });
+  const beyond = capture();
+  await assert.rejects(
+    () => runCronCommand({
+      client,
+      command: { kind: "create", origin: CLI_CHAT, request: schedule({ idempotencyKey: "beyond-1" }) },
+      output: beyond.output,
+      context,
+    }),
+    (error) => error instanceof CronCommandError && /outcome is unknown/.test(error.message),
+  );
+  assert.equal(beyond.text(), "");
+
   // A well-formed refusal stays a definitive, exact report.
   replies.push({ result: { status: "not_found" } });
   await assert.rejects(

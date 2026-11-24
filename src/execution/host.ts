@@ -619,7 +619,8 @@ export class HostExecutionEnv implements ExecutionEnv {
 		try {
 			// The binary was resolved and validated once when this environment was created; the argv
 			// builder still re-resolves and re-checks the workspace, cwd and media paths right here,
-			// so pre-launch path revalidation keeps happening on every command.
+			// and revalidates the executable's pinned inode/size/mtime identity, so pre-launch
+			// revalidation keeps happening on every command.
 			argv = buildDirectBwrapArgsWithBinary(this.#bwrap.binary, {
 				workspace: this.#workspaceRoot,
 				cwd: cwd.value,

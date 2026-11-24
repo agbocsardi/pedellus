@@ -9,6 +9,7 @@
 
 import type { Cursor } from "@earendil-works/pi-durable";
 import type { CronOperatorCancelOutcome, CronOperatorCreateOutcome, CronOperatorJob, CronOperatorListing, CronOperatorRow } from "../automation/operator.js";
+import { CRON_OPERATOR_LIMITS } from "../automation/operator.js";
 import type { CronScheduleInput } from "../automation/cron.js";
 import type { BackgroundStatus } from "../background-status.js";
 import type { AppDeviceListing, AppPairingCreated, AppPairingRefusal } from "../channels/app.js";
@@ -236,57 +237,87 @@ function revokeResult(what: string) {
   };
 }
 
-/** One bounded timestamp field; `null` is the wire spelling of "none yet". */
+/**
+ * Every job-view timestamp must be renderable before a success receipt: the operator renderer
+ * prints `new Date(ms).toISOString()`, which throws beyond the platform date range. The producer
+ * itself refuses dates outside this range (cron-schedule's MAX_DATE_MS), so the same bound here
+ * accepts every same-version reply while rejecting one the terminal could not print.
+ */
+const RENDERABLE_DATE_MS = 8.64e15;
+
+/** Count text in Unicode code points: the producer's `projectedLine` truncates by code point, so
+ * a legal line with astral characters can be up to twice its limit in UTF-16 units. */
+function codePointCount(value: string): number {
+  return [...value].length;
+}
+
+/** One bounded timestamp field; `null` is the wire spelling of "none yet" and is always legal. */
 function cronTimestamp(value: unknown, what: string): number | null {
   if (value === null) return null;
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) unexpected(what);
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value > RENDERABLE_DATE_MS) {
+    unexpected(what);
+  }
   return value;
 }
 
-function boundedJobText(value: unknown, maxChars: number, what: string): string {
-  if (typeof value !== "string" || value.length === 0 || value.length > maxChars) unexpected(what);
+/** One projected text line, bounded in code points at the producer's own limit. Projected text
+ * can legitimately be empty (control characters collapse), so only the bound is enforced. */
+function projectedText(value: unknown, maxCodePoints: number, what: string): string {
+  if (typeof value !== "string" || codePointCount(value) > maxCodePoints) unexpected(what);
   return value;
 }
 
-/** Task summaries a job view may carry; `null` means the task does not exist. */
+/** A generated or operator-supplied identifier: bounded in code points and never empty. */
+function boundedId(value: unknown, maxCodePoints: number, what: string): string {
+  if (typeof value !== "string" || codePointCount(value) === 0 || codePointCount(value) > maxCodePoints) {
+    unexpected(what);
+  }
+  return value;
+}
+
+/** Every status the producer's job state machine can report; anything else is not renderable. */
+const CRON_JOB_STATUSES = new Set([
+  "pending", "running", "waiting", "sleeping", "completing", "completed", "failed", "aborted",
+  "faulted", "orphaned", "parked", "missing", "scheduled", "queued", "cancelled", "stopped",
+] as const);
+
+function cronStatus(value: unknown, what: string): CronOperatorJob["status"] {
+  if (typeof value !== "string" || !CRON_JOB_STATUSES.has(value as never)) unexpected(what);
+  return value as CronOperatorJob["status"];
+}
+
+/** Optional projected error/reason text: `null` when absent, otherwise a bounded line. */
+function cronOptionalText(value: unknown, what: string): string | null {
+  if (value === null) return null;
+  return projectedText(value, CRON_OPERATOR_LIMITS.maxErrorLineChars, what);
+}
+
+/** Task summaries a job view may carry; `null` means the task does not exist, and a task that
+ * exists may not be placed yet (`scheduledAtMs: null`). */
 function cronTaskSummary(value: unknown, what: string): CronOperatorJob["timer"] {
   if (value === null) return null;
   const task = resultObject(value, what);
-  const status = boundedJobText(task.status, 32, what);
   const taskId = cronTimestamp(task.taskId, what);
   if (taskId === null) unexpected(what);
-  const optionalText = (field: unknown): string | null => {
-    if (field === null) return null;
-    if (field === undefined || typeof field !== "string" || field.length > 400) unexpected(what);
-    return field;
-  };
   const scheduledAtMs = cronTimestamp(task.scheduledAtMs, what);
-  if (scheduledAtMs === null) unexpected(what);
   return {
     taskId,
-    status: status as NonNullable<CronOperatorJob["timer"]>["status"],
+    status: cronStatus(task.status, what) as NonNullable<CronOperatorJob["timer"]>["status"],
     scheduledAtMs,
-    error: optionalText(task.error),
-    reason: optionalText(task.reason),
+    error: cronOptionalText(task.error, what),
+    reason: cronOptionalText(task.reason, what),
   };
 }
 
-/** A job view exactly as the terminal renders it: every required field is checked, so a malformed
- * view fails the call and the operator command holds its outcome as unknown instead of rendering
- * a success built from garbage. */
+/**
+ * A job view exactly as the terminal renders it: every required field is checked against the
+ * producer's own limits (`CRON_OPERATOR_LIMITS`, code-point text bounds, renderable timestamps,
+ * the closed status set), so a same-version reply is always accepted while a malformed view fails
+ * the call and the operator command holds its outcome as unknown instead of rendering a success
+ * built from garbage.
+ */
 function cronJobView(value: unknown, what: string): CronOperatorJob {
   const job = resultObject(value, what);
-  const id = boundedJobText(job.id, 64, what);
-  const origin = boundedJobText(job.origin, 200, what);
-  const name = boundedJobText(job.name, 200, what);
-  const mode = job.mode;
-  if (mode !== "background" && mode !== "origin") unexpected(what);
-  const intent = job.intent;
-  if (intent !== "message" && intent !== "digest") unexpected(what);
-  const schedule = boundedJobText(job.schedule, 200, what);
-  const status = boundedJobText(job.status, 32, what) as CronOperatorJob["status"];
-  const nextAtMs = cronTimestamp(job.nextAtMs, what);
-  const message = boundedJobText(job.message, 300, what);
   const lastOutcome = job.lastOutcome === null ? null : (() => {
     const record = resultObject(job.lastOutcome, what);
     if (record.status !== "ok" && record.status !== "error") unexpected(what);
@@ -294,52 +325,62 @@ function cronJobView(value: unknown, what: string): CronOperatorJob {
     return {
       status: outcomeStatus,
       finishedAtMs: cronTimestamp(record.finishedAtMs, what) ?? unexpected(what),
-      error: record.error === null ? null
-        : record.error === undefined ? unexpected(what)
-          : typeof record.error === "string" && record.error.length <= 400 ? record.error : unexpected(what),
+      error: cronOptionalText(record.error, what),
     };
   })();
   const lastSkip = job.lastSkip === null ? null : (() => {
     const record = resultObject(job.lastSkip, what);
     return {
       skippedAtMs: cronTimestamp(record.skippedAtMs, what) ?? unexpected(what),
-      reason: boundedJobText(record.reason, 400, what),
+      reason: projectedText(record.reason, CRON_OPERATOR_LIMITS.maxErrorLineChars, what),
     };
   })();
   const lastFault = job.lastFault === null ? null : (() => {
     const record = resultObject(job.lastFault, what);
     return {
       recordedAtMs: cronTimestamp(record.recordedAtMs, what) ?? unexpected(what),
-      error: boundedJobText(record.error, 400, what),
+      error: projectedText(record.error, CRON_OPERATOR_LIMITS.maxErrorLineChars, what),
     };
   })();
   const deliveryFault = job.deliveryFault === null ? null : (() => {
     const record = resultObject(job.deliveryFault, what);
     return {
       recordedAtMs: cronTimestamp(record.recordedAtMs, what) ?? unexpected(what),
-      message: boundedJobText(record.message, 400, what),
+      message: projectedText(record.message, CRON_OPERATOR_LIMITS.maxErrorLineChars, what),
     };
   })();
-  const timer = cronTaskSummary(job.timer, what);
-  const execution = cronTaskSummary(job.execution, what);
   const target = job.target === null ? null : (() => {
     const record = resultObject(job.target, what);
-    const taskStatus = record.status;
-    if (typeof taskStatus !== "string" || taskStatus.length === 0 || taskStatus.length > 32) unexpected(what);
+    const taskId = cronTimestamp(record.taskId, what);
+    if (taskId === null) unexpected(what);
     return {
-      taskId: cronTimestamp(record.taskId, what) ?? unexpected(what),
-      status: taskStatus as NonNullable<CronOperatorJob["target"]>["status"],
-      error: record.error === null ? null
-        : record.error === undefined ? unexpected(what)
-          : typeof record.error === "string" && record.error.length <= 400 ? record.error : unexpected(what),
-      reason: record.reason === null ? null
-        : record.reason === undefined ? unexpected(what)
-          : typeof record.reason === "string" && record.reason.length <= 400 ? record.reason : unexpected(what),
+      taskId,
+      status: cronStatus(record.status, what) as NonNullable<CronOperatorJob["target"]>["status"],
+      error: cronOptionalText(record.error, what),
+      reason: cronOptionalText(record.reason, what),
     };
   })();
+  const mode = job.mode;
+  if (mode !== "background" && mode !== "origin") unexpected(what);
+  const intent = job.intent;
+  if (intent !== "message" && intent !== "digest") unexpected(what);
   return {
-    id, origin, name, mode, intent, schedule, status, nextAtMs, message,
-    lastOutcome, lastSkip, lastFault, deliveryFault, timer, execution, target,
+    id: boundedId(job.id, CRON_OPERATOR_LIMITS.maxJobIdChars, what),
+    origin: boundedId(job.origin, CRON_OPERATOR_LIMITS.maxSessionKeyChars, what),
+    name: projectedText(job.name, CRON_OPERATOR_LIMITS.maxNameChars, what),
+    mode,
+    intent,
+    schedule: projectedText(job.schedule, CRON_OPERATOR_LIMITS.maxMessageLineChars, what),
+    status: cronStatus(job.status, what),
+    nextAtMs: cronTimestamp(job.nextAtMs, what),
+    message: projectedText(job.message, CRON_OPERATOR_LIMITS.maxMessageLineChars, what),
+    lastOutcome,
+    lastSkip,
+    lastFault,
+    deliveryFault,
+    timer: cronTaskSummary(job.timer, what),
+    execution: cronTaskSummary(job.execution, what),
+    target,
   };
 }
 
@@ -352,7 +393,7 @@ function cronCreateOutcome(value: unknown, what: string): CronOperatorCreateOutc
   const result = resultObject(value, what);
   if (result.status === "unknown_origin") return { status: "unknown_origin" };
   if (result.status !== "scheduled") unexpected(what);
-  const jobId = boundedJobText(result.jobId, 64, what);
+  const jobId = boundedId(result.jobId, CRON_OPERATOR_LIMITS.maxJobIdChars, what);
   const nextAtMs = cronTimestamp(result.nextAtMs, what);
   if (typeof result.deduplicated !== "boolean") unexpected(what);
   return {
@@ -382,7 +423,9 @@ function cronCancelOutcome(value: unknown, what: string): CronOperatorCancelOutc
       }
       const abortError = result.abortError;
       if (abortError !== null && abortError !== undefined
-        && (typeof abortError !== "string" || abortError.length > 400)) unexpected(what);
+        && (typeof abortError !== "string" || codePointCount(abortError) > CRON_OPERATOR_LIMITS.maxErrorLineChars)) {
+        unexpected(what);
+      }
       return {
         status: "cancelled",
         job: cronJobOrNull(result.job, what),
@@ -461,10 +504,14 @@ export const LOCAL_RESULT_CHECKS: { readonly [M in LocalMethod]: (value: unknown
     const what = "job listing";
     const result = resultObject(value, what);
     if (!Array.isArray(result.origins)
-      || result.origins.some((entry) => typeof entry !== "string" || entry.length === 0 || entry.length > 200)) {
+      || result.origins.some((entry) => typeof entry !== "string"
+        || codePointCount(entry) === 0 || codePointCount(entry) > CRON_OPERATOR_LIMITS.maxSessionKeyChars)) {
       unexpected(what);
     }
-    if (!Array.isArray(result.jobs) || result.jobs.length > 100) unexpected(what);
+    // The producer pages `list` at its own row bound; `show` below is unbounded by design.
+    if (!Array.isArray(result.jobs) || result.jobs.length > CRON_OPERATOR_LIMITS.maxListRows) {
+      unexpected(what);
+    }
     const total = result.total;
     if (typeof total !== "number" || !Number.isSafeInteger(total) || total < 0) unexpected(what);
     const nextOffset = result.nextOffset;
@@ -475,11 +522,11 @@ export const LOCAL_RESULT_CHECKS: { readonly [M in LocalMethod]: (value: unknown
       jobs: result.jobs.map((row) => {
         const record = resultObject(row, what);
         return {
-          id: boundedJobText(record.id, 64, what),
-          origin: boundedJobText(record.origin, 200, what),
-          name: boundedJobText(record.name, 200, what),
-          schedule: boundedJobText(record.schedule, 200, what),
-          status: boundedJobText(record.status, 32, what) as CronOperatorRow["status"],
+          id: boundedId(record.id, CRON_OPERATOR_LIMITS.maxJobIdChars, what),
+          origin: boundedId(record.origin, CRON_OPERATOR_LIMITS.maxSessionKeyChars, what),
+          name: projectedText(record.name, CRON_OPERATOR_LIMITS.maxNameChars, what),
+          schedule: projectedText(record.schedule, CRON_OPERATOR_LIMITS.maxMessageLineChars, what),
+          status: cronStatus(record.status, what) as CronOperatorRow["status"],
           nextAtMs: cronTimestamp(record.nextAtMs, what),
         };
       }),
@@ -488,8 +535,9 @@ export const LOCAL_RESULT_CHECKS: { readonly [M in LocalMethod]: (value: unknown
     };
   },
   cronShow: (value: unknown) => {
+    // One exact job id can be recorded under several origins, so the producer caps nothing here.
     const jobs = resultObject(value, "job listing").jobs;
-    if (!Array.isArray(jobs) || jobs.length > 100) unexpected("job listing");
+    if (!Array.isArray(jobs)) unexpected("job listing");
     return { jobs: jobs.map((job) => cronJobView(job, "job listing")) };
   },
   cronCreate: (value: unknown) => cronCreateOutcome(value, "job result"),
