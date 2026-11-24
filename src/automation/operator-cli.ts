@@ -191,7 +191,7 @@ export function renderCronList(listing: CronOperatorListing): string {
   return [
     heading,
     ...jobs.map(jobLine),
-    ...(listing.nextOffset === null ? [] : [`${listing.total} jobs total. Next page: durable-nanobot cron list --offset ${listing.nextOffset}`]),
+    ...(listing.nextOffset === null ? [] : [`${listing.total} jobs total. Next page: pedellus cron list --offset ${listing.nextOffset}`]),
     `Mapped chats: ${origins.length === 0 ? "none" : origins.join(", ")}`,
   ].join("\n");
 }
@@ -250,7 +250,7 @@ function unknownOutcome(command: CronCommand): CronCommandError {
     )
     : refused(
       "the gateway did not answer, so the outcome is unknown: the cancellation may already be recorded. " +
-      "Run `durable-nanobot cron show <jobId>` before retrying.",
+      "Run `pedellus cron show <jobId>` before retrying.",
     );
 }
 
@@ -321,7 +321,7 @@ export async function runCronCommand(options: CronCommandOptions): Promise<void>
     throw unknownOutcome(command);
   }
   if (result.status === "unknown_origin") {
-    throw refused(`"${origin}" is not a mapped chat; nothing was scheduled. Run \`durable-nanobot cron list\` to see the mapped chats.`);
+    throw refused(`"${origin}" is not a mapped chat; nothing was scheduled. Run \`pedellus cron list\` to see the mapped chats.`);
   }
   if (!result.deduplicated) {
     output.write(result.job === null

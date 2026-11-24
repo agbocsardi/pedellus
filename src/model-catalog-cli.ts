@@ -58,7 +58,7 @@ export async function runModelsCommand(
     ? [...new Set(invocation.providers.map(nativeProviderId))]
     : configuredNativeProviders(config);
   if (providers.length === 0) {
-    terminal.output.write("No native providers to refresh; name one, for example `durable-nanobot models refresh openai`.\n");
+    terminal.output.write("No native providers to refresh; name one, for example `pedellus models refresh openai`.\n");
     return { ok: true };
   }
   if (invocation.action === "refresh") {

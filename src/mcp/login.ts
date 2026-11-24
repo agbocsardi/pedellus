@@ -165,7 +165,7 @@ export async function beginMcpLogin(options: McpLoginOptions): Promise<McpLoginR
     const provider = new McpOAuthProvider({
       serverUrl: options.config.url,
       redirectUrl: callback.redirectUrl,
-      clientMetadata: { client_name: "durable-nanobot" },
+      clientMetadata: { client_name: "pedellus" },
       store: staging,
       onRedirect(url) {
         authorizationUrl = url;

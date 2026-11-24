@@ -70,7 +70,7 @@ test('the app config block is opt-in, strict and loopback-only', { timeout: 10_0
     ...WORKSPACE_BASE,
     app: { port: 43190, staticRoot: '/tmp/synthetic-pwa' },
   }, '/tmp/synthetic');
-  assert.deepEqual(parsed.app, { port: 43190, staticRoot: '/tmp/synthetic-pwa', autoArchiveDays: 14, agentName: 'Durable' });
+  assert.deepEqual(parsed.app, { port: 43190, staticRoot: '/tmp/synthetic-pwa', autoArchiveDays: 14, agentName: 'Pedellus' });
   for (const autoArchiveDays of [0, -1, 1.5, '14', null]) {
     assert.throws(() => parseConfig({ ...WORKSPACE_BASE, app: { port: 43190, staticRoot: '/p', autoArchiveDays } }, '/tmp'), /app\.autoArchiveDays/u);
   }
@@ -267,7 +267,7 @@ test('hello replays the durable log in bounded batches, answers later hellos and
     const hello = device.response('h1');
     assert.equal(hello.ok, true);
     assert.equal(hello.v, 2);
-    assert.equal(hello.agent, 'Durable');
+    assert.equal(hello.agent, 'Pedellus');
     assert.equal(hello.device, 'phone');
     assert.equal(hello.head, 600);
     assert.equal(device.events('message').length, APP_LIMITS.replayBatch, 'replay is bounded at 500');

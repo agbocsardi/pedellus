@@ -5,7 +5,7 @@
 #     "faster-whisper==1.1.1",
 # ]
 # ///
-"""Local speech recognition for durable-nanobot (faster-whisper, CPU, small, int8).
+"""Local speech recognition for pedellus (faster-whisper, CPU, small, int8).
 
 Run with `uv run --script scripts/local-transcribe.py <audio> [options]`.
 The runtime invokes it through `uv run --script --offline` with Hugging Face hub

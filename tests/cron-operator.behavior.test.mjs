@@ -284,7 +284,7 @@ test("operator reads attach to no chat and listings have compact reachable pages
   const output = capture();
   await runCronCommand({ client, command: { kind: "list" }, output: output.output, context });
   assert.match(output.text(), /100 cron jobs in 1 chat on this page \(101 total\):/);
-  assert.match(output.text(), /Next page: durable-nanobot cron list --offset 100/);
+  assert.match(output.text(), /Next page: pedellus cron list --offset 100/);
   const pastEnd = capture();
   await runCronCommand({ client, command: { kind: "list", offset: 200 }, output: pastEnd.output, context });
   assert.match(pastEnd.text(), /No jobs at this offset; 101 total/);
@@ -327,7 +327,7 @@ test("the CLI surface creates, lists and reports a lost response as unknown", { 
   const missing = await runCronCli(store.configFile, ["show", "cron-missing"]);
   assert.equal(missing.code, 1);
   assert.equal(missing.stdout, "");
-  assert.match(missing.stderr, /^durable-nanobot cron: no scheduled job with id cron-missing\.$/m);
+  assert.match(missing.stderr, /^pedellus cron: no scheduled job with id cron-missing\.$/m);
 
   const shown = capture();
   await runCronCommand({ client, command: { kind: "show", jobId }, output: shown.output, context });

@@ -575,7 +575,7 @@ test("default --config and agent attach instead of opening another runtime", { t
   assert.match(explicit.stderr, /no running gateway answers/);
   const rejectedName = await runCli(["agent", "--config", configFile, "--conversation", "../escape"]);
   assert.equal(rejectedName.code, 1);
-  assert.match(rejectedName.stderr, /Usage: durable-nanobot/);
+  assert.match(rejectedName.stderr, /Usage: pedellus/);
 });
 
 test("real agent piped input is not lost while the watch attaches", { timeout: 30_000 }, async (t) => {

@@ -200,7 +200,7 @@ export async function runAppCommand(options: {
   if (command.kind === "devices") {
     const devices = await client.appDevices(context);
     if (devices.length === 0) {
-      output.write("No devices are paired. Start one with `durable-nanobot app pair`.\n");
+      output.write("No devices are paired. Start one with `pedellus app pair`.\n");
       return;
     }
     const rows = devices.map((device) => [
@@ -232,7 +232,7 @@ export async function runAppCommand(options: {
   if (command.kind === "shortcut-list") {
     const shortcuts = await client.appShortcutList(context);
     if (shortcuts.length === 0) {
-      output.write("No shortcut tokens exist. Start one with `durable-nanobot app shortcut add --label <name>`.\n");
+      output.write("No shortcut tokens exist. Start one with `pedellus app shortcut add --label <name>`.\n");
       return;
     }
     const rows = shortcuts.map((shortcut) => [

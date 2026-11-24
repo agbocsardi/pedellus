@@ -55,7 +55,7 @@ function attributes(input: SpanAttributes | undefined): SpanAttributes {
 /** Logging must never fail an operation. All callers use fixed event names and projected attributes. */
 function write(event: string, fields: object, warning = false): void {
   try {
-    const line = `durable-nanobot journal: ${JSON.stringify({ event, ...fields })}`;
+    const line = `pedellus journal: ${JSON.stringify({ event, ...fields })}`;
     if (warning) console.warn(line);
     else console.info(line);
   } catch { /* Diagnostic sinks are best effort, never application state. */ }

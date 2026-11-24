@@ -96,11 +96,15 @@ export function App({ store }: { store: Store }) {
     };
   }, []);
 
+  useEffect(() => {
+    document.title = store.agentName;
+  }, [store.agentName]);
+
   if (!conn && store.storageBlocked) return (
     <div className="screen center">
       <div className="card pad" role="status">
-        <h1>Close other Durable windows</h1>
-        <p className="dim">Durable will continue after its local storage can be upgraded.</p>
+        <h1>Close other Pedellus windows</h1>
+        <p className="dim">Pedellus will continue after its local storage can be upgraded.</p>
       </div>
     </div>
   );

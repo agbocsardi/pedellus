@@ -23,7 +23,7 @@ cleanupOutdatedCaches();
 
 /** Must match the app's store (src/store.ts). */
 const DB_NAME = "durable-app";
-const DEFAULT_AGENT = "Durable";
+const DEFAULT_AGENT = "Pedellus";
 const UNREAD_CAP = 99;
 const THREAD_ID = /^(main|t_[A-Za-z0-9_-]{1,40})$/;
 

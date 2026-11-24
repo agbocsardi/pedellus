@@ -19,9 +19,9 @@ export default defineConfig({
       filename: "sw.ts",
       registerType: "autoUpdate",
       manifest: {
-        name: "Durable",
-        short_name: "Durable",
-        description: "Chat channel of the Durable agent gateway",
+        name: "Pedellus",
+        short_name: "Pedellus",
+        description: "Chat channel of the Pedellus assistant gateway",
         start_url: "/",
         scope: "/",
         display: "standalone",

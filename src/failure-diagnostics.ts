@@ -107,7 +107,7 @@ export function failureDiagnostic(error: unknown, stage: FailureStage, taskId?: 
     ...(typeof restarts === "number" && Number.isSafeInteger(restarts) && restarts >= 0 && restarts <= 1_000_000 ? { restarts } : {}),
   };
   const fingerprint = createHash("sha256").update(JSON.stringify({ stage, reason: details.reason, errors })).digest("hex").slice(0, 16);
-  return `durable-nanobot diagnostic: ${JSON.stringify({ stage, fingerprint, ...details,
+  return `pedellus diagnostic: ${JSON.stringify({ stage, fingerprint, ...details,
     ...(Number.isSafeInteger(taskId) && taskId! > 0 ? { taskId } : {}), errors })}`;
 }
 

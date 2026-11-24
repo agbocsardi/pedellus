@@ -9,7 +9,7 @@ export const STARTUP_DIAGNOSTICS = Object.freeze({
   configHome:
     "cannot resolve the default configuration home; set HOME or pass --config <path> (diagnostic details suppressed)",
   defaultConfigFile:
-    "no default configuration found; create ~/.durable-nanobot/config.json or pass --config <path> " +
+    "no default configuration found; run `pedellus init`, create ~/.pedellus/config.json, or pass --config <path> " +
     "(diagnostic details suppressed)",
   configFile:
     "cannot read or parse the configuration file; check that it exists, is readable, and contains valid JSON " +
@@ -20,19 +20,19 @@ export const STARTUP_DIAGNOSTICS = Object.freeze({
     "invalid provider configuration; check allowedModels, providers and the native provider IDs in PROVIDERS.md " +
     "(diagnostic details suppressed)",
   credential:
-    "provider credential is missing or misconfigured; run durable-nanobot login, set the environment variable " +
+    "provider credential is missing or misconfigured; run pedellus login, set the environment variable " +
     "named by credentials.<provider>, or set the provider's native API-key environment (diagnostic details suppressed)",
   model:
-    "configured model or thinking level is unavailable; compare model/allowedModels with `durable-nanobot models list` " +
+    "configured model or thinking level is unavailable; compare model/allowedModels with `pedellus models list` " +
     "(diagnostic details suppressed)",
   authProvider:
-    "unknown provider or no interactive login method; run `durable-nanobot login` without a provider to list " +
+    "unknown provider or no interactive login method; run `pedellus login` without a provider to list " +
     "native providers and their methods (diagnostic details suppressed)",
   authMethod:
     "the selected provider does not offer that authentication method; omit --auth to choose from the methods it " +
     "actually offers (diagnostic details suppressed)",
   authNoCredential:
-    "no stored credential for that provider; run `durable-nanobot login <provider>` first (diagnostic details suppressed)",
+    "no stored credential for that provider; run `pedellus login <provider>` first (diagnostic details suppressed)",
   authCanceled: "login or logout was cancelled; nothing further was attempted (diagnostic details suppressed)",
   authFailed:
     "login or logout failed; check the provider selection, network access for an OAuth flow, and the private " +
@@ -47,11 +47,11 @@ export const STARTUP_DIAGNOSTICS = Object.freeze({
     "cannot prepare the configured workspace or data directory; check workspace, dataDir and extraAllowedDirs " +
     "(diagnostic details suppressed)",
   storeLocked:
-    "another process already owns the configured data store; stop the other running durable-nanobot gateway process " +
+    "another process already owns the configured data store; stop the other running pedellus gateway process " +
     "before starting another (diagnostic details suppressed)",
   preparedContext:
     "startup could not complete automatic interrupted-turn recovery; run " +
-    "`durable-nanobot recovery --config <path>` with this configuration to inspect and cancel a blocked prepared " +
+    "`pedellus recovery --config <path>` with this configuration to inspect and cancel a blocked prepared " +
     "dispatch, or omit `--config` for the default primary configuration, then start again " +
     "(diagnostic details suppressed)",
   unexpected: "command failed; diagnostic details suppressed",
@@ -95,5 +95,5 @@ export function startupDiagnostic(error: unknown): string {
   const code = error instanceof StartupDiagnosticError
     ? knownStartupDiagnosticCode(error.code)
     : "unexpected";
-  return `durable-nanobot: ${STARTUP_DIAGNOSTICS[code]}`;
+  return `pedellus: ${STARTUP_DIAGNOSTICS[code]}`;
 }

@@ -1004,7 +1004,7 @@ async function readRunActivity(
 export async function runApp(gateway: AppGateway, options: AppOptions, context: Context): Promise<void> {
   validateOptions(options);
   const now = options.now ?? (() => Date.now());
-  const agentName = options.agentName ?? "Durable";
+  const agentName = options.agentName ?? "Pedellus";
   const scanIntervalMs = options.scanIntervalMs ?? SCHEDULED_SCAN_INTERVAL_MS;
   /** How long a shortcut waits for its turn before the endpoint answers `pending`. */
   const askWaitMs = options.askWaitMs ?? APP_LIMITS.askWaitMs;

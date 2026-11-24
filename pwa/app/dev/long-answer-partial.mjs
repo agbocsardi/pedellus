@@ -13,7 +13,7 @@
 import { spawn } from "node:child_process";
 import net from "node:net";
 import { fileURLToPath } from "node:url";
-import { chromium } from "/home/gergo/projects/mobile-pi/node_modules/playwright/index.mjs";
+const { chromium } = await import(process.env.PLAYWRIGHT_MODULE || "playwright");
 
 const RUNS = Number(process.argv[2] ?? 10);
 const IDLE_GRACE_MS = 800;

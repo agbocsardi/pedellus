@@ -512,7 +512,7 @@ export async function refreshModelCatalog(
         credentials: "omit",
         headers: {
           accept: "application/json",
-          "user-agent": "durable-nanobot",
+          "user-agent": "pedellus",
           ...(stored?.etag === undefined || stored.models.length === 0 ? {} : { "if-none-match": stored.etag }),
         },
         signal,

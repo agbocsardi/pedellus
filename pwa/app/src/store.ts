@@ -137,7 +137,7 @@ export class Store {
     for (const fn of this.listeners) fn();
   }
 
-  get agentName() { return this.identity?.agent ?? "Durable"; }
+  get agentName() { return this.identity?.agent ?? "Pedellus"; }
   /** The gateway's last advertised commands; undefined until a hello listed them. */
   get commands() { return this.identity?.commands; }
   /** The gateway's last advertised model presets; undefined until a hello listed them. */

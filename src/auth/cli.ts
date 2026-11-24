@@ -222,7 +222,7 @@ export async function runLogin(
     const choice = await chooseLogin(choices, interaction);
     const deviceId = choice.type === "oauth" ? await installationDeviceId(prepared.canonicalDataDir) : undefined;
     await models.login(choice.provider.id, choice.type, interaction, {
-      agentName: "durable-nanobot",
+      agentName: "pedellus",
       ...(deviceId === undefined ? {} : { getDeviceId: () => deviceId }),
     });
     terminal.output.write(`Logged in to ${choice.provider.id} using ${choice.label}.\n`);

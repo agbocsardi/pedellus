@@ -15,7 +15,7 @@ const { StartupDiagnosticError, startupDiagnostic } = await import(new URL("../d
 const { failureDiagnostic, reportFailure } = await import(new URL("../dist/failure-diagnostics.js", import.meta.url).href);
 
 const repoRoot = fileURLToPath(new URL("../", import.meta.url));
-const cli = join(repoRoot, "bin", "durable-nanobot.mjs");
+const cli = join(repoRoot, "bin", "pedellus.mjs");
 const {
   parseConfig,
 } = await import(new URL("../dist/config.js", import.meta.url).href);
@@ -50,7 +50,7 @@ function isolatedEnv(home) {
 
 /** One owner-like config under a temporary HOME; never the owner's real config. */
 async function writeDefaultInstance(home, modelId) {
-  const configDir = join(home, ".durable-nanobot");
+  const configDir = join(home, ".pedellus");
   const workspace = join(configDir, "workspace");
   const dataDir = join(configDir, "state");
   await mkdir(workspace, { recursive: true });
@@ -141,7 +141,7 @@ async function pathExists(path) {
 }
 
 test("failure records keep Durable causes and code locations without serializing sensitive values", () => {
-  const parse = (line) => JSON.parse(line.slice('durable-nanobot diagnostic: '.length));
+  const parse = (line) => JSON.parse(line.slice('pedellus diagnostic: '.length));
   const durable = new SessionFailed(new ReadAfterWrite('Tx.scanTasks()'));
   // These are real Durable error classes; supply a controlled library throw location because
   // constructing them directly here otherwise points at this test, not a Durable call site.
@@ -236,7 +236,7 @@ test("open keeps its primary exception through cleanup failures and forwards Dur
     const task = { id: 42, kind: 'synthetic', conversationId: 1 };
     onReport({ kind: 'task_outdated', reason: 'missing_task', task, error: new Error('PRIVATE-REPORT-ERROR') });
     onReport({ kind: 'task_interrupted', reason: 'restart_limit', restarts: 3, task, error: new Error('PRIVATE-REPORT-ERROR') });
-    const records = lines.map((line) => JSON.parse(line.slice('durable-nanobot diagnostic: '.length)));
+    const records = lines.map((line) => JSON.parse(line.slice('pedellus diagnostic: '.length)));
     assert.ok(records.some((record) => record.stage === 'gateway.open'));
     assert.ok(records.some((record) => record.stage === 'gateway.close.runtime'));
     assert.ok(records.some((record) => record.reason === 'missing_task' && record.taskId === 42));
@@ -292,7 +292,7 @@ test("normal SDK shutdown attempts teardown and releases ownership while keeping
       }
       await assert.rejects(gateway.close(context), (error) => error === (catalogFails ? catalogFailure : harnessFailure));
       assert.equal(harnessCloses, 1, 'an early catalog failure must not skip native teardown');
-      const records = logs.map((line) => JSON.parse(line.slice('durable-nanobot diagnostic: '.length)))
+      const records = logs.map((line) => JSON.parse(line.slice('pedellus diagnostic: '.length)))
         .filter((record) => record.stage === 'gateway.close.runtime');
       assert.deepEqual(records.map((record) => record.errors[0].code), catalogFails ? ['ENOSPC', 'EIO'] : ['EIO']);
       assert.ok(logs.every((line) => !line.includes('PRIVATE-')));
@@ -412,8 +412,8 @@ test("unexpected CLI startup failures emit a safe staged cause record", { timeou
     const gateway = startCli(home, ['gateway'], home);
     const exit = await waitForExit(gateway);
     assert.equal(exit.code, 1);
-    const records = gateway.stderr.split('\n').filter((line) => line.startsWith('durable-nanobot diagnostic: '))
-      .map((line) => JSON.parse(line.slice('durable-nanobot diagnostic: '.length)));
+    const records = gateway.stderr.split('\n').filter((line) => line.startsWith('pedellus diagnostic: '))
+      .map((line) => JSON.parse(line.slice('pedellus diagnostic: '.length)));
     assert.ok(records.some((record) => record.stage === 'gateway.open'), gateway.stderr);
     assert.ok(records.some((record) => record.errors.some((error) => error.code === 'ERR_SQLITE_ERROR')));
     assert.ok(records.some((record) => record.errors.some((error) => error.locations.length > 0)));
@@ -524,11 +524,11 @@ test("a missing default config and explicit config keep separate fixed diagnosti
     const missingExit = await waitForExit(missing);
     assert.equal(missingExit.code, 1);
     assert.match(missing.stderr, /no default configuration found/);
-    assert.match(missing.stderr, /~\/\.durable-nanobot\/config\.json/);
+    assert.match(missing.stderr, /~\/\.pedellus\/config\.json/);
     assert.match(missing.stderr, /diagnostic details suppressed/);
     assert.doesNotMatch(missing.stderr + missing.stdout, new RegExp(home.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
     assert.doesNotMatch(missing.stderr + missing.stdout, new RegExp(SYNTHETIC_ENV));
-    assert.equal(await pathExists(join(home, ".durable-nanobot")), false, "missing default must not create the default home");
+    assert.equal(await pathExists(join(home, ".pedellus")), false, "missing default must not create the default home");
     assert.equal(await pathExists(join(elsewhere, "decoy-state")), false, "the CWD decoy config was used");
     assert.equal(await pathExists(join(elsewhere, "config.json")), true, "the decoy config disappeared");
 
@@ -546,10 +546,10 @@ test("a missing default config and explicit config keep separate fixed diagnosti
     const bare = startCli(home, [], elsewhere);
     const bareExit = await waitForExit(bare);
     assert.equal(bareExit.code, 1);
-    assert.match(bare.stderr, /Usage: durable-nanobot gateway \[--config <path>\]/);
-    assert.match(bare.stderr, /durable-nanobot agent \[--config <path>\] \[--conversation <name>\]/);
-    assert.match(bare.stderr, /durable-nanobot recovery \[--config <path>\] \[--cancel/);
-    assert.match(bare.stderr, /~\/\.durable-nanobot\/config\.json/);
+    assert.match(bare.stderr, /Usage: pedellus gateway \[--config <path>\]/);
+    assert.match(bare.stderr, /pedellus agent \[--config <path>\] \[--conversation <name>\]/);
+    assert.match(bare.stderr, /pedellus recovery \[--config <path>\] \[--cancel/);
+    assert.match(bare.stderr, /~\/\.pedellus\/config\.json/);
 
     const instance = await writeDefaultInstance(home, "gpt-6-luna");
     const legacy = startCli(home, ["--config", join(instance.configDir, "config.json")], elsewhere);
@@ -814,8 +814,8 @@ test("bounded teardown of an attached client and an active synthetic run keeps a
 });
 
 test("shipped user units are static user-service examples and verify with the real launch paths", { timeout: 30_000 }, async (t) => {
-  const primaryPath = join(repoRoot, "systemd", "durable-nanobot.service");
-  const templatePath = join(repoRoot, "systemd", "durable-nanobot@.service");
+  const primaryPath = join(repoRoot, "systemd", "pedellus.service");
+  const templatePath = join(repoRoot, "systemd", "pedellus@.service");
   const primary = await readFile(primaryPath, "utf8");
   const template = await readFile(templatePath, "utf8");
   for (const text of [primary, template]) {
@@ -836,13 +836,13 @@ test("shipped user units are static user-service examples and verify with the re
     assert.match(text, /^MemoryAccounting=yes$/m);
     assert.doesNotMatch(text, /^MemoryMax=|^MemoryHigh=|^TasksMax=/m,
       'the shipped unit accounts memory but imposes no guessed resource cap');
-    assert.match(text, /bin\/durable-nanobot\.mjs gateway --config /);
+    assert.match(text, /bin\/pedellus\.mjs gateway --config /);
     assert.match(text, /^WantedBy=default.target$/m);
-    assert.doesNotMatch(text, /npm start|durable-nanobot\.service\b.*ExecStart|OPENAI|ANTHROPIC|DEEPSEEK_API_KEY|API_KEY=/);
+    assert.doesNotMatch(text, /npm start|pedellus\.service\b.*ExecStart|OPENAI|ANTHROPIC|DEEPSEEK_API_KEY|API_KEY=/);
   }
-  assert.match(primary, /--config %h\/\.durable-nanobot\/config\.json/);
-  assert.match(template, /--config %h\/\.durable-nanobot\/instances\/i-%i\/config\.json/);
-  assert.match(template, /EnvironmentFile=-%h\/\.durable-nanobot\/instances\/i-%i\/secrets\.env/);
+  assert.match(primary, /--config %h\/\.pedellus\/config\.json/);
+  assert.match(template, /--config %h\/\.pedellus\/instances\/i-%i\/config\.json/);
+  assert.match(template, /EnvironmentFile=-%h\/\.pedellus\/instances\/i-%i\/secrets\.env/);
   // The instance specifier is used only inside the one fixed instances
   // directory (plus the unit description), never as a standalone arbitrary path.
   for (const line of template.split("\n")) {
@@ -862,14 +862,14 @@ test("shipped user units are static user-service examples and verify with the re
     await mkdir(join(directory, "units"));
     const substitute = (text) => text
       .replaceAll("/usr/bin/node", process.execPath)
-      .replaceAll("/opt/durable-nanobot", repoRoot);
-    await writeFile(join(directory, "units", "durable-nanobot.service"), substitute(primary));
-    await writeFile(join(directory, "units", "durable-nanobot@demo.service"), substitute(template));
+      .replaceAll("/opt/pedellus", repoRoot);
+    await writeFile(join(directory, "units", "pedellus.service"), substitute(primary));
+    await writeFile(join(directory, "units", "pedellus@demo.service"), substitute(template));
     const verified = spawnSync("systemd-analyze", [
       "verify",
       "--man=no",
-      join(directory, "units", "durable-nanobot.service"),
-      join(directory, "units", "durable-nanobot@demo.service"),
+      join(directory, "units", "pedellus.service"),
+      join(directory, "units", "pedellus@demo.service"),
     ], { encoding: "utf8", timeout: 20_000 });
     assert.equal(verified.status, 0, verified.stderr || verified.stdout);
   } finally {

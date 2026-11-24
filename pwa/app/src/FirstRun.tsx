@@ -26,6 +26,8 @@ function defaultLabel(): string {
   if (/iPad/.test(ua)) return "iPad";
   if (/Macintosh/.test(ua)) return "Mac";
   if (/Android/.test(ua)) return "Android";
+  if (/Windows/.test(ua)) return "Windows";
+  if (/Linux/.test(ua)) return "Linux";
   return "Web";
 }
 
@@ -91,7 +93,7 @@ export function FirstRun({ store, conn }: { store: Store; conn: Connection }) {
         <div className="avatar-slot big">
           <Avatar state={busy ? "thinking" : "idle"} />
         </div>
-        <h1>Durable</h1>
+        <h1>Pedellus</h1>
         <p className="lede">Enter the one-time code from your host to pair this device.</p>
         {showHint && <p className="hint">{HINT}</p>}
         <label htmlFor="pair-code">Pairing code</label>

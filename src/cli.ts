@@ -880,10 +880,10 @@ function aborted(signal: AbortSignal): Promise<void> {
 
 function localGatewayDiagnostic(error: LocalGatewayError): string {
   return error.reason === "unavailable"
-    ? "durable-nanobot: no running gateway answers on this configuration's local endpoint; start " +
-      "`durable-nanobot gateway --config <path>` with the same configuration first; omit `--config` for the default " +
+    ? "pedellus: no running gateway answers on this configuration's local endpoint; start " +
+      "`pedellus gateway --config <path>` with the same configuration first; omit `--config` for the default " +
       "primary configuration (diagnostic details suppressed)"
-    : "durable-nanobot: the configured local gateway endpoint is unavailable or owned by another process; " +
+    : "pedellus: the configured local gateway endpoint is unavailable or owned by another process; " +
       "stop the other gateway before starting another (diagnostic details suppressed)";
 }
 
@@ -891,19 +891,19 @@ function localGatewayDiagnostic(error: LocalGatewayError): string {
 export function runCli(): Promise<void> {
   return main().catch((error) => {
     if (error instanceof PreparedContextRecoveryError) {
-      console.error(`durable-nanobot recovery: ${error.message}`);
+      console.error(`pedellus recovery: ${error.message}`);
     } else if (error instanceof CronUsageError) {
       console.error(error.message);
     } else if (error instanceof CronCommandError) {
-      console.error(`durable-nanobot cron: ${error.message}`);
+      console.error(`pedellus cron: ${error.message}`);
     } else if (error instanceof AppUsageError) {
       console.error(error.message);
     } else if (error instanceof AppCommandError) {
-      console.error(`durable-nanobot app: ${error.message}`);
+      console.error(`pedellus app: ${error.message}`);
     } else if (error instanceof UnknownCommandError) {
       // Only a safe command-shaped token is echoed; any other supplied argument stays private.
       const echo = SAFE_COMMAND_NAME.test(error.token) ? `: ${error.token}` : "";
-      console.error(`durable-nanobot: unknown command${echo}\n${USAGE}`);
+      console.error(`pedellus: unknown command${echo}\n${USAGE}`);
     } else if (error instanceof UsageError) {
       console.error(USAGE);
     } else if (error instanceof LocalGatewayError) {

@@ -1383,7 +1383,7 @@ function appConfig(value: unknown): NonNullable<PortConfig["app"]> {
   if (typeof autoArchiveDays !== "number" || !Number.isSafeInteger(autoArchiveDays) || autoArchiveDays < 1) {
     throw new Error("app.autoArchiveDays must be an integer of at least 1");
   }
-  const agentName = a.agentName === undefined ? "Durable" : a.agentName;
+  const agentName = a.agentName === undefined ? "Pedellus" : a.agentName;
   if (!validAppAgentName(agentName)) {
     throw new Error("app.agentName must be 1 to 40 printable characters");
   }
@@ -1398,7 +1398,7 @@ function appConfig(value: unknown): NonNullable<PortConfig["app"]> {
  * exactly one file; it never searches, merges or creates configuration.
  */
 export function defaultConfigPath(): string {
-  return join(userHome(), ".durable-nanobot", "config.json");
+  return join(userHome(), ".pedellus", "config.json");
 }
 
 function userHome(): string {

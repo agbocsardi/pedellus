@@ -11,6 +11,6 @@ try {
   });
   await runCli();
 } catch {
-  console.error("durable-nanobot: cannot load the TypeScript entry point; check the checkout, dependencies and typecheck (diagnostic details suppressed)");
+  console.error("pedellus: cannot load the TypeScript entry point; check the checkout, dependencies and typecheck (diagnostic details suppressed)");
   process.exitCode = 1;
 }

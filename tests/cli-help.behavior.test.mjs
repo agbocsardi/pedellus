@@ -7,24 +7,24 @@ import { fileURLToPath } from "node:url";
 import { after, test } from "node:test";
 
 const repoRoot = fileURLToPath(new URL("../", import.meta.url));
-const cli = join(repoRoot, "bin", "durable-nanobot.mjs");
+const cli = join(repoRoot, "bin", "pedellus.mjs");
 const probe = join(repoRoot, "tests", "fixtures", "cli-help-probe.mjs");
 const SYNTHETIC_UNSAFE = "/SYNTHETIC-SECRET-ARGUMENT";
 
 const home = await mkdtemp(join(tmpdir(), "nanobot-cli-help-"));
 const absent = join(home, "absent.json");
-const defaultConfigDir = join(home, ".durable-nanobot");
+const defaultConfigDir = join(home, ".pedellus");
 after(async () => { await rm(home, { recursive: true, force: true }); });
 
 const PAGES = [
-  ["gateway", /Usage: durable-nanobot gateway \[--config <path>\]/, /one private Unix socket/],
-  ["agent", /Usage: durable-nanobot agent \[--config <path>\] \[--conversation <name>\]/, /Never opens a second runtime/],
-  ["login", /Usage: durable-nanobot login \[--config <path>\] \[provider\] \[--auth api_key\|oauth\]/, /Terminal-only/],
-  ["logout", /Usage: durable-nanobot logout \[--config <path>\] \[provider\]/, /terminal-only path as login/],
-  ["models", /Usage: durable-nanobot models <refresh\|list> \[--config <path>\] \[provider\.\.\.\]/, /only catalog network path/],
+  ["gateway", /Usage: pedellus gateway \[--config <path>\]/, /one private Unix socket/],
+  ["agent", /Usage: pedellus agent \[--config <path>\] \[--conversation <name>\]/, /Never opens a second runtime/],
+  ["login", /Usage: pedellus login \[--config <path>\] \[provider\] \[--auth api_key\|oauth\]/, /Terminal-only/],
+  ["logout", /Usage: pedellus logout \[--config <path>\] \[provider\]/, /terminal-only path as login/],
+  ["models", /Usage: pedellus models <refresh\|list> \[--config <path>\] \[provider\.\.\.\]/, /only catalog network path/],
   [
     "recovery",
-    /Usage: durable-nanobot recovery \[--config <path>\] \[--cancel <taskId> --fingerprint <sha256>\]/,
+    /Usage: pedellus recovery \[--config <path>\] \[--cancel <taskId> --fingerprint <sha256>\]/,
     /--fingerprint <sha256>/,
   ],
 ];
@@ -127,10 +127,10 @@ test("process help prints the overview on stdout and reads no configuration", { 
   assert.ok(overviews.every((text) => text === overviews[0]), "every overview spelling prints the same page");
 
   const overview = overviews[0];
-  assert.match(overview, /Usage:\n {2}durable-nanobot <command> \[options\]/);
-  assert.match(overview, /durable-nanobot gateway \[--config <path>\]/);
-  assert.match(overview, /durable-nanobot recovery \[--config <path>\] \[--cancel <taskId> --fingerprint <sha256>\]/);
-  assert.match(overview, /~\/\.durable-nanobot\/config\.json/);
+  assert.match(overview, /Usage:\n {2}pedellus <command> \[options\]/);
+  assert.match(overview, /pedellus gateway \[--config <path>\]/);
+  assert.match(overview, /pedellus recovery \[--config <path>\] \[--cancel <taskId> --fingerprint <sha256>\]/);
+  assert.match(overview, /~\/\.pedellus\/config\.json/);
   // The generated slash-command catalogue is part of the overview, with its availability caveat.
   assert.match(overview, /availability depends on the gateway/);
   assert.match(overview, /\/help \[command\] — Show these controls, or one command's detail/);
@@ -140,7 +140,7 @@ test("process help prints the overview on stdout and reads no configuration", { 
   assert.ok(overviewLines.length <= 60, `the overview is ${overviewLines.length} lines`);
   assert.ok(overviewLines.every((line) => line.length <= 120), "no overview line exceeds 120 characters");
   // The configuration default is stated once: in the --config option line only.
-  assert.equal(overviewLines.filter((line) => line.includes("~/.durable-nanobot/config.json")).length, 1);
+  assert.equal(overviewLines.filter((line) => line.includes("~/.pedellus/config.json")).length, 1);
 });
 
 test("per-subcommand help pages print only fixed text and exit 0", { timeout: 30_000 }, async () => {
@@ -150,12 +150,12 @@ test("per-subcommand help pages print only fixed text and exit 0", { timeout: 30
     assert.equal(result.stderr, "");
     assert.match(result.stdout, usage, `${command} page carries its exact usage line`);
     assert.match(result.stdout, detail);
-    assert.match(result.stdout, /~\/\.durable-nanobot\/config\.json/);
+    assert.match(result.stdout, /~\/\.pedellus\/config\.json/);
     // The same page reached through the explicit `help <command>` form.
     assert.equal((await captured(["help", command])).stdout, result.stdout);
     const lines = result.stdout.trimEnd().split("\n");
     assert.ok(lines.length <= 24, `${command} page stays short`);
-    assert.equal(lines.filter((line) => line.includes("~/.durable-nanobot/config.json")).length, 1,
+    assert.equal(lines.filter((line) => line.includes("~/.pedellus/config.json")).length, 1,
       `${command} states the configuration default once`);
   }
 });
@@ -163,8 +163,8 @@ test("per-subcommand help pages print only fixed text and exit 0", { timeout: 30
 test("a help flag is honoured before dispatch while `help` as an argument is not a help request", { timeout: 30_000 }, async () => {
   // A help flag anywhere on a known subcommand line names that subcommand's page and exits 0.
   const pages = [
-    [["gateway", "--config", "--help"], /Usage: durable-nanobot gateway \[--config <path>\]/],
-    [["agent", "--conversation", "work", "--help"], /Usage: durable-nanobot agent \[--config <path>\] \[--conversation <name>\]/],
+    [["gateway", "--config", "--help"], /Usage: pedellus gateway \[--config <path>\]/],
+    [["agent", "--conversation", "work", "--help"], /Usage: pedellus agent \[--config <path>\] \[--conversation <name>\]/],
   ];
   for (const [args, usage] of pages) {
     const result = await captured(args);
@@ -182,13 +182,13 @@ test("a help flag is honoured before dispatch while `help` as an argument is not
   for (const refused of refusals) {
     assert.deepEqual({ code: refused.code, signal: refused.signal ?? null }, { code: 1, signal: null });
     assert.equal(refused.stdout, "", "a malformed form prints no help page");
-    assert.match(refused.stderr, /^Usage: durable-nanobot gateway \[--config <path>\]/);
-    assert.match(refused.stderr, /durable-nanobot <command> --help/);
+    assert.match(refused.stderr, /^Usage: pedellus gateway \[--config <path>\]/);
+    assert.match(refused.stderr, /pedellus <command> --help/);
   }
   // The overview form of a help flag does exit 0, even with an unused --config on the line.
   const overview = await captured(["--help", "--config", absent]);
   assert.deepEqual({ code: overview.code }, { code: 0 }, overview.stderr);
-  assert.match(overview.stdout, /^durable-nanobot — local assistant gateway/);
+  assert.match(overview.stdout, /^pedellus — local assistant gateway/);
   await assert.rejects(stat(defaultConfigDir), /ENOENT/);
 });
 
@@ -196,9 +196,9 @@ test("an unknown subcommand is one fixed diagnostic with usage and a help hint",
   const result = await captured(["bogus-subcommand"]);
   assert.deepEqual({ code: result.code }, { code: 1 });
   assert.equal(result.stdout, "");
-  assert.match(result.stderr, /^durable-nanobot: unknown command: bogus-subcommand/m);
-  assert.match(result.stderr, /Usage: durable-nanobot gateway \[--config <path>\]/);
-  assert.match(result.stderr, /durable-nanobot <command> --help/);
+  assert.match(result.stderr, /^pedellus: unknown command: bogus-subcommand/m);
+  assert.match(result.stderr, /Usage: pedellus gateway \[--config <path>\]/);
+  assert.match(result.stderr, /pedellus <command> --help/);
 
   // A name that is not a safe command shape is never echoed back.
   for (const argument of UNSAFE_ARGUMENTS) {

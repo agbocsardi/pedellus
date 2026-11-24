@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Development mock of the durable-nanobot gateway's /v1 surface, speaking
+// Development mock of the pedellus gateway's /v1 surface, speaking
 // protocol v2 (../../protocol/v2.md). Pairs with a printed one-time code
 // and has independent fake agent turns per thread. State is in memory,
 // including throwaway VAPID keys: pushes are really sent (with web-push) to
@@ -11,7 +11,7 @@ import { generateVAPIDKeys, sendNotification, setVapidDetails } from "web-push";
 import { WebSocketServer } from "ws";
 
 const PORT = Number(process.env.PORT || 8791);
-const AGENT_NAME = process.env.AGENT_NAME?.trim() || "Durable";
+const AGENT_NAME = process.env.AGENT_NAME?.trim() || "Pedellus";
 if ([...AGENT_NAME].length > 40) throw new Error("AGENT_NAME must be at most 40 characters");
 const FRAME_BYTES = 262_144;
 const SEND_TEXT_CHARS = 16_000;

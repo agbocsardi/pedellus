@@ -1,16 +1,21 @@
 [Unit]
-Description=Durable Nanobot gateway (primary configuration)
+Description=Pedellus gateway (secondary instance %i)
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
 [Service]
 Type=exec
 # Replace /usr/bin/node with the absolute Node >= 22.19 executable and
-# /opt/durable-nanobot with this checkout's absolute path. The source launcher
+# /opt/pedellus with this checkout's absolute path. The source launcher
 # loads TypeScript with the pinned tsx runtime; restart picks up edits without a build.
-# Never point this unit at Python's `nanobot` command.
-ExecStart=/usr/bin/node /opt/durable-nanobot/bin/durable-nanobot.mjs gateway --config %h/.durable-nanobot/config.json
-WorkingDirectory=%h/.durable-nanobot
+#
+# The instance name is a systemd unit instance identifier, not a filesystem
+# path. It selects one fixed configuration directory under the owner's home.
+# The literal `i-` prefix keeps even a dot-like instance name inside a real
+# directory instead of allowing it to name `..`; systemd also refuses names that
+# are not valid normalized unit instance names, including any name with `/`.
+ExecStart=/usr/bin/node /opt/pedellus/bin/pedellus.mjs gateway --config %h/.pedellus/instances/i-%i/config.json
+WorkingDirectory=%h/.pedellus/instances/i-%i
 # Explicit, predictable PATH for shell tools, skills, MCP stdio lookup and local
 # transcription (uv). Extend it with a drop-in, never a login-shell profile.
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
@@ -19,7 +24,7 @@ Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 MemoryAccounting=yes
 # Optional per-instance environment, e.g. one provider key per line. Keep the
 # file private and outside this repository; it is ignored when absent.
-EnvironmentFile=-%h/.durable-nanobot/secrets.env
+EnvironmentFile=-%h/.pedellus/instances/i-%i/secrets.env
 Restart=on-failure
 RestartSec=5s
 KillSignal=SIGTERM

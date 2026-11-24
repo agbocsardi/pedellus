@@ -24,10 +24,10 @@ export interface CommandHelp {
 }
 
 /** The historical bare form: a terminal attach, kept for compatibility. */
-export const COMPATIBILITY_SYNOPSIS = "durable-nanobot --config <path>   (agent, compatibility)";
+export const COMPATIBILITY_SYNOPSIS = "pedellus --config <path>   (agent, compatibility)";
 
 /** The fixed primary configuration file, named by the shared --config option line and the usage note. */
-const DEFAULT_CONFIG_FILE = "~/.durable-nanobot/config.json";
+const DEFAULT_CONFIG_FILE = "~/.pedellus/config.json";
 
 /** The one sentence the usage block adds after its synopses, because it is the only configuration default. */
 const DEFAULT_CONFIG_NOTE = `Without --config, gateway, agent, login, logout, models, recovery, cron and app use ${DEFAULT_CONFIG_FILE}.`;
@@ -41,18 +41,18 @@ const CONFIG_OPTION: HelpOption = {
 export const COMMANDS: readonly CommandHelp[] = [
   {
     name: "gateway",
-    synopsis: "durable-nanobot gateway [--config <path>]",
+    synopsis: "pedellus gateway [--config <path>]",
     summary: "Run the single owner runtime and serve conversation surfaces",
     options: [CONFIG_OPTION],
     details: [
       "One gateway owns the store, workspace, cron, tools and every channel.",
       "It serves one private Unix socket; an attached CLI is a conversation surface.",
     ],
-    examples: ["durable-nanobot gateway", "durable-nanobot gateway --config /path/to/config.json"],
+    examples: ["pedellus gateway", "pedellus gateway --config /path/to/config.json"],
   },
   {
     name: "agent",
-    synopsis: "durable-nanobot agent [--config <path>] [--conversation <name>]",
+    synopsis: "pedellus agent [--config <path>] [--conversation <name>]",
     summary: "Attach this terminal to a running gateway",
     options: [
       CONFIG_OPTION,
@@ -65,31 +65,31 @@ export const COMMANDS: readonly CommandHelp[] = [
       "Never opens a second runtime, store or channel.",
       "Without a running gateway it fails with one fixed diagnostic.",
     ],
-    examples: ["durable-nanobot agent", "durable-nanobot agent --conversation work"],
+    examples: ["pedellus agent", "pedellus agent --conversation work"],
   },
   {
     name: "login",
-    synopsis: "durable-nanobot login [--config <path>] [provider] [--auth api_key|oauth]",
-    summary: "Store one provider credential in Durable's private store",
+    synopsis: "pedellus login [--config <path>] [provider] [--auth api_key|oauth]",
+    summary: "Store one provider credential in Pedellus's private store",
     options: [
       CONFIG_OPTION,
       { flags: "[provider]", text: "A native Pi AI provider ID; a documented legacy alias is resolved." },
       { flags: "--auth api_key|oauth", text: "Choose the provider's method instead of the prompt." },
     ],
     details: ["Terminal-only: the gateway never logs in at startup or from a chat turn."],
-    examples: ["durable-nanobot login", "durable-nanobot login openai --auth oauth"],
+    examples: ["pedellus login", "pedellus login openai --auth oauth"],
   },
   {
     name: "logout",
-    synopsis: "durable-nanobot logout [--config <path>] [provider]",
+    synopsis: "pedellus logout [--config <path>] [provider]",
     summary: "Remove one stored provider credential",
     options: [CONFIG_OPTION, { flags: "[provider]", text: "A native Pi AI provider ID; a legacy alias is resolved." }],
     details: ["The same explicit terminal-only path as login."],
-    examples: ["durable-nanobot logout", "durable-nanobot logout openai"],
+    examples: ["pedellus logout", "pedellus logout openai"],
   },
   {
     name: "models",
-    synopsis: "durable-nanobot models <refresh|list> [--config <path>] [provider...]",
+    synopsis: "pedellus models <refresh|list> [--config <path>] [provider...]",
     summary: "Refresh or list the native model catalog from pi.dev",
     options: [
       CONFIG_OPTION,
@@ -99,11 +99,11 @@ export const COMMANDS: readonly CommandHelp[] = [
       "refresh is the only catalog network path; list is offline. Neither grants a model: edit allowedModels.",
       "A refreshed catalog applies at gateway restart or the next /reload that changes model config.",
     ],
-    examples: ["durable-nanobot models refresh", "durable-nanobot models list openai-codex"],
+    examples: ["pedellus models refresh", "pedellus models list openai-codex"],
   },
   {
     name: "recovery",
-    synopsis: "durable-nanobot recovery [--config <path>] [--cancel <taskId> --fingerprint <sha256>]",
+    synopsis: "pedellus recovery [--config <path>] [--cancel <taskId> --fingerprint <sha256>]",
     summary: "Inspect or cancel prepared context that blocks a conversation",
     options: [
       CONFIG_OPTION,
@@ -112,13 +112,13 @@ export const COMMANDS: readonly CommandHelp[] = [
     ],
     details: ["Without options it prints the blocking tasks as JSON; a stale id and fingerprint cancel nothing."],
     examples: [
-      "durable-nanobot recovery",
-      "durable-nanobot recovery --cancel 12 --fingerprint <sha256>",
+      "pedellus recovery",
+      "pedellus recovery --cancel 12 --fingerprint <sha256>",
     ],
   },
   {
     name: "cron",
-    synopsis: "durable-nanobot cron <list|show <jobId>|cancel <jobId>|create> [options] [--config <path>]",
+    synopsis: "pedellus cron <list|show <jobId>|cancel <jobId>|create> [options] [--config <path>]",
     summary: "Inspect and manage scheduled work on this store's mapped chats",
     options: [
       CONFIG_OPTION,
@@ -137,15 +137,15 @@ export const COMMANDS: readonly CommandHelp[] = [
       "Nothing is scheduled if the origin is not a mapped chat; nothing is re-armed or edited.",
     ],
     examples: [
-      "durable-nanobot cron list",
-      "durable-nanobot cron show <jobId>",
-      "durable-nanobot cron cancel <jobId>",
-      "durable-nanobot cron create --origin <sessionKey> --key wake-1 --after 600 --message \"Stretch\"",
+      "pedellus cron list",
+      "pedellus cron show <jobId>",
+      "pedellus cron cancel <jobId>",
+      "pedellus cron create --origin <sessionKey> --key wake-1 --after 600 --message \"Stretch\"",
     ],
   },
   {
     name: "app",
-    synopsis: "durable-nanobot app <pair|devices|revoke <label>|shortcut> [--config <path>] | app push-keys",
+    synopsis: "pedellus app <pair|devices|revoke <label>|shortcut> [--config <path>] | app push-keys",
     summary: "Pair or revoke app devices and shortcut tokens, or generate Web Push keys",
     options: [
       CONFIG_OPTION,
@@ -159,14 +159,14 @@ export const COMMANDS: readonly CommandHelp[] = [
       "push-keys needs no gateway and reads no config: it prints one fresh VAPID key pair once and writes nothing.",
     ],
     examples: [
-      "durable-nanobot app pair",
-      "durable-nanobot app pair --label iphone",
-      "durable-nanobot app devices",
-      "durable-nanobot app revoke iphone",
-      "durable-nanobot app shortcut add --label morning",
-      "durable-nanobot app shortcut list",
-      "durable-nanobot app shortcut revoke morning",
-      "durable-nanobot app push-keys",
+      "pedellus app pair",
+      "pedellus app pair --label iphone",
+      "pedellus app devices",
+      "pedellus app revoke iphone",
+      "pedellus app shortcut add --label morning",
+      "pedellus app shortcut list",
+      "pedellus app shortcut revoke morning",
+      "pedellus app push-keys",
     ],
   },
 ];
@@ -175,7 +175,7 @@ export function findCommandHelp(name: string): CommandHelp | undefined {
   return COMMANDS.find((command) => command.name === name);
 }
 
-/** The exact `Usage: durable-nanobot <name> ...` line for one command. */
+/** The exact `Usage: pedellus <name> ...` line for one command. */
 export function commandUsageLine(command: CommandHelp): string {
   return `Usage: ${command.synopsis}`;
 }
@@ -187,7 +187,7 @@ export function commandUsage(name: string): string {
   return commandUsageLine(command);
 }
 
-const HELP_HINT = "Run `durable-nanobot <command> --help` (or `help <command>`) for one command's page.";
+const HELP_HINT = "Run `pedellus <command> --help` (or `help <command>`) for one command's page.";
 
 /**
  * The complete usage block for a malformed known form: every synopsis, the only configuration
@@ -215,10 +215,10 @@ export function renderOverview(): string {
   // Availability is a runtime property of the gateway this process would attach to.
   const cliCommands = conversationCommandNames("cli");
   return [
-    "durable-nanobot — local assistant gateway and conversation surfaces",
+    "pedellus — local assistant gateway and conversation surfaces",
     "",
     "Usage:",
-    "  durable-nanobot <command> [options]",
+    "  pedellus <command> [options]",
     `  ${COMPATIBILITY_SYNOPSIS}`,
     "",
     "Commands:",
@@ -237,7 +237,7 @@ export function renderOverview(): string {
 /** One command page: synopsis, summary, options, at most two short notes and examples. */
 export function renderCommandHelp(command: CommandHelp): string {
   const lines = [
-    `durable-nanobot ${command.name}`,
+    `pedellus ${command.name}`,
     "",
     commandUsageLine(command),
     "",

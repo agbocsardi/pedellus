@@ -217,7 +217,7 @@ export class McpServerConnection {
     const provider = new McpOAuthProvider({
       serverUrl: config.url,
       redirectUrl: this.oauth.redirectUrl ?? "http://127.0.0.1/oauth-callback",
-      clientMetadata: { client_name: "durable-nanobot" },
+      clientMetadata: { client_name: "pedellus" },
       store: new FileMcpOAuthStateStore(this.oauth.storePath, config.url),
       onRedirect() {
         // A connect-time authorization attempt is never interactive.

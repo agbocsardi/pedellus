@@ -429,7 +429,7 @@ with direct dependency declaration `be2453c84`. Parent typecheck/build/diff chec
 and inert SDK export/lifecycle smoke passed.
 
 Parent ran the following private probes against the **parent's built package**,
-selected with `PI_CODEMODE_CANDIDATE=/home/gergo/projects/pi-nanobot`:
+selected with `PI_CODEMODE_CANDIDATE=<checkout-path>`:
 
 - `/tmp/pi-nanobot-parent-codemode-local.mjs` and `...-optin.mjs`: adaptations of
   the reviewed worker fixtures with explicit built SDK imports; native boundaries,
