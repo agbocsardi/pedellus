@@ -19,6 +19,7 @@ after(async () => { await rm(home, { recursive: true, force: true }); });
 const PAGES = [
   ["gateway", /Usage: pedellus gateway \[--config <path>\]/, /one private Unix socket/],
   ["agent", /Usage: pedellus agent \[--config <path>\] \[--conversation <name>\]/, /Never opens a second runtime/],
+  ["init", /Usage: pedellus init \[--config <path>\] \[--skip-interview\]/, /Never overwrites an existing configuration/],
   ["login", /Usage: pedellus login \[--config <path>\] \[provider\] \[--auth api_key\|oauth\]/, /Terminal-only/],
   ["logout", /Usage: pedellus logout \[--config <path>\] \[provider\]/, /terminal-only path as login/],
   ["models", /Usage: pedellus models <refresh\|list> \[--config <path>\] \[provider\.\.\.\]/, /only catalog network path/],
