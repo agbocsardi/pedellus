@@ -1,7 +1,7 @@
 /**
  * The terminal's operator console for scheduled work.
  *
- * It is a process subcommand (`durable-nanobot cron ...`), not a chat slash command: the owner
+ * It is a process subcommand (`pedellus cron ...`), not a chat slash command: the owner
  * runs it from a shell, and it attaches to the running gateway over the existing private socket.
  * The gateway decides every authority question — which chats exist, which actor owns a job, what
  * a cancellation did — and this module only parses flags, sends one bounded request and renders
@@ -23,7 +23,7 @@ import {
 import { commandUsage, findCommandHelp, renderCommandHelp } from "../help/cli.js";
 import { LocalRemoteError, type LocalGatewayClient } from "../local/client.js";
 
-/** A refusal or failure to report as `durable-nanobot cron: <message>`; exit status 1. */
+/** A refusal or failure to report as `pedellus cron: <message>`; exit status 1. */
 export class CronCommandError extends Error {
   override name = "CronCommandError";
 }

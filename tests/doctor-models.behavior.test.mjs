@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -44,7 +44,7 @@ async function doctor(configPath, overrides = {}) {
     platform: "linux",
     nodeVersion: "v22.19.0",
     isWsl: false,
-    socketProbe: async () => false,
+    socketProbe: async () => "closed",
     ...overrides,
   });
   return { ...result, text: sink.text() };
@@ -67,10 +67,15 @@ async function setup(patch = (config) => config) {
   return { root, workspace, dataDir: join(root, "data"), path };
 }
 
-async function runCli(args, home) {
+async function runCli(args, home, isolatedTmp) {
   const child = spawn(process.execPath, [cli, ...args], {
     cwd: home,
-    env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, LANG: "C.UTF-8" },
+    env: {
+      PATH: process.env.PATH ?? "/usr/bin:/bin",
+      HOME: home,
+      LANG: "C.UTF-8",
+      ...(isolatedTmp === undefined ? {} : { TMPDIR: isolatedTmp }),
+    },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let stdout = "";
@@ -84,42 +89,69 @@ async function runCli(args, home) {
   return { code, stdout, stderr };
 }
 
-test("models list works with no configuration and creates nothing", { timeout: 60_000 }, async () => {
+test("models list works with no configuration and creates nothing (including in TMPDIR)", { timeout: 60_000 }, async () => {
   const home = await fresh();
-  const summary = await runCli(["models", "list"], home);
+  const isolatedTmp = await fresh();
+  const summary = await runCli(["models", "list"], home, isolatedTmp);
   assert.equal(summary.code, 0, summary.stderr);
   assert.match(summary.stdout, /^openai +\d+ chat models$/m);
   assert.match(summary.stdout, /Run `pedellus models list <provider>` to see models for one provider\./);
   const ids = summary.stdout.split("\n").filter((line) => / chat models$/.test(line)).map((line) => line.split(" ")[0]);
   assert.deepEqual(ids, [...ids].sort((a, b) => a.localeCompare(b)));
 
-  const one = await runCli(["models", "list", "openai"], home);
+  const one = await runCli(["models", "list", "openai"], home, isolatedTmp);
   assert.equal(one.code, 0, one.stderr);
   assert.ok(one.stdout.includes(`openai/${OPENAI}  chat  bundled\n`));
   assert.doesNotMatch(one.stdout, /allowed|^(?!openai\/)./m);
   await assert.rejects(stat(join(home, ".pedellus")), /ENOENT/);
+  assert.deepEqual(await readdir(isolatedTmp), [], "read-only models list writes nothing to TMPDIR");
 
   // An explicit missing --config still fails closed.
-  const explicit = await runCli(["models", "list", "--config", join(home, "absent.json")], home);
+  const explicit = await runCli(["models", "list", "--config", join(home, "absent.json")], home, isolatedTmp);
   assert.equal(explicit.code, 1);
   assert.equal(explicit.stdout, "");
 });
 
 test("doctor without a default configuration fails with the init hint and creates nothing", { timeout: 60_000 }, async () => {
   const home = await fresh();
-  const result = await runCli(["doctor"], home);
+  const isolatedTmp = await fresh();
+  const result = await runCli(["doctor"], home, isolatedTmp);
   assert.equal(result.code, 1, result.stderr);
-  assert.match(result.stdout, /^\[FAIL\] config file: not found: .*\.pedellus\/config\.json$/m);
+  assert.match(result.stdout, /^\[FAIL\] config file: not found \(~\/\.pedellus\/config\.json\)$/m);
   assert.match(result.stdout, /Run `pedellus init` to set up Pedellus\./);
   await assert.rejects(stat(join(home, ".pedellus")), /ENOENT/);
+  assert.deepEqual(await readdir(isolatedTmp), [], "read-only doctor writes nothing to TMPDIR");
 });
 
-test("doctor reports a field-level config error and never the secret value", async () => {
+test("doctor reports safe field-level config errors and never echoes secret keys or paths", async () => {
   const { path } = await setup((config) => ({ ...config, telegram: { tokenEnv: SECRET, allowFrom: ["1"] } }));
   const invalid = await doctor(path);
   assert.equal(invalid.ok, false);
-  assert.match(invalid.text, /\[FAIL\] config file: .* is invalid: telegram\.tokenEnv must be an environment variable name/);
+  assert.match(invalid.text, /\[FAIL\] config file: .*telegram\.tokenEnv must be an environment variable name/);
   assert.ok(!invalid.text.includes("AAFsynthetic"), invalid.text);
+
+  // An unknown key carrying a secret must NOT be echoed back.
+  await writeFile(path, JSON.stringify({
+    workspace: "ws",
+    dataDir: "data",
+    model: { provider: "openai", modelId: OPENAI },
+    app: { port: 43190, staticRoot: "/tmp", "sk-synthetic-key-42": true },
+  }));
+  const unknownKey = await doctor(path);
+  assert.equal(unknownKey.ok, false);
+  assert.match(unknownKey.text, /app contains an unrecognized option/);
+  assert.ok(!unknownKey.text.includes("sk-synthetic-key-42"), unknownKey.text);
+
+  // A secret pasted into workspace path must NOT be echoed back when missing.
+  await writeFile(path, JSON.stringify({
+    workspace: `./${SECRET}`,
+    dataDir: "data",
+    model: { provider: "openai", modelId: OPENAI },
+  }));
+  const badPath = await doctor(path);
+  assert.equal(badPath.ok, false);
+  assert.match(badPath.text, /\[FAIL\] workspace: configured workspace does not exist/);
+  assert.ok(!badPath.text.includes("AAFsynthetic"), badPath.text);
 
   await writeFile(path, `{"workspace": "${SECRET}", `);
   const broken = await doctor(path);
@@ -127,14 +159,17 @@ test("doctor reports a field-level config error and never the secret value", asy
   assert.ok(!broken.text.includes("AAFsynthetic"), broken.text);
 });
 
-test("doctor warns about WSL2 Windows drives and a missing systemd", async () => {
-  const result = await doctor("/mnt/c/Users/owner/.pedellus/config.json", { isWsl: true, systemdActive: false });
-  assert.match(result.text, /^\[WARN\] systemd: PID 1 is not systemd; set systemd=true .*\/etc\/wsl\.conf/m);
-  assert.match(result.text, /^\[WARN\] config: \/mnt\/c\/Users\/owner\/\.pedellus\/config\.json is on a Windows drive; .*SQLite WAL/m);
-  assert.match(result.text, /~\/\.pedellus on the Linux \(ext4\) filesystem/);
+test("doctor warns about WSL2 Windows drives (/mnt/<drive>) without flagging /mnt/wslg", async () => {
+  const drive = await doctor("/mnt/c/Users/owner/.pedellus/config.json", { isWsl: true, systemdActive: false });
+  assert.match(drive.text, /^\[WARN\] systemd: PID 1 is not systemd; set systemd=true .*\/etc\/wsl\.conf/m);
+  assert.match(drive.text, /^\[WARN\] config: configured path resolves under a Windows drive \(\/mnt\/<drive>\)/m);
+  assert.match(drive.text, /~\/\.pedellus on the Linux \(ext4\) filesystem/);
+
+  const wslg = await doctor("/mnt/wslg/pedellus/config.json", { isWsl: true, systemdActive: true });
+  assert.doesNotMatch(wslg.text, /Windows drive/);
 });
 
-test("a healthy setup passes, detects env credentials and a running gateway, and creates nothing", async () => {
+test("a healthy setup passes, detects env credentials and gateway probe states, and creates nothing", async () => {
   const { path, dataDir } = await setup();
   const idle = await doctor(path, { env: { OPENAI_API_KEY: "sk-SYNTHETIC-ENV" } });
   assert.equal(idle.ok, true, idle.text);
@@ -151,26 +186,45 @@ test("a healthy setup passes, detects env credentials and a running gateway, and
   try {
     const live = await doctor(path, { env: { OPENAI_API_KEY: "sk-SYNTHETIC-ENV" }, socketProbe: undefined });
     assert.equal(live.ok, true, live.text);
-    assert.match(live.text, /^\[OK\] {3}gateway: running$/m);
+    assert.match(live.text, /^\[OK\] {3}gateway: listening on local socket$/m);
+
+    const timedOut = await doctor(path, { env: { OPENAI_API_KEY: "sk-SYNTHETIC-ENV" }, socketProbe: async () => "timeout" });
+    assert.match(timedOut.text, /^\[WARN\] gateway: local socket timed out/m);
   } finally {
     await new Promise((resolveClose) => server.close(resolveClose));
   }
 });
 
-test("a missing configured memory file is a blocking failure", async () => {
+test("doctor catches missing memory files, symlinked memory dirs, unknown providers, and missing app builds", async () => {
   const { path, workspace } = await setup();
   await rm(join(workspace, "memory", "MEMORY.md"));
-  const result = await doctor(path, { env: { OPENAI_API_KEY: "x" } });
-  assert.equal(result.ok, false);
-  assert.match(result.text, /^\[FAIL\] memory\/MEMORY\.md: missing; startup fails closed/m);
-});
+  const missing = await doctor(path, { env: { OPENAI_API_KEY: "x" } });
+  assert.equal(missing.ok, false);
+  assert.match(missing.text, /^\[FAIL\] memory\/MEMORY\.md: missing; startup fails closed/m);
 
-test("an app static root without index.html fails with the build hint", async () => {
-  const { path } = await setup((config, root) => ({ ...config, app: { port: 8787, staticRoot: join(root, "pwa") } }));
-  const result = await doctor(path, { env: { OPENAI_API_KEY: "x" } });
-  assert.equal(result.ok, false);
-  assert.match(result.text, /^\[FAIL\] app: .*\/pwa\/index\.html is missing$/m);
-  assert.match(result.text, /npm run install:pwa && npm run build:pwa/);
+  // Symlinked memory directory must fail just like loadWorkspaceContextSnapshot.
+  const { path: linkedCfg, workspace: linkedWs, root: linkedRoot } = await setup();
+  const externalMem = join(linkedRoot, "ext-memory");
+  await mkdir(externalMem);
+  await writeFile(join(externalMem, "MEMORY.md"), "x\n");
+  await rm(join(linkedWs, "memory"), { recursive: true, force: true });
+  await symlink(externalMem, join(linkedWs, "memory"));
+  const symRes = await doctor(linkedCfg, { env: { OPENAI_API_KEY: "x" } });
+  assert.equal(symRes.ok, false);
+  assert.match(symRes.text, /\[FAIL\] .*: refused by context loader \(symlink\)/);
+
+  // Unknown provider must fail rather than report "no providers".
+  const { path: typoCfg } = await setup((config) => ({ ...config, model: { provider: "bogus-provider", modelId: "m1" } }));
+  const typoRes = await doctor(typoCfg);
+  assert.equal(typoRes.ok, false);
+  assert.match(typoRes.text, /\[FAIL\] bogus-provider: unknown provider/);
+
+  // Missing app build index.html fails with build hint.
+  const { path: appCfg } = await setup((config, root) => ({ ...config, app: { port: 8787, staticRoot: join(root, "pwa") } }));
+  const appRes = await doctor(appCfg, { env: { OPENAI_API_KEY: "x" } });
+  assert.equal(appRes.ok, false);
+  assert.match(appRes.text, /^\[FAIL\] app: configured app\.staticRoot is missing index\.html$/m);
+  assert.match(appRes.text, /npm run install:pwa && npm run build:pwa/);
 });
 
 test("stored credentials, configured env references and missing credentials are named, never shown", async () => {

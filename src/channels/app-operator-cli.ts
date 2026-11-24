@@ -1,7 +1,7 @@
 /**
  * The terminal's owner console for the app channel.
  *
- * It is a process subcommand (`durable-nanobot app ...`), not a chat slash command: the owner runs
+ * It is a process subcommand (`pedellus app ...`), not a chat slash command: the owner runs
  * it from a shell, and it attaches to the running gateway over the existing private socket. The
  * running app adapter decides every authority question — whether a label is free, how many devices
  * exist, which stream a revocation closes — and this module only parses flags, sends one bounded
@@ -14,7 +14,7 @@ import { commandUsage, findCommandHelp, renderCommandHelp } from "../help/cli.js
 import { generatePushKeys } from "./app-push.js";
 import { validAppLabel } from "./app-protocol.js";
 
-/** A refusal or failure to report as `durable-nanobot app: <message>`; exit status 1. */
+/** A refusal or failure to report as `pedellus app: <message>`; exit status 1. */
 export class AppCommandError extends Error {
   override name = "AppCommandError";
 }

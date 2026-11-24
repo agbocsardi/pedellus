@@ -28,10 +28,10 @@ Want a coding agent to walk you through it instead? Use the
 > **WSL2 essentials**
 >
 > - **Stay on the Linux filesystem.** Clone the repo somewhere under your Linux
->   home (`~`) and keep `~/.pedellus/` there too. Never put either under
->   `/mnt/c/...`: the Windows drive breaks file permissions (Pedellus keeps its
->   data directory `0700`), Unix sockets and SQLite's WAL journal, and is much
->   slower.
+>   home (`~`) and keep `~/.pedellus/` there too. Avoid putting either under
+>   `/mnt/c/...`: the Windows drive (DrvFs) can break file permissions (Pedellus
+>   keeps its data directory `0700`), Unix sockets, `O_NOFOLLOW` checks and
+>   SQLite's WAL journal, and is much slower.
 > - **Background running.** To use the systemd service below, enable systemd in
 >   WSL: add this to `/etc/wsl.conf` (with `sudo`), then run `wsl --shutdown` in
 >   PowerShell and reopen Ubuntu.
@@ -41,29 +41,30 @@ Want a coding agent to walk you through it instead? Use the
 >   systemd=true
 >   ```
 >
->   Even with systemd, WSL2 stops when Windows sleeps or shuts down, and it may
+>   Even with systemd, Windows sleep makes the gateway unreachable, and WSL may
 >   stop the distro shortly after you close the last WSL terminal. Keep a WSL
 >   terminal open while you want Pedellus reachable. For a 24/7 assistant, run it
 >   on an always-on Linux box instead (a small VPS, a Raspberry Pi, a home server).
 > - **Tailscale and the web app.** On the Windows desktop itself you can open the
 >   app at `http://localhost:<port>`, because WSL2 forwards localhost to Windows.
 >   A phone, and Web Push notifications, need HTTPS, which `tailscale serve`
->   provides. Do not run Tailscale inside WSL2 while Tailscale also runs on
->   Windows: you get two tailnet devices fighting over routing and DNS. Instead
->   run Tailscale **on Windows** and point it at the forwarded port from an
->   administrator PowerShell (`tailscale serve --bg <port>`), or run Pedellus on a
->   Linux host that has its own Tailscale. This WSL2 path has not been exercised
->   end to end yet; if localhost forwarding does not reach the port, try WSL's
->   mirrored networking mode.
+>   provides. Avoid running Tailscale inside WSL2 at the same time as Tailscale
+>   on Windows (nested tunneling can break routing). Instead run Tailscale
+>   **on Windows** and point it at the forwarded port from an administrator
+>   PowerShell (`tailscale serve --bg <port>`), or run Pedellus on a Linux host
+>   that has its own Tailscale. This WSL2 path has not been exercised end to end
+>   yet; if localhost forwarding does not reach the port on Windows 11 22H2 or
+>   newer, try WSL's mirrored networking mode.
 
 ## Quickstart: first chat in five minutes
 
 **1. Get the code and install dependencies**
 
+Clone this repository into `~/pedellus` (substitute your clone URL), then
+install dependencies:
+
 ```sh
-cd ~
-git clone <repository-url> pedellus
-cd pedellus
+cd ~/pedellus
 npm ci
 npm link    # optional: puts `pedellus` on your PATH
 ```
@@ -128,9 +129,9 @@ editing. Secrets never go into the config: it names an **environment variable**,
 and the gateway reads the value from its environment.
 
 When you run the gateway in a terminal, `export` the variable first. When it runs
-as the systemd service (below), put the values in `~/.pedellus/secrets.env`, one
-`NAME=value` per line, `chmod 600`. Never commit that file or paste it into a
-chat.
+as the systemd service (below), put the values in the private `EnvironmentFile`
+configured in your systemd unit (`chmod 600`, one `NAME=value` per line). Never
+commit that file or paste it into a chat.
 
 ### Telegram (easiest on your phone)
 
@@ -148,8 +149,8 @@ chat.
 
    `allowFrom` holds decimal user IDs as JSON strings. Everyone listed shares your
    workspace and tool access, so list only yourself or people you fully trust.
-4. Provide the token (`export TELEGRAM_BOT_TOKEN=...` or a line in
-   `secrets.env`), restart the gateway and send your bot a private message.
+4. Provide the token (`export TELEGRAM_BOT_TOKEN=...` or in your unit's
+   `EnvironmentFile`), restart the gateway and send your bot a private message.
 
 Only private chats from listed users reach the assistant. One token can be
 polled by only one bot process. Details: [TELEGRAM.md](./TELEGRAM.md).
@@ -199,16 +200,22 @@ your phone and desktop, over your private tailnet.
    ```
 
    Never use Tailscale Funnel or port forwarding: the app is for your tailnet only.
-4. Pair a device: run `pedellus app pair --label phone`, open the `https://….ts.net`
-   address Tailscale printed on the phone, enter the 8-character code (valid ten
-   minutes), and use "Add to Home Screen" to install it.
+4. Pair a device:
+   - On **iOS**, open the `https://….ts.net` address in Safari, tap Share →
+     **"Add to Home Screen"**, and open the installed app from the Home Screen
+     *first* (Safari and the Home Screen app have separate cookie jars).
+   - On the host, run `pedellus app pair` (unlabeled, so the app's device label
+     is accepted — or pass `--label <name>` and enter the exact same label in
+     the app). Enter the 8-character code (valid ten minutes).
 5. Optional push notifications: `pedellus app push-keys` prints a key pair once.
    Put the private key in the gateway's environment (for example
-   `PEDELLUS_APP_PUSH_PRIVATE_KEY` in `secrets.env`) and the public key in the
-   config as shown in [APP.md](./APP.md#setup).
+   `PEDELLUS_APP_PUSH_PRIVATE_KEY` in your unit's `EnvironmentFile`) and the
+   public key in the config as shown in [APP.md](./APP.md#setup).
 
-The web app is offline-verified only so far; see [APP.md](./APP.md) for status,
-device management (`pedellus app devices`, `pedellus app revoke`) and limits.
+Supervised iPhone/iPad pairing over Tailscale has been exercised on Linux; WSL2
+deployment, Web Push delivery and kill/reopen replay remain unverified. See
+[APP.md](./APP.md) for status, device management (`pedellus app devices`,
+`pedellus app revoke`) and limits.
 
 ## Optional add-ons
 

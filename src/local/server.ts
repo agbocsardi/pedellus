@@ -90,21 +90,28 @@ export function gatewaySocketPath(canonicalDataDir: string): string {
   return path;
 }
 
-/** True when some process answers on the socket; an unresponsive listener still owns it. */
-export function socketIsLive(path: string): Promise<boolean> {
-  return new Promise((resolveLive) => {
+export type SocketProbeState = "listening" | "timeout" | "closed";
+
+/** Probe a Unix socket without modifying it; distinguishes connect, timeout and refusal/absence. */
+export function probeSocket(path: string): Promise<SocketProbeState> {
+  return new Promise((resolveState) => {
     const socket = connect({ path });
     let settled = false;
-    const finish = (live: boolean): void => {
+    const finish = (state: SocketProbeState): void => {
       if (settled) return;
       settled = true;
       socket.destroy();
-      resolveLive(live);
+      resolveState(state);
     };
-    socket.once("connect", () => finish(true));
-    socket.once("error", () => finish(false));
-    socket.setTimeout(1_000, () => finish(true));
+    socket.once("connect", () => finish("listening"));
+    socket.once("error", () => finish("closed"));
+    socket.setTimeout(1_000, () => finish("timeout"));
   });
+}
+
+/** True when some process answers on the socket; an unresponsive listener still owns it. */
+export async function socketIsLive(path: string): Promise<boolean> {
+  return (await probeSocket(path)) !== "closed";
 }
 
 /**

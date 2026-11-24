@@ -3,18 +3,19 @@
  *
  * It never creates a file or directory, never opens SQLite, never makes a network or model call and
  * never prints a secret value, credential content or raw exception text. Credentials are reported by
- * source name only; configuration errors are reduced to `parseConfig`'s field-level message, bounded
- * and with token-like runs redacted. The only socket it touches is a connect-and-close probe of the
- * local gateway socket.
+ * source name only; configuration errors are mapped to trusted field-level summaries without
+ * echoing arbitrary keys or configured path values. The only socket it touches is a connect-and-close
+ * probe of the local gateway socket.
  */
 import { constants } from "node:fs";
-import { access, lstat, readFile, realpath, stat } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { access, lstat, open, readFile, realpath, stat } from "node:fs/promises";
+import { dirname, join, resolve, sep } from "node:path";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import type { AuthCheck, Models } from "@earendil-works/pi-ai";
 import { authStorePath, FileCredentialStore } from "../auth/store.js";
 import { defaultConfigPath, parseConfig, type PortConfig } from "../config.js";
-import { socketIsLive } from "../local/server.js";
+import { loadWorkspaceContextSnapshot, WorkspaceContextFileError, WorkspaceContextInputError, WorkspaceContextPlatformError } from "../context/workspace.js";
+import { probeSocket, type SocketProbeState } from "../local/server.js";
 import { createAuthModels, nativeProviderId } from "../providers.js";
 import { startupDiagnostic } from "../startup-diagnostics.js";
 import { canonicalFuturePath, inside } from "../store.js";
@@ -29,8 +30,8 @@ export interface DoctorOptions {
   readonly nodeVersion?: string;
   readonly isWsl?: boolean;
   readonly systemdActive?: boolean;
-  /** True when some process answers on this Unix socket path. */
-  readonly socketProbe?: (path: string) => Promise<boolean>;
+  /** Socket probe seam; returns a `SocketProbeState` or boolean (`true` = listening). */
+  readonly socketProbe?: (path: string) => Promise<SocketProbeState | boolean>;
 }
 
 type Status = "ok" | "warn" | "fail";
@@ -38,8 +39,10 @@ type Status = "ok" | "warn" | "fail";
 const PREFIX: Readonly<Record<Status, string>> = { ok: "[OK]  ", warn: "[WARN]", fail: "[FAIL]" };
 const MIN_NODE = [22, 19, 0] as const;
 const SOCKET_PATH_LIMIT = 100;
+const MAX_READ_BYTES = 2 * 1024 * 1024;
 const BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md"] as const;
 const ONBOARDING_FILE = "memory/system/onboarding.md";
+const WINDOWS_DRIVE_MOUNT = /^\/mnt\/[a-zA-Z](?:\/|$)/;
 
 class Report {
   readonly counts: Record<Status, number> = { ok: 0, warn: 0, fail: 0 };
@@ -89,15 +92,15 @@ export async function runDoctor(options: DoctorOptions): Promise<{ readonly ok: 
       ? "PID 1 is systemd"
       : "PID 1 is not systemd; set systemd=true under [boot] in /etc/wsl.conf for background services");
     const paths: [string, string][] = [];
-    if (loaded.path !== undefined) paths.push(["config", loaded.path]);
+    if (loaded.path !== undefined) paths.push(["config", await canonicalOrSelf(loaded.path)]);
     if (loaded.config !== undefined) {
       paths.push(["workspace", await canonicalOrSelf(loaded.config.workspace)]);
       paths.push(["dataDir", await canonicalOrSelf(loaded.config.dataDir)]);
     }
-    const drvfs = paths.filter(([, path]) => path === "/mnt" || path.startsWith("/mnt/"));
-    for (const [label, path] of drvfs) {
-      report.check("warn", label, `${path} is on a Windows drive; DrvFs breaks chmod 0700, Unix sockets, ` +
-        "O_NOFOLLOW and SQLite WAL. Use ~/.pedellus on the Linux (ext4) filesystem");
+    const drvfs = paths.filter(([, path]) => WINDOWS_DRIVE_MOUNT.test(path));
+    for (const [label] of drvfs) {
+      report.check("warn", label, "configured path resolves under a Windows drive (/mnt/<drive>); DrvFs can break " +
+        "chmod 0700, Unix sockets, O_NOFOLLOW and SQLite WAL. Use ~/.pedellus on the Linux (ext4) filesystem");
     }
     if (paths.length > 0 && drvfs.length === 0) report.check("ok", "filesystem", "configured paths are on the Linux filesystem");
   }
@@ -108,13 +111,13 @@ export async function runDoctor(options: DoctorOptions): Promise<{ readonly ok: 
     report.note("Skipped: directories, credentials, channels and gateway need a valid configuration.");
   } else {
     report.section("Directories and workspace");
-    const dataDir = await checkDirectories(report, config);
+    const dirs = await checkDirectories(report, config, platform);
     report.section("Provider credentials");
-    await checkCredentials(report, config, dataDir, env);
+    await checkCredentials(report, config, dirs, env);
     report.section("Channels and web");
     await checkChannels(report, config, env);
     report.section("Gateway");
-    await checkGateway(report, dataDir, options.socketProbe ?? socketIsLive);
+    await checkGateway(report, dirs.socketDir, options.socketProbe ?? probeSocket);
   }
 
   const { ok, warn, fail } = report.counts;
@@ -157,17 +160,57 @@ function errorCode(error: unknown): string | undefined {
 }
 
 /**
- * `parseConfig` messages name fields, never values, but a key or enum choice is still owner text:
- * strip control characters, redact token-like runs and bound the length.
+ * Nonblocking, bounded regular-file read so a FIFO, device or huge file cannot hang or OOM doctor.
+ */
+async function readRegularFileBounded(path: string, options: { noFollow?: boolean; maxBytes?: number } = {}): Promise<string> {
+  const flags = constants.O_RDONLY
+    | (typeof constants.O_NONBLOCK === "number" ? constants.O_NONBLOCK : 0)
+    | (options.noFollow === true && typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0);
+  const handle = await open(path, flags);
+  try {
+    const info = await handle.stat();
+    if (!info.isFile()) {
+      const error = new Error("not a regular file") as NodeJS.ErrnoException;
+      error.code = "EINVAL";
+      throw error;
+    }
+    const maxBytes = options.maxBytes ?? MAX_READ_BYTES;
+    if (info.size > maxBytes) {
+      const error = new Error("file exceeds size bound") as NodeJS.ErrnoException;
+      error.code = "EFBIG";
+      throw error;
+    }
+    return await handle.readFile("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Trusted field-level configuration diagnostic. Never echoes arbitrary user keys, configured
+ * path/string values, or raw JSON fragments — unknown-key errors are rewritten to name only the
+ * trusted parent section, and unrecognized messages collapse to a fixed safe summary.
  */
 export function safeConfigMessage(error: unknown): string {
-  const raw = error instanceof Error ? error.message : "";
-  const text = raw
-    .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
-    .replace(/[A-Za-z0-9_\-+/=.:]{24,}/g, (run) => (/\d/.test(run) || run.length > 48 ? "[redacted]" : run))
-    .trim();
-  if (text === "") return "details suppressed";
-  return text.length > 200 ? `${text.slice(0, 199)}…` : text;
+  const raw = error instanceof Error ? error.message.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").trim() : "";
+  if (raw === "") return "invalid configuration (details suppressed)";
+
+  // Never echo an arbitrary JSON key from rejectUnknownKeys (`<section>.<userKey> is not a recognized option`).
+  const unknownOption = /^([a-zA-Z][a-zA-Z0-9_.]*)\.[^.\s]+ is not a recognized option$/.exec(raw);
+  if (unknownOption !== null) return `${unknownOption[1]} contains an unrecognized option`;
+
+  // Known safe field-name messages from parseConfig (no quoted user values or arbitrary paths).
+  const safeField = /^([a-zA-Z][a-zA-Z0-9_.[\]-]{0,60}) (must be [a-zA-Z0-9 ,./_:'"()<>-]+|is required|is invalid|cannot be [a-zA-Z0-9 ,./_-]+|requires [a-zA-Z0-9 ,./_-]+)$/.exec(raw);
+  if (safeField !== null && safeField[0].length <= 160 && !/[A-Za-z0-9_\-+/=]{24,}/.test(safeField[0])) {
+    return safeField[0];
+  }
+
+  // Known safe top-level parseConfig sentences (fixed text, no user interpolation).
+  if (/^(configuration|config) must be a JSON object$/i.test(raw)) return raw;
+  if (/^(modelPreset|modelPresets|allowedModels|model)\b/.test(raw) && raw.length <= 160 && !/[`"'\\/:]/.test(raw)) {
+    return raw;
+  }
+  return "invalid configuration; check required fields and documented formats (details suppressed)";
 }
 
 interface LoadedConfig {
@@ -183,16 +226,17 @@ async function checkConfig(report: Report, explicit: string | undefined): Promis
     report.check("fail", "config file", "cannot resolve the home directory for ~/.pedellus/config.json");
     return {};
   }
+  const labelPath = explicit === undefined ? "~/.pedellus/config.json" : "configured file";
   let text: string;
   try {
-    text = await readFile(path, "utf8");
+    text = await readRegularFileBounded(path);
   } catch (error) {
     const code = errorCode(error);
     if (code === "ENOENT") {
-      report.check("fail", "config file", `not found: ${path}`);
+      report.check("fail", "config file", `not found (${labelPath})`);
       if (explicit === undefined) report.note("Run `pedellus init` to set up Pedellus.");
     } else {
-      report.check("fail", "config file", `cannot read ${path}${code === undefined ? "" : ` (${code})`}`);
+      report.check("fail", "config file", `cannot read ${labelPath}${code === undefined ? "" : ` (${code})`}`);
     }
     return { path };
   }
@@ -201,15 +245,15 @@ async function checkConfig(report: Report, explicit: string | undefined): Promis
     value = JSON.parse(text);
   } catch {
     // JSON.parse messages quote file content, so only the fact is reported.
-    report.check("fail", "config file", `${path} is not valid JSON (details suppressed)`);
+    report.check("fail", "config file", `${labelPath} is not valid JSON (details suppressed)`);
     return { path };
   }
   try {
     const config = { ...parseConfig(value, dirname(path)), configFile: path };
-    report.check("ok", "config file", path);
+    report.check("ok", "config file", labelPath);
     return { path, config };
   } catch (error) {
-    report.check("fail", "config file", `${path} is invalid: ${safeConfigMessage(error)}`);
+    report.check("fail", "config file", `${labelPath} is invalid: ${safeConfigMessage(error)}`);
     return { path };
   }
 }
@@ -218,49 +262,70 @@ async function checkConfig(report: Report, explicit: string | undefined): Promis
 async function existingDirectory(path: string): Promise<{ readonly path: string } | { readonly reason: string }> {
   try {
     const canonical = await realpath(path);
-    if (!(await stat(canonical)).isDirectory()) return { reason: "not a directory" };
+    if (!(await stat(canonical)).isDirectory()) return { reason: "is not a directory" };
     return { path: canonical };
   } catch (error) {
     return { reason: errorCode(error) === "ENOENT" ? "does not exist" : `cannot be read (${errorCode(error) ?? "error"})` };
   }
 }
 
-/** Returns the canonical data directory when it exists and is usable for read-only probes. */
-async function checkDirectories(report: Report, config: PortConfig): Promise<string | undefined> {
+interface DirectoryCheckResult {
+  /** Validated canonical dataDir if it exists on disk and is disjoint from workspace roots. */
+  readonly existingDataDir?: string;
+  /** True when dataDir is disjoint and valid (even if not created yet). */
+  readonly dataDirValid: boolean;
+  /** Canonical dataDir usable for a gateway socket probe (exists, valid, <= 100 bytes). */
+  readonly socketDir?: string;
+}
+
+/** Validate workspace, extraAllowedDirs, dataDir and workspaceContext without writing anything. */
+async function checkDirectories(
+  report: Report,
+  config: PortConfig,
+  platform: NodeJS.Platform,
+): Promise<DirectoryCheckResult> {
   const workspace = await existingDirectory(config.workspace);
-  if ("path" in workspace) report.check("ok", "workspace", workspace.path);
-  else report.check("fail", "workspace", `${config.workspace} ${workspace.reason}`);
+  if ("path" in workspace) report.check("ok", "workspace", "exists and is a directory");
+  else report.check("fail", "workspace", `configured workspace ${workspace.reason}`);
   const roots = "path" in workspace ? [workspace.path] : [];
-  for (const extra of config.extraAllowedDirs ?? []) {
-    const root = await existingDirectory(extra);
+  for (let index = 0; index < (config.extraAllowedDirs ?? []).length; index += 1) {
+    const root = await existingDirectory(config.extraAllowedDirs![index]!);
     if ("path" in root) roots.push(root.path);
-    else report.check("fail", "extraAllowedDirs", `${extra} ${root.reason}`);
+    else report.check("fail", `extraAllowedDirs[${index}]`, `configured directory ${root.reason}`);
   }
 
   let dataDir: string;
   try {
     dataDir = await canonicalFuturePath(config.dataDir);
   } catch (error) {
-    report.check("fail", "dataDir", `${config.dataDir} cannot be resolved (${errorCode(error) ?? "error"})`);
-    return undefined;
+    report.check("fail", "dataDir", `configured dataDir cannot be resolved (${errorCode(error) ?? "error"})`);
+    return { dataDirValid: false };
   }
-  let usable: string | undefined;
+
+  let existingDataDir: string | undefined;
+  let dataDirValid = false;
   if (roots.some((root) => inside(dataDir, root) || inside(root, dataDir))) {
-    report.check("fail", "dataDir", `${dataDir} must be disjoint from workspace and extraAllowedDirs`);
+    report.check("fail", "dataDir", "configured dataDir must be disjoint from workspace and extraAllowedDirs");
   } else {
     try {
       const entry = await lstat(dataDir);
       if (entry.isDirectory()) {
-        report.check("ok", "dataDir", dataDir);
-        usable = dataDir;
+        report.check("ok", "dataDir", "exists and is disjoint from workspace");
+        existingDataDir = dataDir;
+        dataDirValid = true;
       } else {
-        report.check("fail", "dataDir", `${dataDir} is not a directory`);
+        report.check("fail", "dataDir", "configured dataDir is not a directory");
       }
     } catch (error) {
-      if (errorCode(error) === "ENOENT") report.check("ok", "dataDir", `${dataDir} (created at first gateway start)`);
-      else report.check("fail", "dataDir", `${dataDir} cannot be read (${errorCode(error) ?? "error"})`);
+      if (errorCode(error) === "ENOENT") {
+        report.check("ok", "dataDir", "valid path (will be created at first gateway start)");
+        dataDirValid = true;
+      } else {
+        report.check("fail", "dataDir", `configured dataDir cannot be read (${errorCode(error) ?? "error"})`);
+      }
     }
   }
+
   const socketBytes = Buffer.byteLength(resolve(dataDir, "gateway.sock"), "utf8");
   report.check(socketBytes <= SOCKET_PATH_LIMIT ? "ok" : "fail", "socket path", socketBytes <= SOCKET_PATH_LIMIT
     ? `${socketBytes} bytes`
@@ -269,9 +334,13 @@ async function checkDirectories(report: Report, config: PortConfig): Promise<str
   if (config.workspaceContext === undefined) {
     report.check("ok", "workspaceContext", "not configured; no workspace files are loaded");
   } else if ("path" in workspace) {
-    await checkWorkspaceFiles(report, workspace.path, config.workspaceContext.memoryFiles);
+    await checkWorkspaceFiles(report, config.workspace, workspace.path, config.workspaceContext.memoryFiles, platform);
   }
-  return socketBytes <= SOCKET_PATH_LIMIT ? usable : undefined;
+  return {
+    ...(existingDataDir === undefined ? {} : { existingDataDir }),
+    dataDirValid,
+    ...(existingDataDir !== undefined && socketBytes <= SOCKET_PATH_LIMIT ? { socketDir: existingDataDir } : {}),
+  };
 }
 
 async function regularFile(path: string): Promise<"file" | "missing" | "other"> {
@@ -282,22 +351,57 @@ async function regularFile(path: string): Promise<"file" | "missing" | "other"> 
   }
 }
 
-async function checkWorkspaceFiles(report: Report, workspace: string, memoryFiles: readonly string[]): Promise<void> {
+async function checkWorkspaceFiles(
+  report: Report,
+  configuredWorkspace: string,
+  canonicalWorkspace: string,
+  memoryFiles: readonly string[],
+  platform: NodeJS.Platform,
+): Promise<void> {
+  // Run the actual read-only workspace context loader on Linux so doctor matches gateway startup
+  // (catches symlinked workspace roots, symlinked memory/ dirs, hardlinks, unreadable files).
+  if (platform === "linux" && process.platform === "linux") {
+    try {
+      await loadWorkspaceContextSnapshot({
+        workspaceRoot: resolve(configuredWorkspace),
+        memoryFiles,
+      });
+      report.check("ok", "workspaceContext", "snapshot loader verified bootstrap and memory files");
+    } catch (error) {
+      if (error instanceof WorkspaceContextFileError) {
+        const label = error.source.replace(/^workspace:/, "");
+        const reason = error.kind === "missing"
+          ? "missing; startup fails closed on a configured memoryFiles entry"
+          : `refused by context loader (${error.kind}); startup fails closed`;
+        report.check("fail", label, reason);
+      } else if (error instanceof WorkspaceContextInputError || error instanceof WorkspaceContextPlatformError) {
+        report.check("fail", "workspaceContext", error.message);
+      } else {
+        report.check("fail", "workspaceContext", "context snapshot check failed; startup fails closed");
+      }
+      return;
+    }
+  } else {
+    for (const name of memoryFiles) {
+      const kind = await regularFile(join(canonicalWorkspace, name));
+      if (kind === "file") report.check("ok", name, "present");
+      else if (kind === "missing") report.check("fail", name, "missing; startup fails closed on a configured memoryFiles entry");
+      else report.check("fail", name, "not a readable regular file; startup refuses it");
+    }
+  }
+
   for (const name of BOOTSTRAP_FILES) {
-    const kind = await regularFile(join(workspace, name));
+    const kind = await regularFile(join(canonicalWorkspace, name));
     if (kind === "file") report.check("ok", name, "present");
     else if (kind === "missing") report.check("warn", name, "missing; it is omitted from context");
     else report.check("fail", name, "not a readable regular file; startup refuses it");
   }
   for (const name of memoryFiles) {
-    const kind = await regularFile(join(workspace, name));
-    if (kind === "file") report.check("ok", name, "present");
-    else if (kind === "missing") report.check("fail", name, "missing; startup fails closed on a configured memoryFiles entry");
-    else report.check("fail", name, "not a readable regular file; startup refuses it");
+    report.check("ok", name, "present");
   }
   try {
-    const onboarding = join(workspace, ONBOARDING_FILE);
-    if ((await lstat(onboarding)).isFile() && (await readFile(onboarding, "utf8")).trim() !== "") {
+    const text = await readRegularFileBounded(join(canonicalWorkspace, ONBOARDING_FILE), { noFollow: true, maxBytes: 64 * 1024 });
+    if (text.trim() !== "") {
       report.check("ok", "onboarding", `first-chat onboarding pending (${ONBOARDING_FILE})`);
     }
   } catch {
@@ -305,25 +409,33 @@ async function checkWorkspaceFiles(report: Report, workspace: string, memoryFile
   }
 }
 
-/** Native providers referenced by model selection; custom providers have their own keyless/env auth. */
-function referencedNativeProviders(config: PortConfig): readonly string[] {
+/** Every provider spelling referenced by model selection, presets or classifier. */
+function referencedProviders(config: PortConfig): readonly { readonly spelling: string; readonly id: string; readonly kind: "native" | "custom" | "unknown" }[] {
   const builtin = new Set(builtinProviders().map((provider) => provider.id));
+  const custom = new Set(Object.keys(config.providers ?? {}));
   const spellings = [
     ...(config.allowedModels ?? [config.model]).map((model) => model.provider),
     ...Object.values(config.modelPresets ?? {}).map((preset) => preset.provider),
     ...(config.classifierModel === undefined ? [] : [config.classifierModel.provider]),
   ];
-  return [...new Set(spellings.map(nativeProviderId))].filter((id) => builtin.has(id)).sort();
+  const seen = new Map<string, { readonly spelling: string; readonly id: string; readonly kind: "native" | "custom" | "unknown" }>();
+  for (const spelling of spellings) {
+    const id = nativeProviderId(spelling);
+    if (seen.has(id)) continue;
+    const kind = builtin.has(id) ? "native" : custom.has(spelling) ? "custom" : "unknown";
+    seen.set(id, { spelling, id: kind === "custom" ? spelling : id, kind });
+  }
+  return [...seen.values()].sort((a, b) => a.id.localeCompare(b.id));
 }
 
 function configuredEnvName(config: PortConfig, providerId: string): string | undefined {
-  return Object.entries(config.credentials ?? {}).find(([spelling]) => nativeProviderId(spelling) === providerId)?.[1];
+  return Object.entries(config.credentials ?? {}).find(([spelling]) => nativeProviderId(spelling) === providerId || spelling === providerId)?.[1];
 }
 
 function describeAuth(auth: AuthCheck, configuredEnv: string | undefined): string {
   if (auth.type === "oauth") return "stored credential (OAuth)";
   const source = auth.source ?? "";
-  if (source === "stored credential") return source;
+  if (source === "stored credential" || source === "keyless") return source;
   if (source.startsWith("credentials.") && configuredEnv !== undefined) return `env (${configuredEnv})`;
   if (/^[A-Z][A-Z0-9_]*$/.test(source)) return `env (${source})`;
   return source === "" ? "available" : source;
@@ -332,22 +444,45 @@ function describeAuth(auth: AuthCheck, configuredEnv: string | undefined): strin
 async function checkCredentials(
   report: Report,
   config: PortConfig,
-  dataDir: string | undefined,
+  dirs: DirectoryCheckResult,
   env: NodeJS.ProcessEnv,
 ): Promise<void> {
-  const providers = referencedNativeProviders(config);
-  if (providers.length === 0) {
-    report.check("ok", "providers", "no native providers referenced");
+  const providers = referencedProviders(config);
+  const unknown = providers.filter((entry) => entry.kind === "unknown");
+  for (const entry of unknown) {
+    report.check("fail", entry.id, "unknown provider (not a native Pi AI provider or custom providers entry)");
+  }
+  const known = providers.filter((entry) => entry.kind !== "unknown");
+  if (known.length === 0) {
+    if (unknown.length === 0) report.check("ok", "providers", "no providers referenced");
     return;
   }
-  // Read-only: list() and read() only open the file; they never create the directory or a lock.
-  let store: FileCredentialStore | undefined = new FileCredentialStore(authStorePath(dataDir ?? resolve(config.dataDir)));
-  try {
-    await store.list();
-  } catch {
-    report.check("fail", "credential store", "unreadable or invalid; run `pedellus login <provider>` to replace it");
-    store = undefined;
+
+  let store: FileCredentialStore | undefined;
+  if (!dirs.dataDirValid) {
+    report.check("warn", "credential store", "skipped because dataDir is invalid");
+  } else if (dirs.existingDataDir !== undefined) {
+    const credPath = authStorePath(dirs.existingDataDir);
+    let readableRegular = false;
+    try {
+      await readRegularFileBounded(credPath, { noFollow: true, maxBytes: 1024 * 1024 });
+      readableRegular = true;
+    } catch (error) {
+      if (errorCode(error) !== "ENOENT") {
+        report.check("fail", "credential store", "unreadable or not a regular file; run `pedellus login <provider>` to replace it");
+      }
+    }
+    if (readableRegular) {
+      const candidate = new FileCredentialStore(credPath);
+      try {
+        await candidate.list();
+        store = candidate;
+      } catch {
+        report.check("fail", "credential store", "invalid credential store; run `pedellus login <provider>` to replace it");
+      }
+    }
   }
+
   let models: Models;
   try {
     models = createAuthModels(config, env, store);
@@ -355,7 +490,8 @@ async function checkCredentials(
     report.check("fail", "provider configuration", startupDiagnostic(error).replace(/^pedellus: /, ""));
     return;
   }
-  for (const id of providers) {
+  for (const entry of known) {
+    const id = entry.id;
     const configuredEnv = configuredEnvName(config, id);
     let auth: AuthCheck | undefined;
     try {
@@ -371,14 +507,27 @@ async function checkCredentials(
   }
 }
 
+async function checkAppIndex(staticRoot: string): Promise<boolean> {
+  try {
+    const rootReal = await realpath(staticRoot);
+    const indexReal = await realpath(join(staticRoot, "index.html"));
+    if (indexReal !== rootReal && !indexReal.startsWith(`${rootReal}${sep}`)) return false;
+    return (await stat(indexReal)).isFile();
+  } catch {
+    return false;
+  }
+}
+
 async function checkChannels(report: Report, config: PortConfig, env: NodeJS.ProcessEnv): Promise<void> {
-  const secretsFile = config.configFile === undefined ? false : await exists(join(dirname(config.configFile), "secrets.env"));
+  const secretsFile = config.configFile === undefined
+    ? false
+    : await regularFile(join(dirname(config.configFile), "secrets.env")) === "file";
   const envCheck = (label: string, name: string, missing: Status, effect: string): void => {
     const value = Object.hasOwn(env, name) ? env[name] : undefined;
     if (typeof value === "string" && value.trim() !== "") {
       report.check("ok", label, `env (${name}) is set`);
     } else if (secretsFile) {
-      report.check("warn", label, `${name} is not set in this shell; secrets.env beside the config may supply it to the service`);
+      report.check("warn", label, `${name} is not set in this shell; the service EnvironmentFile beside the config may supply it`);
     } else {
       report.check(missing, label, `${name} is not set; ${effect}`);
     }
@@ -394,11 +543,10 @@ async function checkChannels(report: Report, config: PortConfig, env: NodeJS.Pro
   }
   if (config.app !== undefined) {
     any = true;
-    const index = join(config.app.staticRoot, "index.html");
-    if (await regularFile(index) === "file") {
-      report.check("ok", "app", `static root ${config.app.staticRoot}`);
+    if (await checkAppIndex(config.app.staticRoot)) {
+      report.check("ok", "app", "static root contains index.html");
     } else {
-      report.check("fail", "app", `${index} is missing`);
+      report.check("fail", "app", "configured app.staticRoot is missing index.html");
       report.note("Build the app with `npm run install:pwa && npm run build:pwa`.");
     }
     if (config.app.push !== undefined) envCheck("app push", config.app.push.privateKeyEnv, "warn", "Web Push stays off");
@@ -412,20 +560,29 @@ async function checkChannels(report: Report, config: PortConfig, env: NodeJS.Pro
 
 async function checkGateway(
   report: Report,
-  dataDir: string | undefined,
-  probe: (path: string) => Promise<boolean>,
+  socketDir: string | undefined,
+  probe: (path: string) => Promise<SocketProbeState | boolean>,
 ): Promise<void> {
   const notRunning = "not running (start with `pedellus gateway`)";
-  if (dataDir === undefined) {
+  if (socketDir === undefined) {
     report.check("warn", "gateway", notRunning);
     return;
   }
-  const socket = resolve(dataDir, "gateway.sock");
-  let running = false;
+  const socket = resolve(socketDir, "gateway.sock");
+  let state: SocketProbeState = "closed";
   try {
-    running = (await lstat(socket)).isSocket() && await probe(socket);
+    if ((await lstat(socket)).isSocket()) {
+      const result = await probe(socket);
+      state = typeof result === "boolean" ? (result ? "listening" : "closed") : result;
+    }
   } catch {
-    running = false;
+    state = "closed";
   }
-  report.check(running ? "ok" : "warn", "gateway", running ? "running" : notRunning);
+  if (state === "listening") {
+    report.check("ok", "gateway", "listening on local socket");
+  } else if (state === "timeout") {
+    report.check("warn", "gateway", "local socket timed out (unresponsive listener)");
+  } else {
+    report.check("warn", "gateway", notRunning);
+  }
 }

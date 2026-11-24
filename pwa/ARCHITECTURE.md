@@ -134,8 +134,8 @@ this one (stay quiet while hidden), anything else is a network-class reconnect.
 
 ### Authentication
 
-- `pedellus app pair` prints a short-lived one-time code and a QR code in
-  the owner's terminal.
+- `pedellus app pair` prints a short-lived one-time 8-character code and its
+  expiry in the owner's terminal.
 - The app exchanges it for a long random device token. The gateway stores only
   a hash with a device label and can revoke by label.
 - The cookie's 400-day `Max-Age` is deliberate: iOS drops session cookies when a

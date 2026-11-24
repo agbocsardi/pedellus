@@ -11,15 +11,23 @@ SERVICE.md and APP.md as needed. Go step by step, explain briefly what each step
 does, and wait for me when a step needs my input.
 
 Hard rules, no exceptions:
-- Never ask me to paste an API key, bot token, OAuth code, push private key or
-  any other secret into this chat. When a secret is needed, tell me which command
-  to run in my own terminal or which file to edit myself.
-- Never write a secret value into ~/.pedellus/config.json or any file in this
-  repository. The config only holds environment-variable NAMES (credentials,
-  telegram.tokenEnv, discord.tokenEnv, web.search.keyEnv, app.push.privateKeyEnv).
-- Never read, print, copy or edit anything under ~/.pedellus/data/ (it holds the
-  private credential store and the database), and never read the service's
-  environment file (~/.pedellus/secrets.env). You may tell me how to create it.
+- Never ask me to paste an API key, bot token, OAuth code, push private key,
+  pairing code, shortcut token or any other secret into this chat. When a secret
+  is needed, tell me which command to run in my own terminal or which file to
+  edit myself.
+- Never run credential-producing commands on my behalf or capture their stdout
+  (`pedellus init`, `pedellus login`, `pedellus app pair`, `pedellus app push-keys`,
+  `pedellus app shortcut add`). Those belong strictly in my own terminal.
+- Never write a secret value into ~/.pedellus/config.json, any custom config
+  file, or any file in this repository. Config files only hold environment-variable
+  NAMES (credentials, telegram.tokenEnv, discord.tokenEnv, web.search.keyEnv,
+  app.push.privateKeyEnv).
+- Never read, print, copy or edit any configured data directory (for example
+  ~/.pedellus/data/), any systemd EnvironmentFile, or environment variable values.
+  You may tell me how to create an EnvironmentFile myself with chmod 600.
+- Never overwrite an existing config.json or existing workspace files without
+  asking me first. If writing a config manually, start with `toolAllowlist: []`
+  unless I explicitly opt in to workspace file tools or shell access.
 - Do not install a `nanobot` command or alias; the executable is `pedellus`.
 - Do not run `sudo`, enable services or change system settings without asking
   me first and showing the exact command.
@@ -39,14 +47,12 @@ Steps:
 3. Ask me which model provider I want (and whether I have an API key or a
    subscription with OAuth login), and which channels I want: CLI only,
    Telegram, Discord, and/or the installable web app (PWA) over Tailscale.
-4. Ask me to run `pedellus init` myself, in my own terminal, not through you.
-   It handles provider login (the key or OAuth sign-in goes into the private
-   store, not the config), the model preset, the starter workspace and an
-   optional one-minute setup interview. Wait until I say it finished. If `init`
-   is not available in this checkout, fall back to SETUP.md: copy
-   config.example.json to ~/.pedellus/config.json, adapt workspace, dataDir and
-   modelPresets with me, create the workspace files, and have me run
-   `pedellus login` myself.
+4. Check whether ~/.pedellus/config.json already exists. If it does, do not
+   overwrite it — ask whether I want to keep and extend it. Otherwise, ask me to
+   run `pedellus init` myself, in my own terminal, not through you. It handles
+   provider login, model presets, the starter workspace and an optional
+   one-minute setup interview (skippable with `--skip-interview`). Wait until I
+   say it finished.
 5. For each channel I chose, edit ~/.pedellus/config.json cleanly (valid JSON,
    no secrets, keep existing keys):
    - telegram: tokenEnv plus allowFrom with my numeric Telegram user ID as a
@@ -56,20 +62,21 @@ Steps:
    - app: run `npm run install:pwa && npm run build:pwa`, then set
      {"port": 43190, "staticRoot": "<absolute checkout path>/pwa/app/dist"}.
      Explain `tailscale serve --bg 43190` (on WSL2, run Tailscale on Windows,
-     not inside WSL as well), `pedellus app pair --label <name>`, and optional
-     `pedellus app push-keys`.
+     not inside WSL as well), and tell me to run `pedellus app pair` (on iOS,
+     Add to Home Screen and open the installed app *before* pairing) and
+     optional `pedellus app push-keys` myself in my own terminal.
    - media (attachments/voice) and web (Brave search + fetch): only if I want
      them; follow SETUP.md and WEB.md.
    Then tell me exactly which environment variables to set and where (export in
-   the gateway's terminal, or lines in ~/.pedellus/secrets.env with chmod 600
-   when using the service), without ever seeing the values.
+   the gateway's terminal, or lines in the systemd unit's `EnvironmentFile` with
+   chmod 600), without ever seeing the values.
 6. If I want it running in the background: copy systemd/pedellus.service to
    ~/.config/systemd/user/, replacing /usr/bin/node with the real output of
    `command -v node` and /opt/pedellus with this checkout's absolute path
    (`pwd`). On WSL2, check that systemd is enabled (/etc/wsl.conf
-   `[boot] systemd=true`) and remind me that WSL stops when Windows sleeps or
-   the last terminal closes. Show me the systemctl --user commands and let me
-   run them.
+   `[boot] systemd=true`) and remind me that Windows sleep makes the gateway
+   unreachable and closing the last terminal may stop the distro. Show me the
+   systemctl --user commands and let me run them.
 7. Verify: run `pedellus doctor` and fix what it reports. Then have me start
    `pedellus gateway` in one terminal and `pedellus agent` in another (or the
    service plus my chosen channel) and confirm a reply arrives. Use

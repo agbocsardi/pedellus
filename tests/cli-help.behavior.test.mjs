@@ -28,6 +28,7 @@ const PAGES = [
     /Usage: pedellus recovery \[--config <path>\] \[--cancel <taskId> --fingerprint <sha256>\]/,
     /--fingerprint <sha256>/,
   ],
+  ["doctor", /Usage: pedellus doctor \[--config <path>\]/, /Read-only/],
 ];
 
 const MALFORMED = [["help", "--config", absent], ["--config", absent, "help"]];

@@ -16,7 +16,7 @@ import {
   type RefreshOutcome,
 } from "./model-catalog.js";
 import { nativeProviderId } from "./providers.js";
-import { canonicalFuturePath, prepareDataDirectory } from "./store.js";
+import { prepareDataDirectory, validateDataDirectoryReadOnly } from "./store.js";
 
 export interface ModelsInvocation {
   readonly action: "refresh" | "list";
@@ -82,15 +82,15 @@ export async function runModelsCommand(
     writeProviderSummary(terminal);
     return { ok: true };
   }
-  const providers = invocation.providers.length > 0
-    ? [...new Set(invocation.providers.map(nativeProviderId))]
-    : configuredNativeProviders(config!);
-  if (providers.length === 0) {
-    terminal.output.write("No native providers to refresh; name one, for example `pedellus models refresh openai`.\n");
-    return { ok: true };
-  }
   if (invocation.action === "refresh") {
     const prepared = await prepareDataDirectory(config!);
+    const providers = invocation.providers.length > 0
+      ? [...new Set(invocation.providers.map(nativeProviderId))]
+      : configuredNativeProviders(config!);
+    if (providers.length === 0) {
+      terminal.output.write("No native providers to refresh; name one, for example `pedellus models refresh openai`.\n");
+      return { ok: true };
+    }
     const outcomes = await refreshModelCatalog(prepared.canonicalDataDir, providers, {
       ...terminal.refresh,
       ...(terminal.signal === undefined ? {} : { signal: terminal.signal }),
@@ -100,10 +100,17 @@ export async function runModelsCommand(
     const ok = outcomes.every((outcome) => !["failed", "rejected", "unknown-provider"].includes(outcome.status));
     return { ok };
   }
-  // Read-only: a missing data directory simply has no overlay; nothing is created or chmod-ed.
+  const providers = invocation.providers.length > 0
+    ? [...new Set(invocation.providers.map(nativeProviderId))]
+    : configuredNativeProviders(config!);
+  if (providers.length === 0) {
+    terminal.output.write("No native providers to refresh; name one, for example `pedellus models refresh openai`.\n");
+    return { ok: true };
+  }
+  // Read-only: validate dataDir disjointness without creating or chmod-ing directories.
   const loaded: LoadedCatalog = config === undefined
     ? { overlay: new Map() }
-    : await loadModelCatalog(await canonicalFuturePath(config.dataDir));
+    : await loadModelCatalog(await validateDataDirectoryReadOnly(config));
   if (loaded.issue !== undefined) terminal.output.write(`Model catalog file is ${loaded.issue}; showing the bundled catalog.\n`);
   const allowed = new Set((config === undefined ? [] : config.allowedModels ?? [config.model]).map((model) =>
     modelKey({ provider: nativeProviderId(model.provider), modelId: model.modelId })));

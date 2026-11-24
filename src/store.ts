@@ -59,6 +59,33 @@ export async function assertExistingDatabaseFileForRecovery(dbPath: string): Pro
 }
 
 /**
+ * Validate configured roots and dataDir disjointness without creating or modifying anything.
+ * Missing roots are still resolved via `canonicalFuturePath` so read-only commands like
+ * `models list` work before workspace creation while still failing closed on overlapping roots.
+ */
+export async function validateDataDirectoryReadOnly(config: PortConfig): Promise<string> {
+  const roots = await Promise.all([config.workspace, ...(config.extraAllowedDirs ?? [])].map(async (path) => {
+    const canonical = await canonicalFuturePath(path);
+    try {
+      if (!(await stat(canonical)).isDirectory()) throw new Error("configured root is not a directory");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    return canonical;
+  }));
+  const dataDir = await canonicalFuturePath(config.dataDir);
+  if (roots.some((root) => inside(dataDir, root) || inside(root, dataDir))) {
+    throw new Error("dataDir must be disjoint from workspace and extraAllowedDirs");
+  }
+  try {
+    if (!(await stat(dataDir)).isDirectory()) throw new Error("dataDir must be a directory");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  return dataDir;
+}
+
+/**
  * Canonicalize the configured workspace/data roots and the SQLite path. Both the
  * gateway and the owner-driven recovery path use this, so neither can open a
  * database that overlaps a writable host root or a symlinked database file.

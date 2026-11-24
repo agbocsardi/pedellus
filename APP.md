@@ -15,8 +15,9 @@ the operator console; `src/channels/app-files.ts` owns uploads, their durable re
 context and the download lookup; `src/channels/app-tool.ts` is the model-facing `app` file tool,
 whose live host the adapter attaches.
 
-Status: offline-verified only. No tailnet, `tailscale serve`, real device, installed PWA or live
-pairing has been exercised in this repository. The first deployment is a supervised trial.
+Status: supervised Linux deployment and iPhone/iPad pairing over `tailscale serve`
+succeeded; broader on-device streaming, Web Push delivery, kill/reopen replay and
+WSL2 deployment remain unverified.
 
 ## Configuration
 

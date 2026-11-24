@@ -11,10 +11,12 @@ workspace, and you talk to it from wherever is handy:
 - **Reminders and scheduled work** (cron), **background workers**, owner
   questions, file and voice-note attachments.
 - **Tools on your terms:** opt-in coding tools, MCP servers, Code Mode, Brave
-  web search and safe public fetch. The config file is the only authority; every
-  capability is off until you turn it on.
-- Survives restarts: accepted work, queued messages and the transcript live in a
-  local SQLite store and resume when the gateway comes back.
+  web search and safe public fetch. The config file is the only authority;
+  channels, tools and integrations stay off until you turn them on (closed-episode
+  summaries default on and can be disabled with `episodeSummary.enabled: false`).
+- Survives restarts: committed work, queued messages and the transcript live in
+  a local SQLite store and reopen when the gateway comes back (interrupted
+  in-flight model turns or tool calls are cancelled rather than replayed).
 
 **New here?** Start with **[Getting started](./GETTING_STARTED.md)** (Linux or
 Windows with WSL2, about five minutes to a first chat). Prefer to let a coding

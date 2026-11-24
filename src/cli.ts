@@ -133,7 +133,7 @@ function configPath(args: readonly string[], start: number): ConfigSource {
 }
 
 /**
- * `durable-nanobot --config <path>` remains the historical terminal launch. It now attaches
+ * `pedellus --config <path>` remains the historical terminal launch. It now attaches
  * to the running gateway instead of opening a second runtime; no gateway is started
  * implicitly. A subcommand without `--config` uses the fixed primary default; the
  * bare historical form still requires an explicit path.
@@ -267,7 +267,7 @@ function initInvocation(args: readonly string[]): InitInvocation | undefined {
   const rest = args.slice(1);
   for (let index = 0; index < rest.length;) {
     const argument = rest[index];
-    if (argument === "--config" && configPath === undefined && rest[index + 1]) {
+    if (argument === "--config" && configPath === undefined && rest[index + 1] && rest[index + 1] !== "--skip-interview") {
       configPath = rest[index + 1];
       index += 2;
     } else if (argument === "--skip-interview" && !skipInterview) {
@@ -680,7 +680,7 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
         port: config.app.port,
         staticRoot: config.app.staticRoot,
         autoArchiveDays: config.app.autoArchiveDays ?? 14,
-        agentName: config.app.agentName ?? "Durable",
+        agentName: config.app.agentName ?? "Pedellus",
         ...(push === undefined ? {} : { push }),
         followUpMode: config.followUpMode ?? "followUp",
         ...(config.media === undefined

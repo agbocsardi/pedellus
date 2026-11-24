@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
@@ -8,7 +8,8 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = fileURLToPath(new URL("../", import.meta.url));
 const ai = await import(join(repoRoot, "node_modules/@earendil-works/pi-ai/dist/index.js"));
-const { InitError, runInit } = await import(join(repoRoot, "dist/init/index.js"));
+const { InitError, parseProfile, runInit } = await import(join(repoRoot, "dist/init/index.js"));
+const { terminalInteraction } = await import(join(repoRoot, "dist/auth/cli.js"));
 const { loadConfig } = await import(join(repoRoot, "dist/config.js"));
 const { loadWorkspaceContextSnapshot } = await import(join(repoRoot, "dist/context/workspace.js"));
 const { createModels, fauxAssistantMessage, fauxProvider } = ai;
@@ -76,9 +77,12 @@ function syntheticModels(responses) {
 }
 
 const PROFILE = {
-  userMd: "# Owner\n\n- Name: Ada\n- Language: English\n",
-  soulMd: "# Pedellus\n\n- Crisp and warm.\n",
-  memoryMd: "# Memory\n\n- Prefers bullet points.\n",
+  ownerName: "Ada",
+  preferredLanguage: "English",
+  mainUses: ["daily planning", "coding notes"],
+  toneAndDetail: "Brief and crisp by default.",
+  soulBullets: ["Warm and crisp.", "Honest about uncertainty."],
+  standingPreferences: ["Prefers bullet points."],
 };
 
 /** Answers through the basics: login key, deep and fast defaults, time zone, name, file tools, no shell. */
@@ -153,6 +157,7 @@ test("--skip-interview scaffolds a loadable setup with first-chat onboarding", {
   }
   const onboarding = await readFile(join(config.workspace, "memory/system/onboarding.md"), "utf8");
   assert.match(onboarding, /USER\.md/);
+  assert.match(onboarding, /memory\/preferences\/standing\.md/);
   assert.match(onboarding, /empty content/);
   assert.match(sources(snapshot), /memory\/system\/onboarding\.md/, "the onboarding note reaches the first chat");
 
@@ -162,7 +167,7 @@ test("--skip-interview scaffolds a loadable setup with first-chat onboarding", {
   assert.doesNotMatch(sources(later), /onboarding\.md/);
 });
 
-test("the interview runs several turns and saves the personalized profile", { timeout: 30_000 }, async () => {
+test("the interview runs several turns and saves trusted rendered profile files", { timeout: 30_000 }, async () => {
   const configPath = await setupDirectory("interview");
   const seen = [];
   const models = syntheticModels([
@@ -181,19 +186,19 @@ test("the interview runs several turns and saves the personalized profile", { ti
   assert.equal(io.remaining(), 0);
   assert.equal(models.faux.state.callCount, 3);
   assert.match(JSON.stringify(seen.at(-1)), /Brief, please/, "each turn carries the conversation so far");
-  assert.match(io.transcript(), /Proposed files/);
-  assert.doesNotMatch(io.transcript(), /userMd/, "the raw profile block is not echoed");
+  assert.match(io.transcript(), /Proposed files \(full preview\)/);
+  assert.doesNotMatch(io.transcript(), /ownerName/, "raw JSON keys are not echoed");
 
   const { config, snapshot } = await assertConfigAndContext(configPath);
-  assert.equal(await readFile(join(config.workspace, "USER.md"), "utf8"), PROFILE.userMd);
-  assert.equal(await readFile(join(config.workspace, "SOUL.md"), "utf8"), PROFILE.soulMd);
-  assert.equal(await readFile(join(config.workspace, "memory/MEMORY.md"), "utf8"), PROFILE.memoryMd);
+  assert.match(await readFile(join(config.workspace, "USER.md"), "utf8"), /- Name: Ada/);
+  assert.match(await readFile(join(config.workspace, "SOUL.md"), "utf8"), /- Warm and crisp\./);
+  assert.match(await readFile(join(config.workspace, "memory/preferences/standing.md"), "utf8"), /- Prefers bullet points\./);
   await stat(join(config.workspace, "AGENTS.md"));
   await assert.rejects(stat(join(config.workspace, "memory/system/onboarding.md")), /ENOENT/);
   assert.doesNotMatch(sources(snapshot), /onboarding/);
 });
 
-test("a failed or skipped interview falls back to starter files and onboarding", { timeout: 30_000 }, async () => {
+test("a failed, skipped or adversarial interview falls back to starter files and onboarding", { timeout: 30_000 }, async () => {
   const failing = await setupDirectory("failing");
   const broken = syntheticModels([
     fauxAssistantMessage("", { stopReason: "error", errorMessage: "SYNTHETIC-PROVIDER-PAYLOAD upstream 500" }),
@@ -211,9 +216,13 @@ test("a failed or skipped interview falls back to starter files and onboarding",
   assert.equal(skipped.result.outcome, "onboarding");
   const skippedSetup = await assertConfigAndContext(skipping);
   await stat(join(skippedSetup.config.workspace, "memory/system/onboarding.md"));
+
+  // Profiles carrying terminal escapes or secrets are rejected by parseProfile.
+  assert.equal(parseProfile(`\`\`\`pedellus-profile\n${JSON.stringify({ ...PROFILE, ownerName: "\x1b[31mAda" })}\n\`\`\``), undefined);
+  assert.equal(parseProfile(`\`\`\`pedellus-profile\n${JSON.stringify({ ...PROFILE, standingPreferences: [SECRET] })}\n\`\`\``, [SECRET]), undefined);
 });
 
-test("an existing configuration is never overwritten", { timeout: 30_000 }, async () => {
+test("an existing configuration, symlinked root or existing data store is refused without mutation", { timeout: 30_000 }, async () => {
   const configPath = await setupDirectory("existing");
   await writeFile(configPath, "{\"owner\": true}\n");
   const models = syntheticModels([]);
@@ -224,6 +233,25 @@ test("an existing configuration is never overwritten", { timeout: 30_000 }, asyn
   );
   assert.equal(await readFile(configPath, "utf8"), "{\"owner\": true}\n");
   await assert.rejects(stat(join(home, "existing", "workspace")), /ENOENT/, "nothing is scaffolded");
+
+  // Symlinked target directory is refused.
+  const realTarget = join(home, "real-dir");
+  const linkedTarget = join(home, "linked-dir");
+  await mkdir(realTarget);
+  await symlink(realTarget, linkedTarget);
+  await assert.rejects(
+    runInit({ configPath: join(linkedTarget, "config.json"), input: io.input, output: io.output, repoRoot, platform: "linux", isWsl: false, models: models.factory }),
+    (error) => error instanceof InitError && /symlink/.test(error.message),
+  );
+
+  // Second config filename sharing an existing data/credentials.json is refused.
+  const sharedDir = join(home, "shared-root");
+  await mkdir(join(sharedDir, "data"), { recursive: true });
+  await writeFile(join(sharedDir, "data", "credentials.json"), "{\"version\":1,\"credentials\":{}}\n");
+  await assert.rejects(
+    runInit({ configPath: join(sharedDir, "second.json"), input: io.input, output: io.output, repoRoot, platform: "linux", isWsl: false, models: models.factory }),
+    (error) => error instanceof InitError && /already holds/.test(error.message),
+  );
 });
 
 test("a /mnt path on WSL warns and can be aborted with nothing written", { timeout: 30_000 }, async () => {
@@ -240,4 +268,43 @@ test("a /mnt path on WSL warns and can be aborted with nothing written", { timeo
   });
   assert.equal(result.outcome, "aborted");
   assert.match(io.transcript(), /DrvFs/);
+});
+
+test("terminalInteraction never retains secrets in TTY history and settles on EOF and Ctrl-C", { timeout: 10_000 }, async () => {
+  // TTY history check: pressing Up after a secret prompt must never reveal the secret.
+  const input = new PassThrough();
+  input.isTTY = true;
+  let captured = "";
+  const output = new Writable({ write(chunk, _enc, cb) { captured += chunk.toString(); cb(); } });
+  output.isTTY = true;
+  const tty = terminalInteraction({ input, output });
+  try {
+    const first = tty.interaction.prompt({ type: "secret", message: "API key" });
+    input.write(`${SECRET}\r`);
+    assert.equal(await first, SECRET);
+    const second = tty.interaction.prompt({ type: "text", message: "Name" });
+    // Send Up-arrow escape sequence, then Enter.
+    input.write("\x1b[A\r");
+    assert.equal(await second, "");
+    assert.doesNotMatch(captured, new RegExp(SECRET), "secret must never appear in TTY output or history");
+
+    // Raw-TTY Ctrl-C settles the pending prompt instead of hanging.
+    const third = tty.interaction.prompt({ type: "text", message: "Cancelled" });
+    input.write("\x03");
+    await assert.rejects(third, /cancelled|closed/i);
+  } finally {
+    tty.close();
+  }
+
+  // Piped EOF settles pending prompt cleanly.
+  const piped = new PassThrough();
+  const sink = new Writable({ write(_chunk, _enc, cb) { cb(); } });
+  const nonTty = terminalInteraction({ input: piped, output: sink });
+  try {
+    const pending = nonTty.interaction.prompt({ type: "text", message: "EOF test" });
+    piped.end();
+    await assert.rejects(pending, /closed/);
+  } finally {
+    nonTty.close();
+  }
 });

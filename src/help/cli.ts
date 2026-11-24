@@ -1,5 +1,5 @@
 /**
- * Declarative process-level help for the `durable-nanobot` command line.
+ * Declarative process-level help for the `pedellus` command line.
  *
  * Everything here is plain text: rendering a page reads no configuration, opens no
  * socket and starts no runtime, so `--help` works in a checkout with no setup.
@@ -14,7 +14,7 @@ export interface HelpOption {
 
 export interface CommandHelp {
   readonly name: string;
-  /** The exact `durable-nanobot <name> ...` invocation line, without the `Usage: ` prefix. */
+  /** The exact `pedellus <name> ...` invocation line, without the `Usage: ` prefix. */
   readonly synopsis: string;
   readonly summary: string;
   readonly options: readonly HelpOption[];
@@ -116,7 +116,7 @@ export const COMMANDS: readonly CommandHelp[] = [
     details: [
       "refresh is the only catalog network path; list is offline. Neither grants a model: edit allowedModels.",
       "A refreshed catalog applies at gateway restart or the next /reload that changes model config.",
-      "Without a configuration file, list shows the bundled catalog and creates nothing.",
+      "When no --config is given and the default config is missing, list shows the bundled catalog and creates nothing.",
     ],
     examples: ["pedellus models refresh", "pedellus models list openai-codex"],
   },

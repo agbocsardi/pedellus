@@ -46,12 +46,47 @@ export function terminalInteraction(options: AuthTerminalOptions): {
   interaction: AuthInteraction;
   close: () => void;
 } {
+  const isTerminal = Boolean((options.input as NodeJS.ReadStream).isTTY && (options.output as NodeJS.WriteStream).isTTY);
   const readline: ReadlineInterface = createInterface({
     input: options.input,
     output: options.output,
-    terminal: Boolean((options.input as NodeJS.ReadStream).isTTY && (options.output as NodeJS.WriteStream).isTTY),
+    terminal: isTerminal,
+    // Never retain prompt answers (especially secrets) in readline history.
+    historySize: 0,
   });
   const signal = options.signal;
+  // Buffer lines for non-TTY piped inputs so multi-line chunks are never dropped between prompts.
+  const bufferedLines: string[] = [];
+  let pendingLine: ((line: string) => void) | undefined;
+  let closedError: Error | undefined;
+  const abortWaiters = new Set<(error: Error) => void>();
+
+  const failWaiters = (error: Error): void => {
+    if (closedError === undefined) closedError = error;
+    pendingLine = undefined;
+    for (const waiter of [...abortWaiters]) waiter(error);
+    abortWaiters.clear();
+  };
+
+  if (!isTerminal) {
+    readline.on("line", (line) => {
+      if (pendingLine !== undefined) {
+        const resolveLine = pendingLine;
+        pendingLine = undefined;
+        resolveLine(line);
+      } else {
+        bufferedLines.push(line);
+      }
+    });
+  }
+  readline.on("SIGINT", () => {
+    const error = new DOMException("input cancelled", "AbortError");
+    failWaiters(error);
+    readline.close();
+  });
+  readline.on("close", () => {
+    failWaiters(new Error("input closed"));
+  });
 
   const question = (query: string, secret: boolean, promptSignal?: AbortSignal): Promise<string> => new Promise((resolve, reject) => {
     const active = promptSignal === undefined
@@ -63,22 +98,59 @@ export function terminalInteraction(options: AuthTerminalOptions): {
       reject(active.reason);
       return;
     }
+    if (!isTerminal && bufferedLines.length > 0) {
+      options.output.write(query);
+      resolve(bufferedLines.shift()!);
+      return;
+    }
+    if (closedError !== undefined) {
+      reject(closedError);
+      return;
+    }
     let settled = false;
-    const onAbort = () => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      restoreEcho();
-      reject(active?.reason);
-    };
-    const cleanup = () => active?.removeEventListener("abort", onAbort);
-    active?.addEventListener("abort", onAbort, { once: true });
-    const hidden = readline as ReadlineInterface & { _writeToOutput?: (text: string) => void };
+    const hidden = readline as ReadlineInterface & { _writeToOutput?: (text: string) => void; history?: string[] };
     const originalWrite = hidden._writeToOutput;
     const restoreEcho = () => {
       if (originalWrite === undefined) delete hidden._writeToOutput;
       else hidden._writeToOutput = originalWrite;
+      if (Array.isArray(hidden.history) && hidden.history.length > 0) hidden.history.length = 0;
     };
+    const cleanup = () => {
+      active?.removeEventListener("abort", onAbort);
+      abortWaiters.delete(onClosed);
+    };
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      pendingLine = undefined;
+      cleanup();
+      restoreEcho();
+      reject(active?.reason);
+    };
+    const onClosed = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      pendingLine = undefined;
+      cleanup();
+      if (secret && readline.terminal) options.output.write("\n");
+      restoreEcho();
+      reject(error);
+    };
+    active?.addEventListener("abort", onAbort, { once: true });
+    abortWaiters.add(onClosed);
+
+    if (!isTerminal) {
+      options.output.write(query);
+      pendingLine = (answer) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        restoreEcho();
+        resolve(answer);
+      };
+      return;
+    }
+
     if (secret && readline.terminal) {
       hidden._writeToOutput = (text: string) => {
         if (text === query) originalWrite?.call(readline, text);

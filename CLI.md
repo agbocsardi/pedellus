@@ -52,14 +52,16 @@ pedellus init --config /path/to/config.json --skip-interview
    context, cron, episode summaries and digest — no secrets and no `credentials`
    references — plus starter `AGENTS.md`, `SOUL.md`, `USER.md`, `memory/MEMORY.md`;
 5. offers a short terminal interview (at most 8 replies; `/done` wraps up, `/skip`
-   defers) with the `deep` model. Its fenced `pedellus-profile` JSON replaces the
-   starter `USER.md`/`SOUL.md`/`memory/MEMORY.md` this run created, after you confirm.
-   Existing files are never replaced.
+   defers) with the `deep` model. Its fenced `pedellus-profile` JSON holds bounded
+   structured fields rendered into trusted templates for `USER.md`, `SOUL.md` and
+   `memory/preferences/standing.md`, shown in full before you confirm. Existing or
+   intervening owner files are never replaced.
 
 When the interview is skipped, declined, cancelled or fails, `init` writes
 `memory/system/onboarding.md` instead: the first chat on any surface greets you, asks a
-few questions, updates those files and empties the note, so later sessions no longer
-load it. Model errors are reported without provider payloads.
+few questions, updates `USER.md`, `SOUL.md` and `memory/preferences/standing.md` with
+your confirmation and empties the note, so later sessions no longer load it. Model
+errors are reported without provider payloads.
 
 ## Help
 
