@@ -207,6 +207,8 @@ export function failureKind(code: string | undefined): FsFailureKind {
     case "ENOTDIR":
       return "not-directory";
     case "EISDIR":
+    // `O_NONBLOCK` opens of a Unix socket fail with ENXIO: it is a special file, not a read failure.
+    case "ENXIO":
       return "not-regular";
     default:
       return "io";
@@ -292,8 +294,14 @@ export async function openAbsoluteDirectoryNoFollow(
       } catch (error) {
         throw onError(error);
       }
-      await current.close();
+      const previous = current;
+      // Own the new descriptor first, so a failed close of the previous one cannot leak it.
       current = next;
+      try {
+        await previous.close();
+      } catch (error) {
+        throw onError(error);
+      }
     }
     return current;
   } catch (error) {
@@ -384,9 +392,10 @@ export async function openPinnedDirectories(
   try {
     for (const segment of segments) {
       const next = await openPinned(parent, segment, DIRECTORY_FLAGS, source, fail);
-      if (current !== null) await current.close().catch(() => undefined);
+      const previous = current;
       current = next;
       parent = next;
+      if (previous !== null) await previous.close().catch(() => undefined);
     }
     if (current === null) throw fail("not-directory", source);
     return current;

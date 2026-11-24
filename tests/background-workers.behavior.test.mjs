@@ -39,6 +39,7 @@ const [
   { AgentDoc, InboxDoc },
   { ConfigToolCaptureDoc },
   { CODEMODE_TOOL_NAME },
+  { waitForTurnAnswer },
 ] = await Promise.all([
   import(new URL('../dist/config.js', import.meta.url).href),
   import(new URL('../dist/runtime.js', import.meta.url).href),
@@ -49,6 +50,7 @@ const [
   import(`${modules}/pi-durable/dist/index.js`),
   import(new URL('../dist/tools/index.js', import.meta.url).href),
   import(new URL('../dist/extensions/codemode.js', import.meta.url).href),
+  import(new URL('../dist/tasks/background.js', import.meta.url).href),
 ]);
 
 const context = BACKGROUND_CONTEXT;
@@ -1021,6 +1023,127 @@ test('a foreign input holding the result request ID never marks the worker notif
     await reopened.gateway.close(context);
     await rm(fixture.directory, { recursive: true, force: true });
   }
+});
+
+test('a queued result withdrawn by Stop stays unnotified and is redelivered once on reopen', { timeout: 40_000 }, async () => {
+  const fixture = await fixtureWorkspace();
+  const releaseWorker = deferred();
+  const releaseParent = deferred();
+  const busyStarted = deferred();
+  const dispatcher = async (transcript) => {
+    const input = lastUserText(transcript.messages);
+    if (input.includes('Background worker task.')) {
+      await releaseWorker.promise;
+      return fauxAssistantMessage('WITHDRAWN-RESULT');
+    }
+    if (input.includes('[internal worker result]')) return fauxAssistantMessage('noted');
+    if (input === 'busy') {
+      busyStarted.resolve();
+      await releaseParent.promise;
+      return fauxAssistantMessage('busy done');
+    }
+    if (input === 'spawn one' && !dispatcher.issued) {
+      dispatcher.issued = true;
+      return fauxAssistantMessage([
+        fauxToolCall(WORKER_TOOL_NAME, { action: 'start', task: 'withdraw me', workspace_mode: 'shared' }, { id: 'withdraw-start' }),
+      ], { stopReason: 'toolUse' });
+    }
+    return fauxAssistantMessage('ok');
+  };
+  const recordOf = async (harness, conversationId) =>
+    (await harness.snapshot(WorkerRecordsDoc, conversationId, context))?.workers[0];
+  const submissionOf = (harness, conversationId, requestId) =>
+    harness.commit((tx) => tx.submissionByRequest(conversationId, requestId), context);
+  const store = await syntheticStore(fixture, dispatcher);
+  let conversationId;
+  let taskId;
+  try {
+    const conversation = await store.gateway.conversationFor(ORIGIN, context);
+    conversationId = conversation.id;
+    const spawn = await conversation.submit({ type: 'input', content: 'spawn one', requestId: 'spawn' }, context);
+    assert.equal((await spawn.wait(context)).status, 'done');
+    taskId = (await recordOf(store.gateway.harness, conversationId)).taskId;
+    // Keep the parent busy so the result event queues behind its run.
+    await conversation.submit({ type: 'input', content: 'busy', requestId: 'busy' }, context);
+    await within(busyStarted.promise, WAIT_MS, 'the busy parent run');
+    releaseWorker.resolve();
+    await waitFor(async () => (await recordOf(store.gateway.harness, conversationId))?.resultSubmissionId !== undefined,
+      'the queued result confirmed as ours');
+    const queued = await recordOf(store.gateway.harness, conversationId);
+    assert.equal(queued.status, 'completed');
+    assert.equal(queued.notified, false, 'a queued result is not delivered yet');
+    assert.equal((await submissionOf(store.gateway.harness, conversationId, workerResultRequestId(taskId))).status, 'queued');
+    // Owner Stop: withdraws queued inputs, including the result event.
+    const stopping = conversation.abort(context);
+    releaseParent.resolve();
+    await stopping;
+    await waitFor(async () =>
+      (await submissionOf(store.gateway.harness, conversationId, workerResultRequestId(taskId)))?.status === 'unanswered',
+    'the Stop withdrawal');
+    const withdrawn = await recordOf(store.gateway.harness, conversationId);
+    assert.equal(withdrawn.notified, false, 'a withdrawn result must not count as delivered');
+    const entries = (await conversation.entries({ order: 'ascending' }, 200, undefined, context)).items;
+    assert.equal(entries.filter((entry) => entry.kind === WORKER_RESULT_ENTRY_KIND).length, 0,
+      'nothing is redelivered live right after the Stop');
+  } finally {
+    releaseWorker.resolve();
+    releaseParent.resolve();
+    await store.gateway.close(context);
+  }
+  for (let round = 0; round < 2; round += 1) {
+    const reopened = await syntheticStore(fixture, dispatcher);
+    try {
+      await waitFor(async () => (await recordOf(reopened.gateway.harness, conversationId))?.notified === true,
+        'the redelivered result');
+      const conversation = await reopened.gateway.harness.conversation(conversationId, context);
+      const entries = (await conversation.entries({ order: 'ascending' }, 200, undefined, context)).items;
+      const results = entries.filter((entry) => entry.kind === WORKER_RESULT_ENTRY_KIND);
+      assert.equal(results.length, 1, `exactly one delivered result after reopen ${round + 1}`);
+      assert.equal(results[0].data.taskId, taskId);
+      const redelivery = await submissionOf(reopened.gateway.harness, conversationId, workerResultRequestId(taskId, 1));
+      assert.equal(redelivery?.entry, results[0].id);
+    } finally {
+      await reopened.gateway.close(context);
+    }
+  }
+  await rm(fixture.directory, { recursive: true, force: true });
+});
+
+test('a turn wait reconciles a withdrawal that lost the race to placement or an answer', async () => {
+  const fakeSubmission = ({ statuses, abort, settleOnWait }) => {
+    let reads = 0;
+    let waits = 0;
+    return {
+      aborts: 0,
+      wait() {
+        waits += 1;
+        return settleOnWait !== undefined && waits > 1 ? Promise.resolve(settleOnWait) : new Promise(() => {});
+      },
+      async status() { return statuses[Math.min(reads++, statuses.length - 1)]; },
+      async abort() { this.aborts += 1; return abort; },
+    };
+  };
+  const idle = { waitForIdle: async () => {} };
+  const queued = { type: 'input', id: 1, status: 'queued' };
+  const placed = { type: 'input', id: 1, status: 'placed', entry: 5 };
+  const done = { type: 'input', id: 1, status: 'done', entry: 5, answer: 6 };
+
+  // Answered between the status read and the abort: the fresh settlement wins.
+  const answered = fakeSubmission({ statuses: [queued, done], abort: 'settled' });
+  assert.deepEqual(await waitForTurnAnswer(answered, idle, context), { kind: 'settled', record: done });
+
+  // Placed by a successor run first: wait for that run instead of reporting it unanswered.
+  const raced = fakeSubmission({ statuses: [queued, placed], abort: 'already_placed', settleOnWait: done });
+  assert.deepEqual(await waitForTurnAnswer(raced, idle, context), { kind: 'settled', record: done });
+
+  // A confirmed withdrawal is the only `ended` outcome for a queued input.
+  const withdrawn = fakeSubmission({ statuses: [queued], abort: 'aborted' });
+  assert.deepEqual(await waitForTurnAnswer(withdrawn, idle, context), { kind: 'ended', record: queued });
+
+  // A placed input that never settles is bounded, not waited on forever.
+  const stuck = fakeSubmission({ statuses: [placed], abort: 'already_placed' });
+  assert.equal((await waitForTurnAnswer(stuck, idle, context)).kind, 'ended');
+  assert.equal(stuck.aborts, 0, 'a placed input is never aborted');
 });
 
 test('the active-worker bound refuses an extra start instead of queueing it', { timeout: 25_000 }, async () => {

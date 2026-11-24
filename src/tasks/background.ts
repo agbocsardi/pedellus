@@ -61,43 +61,64 @@ export const terminalFailed = <S, R>(result: R, message: string): NextTaskState<
 /* ------------------------------------------------------------------------ */
 
 /**
- * `settled`: the submission reached `done` or `unanswered`. `ended`: the target went idle while the
- * submission was still `queued` or `placed`; a queued input has been withdrawn so a later turn
- * cannot answer it after the caller records a failure.
+ * `settled`: the submission reached `done` or `unanswered`. `ended`: the target went idle and the
+ * submission was withdrawn while still queued (its record is the queued state that was withdrawn),
+ * or it stayed unsettled across the bounded re-waits below.
  */
 export type TurnWait =
   | { readonly kind: "settled"; readonly record: SubmissionRecord }
   | { readonly kind: "ended"; readonly record: SubmissionRecord };
 
+/** Idle observations tolerated while a newly placed submission is still being answered. */
+const TURN_WAIT_ROUNDS = 4;
+
+const isSettled = (record: SubmissionRecord): boolean => record.status === "done" || record.status === "unanswered";
+
 /**
  * Wait for a submitted turn, but also notice a run that ended without answering it. Durable's
  * default `afterFailedRun: "keep"` leaves the input queued, so waiting only on `submission.wait()`
- * would never finish. Once the target is idle, a still-queued input has no run left to answer it.
+ * would never finish. Once the target is idle, a still-queued input has no run left to answer it
+ * and is withdrawn.
+ *
+ * Idle and the status read are not atomic with the withdrawal: a successor run may place (and even
+ * answer) the input in between. The abort result is therefore authoritative, and any state other
+ * than a confirmed withdrawal is re-read fresh: `settled` returns that settlement, and a placed
+ * input is waited for again instead of being reported as unanswered.
  */
 export async function waitForTurnAnswer(
   submission: Submission,
   conversation: Pick<ConversationHandle, "waitForIdle">,
   context: Context,
 ): Promise<TurnWait> {
-  const settled = submission.wait(context).then(
-    (record) => ({ kind: "settled" as const, record: record as SubmissionRecord }),
-    (error: unknown) => ({ kind: "failed" as const, error }),
-  );
-  const idle = conversation.waitForIdle(context).then(
-    () => ({ kind: "idle" as const }),
-    (error: unknown) => ({ kind: "failed" as const, error }),
-  );
-  // A losing side may reject later; it must not become an unhandled rejection.
-  void settled.catch(() => undefined);
-  void idle.catch(() => undefined);
-  const first = await Promise.race([settled, idle]);
-  if (first.kind === "failed") throw first.error;
-  if (first.kind === "settled") return first;
-  const record = await submission.status(context);
-  if (record.status === "done" || record.status === "unanswered") return { kind: "settled", record };
-  // `abort()` withdraws only a queued input; a placed one reports `already_placed`.
-  try { await submission.abort(context); } catch { /* already placed or settled */ }
-  return { kind: "ended", record };
+  let record: SubmissionRecord | undefined;
+  for (let round = 0; round < TURN_WAIT_ROUNDS; round += 1) {
+    const settled = submission.wait(context).then(
+      (value) => ({ kind: "settled" as const, record: value as SubmissionRecord }),
+      (error: unknown) => ({ kind: "failed" as const, error }),
+    );
+    const idle = conversation.waitForIdle(context).then(
+      () => ({ kind: "idle" as const }),
+      (error: unknown) => ({ kind: "failed" as const, error }),
+    );
+    // A losing side may reject later; it must not become an unhandled rejection.
+    void settled.catch(() => undefined);
+    void idle.catch(() => undefined);
+    const first = await Promise.race([settled, idle]);
+    if (first.kind === "failed") throw first.error;
+    if (first.kind === "settled") return first;
+    record = await submission.status(context);
+    if (isSettled(record)) return { kind: "settled", record };
+    if (record.status === "queued") {
+      let outcome: Awaited<ReturnType<Submission["abort"]>> | undefined;
+      try { outcome = await submission.abort(context); } catch { outcome = undefined; }
+      if (outcome === "aborted") return { kind: "ended", record };
+      // Placed or settled since the read (or the abort failed): trust only a fresh record.
+      record = await submission.status(context);
+      if (isSettled(record)) return { kind: "settled", record };
+    }
+    // Placed by a successor run: wait for that run to answer it.
+  }
+  return { kind: "ended", record: record ?? await submission.status(context) };
 }
 
 /** The visible text of an entry's first model message (an assistant answer), joined without separators. */
@@ -211,27 +232,19 @@ export async function resultEntryMatches(
 }
 
 /**
- * Inside one commit: whether the submission under `requestId` carries this task's internal result,
- * either placed as its entry or, when `acceptQueued`, still waiting in the conversation's inbox with
- * exactly that entry. A foreign input under the same request ID never matches.
+ * Inside one commit: whether queued submission `id` waits in the conversation's inbox with exactly
+ * this task's internal result entry. A queued input is not yet in the transcript; this only proves
+ * the queued submission is ours, never that the result was delivered.
  */
-export async function submissionCarriesResult(
+export async function queuedResultMatches(
   tx: Tx,
   conversationId: ConversationId,
-  requestId: string,
+  id: SubmissionRecord["id"],
   expected: InternalResultIdentity,
-  options: { readonly acceptQueued: boolean },
 ): Promise<boolean> {
-  const record = await tx.submissionByRequest(conversationId, requestId);
-  if (record === undefined || record.type !== "input") return false;
-  if (record.status === "queued") {
-    if (!options.acceptQueued) return false;
-    const inbox = await tx.doc(InboxDoc, conversationId);
-    const item = inbox.items.find((candidate) => candidate.id === record.id);
-    if (item === undefined || item.mode === "write") return false;
-    const entry = item.entry as unknown;
-    return isRecord(entry) && entry.kind === expected.kind && isRecord(entry.data) && entry.data.taskId === expected.taskId;
-  }
-  const entryId = placedEntryOf(record);
-  return entryId !== undefined && isInternalResultEntry(await tx.entry(entryId), conversationId, expected);
+  const inbox = await tx.doc(InboxDoc, conversationId);
+  const item = inbox.items.find((candidate) => candidate.id === id);
+  if (item === undefined || item.mode === "write") return false;
+  const entry = item.entry as unknown;
+  return isRecord(entry) && entry.kind === expected.kind && isRecord(entry.data) && entry.data.taskId === expected.taskId;
 }

@@ -9,7 +9,6 @@ import {
   FILE_FLAGS,
   LINE_SEPARATORS,
   RESTRICTED_ROOTS,
-  frontmatterField,
   isWithin,
   openAbsoluteDirectoryNoFollow,
   pinnedChildPath as childPath,
@@ -49,7 +48,9 @@ async function beneath(root: string, relative: string): Promise<FileHandle> {
   try {
     for (const part of relative.split("/").filter(Boolean)) {
       const next = await open(childPath(handle, part), DIRECTORY_FLAGS);
-      await handle.close(); handle = next;
+      // Own the new descriptor before closing the previous one, so a failed close cannot leak it.
+      const previous = handle; handle = next;
+      await previous.close();
     }
     return handle;
   } catch (error) { await handle.close().catch(() => undefined); throw error; }
@@ -134,8 +135,10 @@ async function readNote(root: string, path: string, options: { expectedIdentity?
       if (firstLine) { firstLine = false; if (value === "---") { inHeader = true; return; } }
       if (inHeader) {
         if (value.startsWith("---")) { inHeader = false; if (headerDescription) { descriptionValue = headerDescription; metadataDone = true; } return; }
-        const field = frontmatterField(value);
-        if (field !== undefined && field.key.toLowerCase() === "description") headerDescription = unquoteFrontmatter(field.value);
+        // Deliberately the original pattern: `.` stops at embedded U+2028/U+2029, so such a line is
+        // not a description and the first heading is used instead.
+        const match = /^\s*description\s*:\s*(.*)$/i.exec(value);
+        if (match) headerDescription = unquoteFrontmatter(match[1]!.trim());
         if (!firstHeading && value.trim().startsWith("#")) firstHeading = value.trim().replace(/^#+/, "").trim();
       } else if (value.trim().startsWith("#")) { descriptionValue = value.trim().replace(/^#+/, "").trim(); metadataDone = true; }
     };

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { link, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -9,6 +10,8 @@ import {
   validateMemoryTopicPath,
 } from "../dist/context/memory.js";
 import { SkillsContextInputError, loadSkillsContext } from "../dist/context/skills.js";
+import { MemoryContextFileError } from "../dist/context/memory.js";
+import { createNotesBackend } from "../dist/memory/notes.js";
 
 async function tempRoot(t) {
   const root = await mkdtemp(join(tmpdir(), "nanobot-context-sizes-"));
@@ -197,4 +200,52 @@ test("pinned skill and memory reads skip links and hard-link aliases visibly", a
   const memory = await loadMemoryContext({ workspaceRoot: root });
   assert.deepEqual(memory.entries.map((entry) => entry.path), ["memory/kept.md"]);
   assert.match(memory.manifest, /1 memory files skipped/);
+});
+
+async function listenSocket(t, path) {
+  const server = createServer();
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(path, resolve);
+  });
+  t.after(() => new Promise((resolve) => server.close(() => resolve())));
+}
+
+test("a Unix socket is a non-regular entry: skipped as a skill, rejected as a loaded memory file", async (t) => {
+  const root = await tempRoot(t);
+  await writeFiles(root, { "skills/plain/SKILL.md": "---\ndescription: plain\n---\nbody" });
+  await mkdir(join(root, "skills", "sock"));
+  await listenSocket(t, join(root, "skills", "sock", "SKILL.md"));
+  await mkdir(join(root, "memory"));
+  await listenSocket(t, join(root, "memory", "socket.md"));
+
+  const skills = await loadSkillsContext({ workspaceRoot: root });
+  assert.deepEqual(skills.discovered.map((skill) => skill.name), ["plain"]);
+  assert.deepEqual(skills.skipped, []);
+
+  await assert.rejects(
+    loadMemoryContext({ workspaceRoot: root, loadedFiles: ["memory/socket.md"] }),
+    (error) => error instanceof MemoryContextFileError && error.kind === "not-regular" && error.source === "memory/socket.md",
+  );
+  // As a discovered topic it is not a regular file entry and never blocks the manifest.
+  const memory = await loadMemoryContext({ workspaceRoot: root });
+  assert.deepEqual(memory.entries, []);
+});
+
+test("a notes description line with an embedded line separator keeps the heading fallback", async (t) => {
+  const root = await tempRoot(t);
+  await writeFiles(root, {
+    "memory/separated.md": "---\ndescription: first\u2028second\n---\n# Heading Fallback\nbody",
+    "memory/plain.md": "---\ndescription: 'Quoted plain'\n---\nbody",
+  });
+  const backend = createNotesBackend();
+  t.after(() => backend.close());
+  const page = await backend.browse(
+    { target: "notes", limit: 10 },
+    { storeId: "synthetic", workspaceRoot: root, memoryFiles: [], sessions: [] },
+  );
+  assert.deepEqual(
+    page.hits.map((hit) => [hit.source.path, hit.excerpt]),
+    [["memory/plain.md", "Quoted plain"], ["memory/separated.md", "Heading Fallback"]],
+  );
 });
