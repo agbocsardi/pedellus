@@ -39,6 +39,7 @@ import { createRestartCoordinator, replaceProcess, restartPlan, restartSupported
 import { runTerminalConversation } from "./terminal/index.js";
 import { ownerDisplay } from "./terminal/display.js";
 import { openGateway } from "./runtime.js";
+import { disarmInvalidSleepingCronTimers } from "./automation/cron.js";
 import { prepareDataDirectory, validateDataDirectoryReadOnly } from "./store.js";
 import { StartupDiagnosticError, startupDiagnostic } from "./startup-diagnostics.js";
 import { reportFailure, type FailureStage } from "./failure-diagnostics.js";
@@ -584,6 +585,11 @@ async function runGateway(config: LoadedConfig): Promise<void> {
         // model, chat message or tool can name a path for a reload.
         ...(config.configFile === undefined ? {} : { reloadConfig: () => loadConfig(config.configFile!) }),
       }));
+    // Legacy recovery before serving: disarm cron timers an older build left sleeping on a
+    // deadline no clock can reach. The sweep uses the public task APIs, touches exactly those
+    // timers, and settles them through their own abort handler without arming an occurrence;
+    // it is best-effort and never blocks or fails startup.
+    await disarmInvalidSleepingCronTimers(gateway.harness, context);
     stage = "gateway.local";
     // The gateway owns local attachments too: the CLI only names an operator path. CLI
     // originals live in a code-owned child of the validated operator media root, so a

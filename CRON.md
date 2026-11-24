@@ -490,8 +490,15 @@ fabricated into a valid schedule: its next time projects as "none" and its sched
 `once at an unrepresentable time` (or `every Ns from an unrepresentable time`), while the job
 itself stays inspectable and cancellable. A legacy timer task whose persisted input names such a
 deadline settles as failed with fixed text the moment Durable runs its phase — it never reaches
-the sleep, arms no occurrence and leaves the job cancellable; a sleep beyond the bound written by
-an older build can never come due, so it stays equally inert. Arithmetic overflow while following
+the sleep, arms no occurrence and leaves the job cancellable. A sleep beyond the bound written by
+an older build can never come due, so it is inert — its residual is a clamped native wakeup
+reference that fires and re-arms without dispatching anything, never an executed occurrence — and
+it remains cancellable through the abort path. Because such a restored sleep would otherwise sit
+on that residual forever, the gateway start (`runGateway`) runs one recovery sweep
+(`disarmInvalidSleepingCronTimers`) over the public task APIs: it scans sleeping cron timers,
+disarms exactly those whose persisted deadline is out of range through the task's own abort
+handler, and touches nothing else; valid timers, job records and owner cancellation are
+unaffected, and a sweep failure never blocks startup. Arithmetic overflow while following
 an interval is the absence of a next slot, never a failure of the occurrence that is due right
 now: the timer admits that occurrence exactly once and the job simply stops re-arming, instead of
 the overflow discarding the whole terminal commit.

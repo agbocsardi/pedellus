@@ -4,6 +4,7 @@ import { AssistantEntry, ConversationBusy, InboxDoc, LiveDoc, ResetEntry, define
 import type {
   ConversationHandle,
   ConversationId,
+  Cursor,
   EntryId,
   Extension,
   Harness,
@@ -13,6 +14,7 @@ import type {
   Task,
   TaskId,
   TaskInspection,
+  TaskRecord,
   TaskRuntime,
   Tx,
 } from "@earendil-works/pi-durable";
@@ -1741,4 +1743,55 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
       return viewsOf(harness, conversationId, actor, context);
     },
   };
+}
+
+/**
+ * Recovery sweep for legacy damage, run once by the host that owns the process before it serves
+ * anything: a timer task persisted by an older build can sleep on a deadline beyond the shared
+ * renderable bound. Durable restores such a sleep at open and keeps it in the host's wake state
+ * with a clamped native wakeup reference, and because the deadline can never come due, nothing
+ * ever runs the phase that would settle it. The sweep disarms exactly those timers through the
+ * supported abort path: `abortTask` makes a sleeping task runnable regardless of its deadline,
+ * and the timer's own abort handler settles it "cancelled" without arming an occurrence, so the
+ * restored sleep and its native wakeup reference are gone before the gateway serves. Valid
+ * timers are untouched (the filter is exact), job records are not mutated, and owner inspection
+ * and cancellation keep working through the ordinary paths. The residual without this sweep is
+ * only an inert sleep plus its clamped native wakeup, never an executed occurrence: the due check
+ * holds forever for an out-of-range deadline, and the fire-phase guard settles the task if it is
+ * ever run anyway.
+ */
+export async function disarmInvalidSleepingCronTimers(
+  harness: Pick<Harness, "commit" | "abortTask" | "waitForTask">,
+  context: Context,
+): Promise<number> {
+  const invalid: TaskRecord<JsonValue, JsonValue, JsonValue>[] = [];
+  let cursor: Cursor | undefined;
+  do {
+    const page = await harness.commit(
+      (tx) => tx.scanTasks({ kind: CRON_TIMER_TASK_NAME, status: "sleeping" }, 1_000, cursor),
+      context,
+    );
+    for (const record of page.items) {
+      const input = parseOccurrenceInput(record.input);
+      if (input !== undefined && (input.scheduledAtMs < 0 || input.scheduledAtMs > MAX_DATE_MS)) {
+        invalid.push(record);
+      }
+    }
+    cursor = page.next;
+  } while (cursor !== undefined);
+  let disarmed = 0;
+  for (const record of invalid) {
+    try {
+      // The abort mark makes the sleep runnable immediately; waiting keeps the recovery complete
+      // before the caller starts serving.
+      if (await harness.abortTask(record.id as TaskId<CronTimerResult>, context) === "marked") {
+        await harness.waitForTask(record.id as TaskId<CronTimerResult>, context);
+      }
+      disarmed += 1;
+    } catch {
+      // A record too damaged for the abort path keeps its inert sleep; the fire-phase guard still
+      // settles it if anything ever runs it. Recovery is best-effort and never blocks startup.
+    }
+  }
+  return disarmed;
 }
