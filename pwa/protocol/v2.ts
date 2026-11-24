@@ -51,9 +51,20 @@ export const LIMITS = {
   /** Activity: tool steps kept per turn, tool name length. */
   maxActivitySteps: 50,
   activityToolChars: 64,
+  activityStepIdChars: 64,
   taskTitleChars: 120,
   taskDetailChars: 200,
+  /** `TaskInfo.id` and `task.cancel.task`: one namespaced id (`w:` worker, `c:` scheduled job). */
+  taskIdPattern: /^[wc]:[A-Za-z0-9_-]{1,80}$/,
   uploadIdPattern: /^f_[A-Za-z0-9_-]{22}$/,
+  /** `hello.presets`: at most this many entries; `name` and `model` printable, no whitespace. */
+  maxPresets: 50,
+  presetNameChars: 80,
+  presetModelChars: 240,
+  /** `PresetInfo.label` and `.thinking`: short display text. */
+  presetLabelChars: 40,
+  /** `CommandInfo.name`. */
+  commandNamePattern: /^[a-z][a-z0-9_-]{0,22}$/,
 } as const;
 
 /** `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`: no `I`/`O`, case-insensitive input. */
@@ -106,9 +117,11 @@ export type SendResult = { duplicate: boolean };
 export type ThreadsResult = { threads: ThreadInfo[] };
 export type ThreadCreateResult = { thread: ThreadId; duplicate: boolean };
 
+export type ErrorResponse = { type: "res"; id: string; ok: false; error: ErrorCode };
+/** Any reply, without knowing its request; prefer `ResponseMap[op]`, which is exact per op. */
 export type Response =
   | ({ type: "res"; id: string; ok: true } & Partial<HelloResult & SendResult & ThreadsResult & ThreadCreateResult & PushKeyResult & AnswerResult & TasksResult & TaskCancelResult>)
-  | { type: "res"; id: string; ok: false; error: ErrorCode };
+  | ErrorResponse;
 
 export type MessageEvent = {
   type: "event"; event: "message"; cursor: number; thread: ThreadId; id: string;
@@ -185,3 +198,205 @@ export type AskResult =
 
 export type PairRequest = { code: string; label: string };
 export type PairError = "bad_request" | "invalid_code" | "rate_limited";
+
+type NoResult = Record<never, never>;
+/** Each request's `ok: true` result fields (v2.md, Requests). */
+export interface ResultMap {
+  hello: HelloResult; send: SendResult; ack: NoResult; control: NoResult; ping: NoResult;
+  threads: ThreadsResult; "thread.create": ThreadCreateResult; "thread.rename": NoResult; "thread.archive": NoResult;
+  "push.key": PushKeyResult; "push.subscribe": NoResult; "push.unsubscribe": NoResult;
+  answer: AnswerResult; react: NoResult; tasks: TasksResult; "task.cancel": TaskCancelResult;
+}
+/** The reply to one request op. Fields are as the gateway sends them; a client still checks them. */
+export type ResponseMap = {
+  [Op in Request["op"]]: ({ type: "res"; id: string; ok: true } & ResultMap[Op]) | ErrorResponse;
+};
+
+// -- Field validators shared by the gateway and the app (pure, no dependencies) ----------------
+
+/** Bidirectional overrides and isolates: never in a label, name or title. */
+const BIDI = /[\u202a-\u202e\u2066-\u2069]/u;
+const PRINTABLE = /^[\x20-\x7e\u00a0-\uffff]+$/u;
+
+export function validThreadId(value: unknown): value is ThreadId {
+  return typeof value === "string" && LIMITS.threadIdPattern.test(value);
+}
+
+/** A thread title: 1–80 characters, not blank, no control, format or line/paragraph separators. */
+export function validThreadTitle(value: unknown): value is string {
+  return typeof value === "string" && Array.from(value).length <= LIMITS.threadTitleChars &&
+    value.trim() !== "" && !/[\p{C}\p{Zl}\p{Zp}]/u.test(value);
+}
+
+/** A printable device label: 1–40 characters, no control or format characters, no outer spaces. */
+export function validDeviceLabel(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  if (value.length < LIMITS.labelMinChars || value.length > LIMITS.labelMaxChars) return false;
+  // Spaces are fine inside a label ("Gergo's iPhone"), never at either end.
+  if (value.trim() !== value) return false;
+  return PRINTABLE.test(value) && !BIDI.test(value);
+}
+
+/** `hello.agent`, the gateway's display name: 1–40 printable characters (spaces allowed). */
+export function validAgentName(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0) return false;
+  if (value.length > LIMITS.agentNameMaxChars || value.trim() === "") return false;
+  return PRINTABLE.test(value) && !BIDI.test(value);
+}
+
+/** One pairing code as typed: upper-cased, anything outside `PAIR_ALPHABET` dropped, bounded. */
+export function normalizePairCode(input: string): string {
+  return [...input.toUpperCase()].filter((c) => PAIR_ALPHABET.includes(c)).join("").slice(0, LIMITS.pairCodeChars);
+}
+
+export function validPairCode(value: unknown): value is string {
+  return typeof value === "string" && value.length === LIMITS.pairCodeChars &&
+    [...value].every((c) => PAIR_ALPHABET.includes(c));
+}
+
+/** A preset `name` or `model`: 1–`max` characters, no whitespace, control or bidi characters. */
+export function validPresetToken(value: unknown, max: number): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= max &&
+    !/[\u0000-\u001f\u007f\s]/u.test(value) && !BIDI.test(value);
+}
+
+/**
+ * `hello.presets` as a client reads it: well-formed, uniquely named entries within the bounds the
+ * gateway projects them with; `undefined` when the field is absent or not a list.
+ */
+export function parsePresets(raw: unknown): PresetInfo[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const seen = new Set<string>();
+  const text = (v: unknown): v is string => typeof v === "string" && v.trim() !== "" &&
+    v.length <= LIMITS.presetLabelChars && !/[\p{Cc}]/u.test(v);
+  const out: PresetInfo[] = [];
+  for (const p of raw) {
+    if (out.length >= LIMITS.maxPresets) break;
+    if (!p || typeof p !== "object") continue;
+    const { name, label, model, thinking } = p as Record<string, unknown>;
+    if (!validPresetToken(name, LIMITS.presetNameChars) || seen.has(name) ||
+        !validPresetToken(model, LIMITS.presetModelChars) ||
+        (label !== undefined && !text(label)) || (thinking !== undefined && !text(thinking))) continue;
+    seen.add(name);
+    out.push({ name, model, ...(label ? { label } : {}), ...(thinking ? { thinking } : {}) });
+  }
+  return out;
+}
+
+const isIso = (v: unknown): v is string => typeof v === "string" && !Number.isNaN(Date.parse(v));
+const isCursor = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v > 0;
+const isText = (v: unknown): v is string => typeof v === "string";
+const isId = (v: unknown): v is string => typeof v === "string" && v !== "";
+const oneOf = <T extends string>(v: unknown, values: readonly T[]): v is T =>
+  typeof v === "string" && (values as readonly string[]).includes(v);
+const record = (v: unknown): Record<string, unknown> | undefined =>
+  v !== null && typeof v === "object" && !Array.isArray(v) ? v as Record<string, unknown> : undefined;
+
+/** Well-formed `ActivityStep`s, bounded by `maxActivitySteps`/`activityToolChars`; the rest dropped. */
+export function parseActivitySteps(raw: unknown): ActivityStep[] {
+  if (!Array.isArray(raw)) return [];
+  const out: ActivityStep[] = [];
+  for (const item of raw.slice(0, LIMITS.maxActivitySteps)) {
+    const step = record(item);
+    if (!step) continue;
+    const { id, tool, state, startedAt, endedAt } = step;
+    if (!isId(id) || !isId(tool) || !oneOf(state, ["running", "done", "failed"] as const) || !isIso(startedAt)) continue;
+    out.push({
+      id: id.slice(0, LIMITS.activityStepIdChars), tool: tool.slice(0, LIMITS.activityToolChars), state, startedAt,
+      ...(isIso(endedAt) ? { endedAt } : {}),
+    });
+  }
+  return out;
+}
+
+const ATTACHMENT_KINDS = ["image", "audio", "file", "artifact"] as const;
+
+function parseAttachments(raw: unknown): AttachmentInfo[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out = raw.slice(0, LIMITS.maxAttachments).flatMap((item): AttachmentInfo[] => {
+    const f = record(item);
+    if (!f || !isText(f.id) || !LIMITS.uploadIdPattern.test(f.id) || !isText(f.name) || !isText(f.type) ||
+        typeof f.size !== "number" || !Number.isSafeInteger(f.size) || f.size < 0 || !oneOf(f.kind, ATTACHMENT_KINDS)) return [];
+    return [{ id: f.id, name: f.name, type: f.type, size: f.size, kind: f.kind }];
+  });
+  return out.length ? out : undefined;
+}
+
+/** One well-formed `ThreadInfo` (a `thread` event or a `threads` reply entry), or `undefined`. */
+export function parseThreadInfo(raw: unknown): ThreadInfo | undefined {
+  const t = record(raw);
+  if (!t || !validThreadId(t.id) || !isText(t.title) || typeof t.archived !== "boolean" ||
+      !isText(t.createdAt) || !isText(t.lastAt)) return undefined;
+  const origin = record(t.origin);
+  if (t.origin !== undefined && (!origin || !validThreadId(origin.thread) || !isId(origin.messageId))) return undefined;
+  if (t.archivedReason !== undefined && !oneOf(t.archivedReason, ["manual", "idle"] as const)) return undefined;
+  return {
+    id: t.id, title: t.title, archived: t.archived, createdAt: t.createdAt, lastAt: t.lastAt,
+    ...(t.archivedReason === undefined ? {} : { archivedReason: t.archivedReason }),
+    ...(origin ? { origin: { thread: origin.thread as ThreadId, messageId: origin.messageId as string } } : {}),
+  };
+}
+
+const QUESTION_OPTION_IDS = ["a", "b", "c", "d"] as const;
+
+/**
+ * One durable server event (`message`, `settled`, `divider`, `reaction`, `question`, `thread`), or
+ * `undefined` when a required field is missing or malformed. Malformed optional fields are dropped
+ * rather than refusing the event. The result holds only known fields, so it is safe to persist.
+ */
+export function parseDurableEvent(raw: unknown): DurableEvent | undefined {
+  const f = record(raw);
+  if (!f || f.type !== "event" || !isCursor(f.cursor)) return undefined;
+  const cursor = f.cursor;
+  if (f.event === "thread") {
+    const thread = parseThreadInfo(f.thread);
+    return thread && { type: "event", event: "thread", cursor, thread };
+  }
+  if (!validThreadId(f.thread)) return undefined;
+  const thread = f.thread;
+  switch (f.event) {
+    case "message": {
+      if (!isId(f.id) || !oneOf(f.role, ["user", "assistant", "notice"] as const) || !isText(f.text) || !isText(f.at)) return;
+      const part = record(f.part);
+      const validPart = part && Number.isSafeInteger(part.n) && Number.isSafeInteger(part.i) &&
+        (part.i as number) >= 0 && (part.i as number) < (part.n as number) && (part.n as number) <= LIMITS.maxMessageParts;
+      if (f.part !== undefined && !validPart) return undefined;
+      const attachments = parseAttachments(f.attachments);
+      const steps = f.role === "assistant" ? parseActivitySteps(f.steps) : [];
+      const omitted = typeof f.omitted === "number" && Number.isSafeInteger(f.omitted) && f.omitted > 0 ? f.omitted : undefined;
+      return {
+        type: "event", event: "message", cursor, thread, id: f.id, role: f.role, text: f.text, at: f.at,
+        ...(isText(f.key) ? { key: f.key } : {}),
+        ...(attachments ? { attachments } : {}),
+        ...(steps.length ? { steps } : {}),
+        ...(steps.length && omitted !== undefined ? { omitted } : {}),
+        ...(validPart ? { part: { i: part.i as number, n: part.n as number } } : {}),
+      };
+    }
+    case "settled":
+      if (!isText(f.key) || !oneOf(f.outcome, ["answered", "failed", "aborted"] as const)) return;
+      return { type: "event", event: "settled", cursor, thread, key: f.key, outcome: f.outcome };
+    case "divider":
+      if (!isText(f.at) || !oneOf(f.reason, ["new", "idle"] as const)) return;
+      return { type: "event", event: "divider", cursor, thread, at: f.at, reason: f.reason };
+    case "reaction":
+      if (!isId(f.message) || f.by !== "owner" || (f.emoji !== null && !oneOf(f.emoji, REACTIONS))) return;
+      return { type: "event", event: "reaction", cursor, thread, message: f.message, by: "owner", emoji: f.emoji };
+    case "question": {
+      if (!isText(f.id) || !LIMITS.questionIdPattern.test(f.id) || !isText(f.prompt) || !isText(f.expiresAt) ||
+          !oneOf(f.state, ["open", "answered", "expired", "cancelled", "unknown"] as const) || !Array.isArray(f.options)) return;
+      const options: QuestionOption[] = [];
+      for (const item of f.options) {
+        const o = record(item);
+        if (!o || !oneOf(o.id, QUESTION_OPTION_IDS) || !isText(o.label)) return undefined;
+        options.push({ id: o.id, label: o.label, ...(isText(o.description) ? { description: o.description } : {}) });
+      }
+      if (options.length === 0) return undefined;
+      return {
+        type: "event", event: "question", cursor, thread, id: f.id, prompt: f.prompt, options, expiresAt: f.expiresAt,
+        state: f.state, ...(oneOf(f.answer, QUESTION_OPTION_IDS) ? { answer: f.answer } : {}),
+      };
+    }
+  }
+  return undefined;
+}
