@@ -3,10 +3,7 @@ import { useSyncExternalStore } from "react";
 import type { Connection } from "./conn";
 import type { Store } from "./store";
 import { Avatar } from "./Avatar";
-
-/** Pairing-code alphabet: [A-Z2-9] minus I and O, case-insensitive input. */
-const CODE_CHARS = /^[A-HJ-NP-Z2-9]+$/;
-const CODE_STRIP = /[^A-HJ-NP-Z2-9]/g;
+import { LIMITS, normalizePairCode, validDeviceLabel, validPairCode } from "./protocol";
 
 interface StandaloneNavigator extends Navigator {
   standalone?: boolean;
@@ -48,8 +45,8 @@ export function FirstRun({ store, conn }: { store: Store; conn: Connection }) {
     if (busy) return;
     const c = code.trim();
     const l = label.trim();
-    if (!CODE_CHARS.test(c) || c.length !== 8 || !l || l.length > 40) {
-      setError("Enter the 8-character code and a short device label.");
+    if (!validPairCode(c) || !validDeviceLabel(l)) {
+      setError(`Enter the ${LIMITS.pairCodeChars}-character code and a short device label.`);
       return;
     }
     setBusy(true);
@@ -100,24 +97,24 @@ export function FirstRun({ store, conn }: { store: Store; conn: Connection }) {
         <input
           id="pair-code"
           value={code}
-          onChange={(e) => setCode(e.target.value.toUpperCase().replace(CODE_STRIP, ""))}
+          onChange={(e) => setCode(normalizePairCode(e.target.value))}
           placeholder="XXXXXXXX"
           inputMode="text"
           autoComplete="off"
           autoCapitalize="characters"
           autoCorrect="off"
           spellCheck={false}
-          maxLength={8}
+          maxLength={LIMITS.pairCodeChars}
           disabled={busy}
         />
         <label htmlFor="pair-label">Device label</label>
         <input
           id="pair-label"
           value={label}
-          onChange={(e) => setLabel(e.target.value.slice(0, 40))}
+          onChange={(e) => setLabel(e.target.value.slice(0, LIMITS.labelMaxChars))}
           placeholder="iPhone"
           autoComplete="off"
-          maxLength={40}
+          maxLength={LIMITS.labelMaxChars}
           disabled={busy}
         />
         <button className="primary" type="submit" disabled={busy}>

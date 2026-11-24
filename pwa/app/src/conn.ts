@@ -3,20 +3,36 @@ import {
   LIMITS,
   MAIN_THREAD,
   PROTOCOL_VERSION,
-  type ActivityStep,
+  parseActivitySteps,
+  parseDurableEvent,
+  parsePresets,
+  parseThreadInfo,
+  validAgentName,
   type CommandInfo,
   type ControlCommand,
-  type PresetInfo,
+  type Event as ServerEvent,
   type PushSubscriptionInfo,
   type Reaction,
   type QuestionOptionId,
   type Request,
-  type Response,
-  type ServerFrame,
+  type ResponseMap,
   type ThreadId,
+  type ThreadInfo,
 } from "./protocol";
 import type { Outgoing, Store, ThreadCreate } from "./store";
-import { uploadErrorText, uploadFile } from "./uploads";
+import { uploadLocal } from "./uploads";
+
+type Op = Request["op"];
+type RequestOf<O extends Op> = Extract<Request, { op: O }>;
+/** A reply handler; `undefined` means the stream closed before the reply arrived. */
+type Handler<O extends Op> = (res?: ResponseMap[O]) => void | Promise<void>;
+type AnyReply = ResponseMap[Op];
+
+/** What the connection tells the layer above it; it never navigates on its own. */
+export type ConnectionEvents = {
+  /** A `thread.create` sent from `from` was accepted as `thread`. */
+  onThreadCreated?: (thread: ThreadId, from: ThreadId) => void;
+};
 
 const BASE_DELAY_MS = 1_000;
 const MAX_DELAY_MS = 30_000;
@@ -29,7 +45,7 @@ const MAX_DELAY_MS = 30_000;
 export class Connection {
   private ws: WebSocket | null = null;
   private nextId = 0;
-  private pending = new Map<string, (res?: Response) => void | Promise<void>>();
+  private pending = new Map<string, (res?: AnyReply) => void | Promise<void>>();
   private attempt = 0;
   private sending = new Set<string>();
   private creating = new Set<string>();
@@ -52,31 +68,62 @@ export class Connection {
   private ackFrozen = false;
   private ackCursor: number | null = null;
   private ackTimer: ReturnType<typeof setTimeout> | undefined;
-  private selectCreated: { thread: ThreadId; from: ThreadId } | undefined;
+  private disposed = false;
+  private readonly offQueueChange: () => void;
+  private readonly onVisible = () => {
+    if (!document.hidden) {
+      this.suppressed = false;
+      this.kick();
+      // iOS kills sockets in standby without a close frame: probe now
+      // instead of waiting for the next 25 s tick.
+      this.pingTick();
+    }
+  };
+  private readonly onOnline = () => this.kick();
 
-  constructor(private store: Store) {
+  constructor(private store: Store, private events: ConnectionEvents = {}) {
     this.pingTimer = setInterval(
       () => this.pingTick(),
       LIMITS.pingIntervalMs,
     );
-    document.addEventListener("visibilitychange", () => {
-      if (!document.hidden) {
-        this.suppressed = false;
-        this.kick();
-        // iOS kills sockets in standby without a close frame: probe now
-        // instead of waiting for the next 25 s tick.
-        this.pingTick();
-      }
-    });
-    addEventListener("online", () => this.kick());
-    store.onQueueChange(() => {
+    document.addEventListener("visibilitychange", this.onVisible);
+    addEventListener("online", this.onOnline);
+    this.offQueueChange = store.onQueueChange(() => {
       void store.reloadQueue().then(() => this.flushQueue()).catch(console.error);
     });
     this.connect();
   }
 
+  /**
+   * Stop for good: close the stream without reconnecting, answer every pending reply with
+   * `undefined`, and release every timer and listener. A new `Connection` may follow.
+   */
+  dispose() {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.dead = true;
+    clearInterval(this.pingTimer);
+    clearTimeout(this.pingWatch);
+    clearTimeout(this.reconnectTimer);
+    clearTimeout(this.ackTimer);
+    for (const timer of this.uploadTimers.values()) clearTimeout(timer);
+    this.uploadTimers.clear();
+    document.removeEventListener("visibilitychange", this.onVisible);
+    removeEventListener("online", this.onOnline);
+    this.offQueueChange();
+    const ws = this.ws;
+    this.ws = null;
+    if (ws) {
+      ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
+      ws.close();
+    }
+    for (const handler of this.pending.values()) void handler();
+    this.pending.clear();
+  }
+
   /** After a successful pairing (or manual retry) connect again. */
   revive() {
+    if (this.disposed) return;
     this.dead = false;
     this.suppressed = false;
     this.attempt = 0;
@@ -155,7 +202,7 @@ export class Connection {
     });
   }
 
-  private mutate(frame: Request): Promise<Response | undefined> {
+  private mutate<O extends Op>(frame: RequestOf<O>): Promise<ResponseMap[O] | undefined> {
     return new Promise((resolve) => {
       if (this.store.connState !== "open" || !this.request(frame, resolve)) resolve(undefined);
     });
@@ -164,10 +211,11 @@ export class Connection {
   searchThreads(query: string, onResults: (ids: ReadonlySet<ThreadId>) => void) {
     if (this.store.connState !== "open") return;
     this.request({ type: "req", id: this.id(), op: "threads", query }, async (res) => {
-      if (res?.ok && res.threads) {
-        await this.store.mergeThreads(res.threads).catch(console.error);
+      const threads = res?.ok ? threadList(res.threads) : undefined;
+      if (threads) {
+        await this.store.mergeThreads(threads).catch(console.error);
         this.flushOutgoing();
-        onResults(new Set(res.threads.map((t) => t.id)));
+        onResults(new Set(threads.map((t) => t.id)));
       }
     });
   }
@@ -179,10 +227,7 @@ export class Connection {
       this.creating.delete(c.key);
       if (!res) return; // No reply: retry the same key after replay.
       await this.store.finishCreate(c, res.ok, !!c.from && !res.ok && res.error === "bad_request");
-      if (res.ok && res.thread && openFrom === this.store.openThread) {
-        if (this.store.threads.has(res.thread)) this.store.selectThread(res.thread);
-        else this.selectCreated = { thread: res.thread, from: openFrom };
-      }
+      if (res.ok && typeof res.thread === "string" && openFrom !== undefined) this.events.onThreadCreated?.(res.thread, openFrom);
     })) this.creating.add(c.key);
   }
 
@@ -229,14 +274,15 @@ export class Connection {
     if (this.request({ type: "req", id: this.id(), op: "threads" }, async (res) => {
       this.sending.delete(m.key);
       if (!res) return;
-      if (!res.ok || !res.threads) {
+      const threads = res.ok ? threadList(res.threads) : undefined;
+      if (!threads) {
         this.store.markThreadUnconfirmed(m.thread);
         return;
       }
-      await this.store.mergeThreads(res.threads, true).catch(console.error);
+      await this.store.mergeThreads(threads, true).catch(console.error);
       // An older archive may be absent from the bounded listing. Keep it
       // queued in that case too, until a restore event or reconnect.
-      if (!res.threads.some((t) => t.id === m.thread && !t.archived)) return;
+      if (!threads.some((t) => t.id === m.thread && !t.archived)) return;
       const cur = this.store.outgoing(m.thread, m.key);
       if (cur?.state !== "queued") return;
       if (retriedRace) await this.store.setOutgoingState(m.key, "failed");
@@ -262,18 +308,18 @@ export class Connection {
           await this.store.setOutgoingState(m.key, "failed", "The file is no longer on this device.");
           return;
         }
-        const outcome = await uploadFile(blob, file.name, file.type);
-        if (!outcome.ok) {
-          if (outcome.retry) {
-            const delay = outcome.error === "rate_limited" ? 10_000 : 20_000;
-            this.uploadRetryAt.set(m.key, Date.now() + delay);
-            this.scheduleUpload(m, delay);
-            return;
-          }
-          await this.store.setOutgoingState(m.key, "failed", uploadErrorText(outcome.error, file.name));
+        const step = await uploadLocal(file.id, blob, file.name, file.type);
+        if (this.disposed) return;
+        if (step.kind === "retry") {
+          this.uploadRetryAt.set(m.key, Date.now() + step.delayMs);
+          this.scheduleUpload(m, step.delayMs);
           return;
         }
-        if (!await this.store.setPendingUploadId(m.key, file.id, outcome.id)) return;
+        if (step.kind === "failed") {
+          await this.store.setOutgoingState(m.key, "failed", step.note);
+          return;
+        }
+        if (!await this.store.setPendingUploadId(m.key, file.id, step.id)) return;
       }
       const promoted = await this.store.promotePending(m.key);
       if (promoted) this.sendOutgoing(promoted);
@@ -338,7 +384,6 @@ export class Connection {
     this.ackTimer = undefined;
     this.ackCursor = null;
     this.replayComplete = false;
-    this.selectCreated = undefined;
     this.store.setConn("offline");
     switch (code) {
       case CLOSE.unauthorized:
@@ -383,15 +428,18 @@ export class Connection {
   }
 
   private write(frame: Request): boolean {
+    if (this.disposed) return false;
     const ws = this.ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
     ws.send(JSON.stringify(frame));
     return true;
   }
 
-  private request(frame: Request, handler: (res?: Response) => void | Promise<void>): boolean {
+  /** Send one request; `handler` gets exactly that op's reply (or `undefined` on close). */
+  private request<O extends Op>(frame: RequestOf<O>, handler: Handler<O>): boolean {
     if (!this.write(frame)) return false;
-    this.pending.set(frame.id, handler);
+    // Replies are matched by id, so this handler only ever sees the reply to this op.
+    this.pending.set(frame.id, handler as (res?: AnyReply) => void | Promise<void>);
     return true;
   }
 
@@ -401,21 +449,28 @@ export class Connection {
       this.ws?.close(CLOSE.protocol);
       return;
     }
-    let f: ServerFrame;
+    let raw: unknown;
     try {
-      f = JSON.parse(data) as ServerFrame;
+      raw = JSON.parse(data);
     } catch {
       this.ws?.close(CLOSE.protocol);
       return;
     }
-    if (f.type === "res") {
-      const handler = this.pending.get(f.id);
-      if (handler) {
-        this.pending.delete(f.id);
-        await handler(f);
-      }
+    if (raw === null || typeof raw !== "object") return;
+    const frame = raw as { type?: unknown; id?: unknown; event?: unknown };
+    if (frame.type === "res") {
+      const handler = typeof frame.id === "string" ? this.pending.get(frame.id) : undefined;
+      if (!handler) return;
+      this.pending.delete(frame.id as string);
+      const reply = raw as { ok?: unknown; error?: unknown };
+      // A reply without a boolean `ok` (or a failure without a string code) is a failure the
+      // gateway did not explain; the handler sees it as `internal`, never as success.
+      const wellFormed = reply.ok === true || (reply.ok === false && typeof reply.error === "string");
+      await handler(wellFormed ? raw as AnyReply : { type: "res", id: frame.id as string, ok: false, error: "internal" });
       return;
     }
+    if (frame.type !== "event") return;
+    const f = raw as ServerEvent;
     switch (f.event) {
       case "message":
       case "settled":
@@ -423,33 +478,30 @@ export class Connection {
       case "reaction":
       case "question":
       case "thread": {
-        // A durable event must carry a positive integer cursor; a malformed one from a broken
-        // gateway is dropped instead of being stored and taking the UI down.
-        if (!Number.isSafeInteger(f.cursor) || f.cursor <= 0) {
-          console.error("durable event without a valid cursor dropped", f.event);
+        // Only a well-formed durable event is stored; a malformed one from a broken gateway is
+        // dropped (and never acked as stored) instead of corrupting the cache or the UI.
+        const ev = parseDurableEvent(raw);
+        if (!ev) {
+          console.error("malformed durable event dropped", f.event);
           break;
         }
-        if (this.replaying && this.replayHead !== null && f.cursor <= this.replayHead) {
+        if (this.replaying && this.replayHead !== null && ev.cursor <= this.replayHead) {
           this.replayCount++;
-          this.replayCursor = f.cursor;
+          this.replayCursor = ev.cursor;
         }
-        if (!await this.store.applyDurable(f)) this.ackFrozen = true;
+        if (!await this.store.applyDurable(ev)) this.ackFrozen = true;
         if (this.ws !== ws) break;
-        if (f.event === "thread") {
-          if (f.thread.id === this.selectCreated?.thread) {
-            if (this.store.openThread === this.selectCreated.from) this.store.selectThread(f.thread.id);
-            this.selectCreated = undefined;
-          }
-          if (!f.thread.archived) this.flushOutgoing(f.thread.id);
-        }
+        if (ev.event === "thread" && !ev.thread.archived) this.flushOutgoing(ev.thread.id);
         this.ack(ws);
         break;
       }
       case "preview":
-        this.store.notePreview(f.thread, f.key);
+        if (typeof f.thread === "string" && typeof f.key === "string") this.store.notePreview(f.thread, f.key);
         break;
       case "status":
-        this.store.setStatus(f);
+        if (typeof f.thread !== "string" ||
+            !["idle", "queued", "thinking", "tool", "error"].includes(f.state)) break;
+        this.store.setStatus({ ...f, label: typeof f.label === "string" ? f.label : undefined });
         // Main status is guaranteed after each batch, even when all threads
         // are idle. Other status frames are routed normally, in any order.
         if (f.thread === MAIN_THREAD && this.replaying) {
@@ -477,7 +529,7 @@ export class Connection {
         break;
       case "activity": {
         // Tool steps are display-only: keep well-formed steps, never renderer input.
-        const steps = activitySteps(f.steps);
+        const steps = parseActivitySteps(f.steps);
         const omitted = typeof f.omitted === "number" && Number.isSafeInteger(f.omitted) && f.omitted > 0
           ? f.omitted : undefined;
         if (typeof f.thread === "string" && typeof f.key === "string" && steps.length > 0) {
@@ -504,14 +556,14 @@ export class Connection {
       this.replaying = true;
       this.replayCount = 0;
       this.replayCursor = cursor;
-      this.replayHead = res.head ?? null;
+      this.replayHead = typeof res.head === "number" ? res.head : null;
       this.store.resetStatuses();
       this.store.resetModels();
       this.store.resetActivities();
       const device = typeof res.device === "string" ? res.device : undefined;
       const name = typeof res.agent === "string" ? res.agent.trim() : "";
-      this.store.setIdentity(device, name && [...name].length <= 40 ? name : undefined, commandList(res.commands),
-        presetList(res.presets), typeof res.uploads === "boolean" ? res.uploads : false);
+      this.store.setIdentity(device, validAgentName(name) ? name : undefined, commandList(res.commands),
+        parsePresets(res.presets), typeof res.uploads === "boolean" ? res.uploads : false);
       this.store.setMode("chat");
     });
   }
@@ -519,7 +571,8 @@ export class Connection {
   private refreshThreads(ws: WebSocket) {
     this.request({ type: "req", id: this.id(), op: "threads" }, async (res) => {
       if (!res) return;
-      if (res.ok && res.threads) await this.store.mergeThreads(res.threads, true).catch(console.error);
+      const threads = res.ok ? threadList(res.threads) : undefined;
+      if (threads) await this.store.mergeThreads(threads, true).catch(console.error);
       else this.store.setThreadListUnavailable();
       if (this.ws !== ws) return;
       await this.store.reloadQueue().catch(console.error);
@@ -536,12 +589,14 @@ export class Connection {
     if (document.hidden) return;
     const ws = this.ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    const id = this.id();
-    this.pending.set(id, () => {
+    // One probe at a time: a visibility probe and the interval tick must not stack watchdogs, or
+    // the earlier one would be orphaned and close a healthy stream later.
+    if (this.pingWatch !== undefined) return;
+    const ok = this.request({ type: "req", id: this.id(), op: "ping" }, () => {
       clearTimeout(this.pingWatch);
       this.pingWatch = undefined;
     });
-    if (!this.write({ type: "req", id, op: "ping" })) return;
+    if (!ok) return;
     this.pingWatch = setTimeout(() => {
       // No reply within the timeout: the stream is dead even though the
       // socket looks open. Drop it; the close handler reconnects.
@@ -577,52 +632,20 @@ export class Connection {
   }
 }
 
-/** Well-formed `activity.steps` entries, bounded to the protocol's own limits. */
-export function activitySteps(raw: unknown): ActivityStep[] {
-  if (!Array.isArray(raw)) return [];
-  const out: ActivityStep[] = [];
-  for (const item of raw.slice(0, LIMITS.maxActivitySteps)) {
-    if (!item || typeof item !== "object") continue;
-    const { id, tool, state, startedAt, endedAt } = item as Record<string, unknown>;
-    if (typeof id !== "string" || id === "" || typeof tool !== "string" || tool === "") continue;
-    if (state !== "running" && state !== "done" && state !== "failed") continue;
-    if (typeof startedAt !== "string" || Number.isNaN(Date.parse(startedAt))) continue;
-    out.push({
-      id: id.slice(0, 64),
-      tool: tool.slice(0, LIMITS.activityToolChars),
-      state,
-      startedAt,
-      ...(typeof endedAt === "string" && !Number.isNaN(Date.parse(endedAt)) ? { endedAt } : {}),
-    });
-  }
-  return out;
+/** A `threads` reply's well-formed entries; `undefined` when the field is not a list. */
+function threadList(raw: unknown): ThreadInfo[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  return raw.flatMap((t) => parseThreadInfo(t) ?? []);
 }
 
-const COMMAND_NAME = /^[a-z][a-z0-9_-]{0,22}$/;
 /** Keeps only well-formed `hello.commands` entries; undefined if none were sent. */
 function commandList(raw: unknown): CommandInfo[] | undefined {
   if (!Array.isArray(raw)) return undefined;
   return raw.flatMap((c): CommandInfo[] => {
     if (!c || typeof c !== "object") return [];
     const { name, args, summary, usage } = c as Record<string, unknown>;
-    if (typeof name !== "string" || !COMMAND_NAME.test(name) || typeof summary !== "string"
+    if (typeof name !== "string" || !LIMITS.commandNamePattern.test(name) || typeof summary !== "string"
       || typeof usage !== "string" || (args !== undefined && typeof args !== "string")) return [];
     return [{ name, summary, usage, ...(args ? { args } : {}) }];
-  });
-}
-
-/** Keeps only well-formed, uniquely named `hello.presets` entries; undefined if none were sent. */
-function presetList(raw: unknown): PresetInfo[] | undefined {
-  if (!Array.isArray(raw)) return undefined;
-  const seen = new Set<string>();
-  const text = (v: unknown, max: number) => typeof v === "string" && v.trim() !== "" && v.length <= max && !/[\p{Cc}]/u.test(v);
-  return raw.flatMap((p): PresetInfo[] => {
-    if (!p || typeof p !== "object") return [];
-    const { name, label, model, thinking } = p as Record<string, unknown>;
-    if (!text(name, 64) || /\s/.test(name as string) || seen.has(name as string) || !text(model, 200)
-      || (label !== undefined && !text(label, 40)) || (thinking !== undefined && !text(thinking, 40))) return [];
-    seen.add(name as string);
-    return [{ name: name as string, model: model as string, ...(label ? { label: label as string } : {}),
-      ...(thinking ? { thinking: thinking as string } : {}) }];
   });
 }

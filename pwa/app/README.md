@@ -119,7 +119,7 @@ serves this directory statically on the same origin as `/v1` (behind
   it stays open. Cancelling asks in place first and reports the outcome the
   gateway returns, so an already-finished or foreign task never reads as a
   cancellation.
-- **Artifacts** (`ArtifactCard`/`ArtifactViewer` in `src/Chat.tsx`): a card with a
+- **Artifacts** (`ArtifactCard`/`ArtifactViewer` in `src/Attachments.tsx`): a card with a
   lazily mounted, pointer-inert preview and a full-screen viewer, both an
   iframe with `sandbox="allow-scripts"` only, loaded from `?view=artifact`.
 - The gateway's Shortcuts `POST /v1/ask` endpoint has no app UI; see APP.md, *Shortcuts*.

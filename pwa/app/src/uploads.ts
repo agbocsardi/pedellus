@@ -71,6 +71,34 @@ export async function uploadFile(blob: Blob, name: string, type: string): Promis
   return { ok: false, error: "http", retry: true };
 }
 
+/** What the caller does next with one file: use its id, try again later, or give up with a note. */
+export type UploadStep =
+  | { kind: "done"; id: string }
+  | { kind: "retry"; rateLimited: boolean; delayMs: number }
+  | { kind: "failed"; note: string };
+
+const inflight = new Map<string, Promise<UploadOutcome>>();
+
+/**
+ * The one upload path for a local file, whether it was picked in the composer or is waiting in
+ * the outbox. `fileId` is the local id the file keeps from pick to outbox, so a send queued while
+ * its file is still uploading joins that request instead of uploading the bytes a second time.
+ */
+export async function uploadLocal(fileId: string, blob: Blob, name: string, type: string): Promise<UploadStep> {
+  let pending = inflight.get(fileId);
+  if (!pending) {
+    pending = uploadFile(blob, name, type).finally(() => inflight.delete(fileId));
+    inflight.set(fileId, pending);
+  }
+  const outcome = await pending;
+  if (outcome.ok) return { kind: "done", id: outcome.id };
+  if (outcome.retry) {
+    const rateLimited = outcome.error === "rate_limited";
+    return { kind: "retry", rateLimited, delayMs: rateLimited ? 10_000 : 20_000 };
+  }
+  return { kind: "failed", note: uploadErrorText(outcome.error, name) };
+}
+
 /** One owner-facing line for a failed upload; never echoes gateway internals. */
 export function uploadErrorText(error: string, name: string): string {
   switch (error) {
