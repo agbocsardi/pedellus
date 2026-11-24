@@ -10,7 +10,7 @@ import { canRecord } from "./recorder";
 import type { NewAttachment, Store } from "./store";
 import { archivedLabel } from "./ThreadList";
 import { AUDIO_ICON, CommandItem, FILE_ICON, Icon, IMAGE_ICON, PLUS_ICON, REMOVE_ICON, SEND_ICON } from "./ui";
-import { attachmentKind, forgetUpload, formatBytes, uploadLocal } from "./uploads";
+import { attachmentKind, formatBytes, forgetUpload, ownUploads, releaseUpload, uploadLocal } from "./uploads";
 import { useVoiceRecorder } from "./useVoiceRecorder";
 
 const WRENCH_ICON = "M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.8-3.8a6 6 0 0 1-7.9 7.9l-6.9 6.9a2.1 2.1 0 0 1-3-3l6.9-6.9a6 6 0 0 1 7.9-7.9l-3.8 3.8Z";
@@ -172,17 +172,22 @@ export function Composer({
     // Pin first: `createOutgoing` publishes the new row, and the list may commit it before the
     // await below resumes; a pin set after that would leave the bubble out of view.
     pinned.current = true;
+    const sent = attach?.map(toNewAttachment);
     try {
-      const sent = attach?.map(toNewAttachment);
+      // The chosen files belong to the send from here, ahead of the IndexedDB await: whatever an
+      // eager upload lands while the entry is being written stays theirs, and a remove tapped
+      // mid-handoff cannot discard an accepted id and force a second POST of the same bytes.
+      if (sent?.length) ownUploads(sent.map((file) => file.id));
       const m = await store.createOutgoing(thread, value, retryKey, sent);
-      // An id the entry already carries is owned by it now; one that finished uploading after the
-      // snapshot stays with the uploader, which the outbox pass asks before uploading again.
-      for (const file of sent ?? []) if (file.uploadId) forgetUpload(file.id);
+      // An id the entry already carries is frozen on it now; one that finished uploading after
+      // the snapshot stays with the uploader, which the outbox pass asks before uploading again.
+      for (const file of sent ?? []) if (file.uploadId) releaseUpload(file.id);
       if (!retryKey) setDrafts((prev) => prev[thread] === text ? { ...prev, [thread]: "" } : prev);
       // The files now live in the outbox (blob and ids), so the composer row goes.
       if (attach?.length) dropPicks(thread, attach);
       conn.sendOutgoing(m);
     } catch (err) {
+      for (const file of sent ?? []) releaseUpload(file.id);
       setError(err instanceof DOMException && err.name === "QuotaExceededError"
         ? "Not enough storage on this device for these files."
         : "Can’t save offline on this device.");

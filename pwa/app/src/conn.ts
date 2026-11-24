@@ -20,7 +20,7 @@ import {
   type ThreadInfo,
 } from "./protocol";
 import type { Outgoing, Store, ThreadCreate } from "./store";
-import { forgetUpload, uploadLocal } from "./uploads";
+import { releaseUpload, uploadLocal } from "./uploads";
 
 type Op = Request["op"];
 type RequestOf<O extends Op> = Extract<Request, { op: O }>;
@@ -76,8 +76,11 @@ export class Connection {
   private dead = false;
   private ackFrozen = false;
   /**
-   * Acks never pass a durable event this device refused (malformed or oversized): the gateway
-   * keeps it for replay instead of retiring it as stored. `null` while nothing was refused.
+   * Acks never pass a durable event this device refused (malformed, unknown to this build, or
+   * oversized): the gateway keeps it for replay instead of retiring it as stored. `null` while
+   * nothing was refused. Fencing lives and dies with one socket: a reconnect replays everything
+   * above the checkpoint — refused events included — and re-refuses (or accepts, once repaired)
+   * them there, so a stale ceiling never outlives the stream that set it.
    */
   private ackCeiling: number | null = null;
   private ackCursor: number | null = null;
@@ -345,7 +348,7 @@ export class Connection {
       const promoted = await this.store.promotePending(m.key);
       if (promoted) {
         // These ids are frozen on the entry now; the uploader must not hand them out again.
-        for (const file of promoted.pending ?? []) forgetUpload(file.id);
+        for (const file of promoted.pending ?? []) releaseUpload(file.id);
         if (!this.disposed) this.sendOutgoing(promoted);
       }
     } catch (err) {
@@ -410,6 +413,11 @@ export class Connection {
     this.ackTimer = undefined;
     this.ackCursor = null;
     this.replayComplete = false;
+    // Refusal fencing is scoped to the socket: the next replay resends everything above the
+    // checkpoint — the refused event included — and re-fences it there if it is still bad, so a
+    // repaired replay can advance acks instead of staying frozen at the old stream's ceiling.
+    this.ackFrozen = false;
+    this.ackCeiling = null;
     this.store.setConn("offline");
     switch (code) {
       case CLOSE.unauthorized:
@@ -511,8 +519,7 @@ export class Connection {
         // Only a well-formed durable event is stored; a malformed one from a broken gateway is
         // dropped (and never acked as stored) instead of corrupting the cache or the UI.
         const ev = parseDurableEvent(raw);
-        const cursor = (raw as { cursor?: unknown }).cursor;
-        const known = typeof cursor === "number" && Number.isSafeInteger(cursor) && cursor > 0 ? cursor : undefined;
+        const known = durableCursor(raw);
         // Replay accounting counts every durable frame the gateway sent, refused or not, so a full
         // batch with a bad event in it is still recognised as full.
         if (this.replaying && this.replayHead !== null && (known === undefined || known <= this.replayHead)) {
@@ -574,6 +581,21 @@ export class Connection {
         if (typeof f.thread === "string" && typeof f.key === "string" && steps.length > 0) {
           this.store.setActivity({ ...f, steps, ...(omitted === undefined ? {} : { omitted }) });
         }
+        break;
+      }
+      default: {
+        // An event name this build does not know. With a durable cursor it is a newer gateway's
+        // event type: refused exactly like a malformed one — counted toward the batch, never
+        // stored, never acked past — so the gateway keeps it until an upgraded client. Without a
+        // cursor it is ephemeral, like `status` or `preview`, and safe to ignore.
+        const known = durableCursor(raw);
+        if (known === undefined) break;
+        if (this.replaying && this.replayHead !== null && known <= this.replayHead) {
+          this.replayCount++;
+          this.replayCursor = Math.max(this.replayCursor ?? 0, known);
+        }
+        this.ackCeiling = Math.min(this.ackCeiling ?? known, known - 1);
+        console.warn("unknown durable event refused; acks stay below it", String((raw as { event?: unknown }).event));
         break;
       }
     }
@@ -673,6 +695,12 @@ export class Connection {
       console.error("replay checkpoint not persisted; acks stop", err);
     }
   }
+}
+
+/** A durable event's replay cursor, if the frame carries a usable one. */
+function durableCursor(raw: unknown): number | undefined {
+  const cursor = (raw as { cursor?: unknown }).cursor;
+  return typeof cursor === "number" && Number.isSafeInteger(cursor) && cursor > 0 ? cursor : undefined;
 }
 
 /** A `threads` reply's well-formed entries; `undefined` when the field is not a list. */

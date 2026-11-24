@@ -94,6 +94,7 @@ import {
   validThreadTitle,
   parseThreadId,
   parsePushSubscription,
+  validAppPresetName,
   type AppCommandInfo,
   type AppControlRecord,
   type AppMutation,
@@ -848,7 +849,9 @@ function parseModelArgument(args: string): ModelArgument {
   const parts = args.split(/\s+/u);
   if (parts.length !== 1) return { kind: "usage" };
   const name = parts[0]!;
-  if (name.length > 80 || !/^[^\s\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]+$/u.test(name)) return { kind: "usage" };
+  // The shared preset-token validator: whatever the hello projection would drop, the control
+  // refuses too, instead of accepting names the advertised presets can never include.
+  if (!validAppPresetName(name)) return { kind: "usage" };
   return { kind: "preset", name };
 }
 

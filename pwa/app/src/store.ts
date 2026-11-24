@@ -352,7 +352,8 @@ export class Store {
     const floor = this.resumeCursor ?? 0;
     if (!this.db || this.durableWriteFailed || floor === 0) return;
     const dropped: number[] = [];
-    const outboxKeys: string[] = [];
+    /** User echoes being retired, with the thread that must match their outbox row. */
+    const echoes: { key: string; thread: ThreadId }[] = [];
     const fileIds: string[] = [];
     /** Retire `thread`'s oldest retirable events, in cursor order, while `take` accepts them. */
     const cut = (thread: ThreadId, take: (ev: ChatEvent, taken: number) => boolean) => {
@@ -383,7 +384,7 @@ export class Store {
       if (!out.size) return;
       const removed = events.filter((_, i) => out.has(i));
       this.events.set(thread, events.filter((_, i) => !out.has(i)));
-      dropped.push(...this.forget(thread, removed, outboxKeys, fileIds));
+      dropped.push(...this.forget(thread, removed, echoes, fileIds));
     };
     for (const thread of [...this.events.keys()]) {
       const excess = (this.events.get(thread)?.length ?? 0) - RETENTION.perThread;
@@ -407,22 +408,37 @@ export class Store {
     dropped.push(...stale);
     if (!dropped.length) return;
     if (dropped.length > stale.length) this.changed();
-    await retireRecords(this.db, dropped, outboxKeys);
-    if (outboxKeys.length) this.queueChanges?.postMessage(null);
-    if (fileIds.length) await this.deleteFiles(fileIds);
+    // The outbox rows go by durable echo key in the same transaction, whatever this store's
+    // in-memory copy says: another window may hold the row this one never saw.
+    const pruned = await retireRecords(this.db, dropped, echoes).catch((err) => {
+      console.error("retention did not finish", err);
+      return [];
+    });
+    if (echoes.length) this.queueChanges?.postMessage(null);
+    const ids = [...fileIds, ...pruned];
+    if (ids.length) await this.deleteFiles(ids);
   }
 
-  /** Forget the derived state of retired events (and their outbox rows); returns their cursors. */
-  private forget(thread: ThreadId, removed: ChatEvent[], outboxKeys: string[], fileIds: string[]): number[] {
+  /**
+   * Forget the derived state of retired events; returns their cursors. A user echo also names its
+   * outbox row by key for `retireRecords` to delete — by thread identity, straight from the
+   * transaction, never by this store's possibly stale in-memory copy.
+   */
+  private forget(
+    thread: ThreadId, removed: ChatEvent[], echoes: { key: string; thread: ThreadId }[], fileIds: string[],
+  ): number[] {
     this.searchCache = undefined;
     for (const ev of removed) {
       this.seenCursors.delete(ev.cursor);
       this.searchText.delete(ev.cursor);
       if (ev.event === "message" && ev.part) this.splitMessages.delete(`${thread}\u0000${ev.id}`);
-      if (ev.event === "message" && ev.role === "user" && ev.key !== undefined && this.outgoing(thread, ev.key)) {
-        fileIds.push(...this.outbox.get(ev.key)!.fileIds ?? []);
-        this.outbox.delete(ev.key);
-        outboxKeys.push(ev.key);
+      if (ev.event === "message" && ev.role === "user" && ev.key !== undefined) {
+        echoes.push({ key: ev.key, thread });
+        const m = this.outbox.get(ev.key);
+        if (m && m.thread === thread) {
+          fileIds.push(...m.fileIds ?? []);
+          this.outbox.delete(ev.key);
+        }
       }
       if (ev.event === "reaction" && this.reactions.get(thread)?.get(ev.message)?.cursor === ev.cursor) {
         this.reactions.get(thread)!.delete(ev.message);

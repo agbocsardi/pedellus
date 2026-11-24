@@ -87,6 +87,30 @@ const inflight = new Map<string, Promise<UploadOutcome>>();
 const accepted = new Map<string, string>();
 const MAX_ACCEPTED = 100;
 
+/** File ids owned by a queued send; their accepted ids are the send's, not the composer's. */
+const owned = new Set<string>();
+/** Safety bound only: sends release their ids as they consume them, and discarded rows leak at most this much. */
+const MAX_OWNED = 200;
+
+/**
+ * The listed files belong to a queued send from now on (their picks may still be on screen until
+ * the outbox entry is saved). From here only the outbox pass may consume their accepted ids, so
+ * a remove tapped mid-handoff can never discard an accepted upload and force a second POST of
+ * the same bytes.
+ */
+export function ownUploads(ids: readonly string[]): void {
+  for (const id of ids) {
+    owned.add(id);
+    if (owned.size > MAX_OWNED) owned.delete(owned.values().next().value!);
+  }
+}
+
+/** Undo `ownUploads`: the id is consumed (frozen onto an entry) or the send never queued. */
+export function releaseUpload(fileId: string): void {
+  owned.delete(fileId);
+  accepted.delete(fileId);
+}
+
 /**
  * The one upload path for a local file, whether it was picked in the composer or is waiting in
  * the outbox. `fileId` is the local id the file keeps from pick to outbox, so a send queued while
@@ -117,6 +141,9 @@ export async function uploadLocal(fileId: string, blob: Blob, name: string, type
 
 /** The file's upload id is now owned by a queued send (or the file was dropped): never reuse it. */
 export function forgetUpload(fileId: string): void {
+  // A queued send keeps its claim through the composer-to-outbox handoff; only the outbox pass
+  // (via `releaseUpload`, once the id is frozen onto the entry) may consume it.
+  if (owned.has(fileId)) return;
   accepted.delete(fileId);
 }
 

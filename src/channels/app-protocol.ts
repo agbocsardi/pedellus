@@ -106,6 +106,14 @@ export function validAppAgentName(value: unknown): value is string {
   return validAgentName(value);
 }
 
+/**
+ * A preset name exactly as the hello projection bounds it (the shared wire validator): the
+ * `/model` control accepts the same names `appPresetInfos` can advertise, never a wider set.
+ */
+export function validAppPresetName(value: unknown): value is string {
+  return validPresetToken(value, APP_LIMITS.presetNameChars);
+}
+
 /** Project configured presets onto the bounded wire shape; entries with unprintable fields are dropped. */
 export function appPresetInfos(
   presets: readonly { name: string; provider: string; modelId: string; thinkingLevel?: string }[] | undefined,

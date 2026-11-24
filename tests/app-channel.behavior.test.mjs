@@ -527,6 +527,12 @@ test('hello lists the app command catalogue and control routes args to the owner
 
     // Bad arguments answer with the catalogue's usage line and no effect.
     assert.match(await lastNotice('u1', { command: 'model', args: 'a b' }, 'model usage'), /^Usage: \/model .*Nothing was sent/u);
+    // The control reuses the shared preset-token validator: a name hello cannot advertise — a C1
+    // control (e.g. NEL) or DEL — is usage, not an unknown-but-acceptable preset.
+    assert.match(await lastNotice('u1c', { command: 'model', args: 'bad\u0085name' }, 'model usage for a C1 name'),
+      /^Usage: \/model .*Nothing was sent/u);
+    assert.match(await lastNotice('u1d', { command: 'model', args: 'del\u007fname' }, 'model usage for a DEL name'),
+      /^Usage: \/model .*Nothing was sent/u);
     assert.match(await lastNotice('u2', { command: 'new', args: 'now' }, 'new usage'), /^Usage: \/new \(no arguments\)\./u);
     assert.match(await lastNotice('u3', { command: 'digest', args: 'later' }, 'digest usage'), /^Usage: \/digest /u);
     assert.equal(device.events('divider').length, 0, 'a usage refusal reset nothing');

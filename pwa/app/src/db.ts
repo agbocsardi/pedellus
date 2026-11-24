@@ -1,4 +1,5 @@
 import { openDB, type DBSchema, type IDBPDatabase } from "idb";
+import { MAIN_THREAD } from "./protocol";
 import { DB_NAME, DB_VERSION, STORES } from "./db-constants";
 import type { CommandInfo, DurableEvent, PresetInfo, ThreadId, ThreadInfo, ThreadOrigin } from "./protocol";
 
@@ -80,13 +81,29 @@ export async function loadSnapshot(db: AppDb) {
   return { events, outbox, threads, creates, view, openThread, resumeCursor, identity, push };
 }
 
-/** Drop retired event records and the outbox rows retired with them, together. */
-export async function retireRecords(db: AppDb, cursors: readonly number[], outboxKeys: readonly string[]) {
-  if (!cursors.length && !outboxKeys.length) return;
+/**
+ * Drop retired event records and the outbox rows their user echoes admit, together in one
+ * transaction. Each row is matched by durable echo key and thread identity — never by any
+ * store's in-memory copy, which another window may have changed: the persisted row the echo
+ * points at goes, whatever its state, so an admitted send can never come back as "Not sent"
+ * after a reload. Returns the file-byte ids of the rows deleted, for the caller to clean up.
+ */
+export async function retireRecords(
+  db: AppDb, cursors: readonly number[], echoes: readonly { key: string; thread: ThreadId }[],
+): Promise<string[]> {
+  if (!cursors.length && !echoes.length) return [];
   const tx = db.transaction(["events", "outbox"], "readwrite");
+  const outbox = tx.objectStore("outbox");
+  const fileIds: string[] = [];
   await Promise.all([
     ...cursors.map((cursor) => tx.objectStore("events").delete(cursor)),
-    ...outboxKeys.map((key) => tx.objectStore("outbox").delete(key)),
+    ...echoes.map(async (echo) => {
+      const saved = await outbox.get(echo.key);
+      if (!saved || (saved.thread ?? MAIN_THREAD) !== echo.thread) return;
+      await outbox.delete(echo.key);
+      fileIds.push(...saved.fileIds ?? []);
+    }),
     tx.done,
   ]);
+  return fileIds;
 }
