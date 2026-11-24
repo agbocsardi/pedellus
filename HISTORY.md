@@ -677,7 +677,7 @@ summaries can incur provider costs.
   Truncation is never silent.
   Ordinary message text is cut at its head with a `[... N more characters truncated]` marker. A tool
   call's arguments or a tool result that does not fit is quoted through the same memory-recall
-  head-tail preview (`clipPreview` in `digestion.ts`): a beginning, an omission marker naming how many
+  head-tail preview (`clipPreview` in `transcript.ts`, shared with `digestion.ts`): a beginning, an omission marker naming how many
   characters were left out and the durable `entry:<id>/tool-call|tool-result/<key>` reference of the
   original item, then an end. That preview uses the rest of the entry bound, so any later part of the
   entry is reported with the same counted marker instead of disappearing, and a remaining bound too

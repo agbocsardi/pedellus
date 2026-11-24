@@ -27,6 +27,7 @@ const [
     WORKER_STEER_ENTRY_KIND,
     WORKER_TASK_NAME,
     WorkerRecordsDoc,
+    createWorkerFoundation,
     resolveWorkerTarget,
     workerResultRequestId,
     workerSteerRequestId,
@@ -938,6 +939,86 @@ test('a crash between the terminal commit and the internal event re-admits it on
     assert.equal(record.result, 'RECOVERED-RESULT');
   } finally {
     if (reopened) await reopened.close(context);
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('reopen recovery scans only terminal worker tasks', { timeout: 10_000 }, async () => {
+  const queries = [];
+  const foundation = createWorkerFoundation({
+    now: () => 0,
+    maxConcurrent: 1,
+    allowModel: () => true,
+    spawnModel: async () => { throw new Error('unused'); },
+    workspace: {},
+    prepare: async () => {},
+    finalize: async () => ({ result: null, error: null }),
+    trackWorkspace: () => {},
+    commit: async () => { throw new Error('no admission expected'); },
+  });
+  const harness = {
+    commit: async (change) => change({
+      scanTasks: async (query) => {
+        queries.push(query);
+        return { items: [{ id: 9, kind: WORKER_TASK_NAME, conversationId: 5, state: { status: 'terminal' } }] };
+      },
+    }),
+    snapshot: async () => ({ workers: [] }),
+    conversation: async () => undefined,
+  };
+  assert.equal(await foundation.recover(harness, () => true, context), 0);
+  assert.deepEqual(queries, [{ kind: WORKER_TASK_NAME, status: 'terminal' }]);
+});
+
+test('a foreign input holding the result request ID never marks the worker notified', { timeout: 30_000 }, async () => {
+  const fixture = await fixtureWorkspace();
+  const release = deferred();
+  const dispatcher = async (transcript) => {
+    const input = lastUserText(transcript.messages);
+    if (input.includes('Background worker task.')) {
+      await release.promise;
+      return fauxAssistantMessage('COLLIDED-RESULT');
+    }
+    if (input === 'spawn one' && !dispatcher.issued) {
+      dispatcher.issued = true;
+      return fauxAssistantMessage([
+        fauxToolCall(WORKER_TOOL_NAME, { action: 'start', task: 'collide', workspace_mode: 'shared' }, { id: 'collide-start' }),
+      ], { stopReason: 'toolUse' });
+    }
+    return fauxAssistantMessage('ok');
+  };
+  const store = await syntheticStore(fixture, dispatcher);
+  try {
+    const conversation = await store.gateway.conversationFor(ORIGIN, context);
+    const submission = await conversation.submit({ type: 'input', content: 'spawn one', requestId: 'spawn' }, context);
+    assert.equal((await submission.wait(context)).status, 'done');
+    const records = await store.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context);
+    const taskId = records.workers[0].taskId;
+    // An unrelated input already occupies the result request ID before the worker finishes.
+    const foreign = await conversation.submit(
+      { type: 'input', content: 'foreign input', requestId: workerResultRequestId(taskId) }, context);
+    assert.equal((await foreign.wait(context)).status, 'done');
+    release.resolve();
+    const task = await store.gateway.harness.getTask(taskId, context);
+    assert.ok(task);
+    await waitFor(async () =>
+      (await store.gateway.harness.getTask(taskId, context))?.state.status === 'terminal',
+    'the worker terminal state');
+  } finally {
+    release.resolve();
+    await store.gateway.close(context);
+  }
+  // Reopen recovery is awaited by open and retries the same request ID, still without proof.
+  const reopened = await syntheticStore(fixture, dispatcher);
+  try {
+    const conversation = await reopened.gateway.conversationFor(ORIGIN, context);
+    const record = (await reopened.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context)).workers[0];
+    assert.equal(record.status, 'completed');
+    assert.equal(record.notified, false, 'a deduplicated foreign submission is not this worker\'s admission');
+    const entries = (await conversation.entries({ order: 'ascending' }, 200, undefined, context)).items;
+    assert.equal(entries.filter((entry) => entry.kind === WORKER_RESULT_ENTRY_KIND).length, 0);
+  } finally {
+    await reopened.gateway.close(context);
     await rm(fixture.directory, { recursive: true, force: true });
   }
 });

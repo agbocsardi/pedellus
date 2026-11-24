@@ -107,7 +107,6 @@ import {
   AssistantEntry,
   ResetEntry,
   ToolResultEntry,
-  UserEntry,
   defineDoc,
   type Conversation,
   type ConversationId,
@@ -117,7 +116,6 @@ import {
   type Harness,
 } from "@earendil-works/pi-durable";
 import type { Context } from "@earendil-works/chord";
-import { CRON_INPUT_ENTRY_KIND } from "../automation/cron.js";
 import {
   DIGEST_CHARS_PER_BATCH_MIN,
   DIGEST_ENTRIES_PER_BATCH_MIN,
@@ -126,19 +124,31 @@ import {
   isDigestEntriesBound,
   type DigestBatchLimits,
 } from "./digest-limits.js";
+import { CRON_INPUT_ENTRY_KIND } from "../automation/cron.js";
 import { CHANNEL_STATE_SESSION_SUFFIX, type HistoryChatSession } from "./scope.js";
+import {
+  COMPACT_PREVIEW_MARKER,
+  PREVIEW_CHARS,
+  type TextPreview,
+  type TextShape,
+  clipPreview,
+  cutsSurrogatePair,
+  evidenceSlice,
+  isRecord,
+  isUserInputKind,
+  joinedParts,
+  jsonText,
+  messageText,
+} from "./transcript.js";
+
+// Shared transcript primitives keep their historical digestion export names.
+export { COMPACT_PREVIEW_MARKER, clipPreview, cutsSurrogatePair, evidenceSlice, messageText };
+export type { TextShape };
 
 export const DIGEST_CURSOR_KIND = "nanobot.digest-cursor";
 
 /** Maximum characters in one head-tail tool-result preview, including its omission marker. */
-export const DIGEST_PREVIEW_CHARS = 2_500;
-
-/**
- * The preview a bound too small for the reference marker degrades to. It carries neither the omitted
- * length nor the original reference, so a consumer that needs both (the episode-summary source) checks
- * for it and falls back to its own counted marker instead of quoting an unlabelled cut.
- */
-export const COMPACT_PREVIEW_MARKER = "…";
+export const DIGEST_PREVIEW_CHARS = PREVIEW_CHARS;
 
 export const DIGEST_LIMITS = Object.freeze({
   /** Evidence entries examined by one batch; a longer segment continues in the next batch. */
@@ -190,14 +200,7 @@ export type DigestTrust = "owner" | "assistant" | "untrusted-tool";
 export type DigestItemKind = "message" | "tool-call" | "tool-result";
 
 /** The omitted middle of a head-tail preview; `text` still holds the visible head and tail. */
-export interface DigestPreview {
-  readonly headChars: number;
-  readonly tailChars: number;
-  readonly omittedStart: number;
-  readonly omittedEnd: number;
-  readonly omittedChars: number;
-  readonly marker: string;
-}
+export type DigestPreview = TextPreview;
 
 /** One bounded evidence fragment or preview. */
 export interface DigestEvidence {
@@ -377,10 +380,6 @@ const EMPTY_CURSOR: DigestCursor = Object.freeze({
   pendingToolCalls: Object.freeze([]) as readonly string[],
 });
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
 function positiveId(value: unknown, field: string): EntryId {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
     throw new TypeError(`${field} must be a positive entry ID`);
@@ -511,27 +510,6 @@ function sameCursorPosition(left: DigestCursor, right: DigestCursor): boolean {
     && left.episodeEndEntryId === right.episodeEndEntryId;
 }
 
-/**
- * Extracted message text, keeping empty text blocks so their separators stay in the offset space.
- * This is the exact extraction the earlier closed-episode cursor was produced against; any other
- * empty-block rule would move a stored offset onto a different character.
- */
-export function messageText(content: unknown): string | undefined {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return undefined;
-  const parts: string[] = [];
-  for (const block of content) {
-    if (isRecord(block) && block.type === "text" && typeof block.text === "string") parts.push(block.text);
-  }
-  return parts.length === 0 ? undefined : parts.join("\n");
-}
-
-export interface TextShape {
-  readonly parts: readonly string[];
-  /** Length of `parts.join("\n")`. */
-  readonly length: number;
-}
-
 export interface EvidenceShape extends TextShape {
   readonly role: "user" | "assistant";
   readonly kind: string;
@@ -544,7 +522,7 @@ export interface EvidenceShape extends TextShape {
  */
 export function evidenceShapeOf(entry: EntryRecord): EvidenceShape | undefined {
   const kind = entry.kind;
-  const user = kind === UserEntry.kind || kind === CRON_INPUT_ENTRY_KIND;
+  const user = isUserInputKind(kind);
   const assistant = kind === AssistantEntry.kind;
   if (!user && !assistant) return undefined;
   if (!Array.isArray(entry.model)) return undefined;
@@ -558,38 +536,6 @@ export function evidenceShapeOf(entry: EntryRecord): EvidenceShape | undefined {
   let length = parts.length - 1;
   for (const part of parts) length += part.length;
   return { role: user ? "user" : "assistant", kind, parts, length };
-}
-
-/**
- * True when a fragment ending at `from + take` would split a UTF-16 surrogate pair. The boundary is
- * moved instead, so encoding the fragment as UTF-8 cannot produce a replacement character. Offsets
- * stay in UTF-16 code units, never bytes.
- */
-export function cutsSurrogatePair(shape: TextShape, from: number, take: number): boolean {
-  if (take <= 0) return false;
-  const tail = evidenceSlice(shape, from + take - 1, from + take).charCodeAt(0);
-  if (!(tail >= 0xd800 && tail <= 0xdbff)) return false;
-  const next = evidenceSlice(shape, from + take, from + take + 1).charCodeAt(0);
-  return next >= 0xdc00 && next <= 0xdfff;
-}
-
-/** Slice `parts.join("\n")` without materializing the join. Offsets are UTF-16 code units. */
-export function evidenceSlice(shape: TextShape, from: number, to: number): string {
-  let output = "";
-  let offset = 0;
-  for (let index = 0; index < shape.parts.length; index += 1) {
-    const part = shape.parts[index]!;
-    if (index > 0) {
-      if (offset >= from && offset < to) output += "\n";
-      offset += 1;
-    }
-    const partStart = offset;
-    const partEnd = partStart + part.length;
-    offset = partEnd;
-    if (partEnd <= from || partStart >= to) continue;
-    output += part.slice(Math.max(from, partStart) - partStart, Math.min(to, partEnd) - partStart);
-  }
-  return output;
 }
 
 interface RawItem {
@@ -616,19 +562,8 @@ interface EvidencePlan {
   readonly steps: readonly PlanStep[];
 }
 
-function joinedParts(parts: readonly string[]): TextShape {
-  let length = parts.length === 0 ? 0 : parts.length - 1;
-  for (const part of parts) length += part.length;
-  return { parts, length };
-}
-
 function canonicalArguments(args: unknown): string {
-  try {
-    const text = JSON.stringify(args);
-    return typeof text === "string" ? text : "null";
-  } catch {
-    return "[unserializable arguments]";
-  }
+  return jsonText(args, { absent: "null", unserializable: "[unserializable arguments]" });
 }
 
 /**
@@ -691,7 +626,7 @@ function planOf(entry: EntryRecord, pending: ReadonlySet<string>): EvidencePlan 
     preview: false,
   });
 
-  if (kind === UserEntry.kind || kind === CRON_INPUT_ENTRY_KIND) {
+  if (isUserInputKind(kind)) {
     const parts: string[] = [];
     for (const raw of (entry.model ?? []) as readonly unknown[]) {
       if (!isRecord(raw) || raw.role !== "user") continue;
@@ -843,75 +778,6 @@ function resultCalls(entry: EntryRecord): readonly string[] {
     }
   }
   return ids;
-}
-
-/**
- * One head-tail preview of a long machine result. Both cuts are surrogate-safe: a head ending on a
- * high surrogate or a tail starting on a low surrogate is moved inward by one unit, so the preview
- * never contains half a pair. The marker names the omitted length and the original reference, so a
- * consumer can neither mistake the preview for the whole result nor claim it read the middle.
- *
- * The episode-summary source renderer (`summary-source.ts`) quotes tool calls and tool results through
- * this same function, so both bounded readers show one truncation format with the same provenance.
- */
-export function clipPreview(parts: readonly string[], total: number, limit: number, ref: string): {
-  readonly text: string;
-  readonly preview: DigestPreview;
-} {
-  const shape = joinedParts(parts);
-  const target = Math.max(1, Math.min(DIGEST_PREVIEW_CHARS, limit));
-  const markerOf = (omitted: number): string => `\n… [${omitted} characters omitted; original at ${ref}] …\n`;
-  const headTextOf = (count: number): string => {
-    let end = Math.max(0, Math.min(count, total));
-    if (end > 0 && end < total && cutsSurrogatePair(shape, 0, end)) end -= 1;
-    return evidenceSlice(shape, 0, end);
-  };
-  const tailTextOf = (count: number): string => {
-    let start = Math.max(0, total - Math.max(0, Math.min(count, total)));
-    if (start > 0 && start < total && cutsSurrogatePair(shape, start - 1, 1)) start += 1;
-    return evidenceSlice(shape, start, total);
-  };
-  let head = Math.max(0, Math.floor((target - 80) / 2));
-  let tail = Math.max(0, target - 80 - head);
-  let headText = headTextOf(head);
-  let tailText = tailTextOf(tail);
-  let omitted = Math.max(0, total - headText.length - tailText.length);
-  let marker = markerOf(omitted);
-  let size = headText.length + marker.length + tailText.length;
-  // Reserve room for the marker, then give any leftover back to the head and tail. A pathological
-  // bound smaller than the marker keeps a tiny visible marker rather than an empty preview.
-  while (size > target && (headText.length > 0 || tailText.length > 0)) {
-    const excess = size - target;
-    if (tailText.length >= headText.length && tailText.length > 0) {
-      tail = Math.max(0, tailText.length - excess);
-      tailText = tailTextOf(tail);
-    } else {
-      head = Math.max(0, headText.length - excess);
-      headText = headTextOf(head);
-    }
-    omitted = Math.max(0, total - headText.length - tailText.length);
-    marker = markerOf(omitted);
-    size = headText.length + marker.length + tailText.length;
-  }
-  if (size > target) {
-    // The bound cannot hold the reference marker; keep the head bounded and say so compactly.
-    const compact = COMPACT_PREVIEW_MARKER;
-    headText = headTextOf(Math.max(0, target - compact.length));
-    tailText = "";
-    omitted = Math.max(0, total - headText.length);
-    marker = compact;
-  }
-  return {
-    text: `${headText}${marker}${tailText}`,
-    preview: {
-      headChars: headText.length,
-      tailChars: tailText.length,
-      omittedStart: headText.length,
-      omittedEnd: total - tailText.length,
-      omittedChars: omitted,
-      marker,
-    },
-  };
 }
 
 function evidenceOfItem(
@@ -1224,7 +1090,7 @@ async function scanForCompletedSegment(
         nextId = (entry.id + 1) as EntryId;
         continue;
       }
-      if (entry.kind === UserEntry.kind || entry.kind === CRON_INPUT_ENTRY_KIND) {
+      if (isUserInputKind(entry.kind)) {
         // A new input closes the preceding turn; the walk keeps going so one range can hold several
         // completed turns instead of stopping at each one.
         if (sawInput && hasContent) safeEndEntryId = lastEntryId;
@@ -1525,7 +1391,7 @@ async function validateCompletedSegment(
         continue;
       }
       hasContent = true;
-      if (entry.kind === UserEntry.kind || entry.kind === CRON_INPUT_ENTRY_KIND) {
+      if (isUserInputKind(entry.kind)) {
         sawInput = true;
         pending.clear();
         terminalEntryId = null;
@@ -1556,7 +1422,7 @@ async function validateCompletedSegment(
   )).items[0];
   if (closing?.kind === ResetEntry.kind) return;
   if (!sawInput) throw new TypeError("Digest segment does not open an owner or scheduled turn");
-  if (closing !== undefined && (closing.kind === UserEntry.kind || closing.kind === CRON_INPUT_ENTRY_KIND)) return;
+  if (closing !== undefined && (isUserInputKind(closing.kind))) return;
   if (terminalEntryId !== endEntryId || pending.size > 0) {
     throw new TypeError("Digest segment end is not a completed exchange boundary");
   }

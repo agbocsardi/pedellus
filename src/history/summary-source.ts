@@ -6,7 +6,7 @@
  * a grant, appends an entry or calls a provider.
  *
  * What is included, and what is not:
- * - `pi.user` and `nanobot.cron` entries contribute their user text.
+ * - `pi.user` and cron input entries (`USER_INPUT_ENTRY_KINDS`) contribute their user text.
  * - `pi.assistant` entries contribute visible text and each tool call with its arguments. Thinking
  *   blocks are omitted: they are not part of the stored conversation the user saw, and replaying
  *   them can exceed the source bound.
@@ -31,7 +31,16 @@
 import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
 import type { EntryRecord } from "@earendil-works/pi-durable";
 import type { JsonValue } from "@earendil-works/chord";
-import { COMPACT_PREVIEW_MARKER, clipPreview } from "./digestion.js";
+import {
+  COMPACT_PREVIEW_MARKER,
+  clipPreview,
+  isRecord,
+  isUserInputKind,
+  jsonText,
+  messageText,
+  modelMessages,
+  toolCallBlocks,
+} from "./transcript.js";
 
 export const EPISODE_SUMMARY_SOURCE_LIMITS = Object.freeze({
   /** Characters of quoted text kept per entry; a truncation marker may follow that text. */
@@ -58,7 +67,6 @@ export const EPISODE_SUMMARY_SOURCE_LIMITS = Object.freeze({
   maxTokens: 16_384,
 });
 
-const USER_ENTRY_KINDS: ReadonlySet<string> = new Set(["pi.user", "nanobot.cron"]);
 const ASSISTANT_ENTRY_KIND = "pi.assistant";
 const TOOL_RESULT_ENTRY_KIND = "pi.tool-result";
 
@@ -87,24 +95,9 @@ const SKIPPED_ENTRY: RenderedEntry = Object.freeze({
  * expected object/array/string is skipped or stringified, and nothing here may throw, because a throw
  * in a task phase faults the task and would strand the durable summary chain.
  */
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === "object" && value !== null && !Array.isArray(value);
-
-/** Model messages of an entry, whatever the stored shape claims. */
-function modelMessages(model: unknown): readonly unknown[] {
-  return Array.isArray(model) ? model : [];
-}
-
-/** Content blocks of a message: a bare string, an array of blocks, or anything else. */
-function contentBlocks(content: unknown): readonly Record<string, unknown>[] {
-  if (Array.isArray(content)) return content.filter(isRecord);
-  return [];
-}
-
-function textParts(content: unknown): string[] {
-  if (typeof content === "string") return content.length === 0 ? [] : [content];
-  return contentBlocks(content).flatMap((block) =>
-    block.type === "text" && typeof block.text === "string" ? [block.text] : []);
+/** Visible text of a message, empty when it carries none. */
+function textOf(content: unknown): string {
+  return messageText(content) ?? "";
 }
 
 /**
@@ -152,11 +145,7 @@ function itemKey(value: unknown, index: number): string {
 }
 
 function toolCallArguments(args: unknown): string {
-  try {
-    return JSON.stringify(args ?? {}) ?? "null";
-  } catch {
-    return "[unserializable arguments]";
-  }
+  return jsonText(args ?? {}, { absent: "null", unserializable: "[unserializable arguments]" });
 }
 
 /**
@@ -221,7 +210,7 @@ export function renderEntry(entry: EntryRecord, entryChars = EPISODE_SUMMARY_SOU
 
 function renderEntryUnsafe(entry: EntryRecord, entryChars: number): RenderedEntry {
   const kind = typeof entry.kind === "string" ? entry.kind : "";
-  const isUser = USER_ENTRY_KINDS.has(kind);
+  const isUser = isUserInputKind(kind);
   const isToolResult = kind === TOOL_RESULT_ENTRY_KIND;
   if (!isUser && kind !== ASSISTANT_ENTRY_KIND && !isToolResult) return SKIPPED_ENTRY;
   const messages = modelMessages(entry.model);
@@ -231,7 +220,7 @@ function renderEntryUnsafe(entry: EntryRecord, entryChars: number): RenderedEntr
     for (const item of messages) {
       if (!isRecord(item) || item.role !== "toolResult") continue;
       position += 1;
-      const body = textParts(item.content).join("\n").trim();
+      const body = textOf(item.content).trim();
       if (body.length === 0) continue;
       const toolName = typeof item.toolName === "string" && item.toolName.length > 0
         ? item.toolName
@@ -250,15 +239,14 @@ function renderEntryUnsafe(entry: EntryRecord, entryChars: number): RenderedEntr
   for (const item of messages) {
     if (!isRecord(item)) continue;
     if (item.role === "user") {
-      const body = textParts(item.content).join("\n").trim();
+      const body = textOf(item.content).trim();
       if (body.length > 0) segments.push({ text: `[User]: ${body}` });
       continue;
     }
     if (item.role !== "assistant") continue;
-    const body = textParts(item.content).join("\n").trim();
+    const body = textOf(item.content).trim();
     if (body.length > 0) segments.push({ text: `[Assistant]: ${body}` });
-    for (const block of contentBlocks(item.content)) {
-      if (block.type !== "toolCall") continue;
+    for (const block of toolCallBlocks(item.content)) {
       const key = itemKey(block.id, callPosition);
       callPosition += 1;
       const name = typeof block.name === "string" && block.name.length > 0 ? block.name : "unknown-tool";
@@ -297,7 +285,7 @@ export function renderEntries(
 export function providerSummaryText(message: AssistantMessage): string | undefined {
   try {
     if (!isRecord(message) || message.stopReason !== "stop") return undefined;
-    const blocks = contentBlocks(message.content);
+    const blocks = Array.isArray(message.content) ? message.content.filter(isRecord) : [];
     if (blocks.some((block) => block.type === "toolCall")) return undefined;
     const text = blocks.flatMap((block) => (block.type === "text" && typeof block.text === "string" ? [block.text] : []))
       .join("\n")

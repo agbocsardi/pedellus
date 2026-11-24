@@ -249,7 +249,11 @@ formatted deterministically (no summarizer model call), labeled as internal, and
 worker output is untrusted data rather than user instructions. When steering was accepted, it reports
 how many messages were part of the live worker and whether any had to be cancelled at completion.
 Its admission uses the conversation-scoped request ID `nanobot.worker-result:<taskId>`, and a reopen
-re-attempts any admission a crash interrupted: a retry cannot duplicate the parent turn.
+re-attempts any admission a crash interrupted: a retry cannot duplicate the parent turn. Durable
+dedupes by request ID alone, so the record is marked notified only when the submission under that ID
+carries this worker's own `nanobot.worker-result` entry in the spawning conversation (placed, or still
+queued in its inbox). A foreign input holding the same request ID is not proof: the record stays
+unnotified, is never evicted, and each reopen retries without admitting a duplicate.
 
 Nothing here writes a channel outbox or sends user-facing text. The worker never messages the user.
 The spawning agent decides what, if anything, to relay.

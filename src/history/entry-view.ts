@@ -17,8 +17,13 @@ import {
   UserEntry,
   type EntryRecord,
 } from "@earendil-works/pi-durable";
-import { CRON_INPUT_ENTRY_KIND } from "../automation/cron.js";
-import { WORKER_INPUT_ENTRY_KIND, WORKER_STEER_ENTRY_KIND } from "../workers/worker-task.js";
+import {
+  isRecord,
+  messageText as transcriptText,
+  modelMessages,
+  taskInputLabel,
+  toolCallBlocks,
+} from "./transcript.js";
 
 export type EntryScope = "messages" | "tools" | "all";
 
@@ -98,27 +103,7 @@ export function boundedJson(value: unknown, max: number): string {
 }
 
 export function messageText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  const parts: string[] = [];
-  for (const block of content) {
-    if (block === null || typeof block !== "object") continue;
-    const part = block as { readonly type?: unknown; readonly text?: unknown };
-    if (part.type === "text" && typeof part.text === "string") parts.push(part.text);
-  }
-  return parts.join("\n");
-}
-
-/** Prompt input kinds that are not `pi.user`; the label names the source, never the raw text. */
-const TASK_INPUT_KINDS: Readonly<Record<string, string>> = Object.freeze({
-  [CRON_INPUT_ENTRY_KIND]: "user (cron)",
-  [WORKER_INPUT_ENTRY_KIND]: "user (worker task)",
-  [WORKER_STEER_ENTRY_KIND]: "assistant (worker steer)",
-});
-
-/** Only own keys count: an entry kind such as "constructor" is not a known task input. */
-function taskInputLabel(kind: string): string | undefined {
-  return Object.hasOwn(TASK_INPUT_KINDS, kind) ? TASK_INPUT_KINDS[kind] : undefined;
+  return transcriptText(content) ?? "";
 }
 
 export interface BoundedRenderLimits {
@@ -191,10 +176,7 @@ export function isToolOmittedEntry(entry: EntryRecord, scope: EntryScope): boole
   if (scope !== "messages") return false;
   if (ToolResultEntry.is(entry)) return true;
   if (!AssistantEntry.is(entry) || !Array.isArray(entry.model)) return false;
-  return entry.model.some((message) =>
-    message !== null && typeof message === "object" && Array.isArray((message as { readonly content?: unknown }).content) &&
-    ((message as { readonly content: readonly unknown[] }).content).some((block) =>
-      block !== null && typeof block === "object" && (block as { readonly type?: unknown }).type === "toolCall"));
+  return entry.model.some((message) => isRecord(message) && toolCallBlocks(message.content).length > 0);
 }
 
 export interface BrowsedEntry {
@@ -212,7 +194,7 @@ export function browsedEntry(
 ): BrowsedEntry | undefined {
   let labelText: string | undefined;
   const parts: string[] = [];
-  const messages = Array.isArray(entry.model) ? entry.model : [];
+  const messages = modelMessages(entry.model);
   const taskLabel = taskInputLabel(entry.kind);
   if ((entry.kind === UserEntry.kind || taskLabel !== undefined) && scope !== "tools") {
     for (const raw of messages) {

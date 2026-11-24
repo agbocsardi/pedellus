@@ -40,7 +40,8 @@ The result contains:
   parsed metadata, `metadataStatus`, `modelInvocable`, `disabled`, `available`,
   `enabled`, and requirement details.
 - `skipped`: directory entries refused before their body was read, with a stable
-  reason (`unsafe-name`, `name-too-long`, `symlinked-skill`, `symlinked-file`).
+  reason (`unsafe-name`, `name-too-long`, `symlinked-skill`, `symlinked-file`,
+  `hardlinked-file`).
   A refused skill is therefore visible to the host instead of silently absent.
 - `summary`: the progressive `name — description — locator` lines, prefixed by
   loading guidance. Unavailable skills are marked with their missing gates or
@@ -266,11 +267,17 @@ invalid UTF-8; no partial result is returned. Every body is held in the
 snapshot, so inventory size is bounded by host disk/memory rather than by an
 arbitrary count or byte policy.
 
-Scope is accidental damage, not adversarial confinement. Reads use normal
-filesystem calls, and frontmatter parsing is bounded by the file itself.
-Symlinked skill directories and symlinked `SKILL.md` files are refused and
-reported rather than followed; explicit roots are used as supplied. There is no
-`/proc/self/fd` pinning, hard-link rejection, or post-read race verification.
+Scope is accidental damage, not adversarial confinement. Reads share the
+workspace loader's pinned primitives (`src/context/fs-safe.ts`, Linux-only):
+below each explicit root, skill directories and `SKILL.md` files are opened
+through `/proc/self/fd` without following symlinks, a `SKILL.md` with more than
+one hard link is refused, and a file whose metadata changes during the read (or
+whose name no longer resolves to the read inode) fails the load. Symlinked skill
+directories, symlinked `SKILL.md` files and hard-linked `SKILL.md` files are
+reported in `skipped` rather than followed. An explicit root may itself contain
+symlink components because the host named it; `<workspaceRoot>/skills` may not
+be a symlink. There is no whole-tree recheck after all reads. Request fields
+must be own data properties: an inherited or accessor-backed field is rejected.
 
 Prompt size is not clipped by this package: the renderer composes the whole
 `nanobot_skills` summary, so every discovered name, description and locator
@@ -290,7 +297,7 @@ demand; only the native tool-output limit of that tool applies.
 - Skill names come from directory names, as in Python; frontmatter `name` is not
   authoritative. Directory names that are unsafe or exceed the name bound are
   reported in `skipped`. Directory entries that are symlinks or not directories
-  are reported and skipped, as are symlinked `SKILL.md` files.
+  are reported and skipped, as are symlinked or hard-linked `SKILL.md` files.
 - `metadata.nanobot.os` gating and install hints are parsed but not acted on;
   only `requires.bins` and `requires.env` are evaluated.
 - Python silently ignores an unparseable `metadata` value; this loader fails

@@ -4,10 +4,9 @@ import {
   ResetEntry,
   SystemEntry,
   ToolResultEntry,
-  UserEntry,
   type EntryRecord,
 } from "@earendil-works/pi-durable";
-import { CRON_INPUT_ENTRY_KIND } from "../automation/cron.js";
+import { isRecord, isUserInputKind, jsonText as transcriptJson, toolCallBlocks } from "../history/transcript.js";
 import type {
   MemoryHit,
   MemoryProvenance,
@@ -31,13 +30,7 @@ export interface HistoryPart {
   readonly value: unknown;
 }
 
-interface RecordValue {
-  readonly [key: string]: unknown;
-}
-
-function isRecord(value: unknown): value is RecordValue {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
+type RecordValue = Record<string, unknown>;
 
 function messageTimestamp(raw: RecordValue): number | null {
   const timestamp = raw.timestamp;
@@ -71,12 +64,7 @@ function messageValue(raw: RecordValue, role: "user" | "assistant", content: unk
 }
 
 function jsonText(value: unknown): string {
-  try {
-    const result = JSON.stringify(value);
-    return result === undefined ? "undefined" : result;
-  } catch {
-    return "[unserializable]";
-  }
+  return transcriptJson(value, { absent: "undefined", unserializable: "[unserializable]" });
 }
 
 /** Project only user/assistant text and named tool calls/results, preserving source indexes. */
@@ -86,7 +74,7 @@ export function projectEntry(entry: EntryRecord): { parts: HistoryPart[]; malfor
   let omittedNonText = 0;
   let partIndex = 0;
   let toolOrdinal = 0;
-  const userKind = entry.kind === UserEntry.kind || entry.kind === CRON_INPUT_ENTRY_KIND;
+  const userKind = isUserInputKind(entry.kind);
   const assistantKind = entry.kind === AssistantEntry.kind;
   const toolResultKind = entry.kind === ToolResultEntry.kind;
 
@@ -134,8 +122,7 @@ export function projectEntry(entry: EntryRecord): { parts: HistoryPart[]; malfor
       if (content.text.trim().length > 0) {
         parts.push({ index: partIndex++, kind: "message", messageIndex, role: "assistant", timestamp, body: content.text, value: messageValue(raw, "assistant", content.value) });
       }
-      for (const block of raw.content) {
-        if (!isRecord(block) || block.type !== "toolCall") continue;
+      for (const block of toolCallBlocks(raw.content)) {
         if (typeof block.name !== "string" || block.name.length === 0) {
           malformed++;
           continue;

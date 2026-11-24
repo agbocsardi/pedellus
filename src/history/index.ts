@@ -32,7 +32,6 @@ import {
   ResetEntry,
   SystemEntry,
   ToolResultEntry,
-  UserEntry,
   type ConversationId,
   type EntryId,
   type EntryRecord,
@@ -42,9 +41,14 @@ import {
   openNodeSqliteDatabase,
   type NodeSqliteDatabase,
 } from "@earendil-works/pi-durable/storage/sqlite/node";
-import { CRON_INPUT_ENTRY_KIND } from "../automation/cron.js";
 import { canonicalFuturePath } from "../store.js";
 import { CHANNEL_STATE_SESSION_SUFFIX } from "./scope.js";
+import {
+  boundedCanonicalJson as boundedJson,
+  isRecord,
+  isUserInputKind,
+  messageText,
+} from "./transcript.js";
 import {
   HISTORY_SUMMARY_READ_LIMITS,
   type HistorySummaryView,
@@ -640,10 +644,6 @@ const ALL_ROLES: readonly HistoryHit["role"][] = ["assistant", "user", "tool"];
 const READABLE_ROLES: ReadonlySet<HistoryHit["role"]> = new Set(ALL_ROLES);
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -887,96 +887,9 @@ function entryFingerprint(entry: EntryRecord): string {
   return hash.digest("hex");
 }
 
-function messageText(content: unknown): string | undefined {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return undefined;
-  const parts: string[] = [];
-  for (const block of content) {
-    if (isRecord(block) && block.type === "text" && typeof block.text === "string") parts.push(block.text);
-  }
-  return parts.length === 0 ? undefined : parts.join("\n");
-}
-
 function timestampOf(message: Record<string, unknown>): number | undefined {
   const timestamp = message.timestamp;
   return typeof timestamp === "number" && Number.isFinite(timestamp) ? timestamp : undefined;
-}
-
-interface BoundedJson {
-  readonly text: string;
-  readonly truncated: boolean;
-}
-
-/**
- * Canonical, bounded JSON for tool arguments. It stops once the output budget is
- * reached instead of stringifying an arbitrarily large argument tree in full.
- */
-function boundedJson(value: unknown, maxChars: number, maxDepth = 64): BoundedJson {
-  let output = "";
-  let truncated = false;
-  const append = (text: string): boolean => {
-    if (truncated) return false;
-    if (output.length + text.length > maxChars) {
-      output += text.slice(0, Math.max(0, maxChars - output.length));
-      truncated = true;
-      return false;
-    }
-    output += text;
-    return true;
-  };
-  const walk = (node: unknown, depth: number): boolean => {
-    if (truncated) return false;
-    if (depth > maxDepth) {
-      truncated = true;
-      return false;
-    }
-    if (node === null) return append("null");
-    if (typeof node === "string") {
-      if (!append('"')) return false;
-      let start = 0;
-      while (start < node.length) {
-        const remaining = Math.max(0, maxChars - output.length - 1);
-        if (remaining === 0) {
-          truncated = true;
-          return false;
-        }
-        const take = Math.min(node.length - start, remaining);
-        const encoded = JSON.stringify(node.slice(start, start + take)).slice(1, -1);
-        if (encoded.length > remaining) {
-          output += encoded.slice(0, remaining);
-          truncated = true;
-          return false;
-        }
-        output += encoded;
-        start += take;
-      }
-      return append('"');
-    }
-    if (typeof node === "number" || typeof node === "boolean") return append(String(node));
-    if (Array.isArray(node)) {
-      if (!append("[")) return false;
-      for (let index = 0; index < node.length; index++) {
-        if (index > 0 && !append(",")) return false;
-        if (!walk(node[index], depth + 1)) return false;
-      }
-      return append("]");
-    }
-    if (isRecord(node)) {
-      if (!append("{")) return false;
-      const keys = Object.keys(node).sort();
-      for (let index = 0; index < keys.length; index++) {
-        const key = keys[index]!;
-        if (index > 0 && !append(",")) return false;
-        if (!append(JSON.stringify(key))) return false;
-        if (!append(":")) return false;
-        if (!walk(node[key], depth + 1)) return false;
-      }
-      return append("}");
-    }
-    return append("null");
-  };
-  walk(value, 0);
-  return { text: output, truncated };
 }
 
 function clampCodeUnits(value: string, max: number): string {
@@ -1098,7 +1011,7 @@ function extractDocuments(entry: EntryRecord): Extraction {
   if (entry.kind === ResetEntry.kind || entry.kind === SystemEntry.kind || entry.kind === CompactionEntry.kind) {
     return { docs, malformedEntries, malformedMessages, truncatedParts };
   }
-  const userKind = entry.kind === UserEntry.kind || entry.kind === CRON_INPUT_ENTRY_KIND;
+  const userKind = isUserInputKind(entry.kind);
   const assistantKind = entry.kind === AssistantEntry.kind;
   const toolKind = entry.kind === ToolResultEntry.kind;
   if (!userKind && !assistantKind && !toolKind) return { docs, malformedEntries, malformedMessages, truncatedParts };

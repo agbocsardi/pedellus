@@ -20,18 +20,39 @@
  * prevent ordinary symlink/hard-link escapes and detectable file/directory
  * swaps.
  */
-import { constants } from "node:fs";
 import type { BigIntStats } from "node:fs";
-import { existsSync } from "node:fs";
-import { lstat, open, opendir } from "node:fs/promises";
+import { lstat, opendir } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   CONTEXT_LIMITS,
   type ContextDocumentSnapshot,
   type ConversationContextSnapshot,
 } from "./index.js";
 import type { GatewayContextSnapshotProvider } from "../runtime.js";
+import {
+  CONTROL_CHARACTERS,
+  DIRECTORY_FLAGS,
+  type FileErrorFactory,
+  codePointCount,
+  decodeUtf8,
+  errorCode,
+  fileFailure as classifiedFailure,
+  isRecord,
+  openAbsoluteDirectoryNoFollow,
+  openPinned as openPinnedWith,
+  openPinnedDirectories,
+  ownDataField as ownDataFieldWith,
+  pinnedChildPath,
+  pinnedFsSupported,
+  procFdPath,
+  readPinnedFile as readPinnedWith,
+  safeMemorySegment,
+  sameDirectory,
+  sameFile,
+  sameIdentity,
+  statHandle as statHandleWith,
+  validatedRoot as validatedRootWith,
+} from "./fs-safe.js";
 
 /** Deterministic provenance prefix for workspace files. */
 const WORKSPACE_SOURCE_PREFIX = "workspace:";
@@ -127,12 +148,6 @@ const BOOTSTRAP_FIELDS = Object.freeze([
   ["soul", "SOUL.md"],
   ["user", "USER.md"],
 ] as const);
-const SAFE_NAME_LINE_BREAK = /[\u2028\u2029]/;
-const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
-const PROC_FD = "/proc/self/fd";
-const DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
-const FILE_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
-const RESTRICTED_ROOTS = Object.freeze(["/proc", "/sys", "/dev"]);
 
 interface SelectedFile {
   readonly segments: readonly string[];
@@ -154,53 +169,16 @@ interface MutableWorkspaceSnapshot {
   memory?: readonly ContextDocumentSnapshot[];
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  if (value === null || typeof value !== "object") return false;
-  try {
-    return !Array.isArray(value);
-  } catch {
-    // A revoked Proxy must become a typed input error at the caller, not an
-    // untyped TypeError escaping from Array.isArray.
-    return false;
-  }
-}
-
-interface OwnDataField {
-  readonly found: boolean;
-  readonly value: unknown;
-}
+const inputError = (message: string): Error => new WorkspaceContextInputError(message);
+const fileError: FileErrorFactory = (kind, source) => new WorkspaceContextFileError(kind, source);
 
 /**
  * Capture only own data properties. Inherited and accessor-backed fields are
  * rejected rather than invoked; this mirrors the context renderer's own-data
  * reading rule but fails closed instead of silently treating them as absent.
  */
-function ownDataField(value: unknown, key: string, label: string): OwnDataField {
-  if (value === null || (typeof value !== "object" && typeof value !== "function")) {
-    throw new WorkspaceContextInputError(`${label} must be an object`);
-  }
-  let descriptor: PropertyDescriptor | undefined;
-  try {
-    descriptor = Object.getOwnPropertyDescriptor(value, key);
-  } catch {
-    throw new WorkspaceContextInputError(`${label}.${key} is unreadable`);
-  }
-  if (descriptor === undefined) {
-    let inherited = false;
-    try {
-      inherited = key in value;
-    } catch {
-      inherited = true;
-    }
-    if (inherited) {
-      throw new WorkspaceContextInputError(`${label}.${key} must be an own data property`);
-    }
-    return { found: false, value: undefined };
-  }
-  if (!Object.hasOwn(descriptor, "value")) {
-    throw new WorkspaceContextInputError(`${label}.${key} must be an own data property`);
-  }
-  return { found: true, value: descriptor.value };
+function ownDataField(value: unknown, key: string, label: string): ReturnType<typeof ownDataFieldWith> {
+  return ownDataFieldWith(value, key, label, inputError);
 }
 
 /** Read an array length exactly once from its own data descriptor. */
@@ -228,38 +206,15 @@ function ownArrayLength(value: unknown, label: string): number {
   return descriptor.value;
 }
 
-function isWithin(parent: string, child: string): boolean {
-  const path = relative(parent, child);
-  return path === "" || (path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path));
-}
-
 function assertSupportedPlatform(): void {
-  if (process.platform !== "linux" ||
-      typeof constants.O_NOFOLLOW !== "number" ||
-      typeof constants.O_DIRECTORY !== "number" ||
-      !existsSync(PROC_FD)) {
-    throw new WorkspaceContextPlatformError();
-  }
+  if (!pinnedFsSupported()) throw new WorkspaceContextPlatformError();
 }
 
 function validatedRoot(value: unknown): string {
-  if (typeof value !== "string" || value.length === 0 || value.length > WORKSPACE_CONTEXT_LIMITS.maxWorkspaceRootChars ||
-      !isAbsolute(value) || CONTROL_CHARACTERS.test(value)) {
-    throw new WorkspaceContextInputError("workspaceRoot must be an explicit absolute path");
-  }
-  const root = resolve(value);
-  if (root === sep) {
-    throw new WorkspaceContextInputError("workspaceRoot must not be the filesystem root");
-  }
-  if (root.split(sep).some((component) => component.toLowerCase() === ".nanobot")) {
-    throw new WorkspaceContextInputError("workspaceRoot must not overlap the default ~/.nanobot location");
-  }
-  for (const restricted of RESTRICTED_ROOTS) {
-    if (isWithin(restricted, root)) {
-      throw new WorkspaceContextInputError("workspaceRoot must not be inside a restricted system directory");
-    }
-  }
-  return root;
+  return validatedRootWith(value, "workspaceRoot", {
+    maxChars: WORKSPACE_CONTEXT_LIMITS.maxWorkspaceRootChars,
+    refuseNanobot: true,
+  }, inputError);
 }
 
 function validatedMemoryFiles(value: unknown): readonly string[] {
@@ -303,16 +258,6 @@ function validatedMemoryPath(value: unknown): string {
   return value;
 }
 
-/**
- * Any name the filesystem may hold, except control characters, dot segments and
- * Unicode line separators. The memory loader applies the same locator rule, so a
- * topic it discovers can also be named here.
- */
-function safeMemorySegment(segment: string): boolean {
-  return segment.length > 0 && segment !== "." && segment !== ".." &&
-    !CONTROL_CHARACTERS.test(segment) && !SAFE_NAME_LINE_BREAK.test(segment);
-}
-
 function validatedIdentity(value: unknown): ContextDocumentSnapshot | undefined {
   if (value === undefined) return undefined;
   if (!isRecord(value)) {
@@ -340,38 +285,14 @@ function frozenDocument(source: string, content: string): ContextDocumentSnapsho
   return Object.freeze({ source, content });
 }
 
-function codePointCount(value: string): number {
-  let count = 0;
-  for (const _character of value) count++;
-  return count;
-}
-
-function failureKind(code: string | undefined): WorkspaceFileFailureKind {
-  switch (code) {
-    case "ENOENT":
-      return "missing";
-    case "ELOOP":
-      return "symlink";
-    case "EACCES":
-    case "EPERM":
-      return "unreadable";
-    case "ENOTDIR":
-      return "not-directory";
-    case "EISDIR":
-      return "not-regular";
-    default:
-      return "io";
-  }
-}
-
 function fileFailure(error: unknown, source: string): WorkspaceContextFileError {
-  if (error instanceof WorkspaceContextFileError) return error;
-  return new WorkspaceContextFileError(failureKind((error as NodeJS.ErrnoException | null)?.code), source);
+  return classifiedFailure(error, source, WorkspaceContextFileError);
 }
 
 function rootFailure(error: unknown): WorkspaceContextInputError {
   if (error instanceof WorkspaceContextInputError) return error;
-  const code = (error as NodeJS.ErrnoException | null)?.code;
+  if (error === undefined) return new WorkspaceContextInputError("workspaceRoot must be a directory below the filesystem root");
+  const code = errorCode(error);
   if (code === "ENOENT") return new WorkspaceContextInputError("workspaceRoot must exist");
   if (code === "ELOOP") return new WorkspaceContextInputError("workspaceRoot must not contain symlink components");
   if (code === "EACCES" || code === "EPERM") return new WorkspaceContextInputError("workspaceRoot is not readable");
@@ -379,106 +300,21 @@ function rootFailure(error: unknown): WorkspaceContextInputError {
   return new WorkspaceContextInputError("workspaceRoot cannot be opened safely");
 }
 
-function procFdPath(fd: number): string {
-  return `${PROC_FD}/${fd}`;
+function statHandle(handle: FileHandle, source: string): Promise<BigIntStats> {
+  return statHandleWith(handle, source, fileError);
 }
 
-async function openAbsoluteDirectoryNoFollow(path: string): Promise<FileHandle> {
-  const components = path.slice(1).split(sep).filter(Boolean);
-  if (components.length === 0) {
-    throw new WorkspaceContextInputError("workspaceRoot must be a directory below the filesystem root");
-  }
-  let current: FileHandle;
-  try {
-    current = await open(sep, DIRECTORY_FLAGS);
-  } catch (error) {
-    throw rootFailure(error);
-  }
-  try {
-    for (const component of components) {
-      let next: FileHandle;
-      try {
-        next = await open(join(procFdPath(current.fd), component), DIRECTORY_FLAGS);
-      } catch (error) {
-        throw rootFailure(error);
-      }
-      await current.close();
-      current = next;
-    }
-    return current;
-  } catch (error) {
-    await current.close().catch(() => undefined);
-    throw error;
-  }
+function openPinned(parent: FileHandle, name: string, flags: number, source: string): Promise<FileHandle> {
+  return openPinnedWith(parent, name, flags, source, fileError);
 }
 
-function sameFile(left: BigIntStats, right: BigIntStats): boolean {
-  return left.dev === right.dev &&
-    left.ino === right.ino &&
-    left.size === right.size &&
-    left.mode === right.mode &&
-    left.nlink === right.nlink &&
-    left.mtimeNs === right.mtimeNs &&
-    left.ctimeNs === right.ctimeNs;
-}
-
-function sameDirectory(left: BigIntStats, right: BigIntStats): boolean {
-  return left.dev === right.dev &&
-    left.ino === right.ino &&
-    left.size === right.size &&
-    left.mtimeNs === right.mtimeNs &&
-    left.ctimeNs === right.ctimeNs;
-}
-
-/** Directory identity only: a rename or replacement changes dev/ino/mode. */
-function sameIdentity(left: BigIntStats, right: BigIntStats): boolean {
-  return left.dev === right.dev && left.ino === right.ino && left.mode === right.mode;
-}
-
-async function statHandle(handle: FileHandle, source: string): Promise<BigIntStats> {
-  try {
-    return await handle.stat({ bigint: true });
-  } catch (error) {
-    throw fileFailure(error, source);
-  }
-}
-
-async function openPinned(
-  parent: FileHandle,
-  name: string,
-  flags: number,
-  source: string,
-): Promise<FileHandle> {
-  const path = join(procFdPath(parent.fd), name);
-  try {
-    return await open(path, flags);
-  } catch (error) {
-    const kind = failureKind((error as NodeJS.ErrnoException | null)?.code);
-    // O_NOFOLLOW + O_DIRECTORY can report ENOTDIR on some kernels when the
-    // final component is a symlink. Classify it without following the link.
-    if (kind === "not-directory") {
-      try {
-        const info = await lstat(path, { bigint: true });
-        if (info.isSymbolicLink()) throw new WorkspaceContextFileError("symlink", source);
-      } catch (classificationError) {
-        if (classificationError instanceof WorkspaceContextFileError) throw classificationError;
-      }
-    }
-    throw new WorkspaceContextFileError(kind, source);
-  }
-}
-
-function decodeUtf8(buffer: Buffer, source: string): string {
-  try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(buffer);
-  } catch {
-    throw new WorkspaceContextFileError("encoding", source);
-  }
+function openRelativeDirectory(root: FileHandle, segments: readonly string[], source: string): Promise<FileHandle> {
+  return openPinnedDirectories(root, segments, source, fileError);
 }
 
 /**
- * Read one regular file through an already pinned parent directory. The
- * returned string is a fresh value; empty files are returned as "" and the
+ * Read one regular file through an already pinned parent directory and record
+ * it for the final verification pass. Empty files are returned as "" and the
  * caller decides whether that is meaningful.
  */
 async function readPinnedFile(
@@ -488,57 +324,14 @@ async function readPinnedFile(
   directorySegments: readonly string[],
   state: LoadState,
 ): Promise<string> {
-  const handle = await openPinned(parent, name, FILE_FLAGS, source);
-  try {
-    const before = await statHandle(handle, source);
-    if (!before.isFile()) throw new WorkspaceContextFileError("not-regular", source);
-    if (before.nlink !== 1n) throw new WorkspaceContextFileError("hardlink", source);
-    const size = Number(before.size);
-
-    let buffer: Buffer;
-    try {
-      buffer = Buffer.alloc(size);
-    } catch (error) {
-      // A size the runtime cannot allocate is a read failure for this file; it
-      // must stay a typed file error instead of escaping as an untyped crash.
-      throw fileFailure(error, source);
-    }
-    let offset = 0;
-    while (offset < size) {
-      let bytesRead: number;
-      try {
-        ({ bytesRead } = await handle.read(buffer, offset, size - offset, offset));
-      } catch (error) {
-        throw fileFailure(error, source);
-      }
-      if (bytesRead === 0) throw new WorkspaceContextFileError("changed", source);
-      offset += bytesRead;
-    }
-
-    const after = await statHandle(handle, source);
-    if (!sameFile(before, after)) throw new WorkspaceContextFileError("changed", source);
-
-    let pathInfo: BigIntStats;
-    try {
-      pathInfo = await lstat(join(procFdPath(parent.fd), name), { bigint: true });
-    } catch (error) {
-      const kind = failureKind((error as NodeJS.ErrnoException | null)?.code);
-      throw new WorkspaceContextFileError(kind === "missing" ? "changed" : kind, source);
-    }
-    if (!sameFile(before, pathInfo)) throw new WorkspaceContextFileError("changed", source);
-
-    state.files.push(Object.freeze({
-      segments: Object.freeze([...directorySegments]),
-      name,
-      source,
-      stat: before,
-    }));
-
-    const content = decodeUtf8(buffer, source);
-    return content;
-  } finally {
-    await handle.close().catch(() => undefined);
-  }
+  const read = await readPinnedWith(parent, name, source, fileError);
+  state.files.push(Object.freeze({
+    segments: Object.freeze([...directorySegments]),
+    name,
+    source,
+    stat: read.stat,
+  }));
+  return decodeUtf8(read.buffer, () => new WorkspaceContextFileError("encoding", source));
 }
 
 async function readRootFile(root: FileHandle, name: string, state: LoadState): Promise<string> {
@@ -669,28 +462,6 @@ async function readMemoryFile(root: FileHandle, path: string, state: LoadState):
   }
 }
 
-async function openRelativeDirectory(
-  root: FileHandle,
-  segments: readonly string[],
-  source: string,
-): Promise<FileHandle> {
-  let current: FileHandle | null = null;
-  let parent = root;
-  try {
-    for (const segment of segments) {
-      const next = await openPinned(parent, segment, DIRECTORY_FLAGS, source);
-      if (current !== null) await current.close().catch(() => undefined);
-      current = next;
-      parent = next;
-    }
-    if (current === null) throw new WorkspaceContextFileError("not-directory", source);
-    return current;
-  } catch (error) {
-    if (current !== null) await current.close().catch(() => undefined);
-    throw error;
-  }
-}
-
 /**
  * Reopen each successfully read file through its pinned directory chain and
  * compare dev/inode/size/mode/nlink/mtime/ctime. This catches a file renamed or
@@ -705,7 +476,7 @@ async function verifySelectedFiles(root: FileHandle, state: LoadState): Promise<
         directory = await openRelativeDirectory(root, file.segments, file.source);
         parent = directory;
       }
-      const now = await lstat(join(procFdPath(parent.fd), file.name), { bigint: true });
+      const now = await lstat(pinnedChildPath(parent, file.name), { bigint: true });
       if (!sameFile(file.stat, now)) {
         throw new WorkspaceContextFileError("changed", file.source);
       }
@@ -792,7 +563,7 @@ export async function loadWorkspaceContextSnapshot(
   const identityField = ownDataField(request, "identity", "Workspace context request");
   const identity = validatedIdentity(identityField.found ? identityField.value : undefined);
 
-  const root = await openAbsoluteDirectoryNoFollow(rootPath);
+  const root = await openAbsoluteDirectoryNoFollow(rootPath, rootFailure);
   let rootBefore: BigIntStats;
   try {
     rootBefore = await statHandle(root, "workspace-root");

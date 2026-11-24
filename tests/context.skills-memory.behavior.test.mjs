@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { link, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -8,7 +8,7 @@ import {
   loadMemoryContext,
   validateMemoryTopicPath,
 } from "../dist/context/memory.js";
-import { loadSkillsContext } from "../dist/context/skills.js";
+import { SkillsContextInputError, loadSkillsContext } from "../dist/context/skills.js";
 
 async function tempRoot(t) {
   const root = await mkdtemp(join(tmpdir(), "nanobot-context-sizes-"));
@@ -160,4 +160,41 @@ test("a spaced or non-ASCII topic is writable through the topic-path guard", () 
   for (const path of ["memory/daily notes/2026-01-01.md", "memory/über.md", "memory/a b/c d.md"]) {
     assert.equal(validateMemoryTopicPath(path), path);
   }
+});
+
+test("skills requests refuse inherited fields instead of treating them as present", async (t) => {
+  const root = await tempRoot(t);
+  // An inherited builtinSkillsRoot used to report found with an undefined value.
+  const request = Object.create({ builtinSkillsRoot: root });
+  request.workspaceRoot = root;
+  await assert.rejects(loadSkillsContext(request), (error) =>
+    error instanceof SkillsContextInputError && /builtinSkillsRoot must be an own data property/.test(error.message));
+  const inheritedRoot = Object.create({ workspaceRoot: root });
+  await assert.rejects(loadSkillsContext(inheritedRoot), SkillsContextInputError);
+});
+
+test("pinned skill and memory reads skip links and hard-link aliases visibly", async (t) => {
+  const root = await tempRoot(t);
+  await writeFiles(root, {
+    "skills/plain/SKILL.md": "---\ndescription: plain skill\n---\nbody",
+    "outside/SKILL.md": "---\ndescription: outside\n---\nbody",
+    "memory/kept.md": "# Kept topic",
+    "outside/topic.md": "# Outside topic",
+  });
+  await mkdir(join(root, "skills", "linked"));
+  await symlink(join(root, "outside", "SKILL.md"), join(root, "skills", "linked", "SKILL.md"));
+  await mkdir(join(root, "skills", "aliased"));
+  await link(join(root, "outside", "SKILL.md"), join(root, "skills", "aliased", "SKILL.md"));
+  await link(join(root, "outside", "topic.md"), join(root, "memory", "alias.md"));
+
+  const skills = await loadSkillsContext({ workspaceRoot: root });
+  assert.deepEqual(skills.discovered.map((skill) => skill.name), ["plain"]);
+  assert.deepEqual(skills.skipped, [
+    { name: "aliased", reason: "hardlinked-file" },
+    { name: "linked", reason: "symlinked-file" },
+  ]);
+
+  const memory = await loadMemoryContext({ workspaceRoot: root });
+  assert.deepEqual(memory.entries.map((entry) => entry.path), ["memory/kept.md"]);
+  assert.match(memory.manifest, /1 memory files skipped/);
 });
