@@ -142,6 +142,32 @@ test("doctor reports safe field-level config errors and never echoes secret keys
   assert.match(unknownKey.text, /app contains an unrecognized option/);
   assert.ok(!unknownKey.text.includes("sk-synthetic-key-42"), unknownKey.text);
 
+  // Top-level and `telegram` blocks are strict too; a pasted secret used as a key stays private.
+  for (const [extra, expected] of [
+    [{ [SECRET]: true }, /configuration contains an unrecognized option/],
+    [{ telegram: { tokenEnv: "TELEGRAM_BOT_TOKEN", allowFrom: ["1"], [SECRET]: true } }, /telegram contains an unrecognized option/],
+  ]) {
+    await writeFile(path, JSON.stringify({
+      workspace: "ws",
+      dataDir: "data",
+      model: { provider: "openai", modelId: OPENAI },
+      ...extra,
+    }));
+    const strict = await doctor(path);
+    assert.equal(strict.ok, false);
+    assert.match(strict.text, expected);
+    assert.ok(!strict.text.includes("AAFsynthetic"), strict.text);
+  }
+
+  // Cross-field checks now fail in config itself, with a trusted field-level message.
+  await writeFile(path, JSON.stringify({
+    workspace: "ws",
+    dataDir: "data",
+    model: { provider: "openai", modelId: OPENAI },
+    idleRollover: { afterMinutes: 30 },
+  }));
+  assert.match((await doctor(path)).text, /idleRollover requires classifierModel/);
+
   await writeFile(path, JSON.stringify({
     workspace: "ws",
     dataDir: "data",

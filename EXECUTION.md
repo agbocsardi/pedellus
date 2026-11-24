@@ -73,8 +73,10 @@ same policy and the direct-workspace argv builder rather than a second policy.
   its own namespace. Networking remains available, as in the Python wrapper.
 - When `shell.restrictToWorkspace` is enabled, the policy applies Python's
   practical guard: textual `../`/`..\` and absolute or home paths outside the
-  roots are refused with the workspace-boundary note. This is an
-  accidental-damage guardrail, not confinement; command substitution, shell
+  roots are refused with the workspace-boundary note. In either mode, an
+  absolute or home path inside a protected root (the managed `dataDir`) is
+  refused, even when an allowed root such as full-host `/` contains it. This is
+  an accidental-damage guardrail, not confinement; command substitution, shell
   expansion and permitted programs can still reach outside paths.
 - The native bash tool keeps its own output window, streaming callbacks, spill
   file and structured output. The host env passes those options and results

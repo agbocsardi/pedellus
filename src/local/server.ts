@@ -46,9 +46,30 @@ import {
   requireInteger,
   requireObject,
   requireString,
+  isLocalOperatorMethod,
+  type LocalOperatorMethod,
   type LocalRequestEnvelope,
+  type LocalResult,
+  type LocalRevokeResult,
   type LocalServerMessage,
+  type LocalSessionMethod,
 } from "./protocol.js";
+
+/** What a session handler may use: the attached surface, its session key and the request's own id. */
+interface AttachedRequest {
+  readonly surface: ReturnType<typeof inProcessTerminalConversation>;
+  readonly sessionKey: string;
+  readonly requestId: number;
+}
+
+/**
+ * The console's own label check is the same one the CLI runs before sending, so `invalid-label` is a
+ * refused request, never a result shape the client has to know.
+ */
+function revokeOutcome(result: LocalRevokeResult | "invalid-label"): LocalRevokeResult {
+  if (result === "invalid-label") throw new LocalRequestError("invalid", "label is not accepted");
+  return result;
+}
 
 export interface LocalGatewayHostOptions {
   /** Absolute path inside the private data directory. */
@@ -214,41 +235,33 @@ class LocalConnection {
   }
 
   /** Stop the local observer; durably admitted work keeps running in the gateway. */
-  async close(): Promise<void> {
-    this.finished = true;
-    this.detachMcpSurface?.();
-    this.detachMcpSurface = undefined;
-    this.detachAskSurface?.();
-    this.detachAskSurface = undefined;
-    this.scope.cancel(new Error("local client disconnected"));
-    try {
-      await this.watch?.stop();
-    } catch {
-      // A stopped or failed watch needs no further cleanup.
-    }
-    this.watch = undefined;
-    this.socket.destroy();
-    this.submissions.clear();
-    this.settled = new Map();
-    this.settledOrder = [];
-    this.finishClosed();
+  close(): Promise<void> {
+    return this.teardown();
   }
 
+  /** Socket error/close, protocol failure or an outbound overflow: the same teardown, not awaited. */
   private shutdown(): void {
-    if (this.finished) return;
+    void this.teardown();
+  }
+
+  /** Runs once; a later call (from either path) waits for the first one to finish. */
+  private teardown(): Promise<void> {
+    if (this.finished) return this.closed;
     this.finished = true;
     this.detachMcpSurface?.();
     this.detachMcpSurface = undefined;
     this.detachAskSurface?.();
     this.detachAskSurface = undefined;
     this.scope.cancel(new Error("local client disconnected"));
-    void this.watch?.stop().catch(() => undefined);
+    const watch = this.watch;
     this.watch = undefined;
     this.socket.destroy();
     this.submissions.clear();
     this.settled = new Map();
     this.settledOrder = [];
-    this.finishClosed();
+    // A stopped or failed watch needs no further cleanup.
+    void (watch?.stop() ?? Promise.resolve()).catch(() => undefined).then(() => this.finishClosed());
+    return this.closed;
   }
 
   private onData(chunk: Buffer): void {
@@ -297,6 +310,7 @@ class LocalConnection {
     }
     try {
       const result = await this.dispatch(request);
+      // `restart` already sent its own acknowledgement, flushed, before the host tears down.
       if (!this.finished && request.method !== "restart") this.send({ id: request.id, result });
     } catch (error) {
       journalEvent("local.request.failed", { type: request.method,
@@ -306,261 +320,264 @@ class LocalConnection {
   }
 
   private async dispatch(request: LocalRequestEnvelope): Promise<unknown> {
-    if (request.method === "attach") return this.attach(request.params);
+    const method = request.method;
+    if (method === "attach") return this.attach(request.params);
     // Store-wide owner controls require the private socket, not a conversation attachment.
-    switch (request.method) {
-      case "cronList": {
-        const params = requireObject(request.params ?? {});
-        onlyKeys(params, ["offset"]);
-        const offset = params.offset === undefined ? 0 : requireInteger(params, "offset", 0, Number.MAX_SAFE_INTEGER);
-        return this.cronOperator().list(this.scope.context, offset);
-      }
-      case "cronShow": {
-        const params = requireObject(request.params);
-        onlyKeys(params, ["id"]);
-        return {
-          jobs: await this.cronOperator().show(
-            requireString(params, "id", CRON_OPERATOR_LIMITS.maxJobIdChars),
-            this.scope.context,
-          ),
-        };
-      }
-      case "cronCreate": {
-        const params = requireObject(request.params);
-        onlyKeys(params, ["origin", "request"]);
-        const operator = this.cronOperator();
-        const origin = requireString(params, "origin", CRON_OPERATOR_LIMITS.maxSessionKeyChars);
-        try {
-          return await operator.create(origin, params.request, this.scope.context);
-        } catch (error) {
-          // A refused request carries the host's own fixed text; it reached no scheduling commit.
-          if (error instanceof CronOperatorInputError) throw new LocalRequestError("invalid", error.message);
-          throw error;
-        }
-      }
-      case "cronCancel": {
-        const params = requireObject(request.params);
-        onlyKeys(params, ["id"]);
-        return this.cronOperator().cancel(
-          requireString(params, "id", CRON_OPERATOR_LIMITS.maxJobIdChars),
-          this.scope.context,
-        );
-      }
-      case "appPair": {
-        const params = requireObject(request.params ?? {});
-        onlyKeys(params, ["label"]);
-        const label = params.label === undefined ? undefined : requireString(params, "label", 40);
-        return this.appConsole().pair(label);
-      }
-      case "appDevices": {
-        const params = requireObject(request.params ?? {});
-        onlyKeys(params, []);
-        return { devices: await this.appConsole().devices() };
-      }
-      case "appRevoke": {
-        const params = requireObject(request.params);
-        onlyKeys(params, ["label"]);
-        return { result: await this.appConsole().revoke(requireString(params, "label", 40)) };
-      }
-      case "appShortcutAdd": {
-        const params = requireObject(request.params ?? {});
-        onlyKeys(params, ["label"]);
-        return this.appConsole().shortcutAdd(requireString(params, "label", 40));
-      }
-      case "appShortcutList": {
-        const params = requireObject(request.params ?? {});
-        onlyKeys(params, []);
-        return { shortcuts: await this.appConsole().shortcuts() };
-      }
-      case "appShortcutRevoke": {
-        const params = requireObject(request.params);
-        onlyKeys(params, ["label"]);
-        return { result: await this.appConsole().shortcutRevoke(requireString(params, "label", 40)) };
-      }
-    }
+    if (isLocalOperatorMethod(method)) return this.operatorHandlers[method](request.params);
     if (this.surface === undefined || this.sessionKey === undefined || this.gatewayConversation === undefined) {
       throw new LocalRequestError("unavailable", "attach must be the first request");
     }
-    switch (request.method) {
-      case "watch":
-        return this.startWatch();
-      case "submit":
-        return this.submit(request.params);
-      case "submitAttachment":
-        return this.submitAttachment(request.params);
-      case "submissionStatus":
-        return this.submissionStatus(request.params);
-      case "answer": {
-        const params = requireObject(request.params);
-        onlyKeys(params, ["entryId"]);
-        return this.surface.answer(requireInteger(params, "entryId", 1, LOCAL_PROTOCOL_LIMITS.maxEntryId), this.scope.context);
-      }
-      case "status": {
-        // The background summary is an additive capability field on the same request: it is the
-        // gateway's own bounded read for this already-attached conversation, and a host read failure
-        // leaves the core status exactly as before rather than claiming an idle background.
-        const status = await this.surface.status(this.scope.context);
-        let background: BackgroundStatus | undefined;
-        try {
-          background = await this.options.gateway.backgroundStatus(this.sessionKey, this.scope.context);
-        } catch {
-          background = undefined;
-        }
-        return background === undefined ? status : { ...status, background };
-      }
-      case "ackNotices": {
-        // The CLI prints the notices carried by its attach, then acknowledges exactly those records.
-        // A failed acknowledgement leaves them pending, so a later attach repeats rather than loses them.
-        const params = requireObject(request.params);
-        onlyKeys(params, ["ids"]);
-        await this.ackHostNotices(noticeIds(params.ids));
-        return {};
-      }
-      case "entries": {
-        const params = requireObject(request.params);
-        onlyKeys(params, ["query", "limit", "cursor"]);
-        return this.surface.entries(
-          entryQuery(params.query),
-          requireInteger(params, "limit", 1, LOCAL_PROTOCOL_LIMITS.maxEntryPage),
-          optionalCursor(params, "cursor") as Cursor | undefined,
-          this.scope.context,
-        );
-      }
-      case "compact":
-        return { taskId: await this.surface.compact(this.scope.context) };
-      case "abort":
-        await this.surface.abort(this.scope.context);
-        return {};
-      case "reset":
-        return this.options.gateway.resetSession(this.sessionKey, this.scope.context);
-      case "restart": {
-        onlyKeys(requireObject(request.params ?? {}), []);
-        if (!this.options.restart?.supported) {
-          throw new LocalRequestError("unavailable", "gateway process restart is unavailable on this host");
-        }
-        try {
-          await this.options.restart.request(() => new Promise<void>((resolveSent, rejectSent) => {
-            this.socket.write(`${JSON.stringify({ id: request.id, result: {} })}\n`, (error) => {
-              if (error) rejectSent(error);
-              else resolveSent();
-            });
-          }));
-        } catch (error) {
-          // A busy refusal is a known no-effect before any acknowledgement; the terminal prints its
-          // fixed reason instead of the generic protocol failure.
-          if (error instanceof RestartBusyError) throw new LocalRequestError("busy", error.message);
-          throw error;
-        }
-        return {};
-      }
-      case "listModels":
-        return this.options.gateway.listModels(this.sessionKey, this.scope.context);
-      case "selectModel": {
-        const params = requireObject(request.params);
-        onlyKeys(params, ["selection"]);
-        return this.options.gateway.selectModel(
-          this.sessionKey,
-          modelSelection(params.selection),
-          this.scope.context,
-        );
-      }
-      case "selectModelPreset": {
-        const params = requireObject(request.params);
-        onlyKeys(params, ["name"]);
-        return this.options.gateway.selectModelPreset(
-          this.sessionKey,
-          requireString(params, "name", LOCAL_PROTOCOL_LIMITS.maxLabelChars),
-          this.scope.context,
-        );
-      }
-      case "reloadModels": {
-        onlyKeys(requireObject(request.params ?? {}), []);
-        if (typeof this.options.gateway.reloadModels !== "function") {
-          throw new LocalRequestError("unavailable", "live model reload is unavailable on this host");
-        }
-        return this.options.gateway.reloadModels(this.scope.context);
-      }
-      case "refreshContext": {
-        if (!this.options.contextRefresh) {
-          throw new LocalRequestError("unavailable", "workspace context is not configured");
-        }
-        return this.options.gateway.refreshContext(this.sessionKey, this.scope.context);
-      }
-      case "mcpList":
-        onlyKeys(requireObject(request.params ?? {}), []);
-        return { listing: await this.mcpAdmin().list(this.scope.context) };
-      case "mcpCallback": {
-        const params = requireObject(request.params);
-        onlyKeys(params, ["text"]);
-        return this.mcpAdmin().submitCallback(
-          this.sessionKey,
-          requireString(params, "text", 8_192),
-          this.scope.context,
-        );
-      }
-      case "digestStart":
-        return this.options.gateway.memoryDigest.start(this.digestWriter(), this.scope.context);
-      case "digestStatus": {
-        // The live run's origin conversation is host-internal ownership metadata: it lets the host
-        // label a run as this chat's or another's. Only that bounded view crosses the socket, so no
-        // other chat's conversation ID is exposed and a later internal field is not either.
-        const status = await this.options.gateway.memoryDigest.status(this.digestWriter(), this.scope.context);
-        // Annotated with the projected shape, so a new internal status field must be admitted here
-        // deliberately instead of reaching the socket by accident.
-        const projected: MemoryDigestStatusView = {
-          liveTaskId: status.liveTaskId,
-          latest: status.latest,
-          pendingNotices: status.pendingNotices,
-          canStart: status.canStart,
-          refusal: status.refusal,
-        };
-        return projected;
-      }
-      case "historySearch": {
-        const params = requireObject(request.params);
-        onlyKeys(params, ["query"]);
-        return this.options.gateway.historySearch(historyQuery(params.query), this.scope.context);
-      }
-      case "historyEpisodes": {
-        const params = requireObject(request.params);
-        onlyKeys(params, ["session", "query"]);
-        return this.options.gateway.listHistoryEpisodes(
-          historySession(params.session, this.sessionKey),
-          episodeQuery(params.query),
-          this.scope.context,
-        );
-      }
-      case "historyEpisode": {
-        const params = requireObject(request.params);
-        onlyKeys(params, ["session", "startEntryId"]);
-        return this.options.gateway.historyEpisode(
-          historySession(params.session, this.sessionKey),
-          requireInteger(params, "startEntryId", 1, LOCAL_PROTOCOL_LIMITS.maxEntryId),
-          this.scope.context,
-        );
-      }
-      case "historyEntries": {
-        const params = requireObject(request.params);
-        onlyKeys(params, ["session", "query", "limit", "cursor"]);
-        const page = await this.options.gateway.historyEntries(
-          historySession(params.session, this.sessionKey),
-          entryQuery(params.query),
-          requireInteger(params, "limit", 1, LOCAL_PROTOCOL_LIMITS.maxEntryPage),
-          optionalCursor(params, "cursor") as Cursor | undefined,
-          this.scope.context,
-        );
-        return {
-          conversationId: page.conversationId,
-          items: page.items.map((entry) => projectEntry(entry)),
-          ...(page.next === undefined ? {} : { next: page.next }),
-        };
-      }
-      default:
-        throw new LocalRequestError("invalid", "unsupported request method");
+    if (!Object.hasOwn(this.sessionHandlers, method)) {
+      throw new LocalRequestError("invalid", "unsupported request method");
     }
+    return this.sessionHandlers[method as LocalSessionMethod](request.params, {
+      surface: this.surface,
+      sessionKey: this.sessionKey,
+      requestId: request.id,
+    });
   }
 
-  private async attach(params: unknown): Promise<unknown> {
+  /** One handler per operator method; the table's type makes a missing or mistyped method a compile error. */
+  private readonly operatorHandlers: { readonly [M in LocalOperatorMethod]: (params: unknown) => Promise<LocalResult<M>> } = {
+    cronList: async (raw) => {
+      const params = requireObject(raw ?? {});
+      onlyKeys(params, ["offset"]);
+      const offset = params.offset === undefined ? 0 : requireInteger(params, "offset", 0, Number.MAX_SAFE_INTEGER);
+      return this.cronOperator().list(this.scope.context, offset);
+    },
+    cronShow: async (raw) => {
+      const params = requireObject(raw);
+      onlyKeys(params, ["id"]);
+      return {
+        jobs: await this.cronOperator().show(
+          requireString(params, "id", CRON_OPERATOR_LIMITS.maxJobIdChars),
+          this.scope.context,
+        ),
+      };
+    },
+    cronCreate: async (raw) => {
+      const params = requireObject(raw);
+      onlyKeys(params, ["origin", "request"]);
+      const operator = this.cronOperator();
+      const origin = requireString(params, "origin", CRON_OPERATOR_LIMITS.maxSessionKeyChars);
+      try {
+        return await operator.create(origin, params.request, this.scope.context);
+      } catch (error) {
+        // A refused request carries the host's own fixed text; it reached no scheduling commit.
+        if (error instanceof CronOperatorInputError) throw new LocalRequestError("invalid", error.message);
+        throw error;
+      }
+    },
+    cronCancel: async (raw) => {
+      const params = requireObject(raw);
+      onlyKeys(params, ["id"]);
+      return this.cronOperator().cancel(
+        requireString(params, "id", CRON_OPERATOR_LIMITS.maxJobIdChars),
+        this.scope.context,
+      );
+    },
+    appPair: async (raw) => {
+      const params = requireObject(raw ?? {});
+      onlyKeys(params, ["label"]);
+      const label = params.label === undefined ? undefined : requireString(params, "label", 40);
+      return this.appConsole().pair(label);
+    },
+    appDevices: async (raw) => {
+      onlyKeys(requireObject(raw ?? {}), []);
+      return { devices: await this.appConsole().devices() };
+    },
+    appRevoke: async (raw) => {
+      const params = requireObject(raw);
+      onlyKeys(params, ["label"]);
+      return { result: revokeOutcome(await this.appConsole().revoke(requireString(params, "label", 40))) };
+    },
+    appShortcutAdd: async (raw) => {
+      const params = requireObject(raw ?? {});
+      onlyKeys(params, ["label"]);
+      return this.appConsole().shortcutAdd(requireString(params, "label", 40));
+    },
+    appShortcutList: async (raw) => {
+      onlyKeys(requireObject(raw ?? {}), []);
+      return { shortcuts: await this.appConsole().shortcuts() };
+    },
+    appShortcutRevoke: async (raw) => {
+      const params = requireObject(raw);
+      onlyKeys(params, ["label"]);
+      return { result: revokeOutcome(await this.appConsole().shortcutRevoke(requireString(params, "label", 40))) };
+    },
+  };
+
+  /** One handler per attached-conversation method; each runs only after a successful attach. */
+  private readonly sessionHandlers: {
+    readonly [M in LocalSessionMethod]: (params: unknown, attached: AttachedRequest) => Promise<LocalResult<M>>;
+  } = {
+    watch: async () => this.startWatch(),
+    submit: async (raw) => this.submit(raw),
+    submitAttachment: async (raw) => this.submitAttachment(raw),
+    submissionStatus: async (raw) => this.submissionStatus(raw),
+    answer: async (raw, { surface }) => {
+      const params = requireObject(raw);
+      onlyKeys(params, ["entryId"]);
+      return surface.answer(requireInteger(params, "entryId", 1, LOCAL_PROTOCOL_LIMITS.maxEntryId), this.scope.context);
+    },
+    status: async (_raw, { surface, sessionKey }) => {
+      // The background summary is an additive capability field on the same request: it is the
+      // gateway's own bounded read for this already-attached conversation, and a host read failure
+      // leaves the core status exactly as before rather than claiming an idle background.
+      const status = await surface.status(this.scope.context);
+      let background: BackgroundStatus | undefined;
+      try {
+        background = await this.options.gateway.backgroundStatus(sessionKey, this.scope.context);
+      } catch {
+        background = undefined;
+      }
+      return background === undefined ? status : { ...status, background };
+    },
+    ackNotices: async (raw) => {
+      // The CLI prints the notices carried by its attach, then acknowledges exactly those records.
+      // A failed acknowledgement leaves them pending, so a later attach repeats rather than loses them.
+      const params = requireObject(raw);
+      onlyKeys(params, ["ids"]);
+      await this.ackHostNotices(noticeIds(params.ids));
+      return {};
+    },
+    entries: async (raw, { surface }) => {
+      const params = requireObject(raw);
+      onlyKeys(params, ["query", "limit", "cursor"]);
+      return surface.entries(
+        entryQuery(params.query),
+        requireInteger(params, "limit", 1, LOCAL_PROTOCOL_LIMITS.maxEntryPage),
+        optionalCursor(params, "cursor") as Cursor | undefined,
+        this.scope.context,
+      );
+    },
+    compact: async (_raw, { surface }) => ({ taskId: await surface.compact(this.scope.context) }),
+    abort: async (_raw, { surface }) => {
+      await surface.abort(this.scope.context);
+      return {};
+    },
+    reset: async (_raw, { sessionKey }) => this.options.gateway.resetSession(sessionKey, this.scope.context),
+    restart: async (raw, { requestId }) => {
+      onlyKeys(requireObject(raw ?? {}), []);
+      if (!this.options.restart?.supported) {
+        throw new LocalRequestError("unavailable", "gateway process restart is unavailable on this host");
+      }
+      try {
+        // The acknowledgement goes through the same bounded `send` as every reply, and the host
+        // waits for it to flush before tearing this connection down.
+        await this.options.restart.request(() => new Promise<void>((resolveSent, rejectSent) => {
+          const queued = this.send({ id: requestId, result: {} }, (error) => {
+            if (error) rejectSent(error);
+            else resolveSent();
+          });
+          if (!queued) rejectSent(new Error("the local attachment is no longer connected"));
+        }));
+      } catch (error) {
+        // A busy refusal is a known no-effect before any acknowledgement; the terminal prints its
+        // fixed reason instead of the generic protocol failure.
+        if (error instanceof RestartBusyError) throw new LocalRequestError("busy", error.message);
+        throw error;
+      }
+      return {};
+    },
+    listModels: async (_raw, { sessionKey }) => this.options.gateway.listModels(sessionKey, this.scope.context),
+    selectModel: async (raw, { sessionKey }) => {
+      const params = requireObject(raw);
+      onlyKeys(params, ["selection"]);
+      return this.options.gateway.selectModel(sessionKey, modelSelection(params.selection), this.scope.context);
+    },
+    selectModelPreset: async (raw, { sessionKey }) => {
+      const params = requireObject(raw);
+      onlyKeys(params, ["name"]);
+      return this.options.gateway.selectModelPreset(
+        sessionKey,
+        requireString(params, "name", LOCAL_PROTOCOL_LIMITS.maxLabelChars),
+        this.scope.context,
+      );
+    },
+    reloadModels: async (raw) => {
+      onlyKeys(requireObject(raw ?? {}), []);
+      if (typeof this.options.gateway.reloadModels !== "function") {
+        throw new LocalRequestError("unavailable", "live model reload is unavailable on this host");
+      }
+      return this.options.gateway.reloadModels(this.scope.context);
+    },
+    refreshContext: async (_raw, { sessionKey }) => {
+      if (!this.options.contextRefresh) {
+        throw new LocalRequestError("unavailable", "workspace context is not configured");
+      }
+      return this.options.gateway.refreshContext(sessionKey, this.scope.context);
+    },
+    mcpList: async (raw) => {
+      onlyKeys(requireObject(raw ?? {}), []);
+      return { listing: await this.mcpAdmin().list(this.scope.context) };
+    },
+    mcpCallback: async (raw, { sessionKey }) => {
+      const params = requireObject(raw);
+      onlyKeys(params, ["text"]);
+      return this.mcpAdmin().submitCallback(sessionKey, requireString(params, "text", 8_192), this.scope.context);
+    },
+    digestStart: async () => this.options.gateway.memoryDigest.start(this.digestWriter(), this.scope.context),
+    digestStatus: async () => {
+      // The live run's origin conversation is host-internal ownership metadata: it lets the host
+      // label a run as this chat's or another's. Only that bounded view crosses the socket, so no
+      // other chat's conversation ID is exposed and a later internal field is not either.
+      const status = await this.options.gateway.memoryDigest.status(this.digestWriter(), this.scope.context);
+      // Annotated with the projected shape, so a new internal status field must be admitted here
+      // deliberately instead of reaching the socket by accident.
+      const projected: MemoryDigestStatusView = {
+        liveTaskId: status.liveTaskId,
+        latest: status.latest,
+        pendingNotices: status.pendingNotices,
+        canStart: status.canStart,
+        refusal: status.refusal,
+      };
+      return projected;
+    },
+    historySearch: async (raw) => {
+      const params = requireObject(raw);
+      onlyKeys(params, ["query"]);
+      return this.options.gateway.historySearch(historyQuery(params.query), this.scope.context);
+    },
+    historyEpisodes: async (raw, { sessionKey }) => {
+      const params = requireObject(raw);
+      onlyKeys(params, ["session", "query"]);
+      return this.options.gateway.listHistoryEpisodes(
+        historySession(params.session, sessionKey),
+        episodeQuery(params.query),
+        this.scope.context,
+      );
+    },
+    historyEpisode: async (raw, { sessionKey }) => {
+      const params = requireObject(raw);
+      onlyKeys(params, ["session", "startEntryId"]);
+      const episode = await this.options.gateway.historyEpisode(
+        historySession(params.session, sessionKey),
+        requireInteger(params, "startEntryId", 1, LOCAL_PROTOCOL_LIMITS.maxEntryId),
+        this.scope.context,
+      );
+      // JSON drops `undefined`, which would leave a reply without a result; `null` keeps it a reply.
+      return episode ?? null;
+    },
+    historyEntries: async (raw, { sessionKey }) => {
+      const params = requireObject(raw);
+      onlyKeys(params, ["session", "query", "limit", "cursor"]);
+      const page = await this.options.gateway.historyEntries(
+        historySession(params.session, sessionKey),
+        entryQuery(params.query),
+        requireInteger(params, "limit", 1, LOCAL_PROTOCOL_LIMITS.maxEntryPage),
+        optionalCursor(params, "cursor") as Cursor | undefined,
+        this.scope.context,
+      );
+      return {
+        conversationId: page.conversationId,
+        items: page.items.map((entry) => projectEntry(entry)),
+        ...(page.next === undefined ? {} : { next: page.next }),
+      };
+    },
+  };
+
+  private async attach(params: unknown): Promise<LocalResult<"attach">> {
     if (this.gatewayConversation !== undefined) {
       throw new LocalRequestError("invalid", "connection is already attached");
     }
@@ -714,7 +731,7 @@ class LocalConnection {
     };
   }
 
-  private async startWatch(): Promise<unknown> {
+  private async startWatch(): Promise<LocalResult<"watch">> {
     if (this.surface === undefined) throw new LocalRequestError("unavailable", "attach must be the first request");
     await this.watch?.stop().catch(() => undefined);
     const watch = await this.surface.watch(this.scope.context);
@@ -747,7 +764,7 @@ class LocalConnection {
    * model receives only the stored workspace-relative locator and bounded metadata,
    * never image content or an automatic vision/transcription call.
    */
-  private async submitAttachment(params: unknown): Promise<unknown> {
+  private async submitAttachment(params: unknown): Promise<LocalResult<"submitAttachment">> {
     if (this.surface === undefined) throw new LocalRequestError("unavailable", "attach must be the first request");
     const ingress = this.options.attachments;
     if (ingress === undefined) {
@@ -820,14 +837,18 @@ class LocalConnection {
     return { status: (await submission.status(this.scope.context)).status };
   }
 
-  private send(message: LocalServerMessage): boolean {
+  /**
+   * Queue one line under the outbound bound. `flushed`, when given, runs once the line has been
+   * handed to the OS (or failed); it is not called when this returns false.
+   */
+  private send(message: LocalServerMessage, flushed?: (error?: Error | null) => void): boolean {
     if (this.finished || this.socket.destroyed) return false;
     if (this.socket.writableLength > LOCAL_PROTOCOL_LIMITS.maxOutboundBytes) {
       this.shutdown();
       return false;
     }
     try {
-      this.socket.write(`${JSON.stringify(message)}\n`);
+      this.socket.write(`${JSON.stringify(message)}\n`, flushed);
       return true;
     } catch {
       this.shutdown();

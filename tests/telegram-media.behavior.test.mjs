@@ -1566,10 +1566,10 @@ test('media config is validated and traversal directories are refused before sta
     { enabled: false });
   assert.equal(parseConfig({ ...base, media: {} }, '/tmp').media.directory, 'media');
   assert.throws(() => parseConfig({ ...base, media: { directory: '../outside' } }, '/tmp'), /media\.directory/);
-  assert.throws(() => parseConfig({ ...base, media: { unknown: true } }, '/tmp'), /Unknown media field/);
+  assert.throws(() => parseConfig({ ...base, media: { unknown: true } }, '/tmp'), /media\.unknown is not a recognized option/);
   assert.throws(() => parseConfig({ ...base, media: { transcription: { enabled: 'yes' } } }, '/tmp'), /enabled must be a boolean/);
   assert.throws(() => parseConfig({ ...base, media: { transcription: { maxDurationSeconds: 0 } } }, '/tmp'), /maxDurationSeconds/);
-  assert.throws(() => parseConfig({ ...base, media: { transcription: { cloud: true } } }, '/tmp'), /Unknown media\.transcription field/);
+  assert.throws(() => parseConfig({ ...base, media: { transcription: { cloud: true } } }, '/tmp'), /media\.transcription\.cloud is not a recognized option/);
 });
 
 test('the bounded body check enforces advertised and actual byte limits', async () => {

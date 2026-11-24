@@ -264,7 +264,7 @@ test('worker config is a small finite opt-in, not an open registry', { timeout: 
       `maxConcurrent=${String(bad)} must be rejected`,
     );
   }
-  assert.throws(() => parseConfig({ ...base, workers: { enabled: true, queue: true } }, '/'), /Unknown workers field: queue/);
+  assert.throws(() => parseConfig({ ...base, workers: { enabled: true, queue: true } }, '/'), /workers\.queue is not a recognized option/);
   assert.throws(() => parseConfig({ ...base, workers: { enabled: true, preset: 'fast' } }, '/'), /workers\.preset requires named modelPresets/);
   assert.throws(
     () => parseConfig({

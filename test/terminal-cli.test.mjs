@@ -555,6 +555,30 @@ test("startup errors do not disclose sensitive paths", { timeout: timeoutMs + 2_
   assert.doesNotMatch(result.stderr + result.stdout, new RegExp(secret));
 });
 
+test("client commands never create the data directory when no gateway is running", { timeout: 90_000 }, async () => {
+  const { stat, writeFile } = await import("node:fs/promises");
+  const root = await mkdtemp(join(tmpdir(), "nanobot-cli-readonly-"));
+  try {
+    const workspace = join(root, "workspace");
+    const dataDir = join(root, "data");
+    await mkdir(workspace);
+    const configPath = join(root, "config.json");
+    await writeFile(configPath, JSON.stringify({ workspace, dataDir, model: { provider: "faux", modelId: "faux-1" } }));
+    const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
+    for (const args of [["agent"], ["cron", "list"], ["app", "devices"]]) {
+      // Three cold CLI starts; the bound only has to survive a loaded parallel test run.
+      const result = spawnSync(process.execPath, [cli, ...args, "--config", configPath], {
+        encoding: "utf8", timeout: 25_000, input: "",
+      });
+      assert.equal(result.status, 1, `${args.join(" ")}: ${result.stderr}`);
+      assert.match(result.stderr, /no running gateway answers/, args.join(" "));
+      await assert.rejects(stat(dataDir), { code: "ENOENT" }, `${args.join(" ")} must not create dataDir`);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("local model command lists, selects, rejects invalid input without disclosure, and persists through Gateway", { timeout: timeoutMs + 2_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "nanobot-terminal-model-"));
   const workspace = join(directory, "workspace");

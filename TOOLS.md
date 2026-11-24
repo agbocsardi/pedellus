@@ -32,8 +32,8 @@ described below; Code Mode is not part of this slice.
 - An empty or absent `toolAllowlist` means no tool extension and no host
   execution environment. Existing gateway behavior is unchanged.
 - The allowlist is the host-owned **ceiling** and the authority. Every name must
-  be one of `read`, `write`, `edit` or `bash`; an unsupported name fails startup
-  before provider or storage setup. Validated chats receive exactly these tools,
+  be one of `read`, `write`, `edit` or `bash`; an unsupported name is a config
+  error (also reported by `pedellus doctor`), before provider or storage setup. Validated chats receive exactly these tools,
   described below.
 - `toolTimeoutSeconds` is the config-level default for the host shell. Absent
   keeps the shared policy default (60 s); `0` disables the default timeout. A
@@ -55,7 +55,8 @@ described below; Code Mode is not part of this slice.
   This requires the host shell (`toolSandbox: "bwrap"` is incompatible). The
   configured workspace remains the default cwd and memory/skills location.
   File tools still refuse the managed `dataDir`, including resolved aliases and
-  removal/rename of its ancestors; use gateway APIs for live state. This is
+  removal/rename of its ancestors, and the shell guard refuses commands that
+  name a path inside it; use gateway APIs for live state. This is
   accidental-damage protection, not shell confinement: host programs can still
   access anything permitted by the OS. No sudo, secret environment inheritance,
   additional tool grants or wider Telegram admission is implied. Shared workers

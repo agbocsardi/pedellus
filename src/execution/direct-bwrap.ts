@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { accessSync, constants, existsSync, realpathSync, statSync } from "node:fs";
-import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { isPathWithin } from "./policy.js";
 
 /**
  * Build a Bubblewrap argv that runs a command against the caller's actual
@@ -56,11 +57,6 @@ function isExecutableFile(path: string): boolean {
 	} catch {
 		return false;
 	}
-}
-
-function isWithin(root: string, path: string): boolean {
-	const rel = relative(root, path);
-	return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
 /** Validate identity and version once per canonical binary path; never fall back to another executable. */
@@ -157,7 +153,7 @@ function resolveWorkspaceCwd(workspace: string, requested?: string): string {
 	if (!statSync(canonical).isDirectory()) throw new Error(`cwd is not a directory: ${requested}`);
 	// Never widen access: a cwd outside the workspace falls back to the
 	// workspace root, matching the Python wrapper.
-	return isWithin(workspace, canonical) ? canonical : workspace;
+	return isPathWithin(workspace, canonical) ? canonical : workspace;
 }
 
 /**
@@ -173,8 +169,18 @@ function resolveWorkspaceCwd(workspace: string, requested?: string): string {
  * function writes nothing and creates no sandbox state.
  */
 export function buildDirectBwrapArgs(options: DirectBwrapOptions): string[] {
-	const bwrap = resolveDirectBwrapPath(options.bwrapPath);
+	return buildDirectBwrapArgsWithBinary(resolveDirectBwrapPath(options.bwrapPath), options);
+}
 
+/**
+ * The same argv with a binary the caller already resolved through `resolveDirectBwrapPath` (for
+ * example once per environment), so a long-lived shell does not re-resolve it on every command.
+ */
+export function buildDirectBwrapArgsWithBinary(
+	bwrap: string,
+	options: Omit<DirectBwrapOptions, "bwrapPath">,
+): string[] {
+	requireAbsolute(bwrap, "bwrap");
 	const workspaceInput = requireAbsolute(options.workspace, "workspace");
 	if (workspaceInput === sep) throw new Error("workspace must not be the host filesystem root");
 	const workspace = canonicalDirectory(workspaceInput, "workspace");
@@ -187,7 +193,7 @@ export function buildDirectBwrapArgs(options: DirectBwrapOptions): string[] {
 		if (mediaInput === sep) throw new Error("mediaDirectory must not be the host filesystem root");
 		media = canonicalDirectory(mediaInput, "mediaDirectory");
 		if (media === sep) throw new Error("mediaDirectory must not resolve to the host filesystem root");
-		if (isWithin(media, workspace) || isWithin(workspace, media)) {
+		if (isPathWithin(media, workspace) || isPathWithin(workspace, media)) {
 			throw new Error("mediaDirectory must not overlap the workspace");
 		}
 	}

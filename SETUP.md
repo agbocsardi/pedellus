@@ -96,6 +96,10 @@ The shipped [`config.example.json`](./config.example.json) is the starting point
 | `digest` | Requires an explicit background `preset` or `model`; never inherits the chat model. Defaults per invocation: `entriesPerBatch` 2000, `charsPerBatch` 200,000 UTF-16 units (both minimum 2), `maxToolCalls` 24, `maxRequests` 12 successful responses (native failed retries allowed), `maxInputTokens` 500,000 reported input including cache (soft ceiling), `runTimeoutSeconds` 600, `maxChangedFiles` 8 and `maxDiffChars` 32,000 inserted plus removed units. One fitting completed-turn range is one batch; a larger range splits into ordered chunks, potentially within a turn. Evidence includes owner/assistant prose and paired untrusted tool calls/results; long results have 2,500-character head/tail previews with original references. See [bounds and fixed safety caps](HISTORY.md). Values are captured per run; this block enables no schedule. |
 | `credentials` | Provider spelling → environment-variable *name*. No secret value belongs in this file. Native provider environment names also work without an entry. |
 
+Every block is strict: an unknown key at the top level or inside a block (for
+example a misspelled `restrictToWorkspce`) fails startup instead of being
+ignored, and `pedellus doctor` reports the block without echoing the key.
+
 Export the key named by `credentials.openai` (or whichever provider you allow):
 
 ```sh

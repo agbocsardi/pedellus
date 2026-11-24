@@ -7,6 +7,31 @@
  * every Durable handle, root/state/fork conversation and model credential.
  */
 
+import type { Cursor } from "@earendil-works/pi-durable";
+import type { CronOperatorCancelOutcome, CronOperatorCreateOutcome, CronOperatorJob, CronOperatorListing } from "../automation/operator.js";
+import type { CronScheduleInput } from "../automation/cron.js";
+import type { BackgroundStatus } from "../background-status.js";
+import type { AppDeviceListing, AppPairingCreated, AppPairingRefusal } from "../channels/app.js";
+import type { AppShortcutCreated, AppShortcutListing, AppShortcutRefusal } from "../channels/app-shortcuts.js";
+import type { HistoryEpisode, HistoryEpisodePage, HistoryEpisodeQuery } from "../history/episodes.js";
+import type { HistoryPage, HistoryQuery } from "../history/index.js";
+import type { MemoryDigestStartResult, MemoryDigestStatusView } from "../history/memory-digest.js";
+import type { McpAdminListing, McpCallbackResult } from "../mcp/index.js";
+import type { ModelReloadResult } from "../model-reload.js";
+import { validAskQuestionView, type AskQuestionView } from "../questions/index.js";
+import type {
+  GatewayModelList,
+  GatewayModelSelection,
+  GatewayModelSelectionRequest,
+  GatewaySessionReset,
+} from "../runtime.js";
+import type {
+  TerminalAnswerText,
+  TerminalEntryPage,
+  TerminalEntryQuery,
+  TerminalStatus,
+} from "../terminal/conversation.js";
+
 export const LOCAL_PROTOCOL_VERSION = 4;
 
 export const LOCAL_PROTOCOL_LIMITS = Object.freeze({
@@ -77,6 +102,297 @@ export type LocalServerMessage =
   | { readonly event: "mcpAuthorization"; readonly authorization: unknown }
   | { readonly event: "mcpNotice"; readonly text: string };
 
+type LocalEmpty = Readonly<Record<string, never>>;
+
+export interface LocalHostNotice {
+  readonly id: string;
+  readonly text: string;
+}
+
+/** The attach handshake: protocol version, the one scoped conversation and its capability flags. */
+export interface LocalAttachResult {
+  readonly protocol: number;
+  readonly sessionKey: string;
+  readonly conversationId: number;
+  readonly tools: readonly string[];
+  readonly contextRefresh: boolean;
+  readonly presets: boolean;
+  readonly reload: boolean;
+  readonly attachments: boolean;
+  readonly digest: boolean;
+  readonly mcp: boolean;
+  readonly restart: boolean;
+  readonly notices: readonly LocalHostNotice[];
+  readonly questions: readonly AskQuestionView[];
+}
+
+export type LocalRevokeResult = "revoked" | "missing";
+
+/**
+ * Every request the local socket accepts, with its wire params and wire result. The server's handler
+ * tables and the client's calls are both typed from this one map, so a method added, renamed or
+ * reshaped on one side is a compile error on the other. Results are still untrusted on arrival: the
+ * client checks each one with `LOCAL_RESULT_CHECKS` before use.
+ */
+export interface LocalProtocolMethods {
+  attach: { params: { readonly conversation?: string }; result: LocalAttachResult };
+  // Store-wide operator controls: reachable without an attach.
+  cronList: { params: { readonly offset?: number }; result: CronOperatorListing };
+  cronShow: { params: { readonly id: string }; result: { readonly jobs: CronOperatorJob[] } };
+  cronCreate: { params: { readonly origin: string; readonly request: CronScheduleInput }; result: CronOperatorCreateOutcome };
+  cronCancel: { params: { readonly id: string }; result: CronOperatorCancelOutcome };
+  appPair: {
+    params: { readonly label?: string };
+    result: AppPairingCreated | { readonly refused: AppPairingRefusal };
+  };
+  appDevices: { params: LocalEmpty; result: { readonly devices: readonly AppDeviceListing[] } };
+  appRevoke: { params: { readonly label: string }; result: { readonly result: LocalRevokeResult } };
+  appShortcutAdd: {
+    params: { readonly label: string };
+    result: AppShortcutCreated | { readonly refused: AppShortcutRefusal };
+  };
+  appShortcutList: { params: LocalEmpty; result: { readonly shortcuts: readonly AppShortcutListing[] } };
+  appShortcutRevoke: { params: { readonly label: string }; result: { readonly result: LocalRevokeResult } };
+  // Attached-conversation requests.
+  watch: { params: LocalEmpty; result: LocalEmpty };
+  submit: { params: { readonly content: string }; result: { readonly id: number } };
+  submitAttachment: {
+    params: { readonly path: string; readonly content?: string };
+    result: { readonly id: number; readonly attachment: { readonly relativePath: string; readonly bytes: number } };
+  };
+  submissionStatus: { params: { readonly id: number }; result: { readonly status: string } };
+  answer: { params: { readonly entryId: number }; result: TerminalAnswerText };
+  status: { params: LocalEmpty; result: TerminalStatus & { readonly background?: BackgroundStatus } };
+  ackNotices: { params: { readonly ids: readonly string[] }; result: LocalEmpty };
+  entries: {
+    params: { readonly query: TerminalEntryQuery; readonly limit: number; readonly cursor?: Cursor };
+    result: TerminalEntryPage;
+  };
+  compact: { params: LocalEmpty; result: { readonly taskId: number } };
+  abort: { params: LocalEmpty; result: LocalEmpty };
+  reset: { params: LocalEmpty; result: GatewaySessionReset };
+  restart: { params: LocalEmpty; result: LocalEmpty };
+  listModels: { params: LocalEmpty; result: GatewayModelList };
+  selectModel: { params: { readonly selection: GatewayModelSelectionRequest }; result: GatewayModelSelection };
+  selectModelPreset: { params: { readonly name: string }; result: GatewayModelSelection };
+  reloadModels: { params: LocalEmpty; result: ModelReloadResult };
+  refreshContext: { params: LocalEmpty; result: { readonly skills: number } };
+  mcpList: { params: LocalEmpty; result: { readonly listing: McpAdminListing } };
+  mcpCallback: { params: { readonly text: string }; result: McpCallbackResult };
+  digestStart: { params: LocalEmpty; result: MemoryDigestStartResult };
+  digestStatus: { params: LocalEmpty; result: MemoryDigestStatusView };
+  historySearch: { params: { readonly query: HistoryQuery }; result: HistoryPage };
+  historyEpisodes: {
+    params: { readonly session?: string; readonly query?: HistoryEpisodeQuery };
+    result: HistoryEpisodePage;
+  };
+  /** JSON has no `undefined`: a missing episode crosses the socket as `null`. */
+  historyEpisode: { params: { readonly session?: string; readonly startEntryId: number }; result: HistoryEpisode | null };
+  historyEntries: {
+    params: {
+      readonly session?: string;
+      readonly query: TerminalEntryQuery;
+      readonly limit: number;
+      readonly cursor?: Cursor;
+    };
+    result: TerminalEntryPage;
+  };
+}
+
+export type LocalMethod = keyof LocalProtocolMethods;
+export type LocalParams<M extends LocalMethod> = LocalProtocolMethods[M]["params"];
+export type LocalResult<M extends LocalMethod> = LocalProtocolMethods[M]["result"];
+
+/** Requests served on the private socket without an attach; everything else needs one. */
+export const LOCAL_OPERATOR_METHODS = Object.freeze([
+  "cronList", "cronShow", "cronCreate", "cronCancel",
+  "appPair", "appDevices", "appRevoke", "appShortcutAdd", "appShortcutList", "appShortcutRevoke",
+] as const satisfies readonly LocalMethod[]);
+
+export type LocalOperatorMethod = typeof LOCAL_OPERATOR_METHODS[number];
+export type LocalSessionMethod = Exclude<LocalMethod, "attach" | LocalOperatorMethod>;
+
+export function isLocalOperatorMethod(method: string): method is LocalOperatorMethod {
+  return (LOCAL_OPERATOR_METHODS as readonly string[]).includes(method);
+}
+
+function unexpected(what: string): never {
+  throw new LocalGatewayError("unavailable", `local gateway sent an unexpected ${what}`);
+}
+
+function resultObject(value: unknown, what: string): Record<string, unknown> {
+  return asObject(value) ?? unexpected(what);
+}
+
+function safeId(value: unknown, what: string): number {
+  return typeof value === "number" && Number.isSafeInteger(value) ? value : unexpected(what);
+}
+
+function revokeResult(what: string) {
+  return (value: unknown): { readonly result: LocalRevokeResult } => {
+    const result = resultObject(value, what).result;
+    if (result !== "revoked" && result !== "missing") unexpected(what);
+    return { result };
+  };
+}
+
+function labelledRows<T>(key: string, what: string) {
+  return (value: unknown): T[] => {
+    const rows = resultObject(value, what)[key];
+    if (!Array.isArray(rows) || rows.some((entry) => {
+      const row = asObject(entry);
+      return row === undefined || typeof row.label !== "string" || typeof row.createdAtMs !== "number";
+    })) unexpected(what);
+    return rows as T[];
+  };
+}
+
+/**
+ * A result whose detailed shape is presentation data the terminal renders defensively; the
+ * transport only requires the JSON object the server always sends.
+ */
+function objectResult<T>(what: string) {
+  return (value: unknown): T => resultObject(value, what) as T;
+}
+
+function attachResult(value: unknown): LocalAttachResult {
+  const what = "attach result";
+  const result = resultObject(value, what);
+  if (result.protocol !== LOCAL_PROTOCOL_VERSION) {
+    throw new LocalGatewayError("unavailable", "local gateway protocol mismatch");
+  }
+  if (typeof result.sessionKey !== "string" || result.sessionKey.length === 0
+    || !Number.isSafeInteger(result.conversationId)) unexpected(what);
+  const tools = result.tools;
+  if (!Array.isArray(tools) || tools.some((tool) => typeof tool !== "string")) unexpected(what);
+  const questions = result.questions ?? [];
+  if (!Array.isArray(questions) || questions.some((entry) => !validAskQuestionView(entry))) unexpected(what);
+  const notices = result.notices ?? [];
+  if (!Array.isArray(notices) || notices.length > LOCAL_PROTOCOL_LIMITS.maxNoticeIds) unexpected(what);
+  return {
+    protocol: LOCAL_PROTOCOL_VERSION,
+    sessionKey: result.sessionKey as string,
+    conversationId: result.conversationId as number,
+    tools: tools as string[],
+    contextRefresh: result.contextRefresh === true,
+    presets: result.presets === true,
+    reload: result.reload === true,
+    attachments: result.attachments === true,
+    digest: result.digest === true,
+    mcp: result.mcp === true,
+    restart: result.restart === true,
+    questions: questions as AskQuestionView[],
+    notices: notices.map((entry) => {
+      const notice = asObject(entry);
+      if (notice === undefined || typeof notice.id !== "string" || notice.id.length === 0
+        || typeof notice.text !== "string" || notice.text.trim() === ""
+        || notice.text.length > LOCAL_PROTOCOL_LIMITS.maxNoticeTextChars) unexpected(what);
+      return { id: notice.id as string, text: notice.text as string };
+    }),
+  };
+}
+
+/**
+ * The client's trust boundary: one check per method, applied to every result before use. A wrong
+ * shape fails the call with a fixed `unavailable` diagnostic and never reaches the terminal.
+ */
+export const LOCAL_RESULT_CHECKS: { readonly [M in LocalMethod]: (value: unknown) => LocalResult<M> } = Object.freeze({
+  attach: attachResult,
+  cronList: (value: unknown) => {
+    const result = resultObject(value, "job listing");
+    if (!Array.isArray(result.jobs) || !Array.isArray(result.origins)) unexpected("job listing");
+    return result as unknown as CronOperatorListing;
+  },
+  cronShow: (value: unknown) => {
+    const jobs = resultObject(value, "job listing").jobs;
+    if (!Array.isArray(jobs)) unexpected("job listing");
+    return { jobs: jobs as CronOperatorJob[] };
+  },
+  cronCreate: objectResult<CronOperatorCreateOutcome>("job result"),
+  cronCancel: objectResult<CronOperatorCancelOutcome>("job result"),
+  appPair: (value: unknown) => {
+    const what = "pairing result";
+    const result = resultObject(value, what);
+    if (typeof result.refused === "string") {
+      if (result.refused !== "label-in-use" && result.refused !== "device-limit"
+        && result.refused !== "pairing-limit" && result.refused !== "invalid-label") unexpected(what);
+      return { refused: result.refused as AppPairingRefusal };
+    }
+    if (typeof result.code !== "string" || typeof result.expiresAtMs !== "number") unexpected(what);
+    return { code: result.code, expiresAtMs: result.expiresAtMs };
+  },
+  appDevices: (value: unknown) => ({ devices: labelledRows<AppDeviceListing>("devices", "device listing")(value) }),
+  appRevoke: revokeResult("revoke result"),
+  appShortcutAdd: (value: unknown) => {
+    const what = "shortcut result";
+    const result = resultObject(value, what);
+    if (typeof result.refused === "string") {
+      if (result.refused !== "invalid-label" && result.refused !== "label-in-use"
+        && result.refused !== "shortcut-limit") unexpected(what);
+      return { refused: result.refused as AppShortcutRefusal };
+    }
+    if (typeof result.token !== "string" || typeof result.label !== "string"
+      || typeof result.createdAtMs !== "number") unexpected(what);
+    return { label: result.label, token: result.token, createdAtMs: result.createdAtMs };
+  },
+  appShortcutList: (value: unknown) => ({
+    shortcuts: labelledRows<AppShortcutListing>("shortcuts", "shortcut listing")(value),
+  }),
+  appShortcutRevoke: revokeResult("shortcut revoke result"),
+  watch: objectResult<LocalEmpty>("watch result"),
+  submit: (value: unknown) => ({ id: safeId(resultObject(value, "submission").id, "submission") }),
+  submitAttachment: (value: unknown) => {
+    const what = "attachment submission";
+    const result = resultObject(value, what);
+    const id = result.id;
+    if (typeof id !== "number" || !Number.isSafeInteger(id) || id < 1) unexpected(what);
+    const attachment = asObject(result.attachment);
+    const relativePath = attachment?.relativePath;
+    const bytes = attachment?.bytes;
+    if (typeof relativePath !== "string" || relativePath.length === 0
+      || typeof bytes !== "number" || !Number.isSafeInteger(bytes) || bytes < 0) unexpected(what);
+    return { id, attachment: { relativePath, bytes } };
+  },
+  submissionStatus: (value: unknown) => {
+    const status = resultObject(value, "submission status").status;
+    if (typeof status !== "string") unexpected("submission status");
+    return { status };
+  },
+  answer: (value: unknown) => {
+    const result = resultObject(value, "answer");
+    if (typeof result.text !== "string") unexpected("answer");
+    return result as unknown as TerminalAnswerText;
+  },
+  status: objectResult<LocalResult<"status">>("status"),
+  ackNotices: objectResult<LocalEmpty>("acknowledgement"),
+  entries: objectResult<TerminalEntryPage>("entry page"),
+  compact: (value: unknown) => ({ taskId: safeId(resultObject(value, "compaction result").taskId, "compaction result") }),
+  abort: objectResult<LocalEmpty>("abort result"),
+  reset: (value: unknown) => {
+    const result = resultObject(value, "reset result");
+    if (result.status !== "reset" && result.status !== "busy") unexpected("reset result");
+    return result as unknown as GatewaySessionReset;
+  },
+  restart: objectResult<LocalEmpty>("restart result"),
+  listModels: objectResult<GatewayModelList>("model list"),
+  selectModel: objectResult<GatewayModelSelection>("model selection"),
+  selectModelPreset: objectResult<GatewayModelSelection>("model selection"),
+  reloadModels: objectResult<ModelReloadResult>("reload result"),
+  refreshContext: (value: unknown) => {
+    const skills = resultObject(value, "context refresh").skills;
+    if (typeof skills !== "number") unexpected("context refresh");
+    return { skills };
+  },
+  mcpList: (value: unknown) => ({ listing: resultObject(resultObject(value, "MCP listing").listing, "MCP listing") as unknown as McpAdminListing }),
+  mcpCallback: objectResult<McpCallbackResult>("MCP callback result"),
+  digestStart: objectResult<MemoryDigestStartResult>("digest result"),
+  digestStatus: objectResult<MemoryDigestStatusView>("digest status"),
+  historySearch: objectResult<HistoryPage>("history page"),
+  historyEpisodes: objectResult<HistoryEpisodePage>("episode page"),
+  historyEpisode: (value: unknown) => value === null ? null : objectResult<HistoryEpisode>("episode")(value),
+  historyEntries: objectResult<TerminalEntryPage>("entry page"),
+});
+
 /** Parse one request line into a bounded envelope; reject everything else. */
 export function parseRequestLine(line: string): LocalRequestEnvelope {
   let value: unknown;
@@ -145,11 +461,14 @@ export function parseServerLine(line: string): LocalServerMessage {
   throw new LocalGatewayError("unavailable", "local gateway sent an unexpected message");
 }
 
+/** CLI conversation name (`cli:<name>`), shared by `pedellus agent --conversation` and the attach request. */
+export const CONVERSATION_NAME_PATTERN = /^[a-z0-9](?:[a-z0-9_-]{0,30})[a-z0-9]$|^[a-z0-9]$/;
+
 /** An absent name is the historical `cli:default` conversation. */
 export function conversationToken(value: unknown): string {
   if (value === undefined) return "default";
   if (typeof value !== "string" || value.length > LOCAL_PROTOCOL_LIMITS.maxConversationTokenChars
-    || !/^[a-z0-9](?:[a-z0-9_-]{0,30})[a-z0-9]$|^[a-z0-9]$/.test(value)) {
+    || !CONVERSATION_NAME_PATTERN.test(value)) {
     throw new LocalRequestError("invalid", "conversation name is not accepted");
   }
   return value;

@@ -512,6 +512,23 @@ test("a second local gateway owner is refused without disturbing the live one", 
   await client.close();
 });
 
+test("an operator-only connection reaches no chat, and a missing episode stays a reply", { timeout: 20_000 }, async (t) => {
+  const { socketPath } = await makeEnvironment(t);
+  const { LocalRemoteError } = await import(pathToFileURL(`${pkg}/dist/local/client.js`).href);
+  const operator = await connectLocalGateway({ socketPath, operatorOnly: true, context });
+  // Its type has no conversation methods; a raw call still reaches no chat on the gateway.
+  await assert.rejects(operator.status(context), (error) => error instanceof LocalRemoteError && error.code === "unavailable");
+  await operator.close();
+  await operator.close();
+
+  const client = await connectLocalGateway({ socketPath, context });
+  // JSON drops `undefined`; the reply must still arrive and leave the connection usable.
+  assert.equal(await client.episode(client.sessionKey, 999_999, context), undefined);
+  assert.equal((await client.status(context)).run, undefined);
+  await client.close();
+  await assert.rejects(client.status(context), /closed/);
+});
+
 test("malformed and out-of-scope requests stay inside the attach scope", { timeout: 20_000 }, async (t) => {
   const { socketPath } = await makeEnvironment(t);
   const raw = await rawConnection(socketPath);

@@ -171,7 +171,7 @@ test("named preset parsing rejects ambiguous config and dedupes one model pair",
   );
   assert.throws(
     () => parseConfig({ ...base, modelPresets: { fast: { ...presets.fast, temperature: 1 } }, modelPreset: "fast" }, root),
-    /Unknown modelPresets.fast field: temperature/,
+    /modelPresets\.fast\.temperature is not a recognized option/,
   );
   assert.throws(
     () => parseConfig({ ...base, modelPresets: { fast: { ...presets.fast, thinkingLevel: "turbo" } }, modelPreset: "fast" }, root),

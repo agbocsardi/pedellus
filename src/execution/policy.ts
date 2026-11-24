@@ -22,8 +22,9 @@ export const DEFAULT_SHELL_DENY_PATTERNS: readonly string[] = [
 	String.raw`>\s*/dev/sd`, // write to a block device
 	String.raw`\b(shutdown|reboot|poweroff)\b`, // system power
 	String.raw`:\(\)\s*\{.*\};\s*:`, // fork bomb
-	// Direct writes to bot-managed state files. These are managed by the application, and a shell write can corrupt
-	// their cursor/format invariants.
+	// Direct writes to the Python nanobot's managed state files (`memory/history.jsonl`, `.dream_cursor`). Pedellus
+	// keeps its own state under the protected dataDir, but a workspace shared with a Python bot still holds these, and
+	// a shell write can corrupt their cursor/format invariants.
 	String.raw`>>?\s*\S*(?:history\.jsonl|\.dream_cursor)`,
 	String.raw`\btee\b[^|;&<>]*(?:history\.jsonl|\.dream_cursor)`,
 	String.raw`\b(?:cp|mv)\b(?:\s+[^\s|;&<>]+)+\s+\S*(?:history\.jsonl|\.dream_cursor)`,
@@ -41,7 +42,7 @@ const SHELL_BOUNDARY_NOTE =
 	"Do NOT retry with shell tricks (symlinks, base64 piping, alternative " +
 	"tools, working_dir overrides). If the user genuinely needs this " +
 	"resource, tell them you cannot reach it under the current " +
-	"restrict_to_workspace policy and ask how to proceed.";
+	"tool policy and ask how to proceed.";
 const BENIGN_DEVICE_PATHS = new Set([
 	"/dev/null",
 	"/dev/zero",
@@ -376,9 +377,9 @@ export function createExecutionPolicy(options: ExecutionPolicyOptions): Executio
 				}
 				if (allowPatterns.length > 0) return "Command blocked by allowlist filter (not in allowlist)";
 			}
-			if (!restrictToWorkspace) return undefined;
+			if (!restrictToWorkspace && protectedRoots.length === 0) return undefined;
 			const trimmed = text.trim();
-			if (trimmed.includes("../") || trimmed.includes("..\\")) {
+			if (restrictToWorkspace && (trimmed.includes("../") || trimmed.includes("..\\"))) {
 				return `Error: Command blocked by safety guard (path traversal detected)${SHELL_BOUNDARY_NOTE}`;
 			}
 			const environment = policy.shellEnvironment();
@@ -392,7 +393,8 @@ export function createExecutionPolicy(options: ExecutionPolicyOptions): Executio
 				} else if (expanded.startsWith("~/") || expanded.startsWith("~\\")) {
 					target = resolve(environment.HOME ?? roots[0]!, expanded.slice(2));
 				} else if (expanded.startsWith("~")) {
-					// An unknown user home cannot be authorized lexically; fail closed.
+					// An unknown user home cannot be authorized lexically; fail closed when confined.
+					if (!restrictToWorkspace) continue;
 					return `Error: Command blocked by safety guard (path outside working dir) [target_path="${expanded}"]${SHELL_BOUNDARY_NOTE}`;
 				} else if (isAbsolute(expanded)) {
 					target = resolve(expanded);
@@ -400,7 +402,12 @@ export function createExecutionPolicy(options: ExecutionPolicyOptions): Executio
 					target = resolve(base, expanded);
 				}
 				if (isBenignDevicePath(target)) continue;
-				if (roots.some((root) => isPathWithin(root, target))) continue;
+				// Managed data stays off-limits even when an allowed root contains it (full-host mode
+				// allows `/`). Like the rest of this guard it is lexical accident protection only.
+				if (protectedPath(target) !== undefined) {
+					return `Error: Command blocked by safety guard (path is managed gateway data; use the owning gateway APIs)${SHELL_BOUNDARY_NOTE}`;
+				}
+				if (!restrictToWorkspace || roots.some((root) => isPathWithin(root, target))) continue;
 				return `Error: Command blocked by safety guard (path outside working dir) [target_path="${target}"]${SHELL_BOUNDARY_NOTE}`;
 			}
 			return undefined;

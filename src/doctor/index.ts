@@ -205,6 +205,7 @@ async function readRegularFileBounded(path: string, options: { noFollow?: boolea
 const TRUSTED_CONFIG_FIELDS = new Set([
   "workspace", "dataDir", "extraAllowedDirs", "model", "allowedModels", "modelPresets", "modelPreset",
   "classifierModel", "toolAllowlist", "toolSandbox", "bwrapPath", "toolTimeoutSeconds", "followUpMode",
+  "restrictToWorkspace", "thinkingLevel",
   "workspaceContext", "workspaceContext.memoryFiles", "workspaceContext.memoryManifest", "workspaceContext.skills",
   "workspaceContext.skills.builtinSkillsRoot", "workspaceContext.skills.disabledSkills",
   "cron", "cron.enabled", "cron.timeZone", "episodeSummary", "episodeSummary.enabled", "episodeSummary.preset",
@@ -249,9 +250,10 @@ export function safeConfigMessage(error: unknown): string {
 
   // 1. Unknown option in any strict section (handles dotted arbitrary keys too).
   if (raw.endsWith(" is not a recognized option")) {
-    for (const section of STRICT_OPTION_SECTIONS) {
+    for (const section of [...STRICT_OPTION_SECTIONS, ...DYNAMIC_KEY_SECTIONS]) {
       if (raw.startsWith(`${section}.`)) return `${section} contains an unrecognized option`;
     }
+    // Top-level (`config.<key>`) and anything else: the key itself is never echoed.
     return "configuration contains an unrecognized option";
   }
 

@@ -21,6 +21,7 @@ import { parseMcpConfig, type McpConfig } from "./mcp/config.js";
 import { VISION_HANDOFF_DEFAULTS, VISION_HANDOFF_LIMITS } from "./media/vision.js";
 import { parseWebConfig, type WebConfig } from "./web/config.js";
 import { WORKER_LIMITS, WORKER_TOOL_GRANTS } from "./workers/limits.js";
+import { CODING_TOOL_NAMES } from "./tools/coding.js";
 import { DIGEST_CHARS_PER_BATCH_MIN, DIGEST_ENTRIES_PER_BATCH_MIN } from "./history/digest-limits.js";
 
 /**
@@ -449,6 +450,16 @@ function object(value: unknown, name: string): Record<string, unknown> {
   Object.setPrototypeOf(copy, null);
   return copy;
 }
+/**
+ * The one unknown-key refusal for every strict config block. Its `<section>.<key> is not a recognized
+ * option` shape is what `doctor` maps to a key-free "<section> contains an unrecognized option", so the
+ * owner-chosen key itself never reaches a diagnostic.
+ */
+function rejectUnknownKeys(value: Record<string, unknown>, allowed: readonly string[], name: string): void {
+  for (const key of Object.keys(value)) {
+    if (!allowed.includes(key)) throw new Error(`${name}.${key} is not a recognized option`);
+  }
+}
 function nonempty(value: unknown, name: string): string {
   if (typeof value !== "string" || value.trim() === "") throw new Error(`${name} must be a non-empty string`);
   return value;
@@ -470,10 +481,10 @@ export function parseToolTimeoutSeconds(value: unknown): number | undefined {
 
 function modelReference(value: unknown, name: string): ModelReference {
   const model = object(value, name);
-  return {
+  return Object.freeze({
     provider: providerKey(model.provider, `${name}.provider`),
     modelId: nonempty(model.modelId, `${name}.modelId`),
-  };
+  });
 }
 
 /** Stable identity for a provider/model pair; shared by config validation and provider resolution. */
@@ -488,13 +499,16 @@ function modelThinkingLevel(value: unknown, name: string): ModelThinkingLevel {
   return value as ModelThinkingLevel;
 }
 
+/** Provider ID syntax shared by config keys and CLI provider arguments. */
+export const PROVIDER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
 /**
  * Provider spelling accepted by config and native Pi AI. This is a syntax bound,
  * not a provider whitelist; existence is checked against native/custom providers
  * during startup.
  */
 function providerKey(value: unknown, name: string): string {
-  if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(value)) {
+  if (typeof value !== "string" || !PROVIDER_ID_PATTERN.test(value)) {
     throw new Error(`${name} must be a provider ID using letters, digits, dot, underscore or hyphen`);
   }
   return value;
@@ -525,11 +539,7 @@ function nonnegativeNumber(value: unknown, name: string): number {
 
 function customModelConfig(value: unknown, name: string): CustomModelConfig {
   const raw = object(value, name);
-  for (const key of Object.keys(raw)) {
-    if (!["id", "name", "reasoning", "input", "contextWindow", "maxTokens", "cost"].includes(key)) {
-      throw new Error(`Unknown ${name} field: ${key}`);
-    }
-  }
+  rejectUnknownKeys(raw, ["id", "name", "reasoning", "input", "contextWindow", "maxTokens", "cost"], name);
   const id = nonempty(raw.id, `${name}.id`);
   const displayName = raw.name === undefined ? id : nonempty(raw.name, `${name}.name`);
   let reasoning = false;
@@ -549,25 +559,21 @@ function customModelConfig(value: unknown, name: string): CustomModelConfig {
     input = [...values];
   }
   const costRaw = object(raw.cost, `${name}.cost`);
-  for (const key of Object.keys(costRaw)) {
-    if (!["input", "output", "cacheRead", "cacheWrite"].includes(key)) {
-      throw new Error(`Unknown ${name}.cost field: ${key}`);
-    }
-  }
-  return {
+  rejectUnknownKeys(costRaw, ["input", "output", "cacheRead", "cacheWrite"], `${name}.cost`);
+  return Object.freeze({
     id,
     name: displayName,
     reasoning,
-    input,
+    input: Object.freeze(input),
     contextWindow: positiveInteger(raw.contextWindow, `${name}.contextWindow`),
     maxTokens: positiveInteger(raw.maxTokens, `${name}.maxTokens`),
-    cost: {
+    cost: Object.freeze({
       input: nonnegativeNumber(costRaw.input, `${name}.cost.input`),
       output: nonnegativeNumber(costRaw.output, `${name}.cost.output`),
       cacheRead: nonnegativeNumber(costRaw.cacheRead, `${name}.cost.cacheRead`),
       cacheWrite: nonnegativeNumber(costRaw.cacheWrite, `${name}.cost.cacheWrite`),
-    },
-  };
+    }),
+  });
 }
 
 function customProvidersConfig(value: unknown): Readonly<Record<string, CustomProviderConfig>> {
@@ -577,11 +583,7 @@ function customProvidersConfig(value: unknown): Readonly<Record<string, CustomPr
   for (const [rawKey, entry] of Object.entries(raw)) {
     const key = providerKey(rawKey, "providers key");
     const provider = object(entry, `providers.${key}`);
-    for (const field of Object.keys(provider)) {
-      if (!["name", "baseUrl", "api", "models"].includes(field)) {
-        throw new Error(`Unknown providers.${key} field: ${field}`);
-      }
-    }
+    rejectUnknownKeys(provider, ["name", "baseUrl", "api", "models"], `providers.${key}`);
     if (typeof provider.api !== "string" || !(CUSTOM_PROVIDER_APIS as readonly string[]).includes(provider.api)) {
       throw new Error(`providers.${key}.api must be one of ${CUSTOM_PROVIDER_APIS.join(", ")}`);
     }
@@ -629,11 +631,7 @@ function modelPresetsConfig(value: unknown): Readonly<Record<string, ModelPreset
   for (const [rawName, entry] of Object.entries(raw)) {
     const name = modelPresetName(rawName, "modelPresets name");
     const preset = object(entry, `modelPresets.${name}`);
-    for (const key of Object.keys(preset)) {
-      if (key !== "provider" && key !== "modelId" && key !== "thinkingLevel" && key !== "needsVisionHandoff") {
-        throw new Error(`Unknown modelPresets.${name} field: ${key}`);
-      }
-    }
+    rejectUnknownKeys(preset, ["provider", "modelId", "thinkingLevel", "needsVisionHandoff"], `modelPresets.${name}`);
     if (preset.needsVisionHandoff !== undefined && typeof preset.needsVisionHandoff !== "boolean") {
       throw new Error(`modelPresets.${name}.needsVisionHandoff must be a boolean`);
     }
@@ -666,9 +664,7 @@ function modelPresetsConfig(value: unknown): Readonly<Record<string, ModelPreset
 
 function idleRolloverConfig(value: unknown): IdleRolloverConfig {
   const raw = object(value, "idleRollover");
-  for (const key of Object.keys(raw)) {
-    if (key !== "afterMinutes") throw new Error(`Unknown idleRollover field: ${key}`);
-  }
+  rejectUnknownKeys(raw, ["afterMinutes"], "idleRollover");
   const after = raw.afterMinutes;
   if (typeof after !== "number" || !Number.isSafeInteger(after) || after < 1 || after > 7 * 24 * 60) {
     throw new Error("idleRollover.afterMinutes must be an integer from 1 to 10080");
@@ -681,11 +677,7 @@ function visionHandoffConfig(
   modelPresets: Readonly<Record<string, ModelPreset>> | undefined,
 ): VisionHandoffConfig {
   const raw = object(value, "visionHandoff");
-  for (const key of Object.keys(raw)) {
-    if (key !== "describerPreset" && key !== "maxRawImages" && key !== "maxDescriptionTokens" && key !== "prompt") {
-      throw new Error(`Unknown visionHandoff field: ${key}`);
-    }
-  }
+  rejectUnknownKeys(raw, ["describerPreset", "maxRawImages", "maxDescriptionTokens", "prompt"], "visionHandoff");
   if (modelPresets === undefined) {
     throw new Error("visionHandoff requires named modelPresets and a describerPreset");
   }
@@ -732,11 +724,7 @@ function visionHandoffConfig(
 
 function workspaceSkillsConfig(value: unknown): WorkspaceSkillsConfig {
   const raw = object(value, "workspaceContext.skills");
-  for (const key of Object.keys(raw)) {
-    if (key !== "builtinSkillsRoot" && key !== "disabledSkills") {
-      throw new Error(`Unknown workspaceContext.skills field: ${key}`);
-    }
-  }
+  rejectUnknownKeys(raw, ["builtinSkillsRoot", "disabledSkills"], "workspaceContext.skills");
   let builtinSkillsRoot: string | undefined;
   if (raw.builtinSkillsRoot !== undefined) {
     const path = nonempty(raw.builtinSkillsRoot, "workspaceContext.skills.builtinSkillsRoot");
@@ -764,11 +752,7 @@ function skillNames(value: unknown, label: string): readonly string[] {
 
 function workspaceContextConfig(value: unknown): WorkspaceContextConfig {
   const raw = object(value, "workspaceContext");
-  for (const key of Object.keys(raw)) {
-    if (key !== "memoryFiles" && key !== "memoryManifest" && key !== "skills") {
-      throw new Error(`Unknown workspaceContext field: ${key}`);
-    }
-  }
+  rejectUnknownKeys(raw, ["memoryFiles", "memoryManifest", "skills"], "workspaceContext");
   if (raw.memoryManifest !== undefined && typeof raw.memoryManifest !== "boolean") {
     throw new Error("workspaceContext.memoryManifest must be a boolean");
   }
@@ -805,30 +789,24 @@ function workspaceContextConfig(value: unknown): WorkspaceContextConfig {
 
 function cronConfig(value: unknown): CronConfig {
   const raw = object(value, "cron");
-  for (const key of Object.keys(raw)) {
-    if (key !== "enabled" && key !== "timeZone") throw new Error(`Unknown cron field: ${key}`);
-  }
+  rejectUnknownKeys(raw, ["enabled", "timeZone"], "cron");
   if (typeof raw.enabled !== "boolean") throw new Error("cron.enabled must be a boolean");
-  if (!raw.enabled) return { enabled: false };
-  if (raw.timeZone === undefined) return { enabled: true };
+  if (!raw.enabled) return Object.freeze({ enabled: false });
+  if (raw.timeZone === undefined) return Object.freeze({ enabled: true });
   const timeZone = nonempty(raw.timeZone, "cron.timeZone");
   try {
     new Intl.DateTimeFormat("en-US", { timeZone }).format(0);
   } catch {
     throw new Error("cron.timeZone must be an IANA time zone name");
   }
-  return { enabled: true, timeZone };
+  return Object.freeze({ enabled: true, timeZone });
 }
 
 function workersConfig(value: unknown): WorkersConfig {
   const raw = object(value, "workers");
-  for (const key of Object.keys(raw)) {
-    if (key !== "enabled" && key !== "maxConcurrent" && key !== "preset" && key !== "toolAllowlist") {
-      throw new Error(`Unknown workers field: ${key}`);
-    }
-  }
+  rejectUnknownKeys(raw, ["enabled", "maxConcurrent", "preset", "toolAllowlist"], "workers");
   if (typeof raw.enabled !== "boolean") throw new Error("workers.enabled must be a boolean");
-  if (!raw.enabled) return { enabled: false };
+  if (!raw.enabled) return Object.freeze({ enabled: false });
   const workers: { enabled: boolean; maxConcurrent?: number; preset?: string; toolAllowlist?: readonly string[] } = { enabled: true };
   if (raw.maxConcurrent !== undefined) {
     if (typeof raw.maxConcurrent !== "number" || !Number.isSafeInteger(raw.maxConcurrent)
@@ -858,11 +836,7 @@ function workersConfig(value: unknown): WorkersConfig {
 function whisperCliEngineConfig(value: unknown): WhisperCliEngineConfig {
   const raw = object(value, "media.transcription.whisperCli");
   const keys = ["binary", "model", "vadModel", "ffmpeg", "ffprobe"] as const;
-  for (const key of Object.keys(raw)) {
-    if (!(keys as readonly string[]).includes(key)) {
-      throw new Error(`Unknown media.transcription.whisperCli field: ${key}`);
-    }
-  }
+  rejectUnknownKeys(raw, keys, "media.transcription.whisperCli");
   const parsed: Record<string, string> = {};
   for (const key of keys) {
     const entry = raw[key];
@@ -884,12 +858,7 @@ function whisperCliEngineConfig(value: unknown): WhisperCliEngineConfig {
  */
 function hexEngineConfig(value: unknown): HexEngineConfig {
   const raw = object(value, "media.transcription.hex");
-  const keys = ["binary", "ffmpeg", "ffprobe", "model"] as const;
-  for (const key of Object.keys(raw)) {
-    if (!(keys as readonly string[]).includes(key)) {
-      throw new Error(`Unknown media.transcription.hex field: ${key}`);
-    }
-  }
+  rejectUnknownKeys(raw, ["binary", "ffmpeg", "ffprobe", "model"], "media.transcription.hex");
   const parsed: Record<string, string> = {};
   for (const key of ["binary", "ffmpeg", "ffprobe"] as const) {
     const entry = raw[key];
@@ -912,12 +881,11 @@ function hexEngineConfig(value: unknown): HexEngineConfig {
 
 function mediaTranscriptionConfig(value: unknown): MediaTranscriptionConfig {
   const raw = object(value, "media.transcription");
-  for (const key of Object.keys(raw)) {
-    if (key !== "enabled" && key !== "language" && key !== "maxDurationSeconds" &&
-        key !== "timeoutMs" && key !== "backend" && key !== "whisperCli" && key !== "hex") {
-      throw new Error(`Unknown media.transcription field: ${key}`);
-    }
-  }
+  rejectUnknownKeys(
+    raw,
+    ["enabled", "language", "maxDurationSeconds", "timeoutMs", "backend", "whisperCli", "hex"],
+    "media.transcription",
+  );
   if (raw.enabled !== undefined && typeof raw.enabled !== "boolean") {
     throw new Error("media.transcription.enabled must be a boolean");
   }
@@ -974,9 +942,7 @@ function mediaTranscriptionConfig(value: unknown): MediaTranscriptionConfig {
 
 function codeModeConfig(value: unknown): CodeModeConfig {
   const raw = object(value, "codemode");
-  for (const key of Object.keys(raw)) {
-    if (key !== "enabled") throw new Error(`Unknown codemode field: ${key}`);
-  }
+  rejectUnknownKeys(raw, ["enabled"], "codemode");
   if (typeof raw.enabled !== "boolean") throw new Error("codemode.enabled must be a boolean");
   return Object.freeze({ enabled: raw.enabled });
 }
@@ -1001,11 +967,7 @@ function digestConfig(
   modelPresets: Readonly<Record<string, ModelPreset>> | undefined,
 ): DigestConfig {
   const raw = object(value, "digest");
-  for (const key of Object.keys(raw)) {
-    if (key !== "model" && key !== "preset" && !(DIGEST_CONFIG_FIELDS as readonly string[]).includes(key)) {
-      throw new Error(`Unknown digest field: ${key}`);
-    }
-  }
+  rejectUnknownKeys(raw, ["model", "preset", ...DIGEST_CONFIG_FIELDS], "digest");
   const parsed: Partial<Record<DigestNumericField, number>> = {};
   for (const field of DIGEST_CONFIG_FIELDS) {
     const bound = raw[field];
@@ -1049,9 +1011,7 @@ function digestConfig(
 
 function mediaConfig(value: unknown): MediaConfig {
   const raw = object(value, "media");
-  for (const key of Object.keys(raw)) {
-    if (key !== "directory" && key !== "transcription") throw new Error(`Unknown media field: ${key}`);
-  }
+  rejectUnknownKeys(raw, ["directory", "transcription"], "media");
   const directory = validateMediaDirectory(raw.directory);
   return Object.freeze({
     directory,
@@ -1059,8 +1019,27 @@ function mediaConfig(value: unknown): MediaConfig {
   });
 }
 
+/**
+ * Exactly the accepted top-level keys. An unknown key is a typo (or a stale option) that must fail
+ * closed instead of silently leaving an intended restriction unapplied.
+ */
+const TOP_LEVEL_KEYS = [
+  "workspace", "dataDir", "followUpMode",
+  "model", "allowedModels", "thinkingLevel", "classifierModel", "modelPresets", "modelPreset", "visionHandoff",
+  "toolAllowlist", "toolTimeoutSeconds", "toolSandbox", "restrictToWorkspace", "extraAllowedDirs", "bwrapPath",
+  "workspaceContext", "mcp", "cron", "workers", "codemode", "digest", "media", "episodeSummary", "idleRollover",
+  "credentials", "providers", "web", "telegram", "discord", "app",
+] as const;
+
+/** Exactly the accepted `telegram` keys; an unknown key must not silently widen or skip a restriction. */
+const TELEGRAM_KEYS = ["tokenEnv", "allowFrom", "pollTimeoutSeconds"] as const;
+
+/** Mutable view used only while `parseConfig` assembles the result it then freezes. */
+type ConfigDraft = { -readonly [K in keyof PortConfig]: PortConfig[K] };
+
 export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig {
   const raw = object(value, "config");
+  rejectUnknownKeys(raw, TOP_LEVEL_KEYS, "config");
   const presetMode = raw.modelPreset !== undefined || raw.modelPresets !== undefined;
   let model: ModelReference;
   let allowedModels: ModelReference[];
@@ -1080,13 +1059,13 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
     modelPreset = modelPresetName(raw.modelPreset, "modelPreset");
     const selected = Object.hasOwn(modelPresets, modelPreset) ? modelPresets[modelPreset] : undefined;
     if (selected === undefined) throw new Error("modelPreset must name an entry in modelPresets");
-    model = { provider: selected.provider, modelId: selected.modelId };
+    model = Object.freeze({ provider: selected.provider, modelId: selected.modelId });
     // The catalog is the allowlist: one pair per provider/model even when two presets differ only
     // by thinking level, because native selection is keyed by the model pair.
     const seen = new Set<string>();
     allowedModels = [];
     for (const preset of Object.values(modelPresets)) {
-      const reference = { provider: preset.provider, modelId: preset.modelId };
+      const reference = Object.freeze({ provider: preset.provider, modelId: preset.modelId });
       const key = modelKey(reference);
       if (seen.has(key)) continue;
       seen.add(key);
@@ -1106,12 +1085,13 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
       if (!keys.includes(modelKey(model))) throw new Error("model must be included in allowedModels");
     }
   }
+  Object.freeze(allowedModels);
   // One classifier model is a separate authority from chat selection. Absent means no
   // classifier is reachable, however many providers are registered.
   const classifierModel = raw.classifierModel === undefined
     ? undefined
     : modelReference(raw.classifierModel, "classifierModel");
-  const config: PortConfig = {
+  const config: ConfigDraft = {
     workspace: resolve(baseDir, nonempty(raw.workspace, "workspace")),
     dataDir: resolve(baseDir, nonempty(raw.dataDir, "dataDir")),
     followUpMode: followUpModeConfig(raw.followUpMode),
@@ -1121,45 +1101,31 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
     ...(modelPresets === undefined ? {} : { modelPresets }),
     ...(modelPreset === undefined ? {} : { modelPreset }),
   };
-  let toolAllowlist: string[] = [];
-  if (raw.toolAllowlist !== undefined) {
-    if (!Array.isArray(raw.toolAllowlist)) throw new Error("toolAllowlist must be an array");
-    toolAllowlist = raw.toolAllowlist.map((name, index) => {
-      if (typeof name !== "string" || name.length === 0 || name.trim() !== name || /[\u0000-\u001f\u007f]/.test(name)) {
-        throw new Error(`toolAllowlist[${index}] must be an exact non-empty tool name`);
-      }
-      return name;
-    });
-    const foldedNames = toolAllowlist.map((name) => name.toLocaleLowerCase("en-US"));
-    if (new Set(foldedNames).size !== foldedNames.length) {
-      throw new Error("toolAllowlist must not contain duplicate or case-ambiguous names");
-    }
-  }
-  config.toolAllowlist = toolAllowlist;
+  config.toolAllowlist = toolAllowlistConfig(raw.toolAllowlist);
   const toolTimeoutSeconds = parseToolTimeoutSeconds(raw.toolTimeoutSeconds);
-  if (toolTimeoutSeconds !== undefined) Object.assign(config, { toolTimeoutSeconds });
+  if (toolTimeoutSeconds !== undefined) config.toolTimeoutSeconds = toolTimeoutSeconds;
   if (raw.toolSandbox !== undefined) {
     if (raw.toolSandbox !== "host" && raw.toolSandbox !== "bwrap") {
       throw new Error('toolSandbox must be "host" or "bwrap"');
     }
-    Object.assign(config, { toolSandbox: raw.toolSandbox });
+    config.toolSandbox = raw.toolSandbox;
   }
   if (raw.restrictToWorkspace !== undefined) {
     if (typeof raw.restrictToWorkspace !== "boolean") throw new Error("restrictToWorkspace must be a boolean");
     if (raw.restrictToWorkspace === false && raw.toolSandbox === "bwrap") {
       throw new Error("restrictToWorkspace: false requires the host shell, not bwrap");
     }
-    Object.assign(config, { restrictToWorkspace: raw.restrictToWorkspace });
+    config.restrictToWorkspace = raw.restrictToWorkspace;
   }
   if (raw.workspaceContext !== undefined) {
-    Object.assign(config, { workspaceContext: workspaceContextConfig(raw.workspaceContext) });
+    config.workspaceContext = workspaceContextConfig(raw.workspaceContext);
   }
   // Parsed after the workspace is resolved: a stdio server's cwd is confined to it.
   if (raw.mcp !== undefined) {
-    Object.assign(config, { mcp: parseMcpConfig(raw.mcp, config.workspace) });
+    config.mcp = parseMcpConfig(raw.mcp, config.workspace);
   }
   if (raw.cron !== undefined) {
-    Object.assign(config, { cron: cronConfig(raw.cron) });
+    config.cron = cronConfig(raw.cron);
   }
   if (raw.workers !== undefined) {
     const workers = workersConfig(raw.workers);
@@ -1169,53 +1135,28 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
         throw new Error("workers.preset must name an entry in modelPresets");
       }
     }
-    Object.assign(config, { workers });
+    config.workers = workers;
   }
   if (raw.codemode !== undefined) {
-    Object.assign(config, { codemode: codeModeConfig(raw.codemode) });
+    config.codemode = codeModeConfig(raw.codemode);
   }
   if (raw.digest !== undefined) {
-    Object.assign(config, { digest: digestConfig(raw.digest, allowedModels, modelPresets) });
+    config.digest = digestConfig(raw.digest, allowedModels, modelPresets);
   }
   if (raw.media !== undefined) {
-    Object.assign(config, { media: mediaConfig(raw.media) });
+    config.media = mediaConfig(raw.media);
   }
   if (raw.episodeSummary !== undefined) {
-    const summary = object(raw.episodeSummary, "episodeSummary");
-    for (const key of Object.keys(summary)) {
-      if (key !== "enabled" && key !== "model" && key !== "preset") {
-        throw new Error(`Unknown episodeSummary field: ${key}`);
-      }
-    }
-    if (summary.enabled !== undefined && typeof summary.enabled !== "boolean") {
-      throw new Error("episodeSummary.enabled must be a boolean");
-    }
-    if (summary.model !== undefined && summary.preset !== undefined) {
-      throw new Error("episodeSummary.model and episodeSummary.preset are mutually exclusive");
-    }
-    const summaryModel = summary.model === undefined ? undefined : modelReference(summary.model, "episodeSummary.model");
-    if (summaryModel !== undefined && !allowedModels.some((choice) => modelKey(choice) === modelKey(summaryModel))) {
-      throw new Error("episodeSummary.model must be included in allowedModels");
-    }
-    let summaryPreset: string | undefined;
-    if (summary.preset !== undefined) {
-      if (modelPresets === undefined) throw new Error("episodeSummary.preset requires named modelPresets");
-      summaryPreset = modelPresetName(summary.preset, "episodeSummary.preset");
-      if (!Object.hasOwn(modelPresets, summaryPreset)) {
-        throw new Error("episodeSummary.preset must name an entry in modelPresets");
-      }
-    }
-    config.episodeSummary = {
-      ...(summary.enabled === undefined ? {} : { enabled: summary.enabled }),
-      ...(summaryModel === undefined ? {} : { model: summaryModel }),
-      ...(summaryPreset === undefined ? {} : { preset: summaryPreset }),
-    };
+    config.episodeSummary = episodeSummaryConfig(raw.episodeSummary, allowedModels, modelPresets);
   }
   if (raw.idleRollover !== undefined) {
-    Object.assign(config, { idleRollover: idleRolloverConfig(raw.idleRollover) });
+    // Rollover classifies the owner's next message with the one configured classifier; there is
+    // no fallback model, so the pair is a pure config cross-check.
+    if (classifierModel === undefined) throw new Error("idleRollover requires classifierModel");
+    config.idleRollover = idleRolloverConfig(raw.idleRollover);
   }
   if (raw.visionHandoff !== undefined) {
-    Object.assign(config, { visionHandoff: visionHandoffConfig(raw.visionHandoff, modelPresets) });
+    config.visionHandoff = visionHandoffConfig(raw.visionHandoff, modelPresets);
   }
   if (modelPresets !== undefined) {
     const flagged = Object.entries(modelPresets)
@@ -1232,12 +1173,14 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
   }
   if (raw.extraAllowedDirs !== undefined) {
     if (!Array.isArray(raw.extraAllowedDirs)) throw new Error("extraAllowedDirs must be an array");
-    Object.assign(config, { extraAllowedDirs: raw.extraAllowedDirs.map((v, i) => resolve(baseDir, nonempty(v, `extraAllowedDirs[${i}]`))) });
+    config.extraAllowedDirs = Object.freeze(
+      raw.extraAllowedDirs.map((v, i) => resolve(baseDir, nonempty(v, `extraAllowedDirs[${i}]`))),
+    );
   }
   if (raw.bwrapPath !== undefined) {
     const path = nonempty(raw.bwrapPath, "bwrapPath");
     if (!isAbsolute(path)) throw new Error("bwrapPath must be absolute");
-    Object.assign(config, { bwrapPath: path });
+    config.bwrapPath = path;
   }
   if (raw.credentials !== undefined) {
     const credentials = object(raw.credentials, "credentials");
@@ -1246,31 +1189,103 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
       const key = providerKey(rawKey, "credentials key");
       normalized[key] = envName(name, `credentials.${key}`);
     }
-    Object.assign(config, { credentials: Object.freeze(normalized) });
+    config.credentials = Object.freeze(normalized);
   }
   if (raw.providers !== undefined) {
-    Object.assign(config, { providers: customProvidersConfig(raw.providers) });
+    config.providers = customProvidersConfig(raw.providers);
   }
   if (raw.telegram !== undefined) {
-    const t = object(raw.telegram, "telegram");
-    if (!Array.isArray(t.allowFrom) || t.allowFrom.length === 0 || t.allowFrom.some((id) => typeof id !== "string" || !/^\d+$/.test(id))) throw new Error("telegram.allowFrom must be a non-empty list of decimal user IDs");
-    const telegram: NonNullable<PortConfig["telegram"]> = { tokenEnv: envName(t.tokenEnv, "telegram.tokenEnv"), allowFrom: t.allowFrom as string[] };
-    if (t.pollTimeoutSeconds !== undefined) {
-      if (typeof t.pollTimeoutSeconds !== "number" || !Number.isInteger(t.pollTimeoutSeconds) || t.pollTimeoutSeconds < 1 || t.pollTimeoutSeconds > 50) throw new Error("telegram.pollTimeoutSeconds must be an integer from 1 to 50");
-      telegram.pollTimeoutSeconds = t.pollTimeoutSeconds;
-    }
-    Object.assign(config, { telegram });
+    config.telegram = telegramConfig(raw.telegram);
   }
   if (raw.discord !== undefined) {
-    Object.assign(config, { discord: discordConfig(raw.discord) });
+    config.discord = discordConfig(raw.discord);
   }
   if (raw.app !== undefined) {
-    Object.assign(config, { app: appConfig(raw.app) });
+    config.app = appConfig(raw.app);
   }
   if (raw.web !== undefined) {
-    Object.assign(config, { web: parseWebConfig(raw.web) });
+    config.web = parseWebConfig(raw.web);
   }
-  return config;
+  return Object.freeze(config);
+}
+
+/**
+ * Foreground coding-tool ceiling. Only the reviewed native coding tools have registrations; any
+ * other name (including a separately configured capability such as `web_search`) is refused here
+ * rather than at gateway open, so `doctor` and `init` see the same failure.
+ */
+function toolAllowlistConfig(value: unknown): readonly string[] {
+  if (value === undefined) return Object.freeze([]);
+  if (!Array.isArray(value)) throw new Error("toolAllowlist must be an array");
+  const names = value.map((name, index) => {
+    if (typeof name !== "string" || name.length === 0 || name.trim() !== name || /[\u0000-\u001f\u007f]/.test(name)) {
+      throw new Error(`toolAllowlist[${index}] must be an exact non-empty tool name`);
+    }
+    return name;
+  });
+  const foldedNames = names.map((name) => name.toLocaleLowerCase("en-US"));
+  if (new Set(foldedNames).size !== foldedNames.length) {
+    throw new Error("toolAllowlist must not contain duplicate or case-ambiguous names");
+  }
+  if (names.some((name) => !(CODING_TOOL_NAMES as readonly string[]).includes(name))) {
+    throw new Error(`toolAllowlist must name only coding tools (${CODING_TOOL_NAMES.join(", ")})`);
+  }
+  return Object.freeze(names);
+}
+
+function episodeSummaryConfig(
+  value: unknown,
+  allowedModels: readonly ModelReference[],
+  modelPresets: Readonly<Record<string, ModelPreset>> | undefined,
+): NonNullable<PortConfig["episodeSummary"]> {
+  const summary = object(value, "episodeSummary");
+  rejectUnknownKeys(summary, ["enabled", "model", "preset"], "episodeSummary");
+  if (summary.enabled !== undefined && typeof summary.enabled !== "boolean") {
+    throw new Error("episodeSummary.enabled must be a boolean");
+  }
+  if (summary.model !== undefined && summary.preset !== undefined) {
+    throw new Error("episodeSummary.model and episodeSummary.preset are mutually exclusive");
+  }
+  const summaryModel = summary.model === undefined ? undefined : modelReference(summary.model, "episodeSummary.model");
+  if (summaryModel !== undefined && !allowedModels.some((choice) => modelKey(choice) === modelKey(summaryModel))) {
+    throw new Error("episodeSummary.model must be included in allowedModels");
+  }
+  let summaryPreset: string | undefined;
+  if (summary.preset !== undefined) {
+    if (modelPresets === undefined) throw new Error("episodeSummary.preset requires named modelPresets");
+    summaryPreset = modelPresetName(summary.preset, "episodeSummary.preset");
+    if (!Object.hasOwn(modelPresets, summaryPreset)) {
+      throw new Error("episodeSummary.preset must name an entry in modelPresets");
+    }
+  }
+  return Object.freeze({
+    ...(summary.enabled === undefined ? {} : { enabled: summary.enabled }),
+    ...(summaryModel === undefined ? {} : { model: summaryModel }),
+    ...(summaryPreset === undefined ? {} : { preset: summaryPreset }),
+  });
+}
+
+/** `telegram`: opt-in, with an explicit decimal sender allowlist and the token named by variable. */
+function telegramConfig(value: unknown): NonNullable<PortConfig["telegram"]> {
+  const t = object(value, "telegram");
+  rejectUnknownKeys(t, TELEGRAM_KEYS, "telegram");
+  if (!Array.isArray(t.allowFrom) || t.allowFrom.length === 0
+    || t.allowFrom.some((id) => typeof id !== "string" || !/^\d+$/.test(id))) {
+    throw new Error("telegram.allowFrom must be a non-empty list of decimal user IDs");
+  }
+  let pollTimeoutSeconds: number | undefined;
+  if (t.pollTimeoutSeconds !== undefined) {
+    if (typeof t.pollTimeoutSeconds !== "number" || !Number.isInteger(t.pollTimeoutSeconds)
+      || t.pollTimeoutSeconds < 1 || t.pollTimeoutSeconds > 50) {
+      throw new Error("telegram.pollTimeoutSeconds must be an integer from 1 to 50");
+    }
+    pollTimeoutSeconds = t.pollTimeoutSeconds;
+  }
+  return Object.freeze({
+    tokenEnv: envName(t.tokenEnv, "telegram.tokenEnv"),
+    allowFrom: Object.freeze([...t.allowFrom as string[]]),
+    ...(pollTimeoutSeconds === undefined ? {} : { pollTimeoutSeconds }),
+  });
 }
 
 /**
@@ -1278,24 +1293,18 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
  * meaning ("no narrowing"); an empty sender list is refused, because it would leave every sender
  * refused and the channel unusable while looking configured.
  */
-function snowflakeList(value: unknown, name: string, allowEmpty: boolean): string[] {
+function snowflakeList(value: unknown, name: string, allowEmpty: boolean): readonly string[] {
   if (!Array.isArray(value) || value.some((id) => typeof id !== "string" || !/^[1-9][0-9]{0,19}$/.test(id))) {
     throw new Error(`${name} must be a list of decimal Discord snowflakes`);
   }
   if (!allowEmpty && value.length === 0) throw new Error(`${name} must not be empty`);
   if (new Set(value).size !== value.length) throw new Error(`${name} must not repeat an ID`);
-  return value as string[];
+  return Object.freeze([...value as string[]]);
 }
 
 /** Exactly the accepted `discord` keys; an unknown key is a typo that must not silently widen access. */
 const DISCORD_KEYS = ["tokenEnv", "allowFrom", "dmAllowFrom", "allowChannels", "groupPolicy", "streaming", "receipts"] as const;
 const DISCORD_RECEIPT_KEYS = ["read", "working", "delayMs"] as const;
-
-function rejectUnknownKeys(value: Record<string, unknown>, allowed: readonly string[], name: string): void {
-  for (const key of Object.keys(value)) {
-    if (!allowed.includes(key)) throw new Error(`${name}.${key} is not a recognized option`);
-  }
-}
 
 /** `discord`: opt-in, default-deny, and no wildcard spelling in any list. */
 function discordConfig(value: unknown): NonNullable<PortConfig["discord"]> {
@@ -1376,9 +1385,10 @@ function appConfig(value: unknown): NonNullable<PortConfig["app"]> {
   if (typeof a.port !== "number" || !Number.isSafeInteger(a.port) || a.port < 1 || a.port > 65_535) {
     throw new Error("app.port must be an integer from 1 to 65535");
   }
-  if (typeof a.staticRoot !== "string" || a.staticRoot.trim() === "" || !a.staticRoot.startsWith("/")) {
+  if (typeof a.staticRoot !== "string" || a.staticRoot.trim() === "" || !isAbsolute(a.staticRoot)) {
     throw new Error("app.staticRoot must be an absolute directory path");
   }
+  const staticRoot = resolve(a.staticRoot);
   const autoArchiveDays = a.autoArchiveDays === undefined ? 14 : a.autoArchiveDays;
   if (typeof autoArchiveDays !== "number" || !Number.isSafeInteger(autoArchiveDays) || autoArchiveDays < 1) {
     throw new Error("app.autoArchiveDays must be an integer of at least 1");
@@ -1388,7 +1398,7 @@ function appConfig(value: unknown): NonNullable<PortConfig["app"]> {
     throw new Error("app.agentName must be 1 to 40 printable characters");
   }
   const push = a.push === undefined ? undefined : appPushConfig(a.push);
-  return Object.freeze({ port: a.port, staticRoot: a.staticRoot, autoArchiveDays, agentName, ...(push === undefined ? {} : { push }) });
+  return Object.freeze({ port: a.port, staticRoot, autoArchiveDays, agentName, ...(push === undefined ? {} : { push }) });
 }
 
 /**
@@ -1414,6 +1424,6 @@ export async function loadConfig(path: string): Promise<PortConfig> {
   let value: unknown;
   try { value = JSON.parse(await readFile(absolute, "utf8")); }
   catch (cause) { throw new StartupDiagnosticError("configFile", { cause }); }
-  try { return { ...parseConfig(value, dirname(absolute)), configFile: absolute }; }
+  try { return Object.freeze({ ...parseConfig(value, dirname(absolute)), configFile: absolute }); }
   catch (cause) { throw new StartupDiagnosticError("configInvalid", { cause }); }
 }

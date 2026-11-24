@@ -1,10 +1,11 @@
 import { chmod, lstat, mkdir, realpath, stat } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { relative, resolve } from "node:path";
 import type { PortConfig } from "./config.js";
+import { isPathWithin } from "./execution/policy.js";
 
+/** `path` is `root` or lexically below it; the one shared containment check. */
 export function inside(path: string, root: string): boolean {
-  const rel = relative(root, path);
-  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+  return isPathWithin(root, path);
 }
 
 export async function canonicalFuturePath(path: string): Promise<string> {
