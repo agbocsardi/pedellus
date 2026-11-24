@@ -62,9 +62,9 @@ Steps:
    - app: run `npm run install:pwa && npm run build:pwa`, then set
      {"port": 43190, "staticRoot": "<absolute checkout path>/pwa/app/dist"}.
      Explain `tailscale serve --bg 43190` (on WSL2, run Tailscale on Windows,
-     not inside WSL as well), and tell me to run `pedellus app pair` (on iOS,
-     Add to Home Screen and open the installed app *before* pairing) and
-     optional `pedellus app push-keys` myself in my own terminal.
+     not inside WSL as well) and optional `pedellus app push-keys` (which I run
+     myself in my own terminal). Pairing happens in step 7 once the gateway is
+     running.
    - media (attachments/voice) and web (Brave search + fetch): only if I want
      them; follow SETUP.md and WEB.md.
    Then tell me exactly which environment variables to set and where (export in
@@ -79,8 +79,11 @@ Steps:
    systemctl --user commands and let me run them.
 7. Verify: run `pedellus doctor` and fix what it reports. Then have me start
    `pedellus gateway` in one terminal and `pedellus agent` in another (or the
-   service plus my chosen channel) and confirm a reply arrives. Use
-   `pedellus --help` and the docs rather than guessing flags.
+   service plus my chosen channel) and confirm a reply arrives. If I enabled
+   the web app, have me pair now while the gateway is running by running
+   `pedellus app pair` in my own terminal (on iOS, Add to Home Screen and open
+   the installed app *before* entering the pairing code). Use `pedellus --help`
+   and the docs rather than guessing flags.
 8. Finish with a short summary: what is configured, which environment variables
    I still need to set, how to start and stop it, and where the logs are.
 ```

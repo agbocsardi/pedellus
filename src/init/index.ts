@@ -62,7 +62,9 @@ const FAST_MODEL_HINT = /(mini|flash|haiku|lite|nano|small|fast|luna)/i;
 const ASSISTANT_NAME = /^[^\p{Cc}\p{Cf}]{1,40}$/u;
 const WINDOWS_DRIVE_MOUNT = /^\/mnt\/[a-zA-Z](?:\/|$)/;
 const ANSI_ESCAPE = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])/g;
+const HAS_ANSI_ESCAPE = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])/;
 const DISALLOWED_CONTROLS = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g;
+const HAS_DISALLOWED_CONTROLS = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/;
 const SECRET_LIKE = /(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{16,}|AIza[0-9A-Za-z_-]{20,}|AKIA[0-9A-Z]{16}|[0-9]{8,}:[A-Za-z0-9_-]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)/;
 
 /** A fixed, owner-facing init failure: safe to print verbatim, never carrying a path or payload. */
@@ -290,154 +292,178 @@ export async function runInit(options: InitOptions): Promise<InitResult> {
       if (!await io.confirm("Continue anyway?", false)) return aborted(out, configPath);
     }
 
-    // Directories first: the credential store needs the private data directory.
+    // Directories first: acquire an exclusive sibling init lock inside `root` before checking
+    // for an existing store or mutating anything, preventing concurrent inits from sharing a store.
     const root = dirname(configPath);
     const workspace = join(root, "workspace");
     const dataDir = join(root, "data");
+    const initLockDir = join(root, ".pedellus-init.lock");
     await mkdir(root, { recursive: true, mode: 0o700 });
-    for (const directory of [
-      workspace,
-      join(workspace, "memory"),
-      join(workspace, "memory", "system"),
-      join(workspace, "memory", "preferences"),
-      join(workspace, "skills"),
-    ]) {
-      await mkdir(directory, { recursive: true });
-    }
-    const prepared = await prepareDataDirectory(bootstrapConfig(workspace, dataDir));
-    const copied = await copyStarterSkills(options.repoRoot ?? defaultRepoRoot(), join(workspace, "skills"));
-    out(`Created the workspace and private data directory${copied.length === 0 ? "" : ` (skills: ${copied.join(", ")})`}.\n\n`);
-
-    // Step 1: provider login into data/credentials.json (only chat-capable providers).
-    out("Step 1 of 2: connect a model provider\n");
-    const store = new FileCredentialStore(authStorePath(prepared.canonicalDataDir));
-    const models = options.models?.(store) ??
-      createAuthModels(bootstrapConfig(workspace, dataDir), options.env ?? process.env, store);
-    const chatChoices = interactiveChoices(models).filter((candidate) => candidate.provider.getModels().length > 0);
-    if (chatChoices.length === 0) {
-      throw new InitError("no chat-capable providers with interactive login are available");
-    }
-    const choice = await chooseLogin(chatChoices, io.interaction);
+    let lockHeld = false;
     try {
-      await loginWithChoice(models, choice, prepared.canonicalDataDir, io.interaction);
-    } catch (cause) {
-      if (cause instanceof StartupDiagnosticError) throw cause;
-      throw new StartupDiagnosticError(options.signal?.aborted ? "authCanceled" : "authFailed", { cause });
-    }
-    out(`Logged in to ${choice.provider.id} using ${choice.label}.\n\n`);
-
-    const providerId = choice.provider.id;
-    const storedSecrets = await collectStoredSecretStrings(store, providerId);
-    const listed = await availableModels(models, providerId, options.signal);
-    if (listed.length === 0) {
-      throw new InitError(`provider ${providerId} exposes no chat models in the current catalog`);
-    }
-    const deep = await chooseModel(io, out, listed, "Default (deep) model", listed[0]!);
-    const fastDefault = listed.find((model) => model.id !== deep.id && FAST_MODEL_HINT.test(model.id)) ?? deep.model;
-    const fast = await chooseModel(io, out, listed, "Fast model (quick replies, digests)", fastDefault);
-
-    // Quick basics.
-    out("\nA few basics (press Enter to accept the default):\n");
-    let timeZone = await io.ask("Time zone (IANA)", defaultTimeZone());
-    while (!validTimeZone(timeZone)) {
-      out("That is not an IANA time zone name, for example Europe/Budapest or UTC.\n");
-      timeZone = await io.ask("Time zone (IANA)", defaultTimeZone());
-    }
-    let name = await io.ask("Assistant name", "Pedellus");
-    while (!ASSISTANT_NAME.test(name)) {
-      out("Use 1-40 printable characters.\n");
-      name = await io.ask("Assistant name", "Pedellus");
-    }
-    const fileTools = await io.confirm("Let the assistant read and edit workspace files (read, write, edit)?", true);
-    out(
-      "The shell tool (bash) runs commands as your user; restrictToWorkspace narrows its working directory\n" +
-      "but it is not a sandbox. Enable it only if you trust the model with your account.\n",
-    );
-    const shell = await io.confirm("Enable the bash shell tool?", false);
-
-    const basics: TemplateBasics = { name, timeZone, fileTools };
-    const rawConfig = {
-      workspace: "./workspace",
-      dataDir: "./data",
-      modelPresets: {
-        fast: preset(providerId, fast, "off"),
-        deep: preset(providerId, deep, "high"),
-      },
-      modelPreset: "deep",
-      workspaceContext: { memoryFiles: ["memory/MEMORY.md"], memoryManifest: true, skills: {} },
-      toolAllowlist: [...(fileTools ? ["read", "write", "edit"] : []), ...(shell ? ["bash"] : [])],
-      followUpMode: "followUp",
-      cron: { enabled: true, timeZone },
-      episodeSummary: { enabled: true },
-      digest: { preset: "fast" },
-    };
-    // Validate the parsed config, resolved chat models, and (on Linux) the actual workspace snapshot
-    // before publishing config.json so a success receipt implies a startable configuration.
-    const parsedConfig = parseConfig(rawConfig, root);
-    resolveModelChoices(models, parsedConfig.allowedModels ?? [parsedConfig.model]);
-    const created = await writeStarterFiles(workspace, basics);
-    if (platform === "linux" && process.platform === "linux") {
-      await loadWorkspaceContextSnapshot({
-        workspaceRoot: workspace,
-        memoryFiles: parsedConfig.workspaceContext?.memoryFiles ?? [],
-      });
-    }
-    if (!await publishExclusive(configPath, `${JSON.stringify(rawConfig, null, 2)}\n`, 0o600)) {
-      throw new InitError("a configuration file appeared at the target path during setup; it was left untouched");
-    }
-    out("\nWrote the configuration (no secrets; credentials stay in the private data directory).\n\n");
-
-    // Step 2: the optional interview. Every cancellation, refusal or failure after config creation
-    // falls back to the first-chat onboarding note so the setup is always complete.
-    let outcome: InitOutcome = "onboarding";
-    try {
-      let interviewed = false;
-      if (!options.skipInterview) {
-        out("Step 2 of 2: get acquainted\n");
-        interviewed = await io.confirm("Run a quick setup interview with Pedellus now to personalize your profile?", true);
-      }
-      if (interviewed) {
-        let profile: StructuredProfile | undefined;
-        try {
-          profile = await interview(models, deep.model, basics, io, out, storedSecrets, options.signal);
-        } catch (error) {
-          if (isCancellation(error, options.signal)) throw error;
-          out("\nThe interview could not continue (model or network error; details suppressed).\n");
-        }
-        if (profile !== undefined) {
-          const rendered = renderProfileFiles(basics, profile);
-          out("\nProposed files (full preview):\n");
-          for (const [relative, body] of rendered) {
-            out(`\n--- ${relative} ---\n${body}`);
-          }
-          out("\n");
-          if (await io.confirm("Save these personalized files?", true)) {
-            const { written, kept } = await savePersonalized(workspace, created, rendered);
-            if (kept.length > 0) out(`Kept your existing or modified ${kept.join(", ")} unchanged.\n`);
-            if (written.length > 0) outcome = "personalized";
-          }
-        }
-      }
+      await mkdir(initLockDir, { mode: 0o700 });
+      lockHeld = true;
     } catch (error) {
-      await writeOnboarding(workspace, basics);
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new InitError("another `pedellus init` is already running in this directory");
+      }
       throw error;
     }
+    try {
+      // Re-check under the lock so concurrent runs cannot both pass the pre-check.
+      await assertSafeTargetLayout(configPath);
+      if (await exists(configPath)) {
+        throw new InitError(
+          "a configuration file already exists at the target path and is never overwritten; " +
+          "check it with `pedellus doctor`, add a provider with `pedellus login`, or pass a new --config <path>",
+        );
+      }
+      for (const directory of [
+        workspace,
+        join(workspace, "memory"),
+        join(workspace, "memory", "system"),
+        join(workspace, "memory", "preferences"),
+        join(workspace, "skills"),
+      ]) {
+        await mkdir(directory, { recursive: true });
+      }
+      const prepared = await prepareDataDirectory(bootstrapConfig(workspace, dataDir));
+      const copied = await copyStarterSkills(options.repoRoot ?? defaultRepoRoot(), join(workspace, "skills"));
+      out(`Created the workspace and private data directory${copied.length === 0 ? "" : ` (skills: ${copied.join(", ")})`}.\n\n`);
 
-    if (outcome !== "personalized") {
-      await writeOnboarding(workspace, basics);
-      out(`${name} will introduce itself and finish getting to know you in your first chat.\n`);
-    }
+      // Step 1: provider login into data/credentials.json (only chat-capable providers).
+      out("Step 1 of 2: connect a model provider\n");
+      const store = new FileCredentialStore(authStorePath(prepared.canonicalDataDir));
+      const models = options.models?.(store) ??
+        createAuthModels(bootstrapConfig(workspace, dataDir), options.env ?? process.env, store);
+      const chatChoices = interactiveChoices(models).filter((candidate) => candidate.provider.getModels().length > 0);
+      if (chatChoices.length === 0) {
+        throw new InitError("no chat-capable providers with interactive login are available");
+      }
+      const choice = await chooseLogin(chatChoices, io.interaction);
+      try {
+        await loginWithChoice(models, choice, prepared.canonicalDataDir, io.interaction);
+      } catch (cause) {
+        if (cause instanceof StartupDiagnosticError) throw cause;
+        throw new StartupDiagnosticError(terminal.signal.aborted ? "authCanceled" : "authFailed", { cause });
+      }
+      out(`Logged in to ${choice.provider.id} using ${choice.label}.\n\n`);
 
-    out(
-      "\nNext steps:\n" +
-      "  pedellus doctor    check the setup\n" +
-      "  pedellus gateway   start the assistant (keep it running)\n" +
-      "  pedellus agent     chat from another terminal\n",
-    );
-    if (!isDefaultConfigPath(configPath)) {
-      out("Pass --config <path> to each command, since this is not the default configuration path.\n");
+      const providerId = choice.provider.id;
+      const storedSecrets = await collectStoredSecretStrings(store, providerId);
+      const listed = await availableModels(models, providerId, terminal.signal);
+      if (listed.length === 0) {
+        throw new InitError(`provider ${providerId} exposes no chat models in the current catalog`);
+      }
+      const deep = await chooseModel(io, out, listed, "Default (deep) model", listed[0]!);
+      const fastDefault = listed.find((model) => model.id !== deep.id && FAST_MODEL_HINT.test(model.id)) ?? deep.model;
+      const fast = await chooseModel(io, out, listed, "Fast model (quick replies, digests)", fastDefault);
+
+      // Quick basics.
+      out("\nA few basics (press Enter to accept the default):\n");
+      let timeZone = await io.ask("Time zone (IANA)", defaultTimeZone());
+      while (!validTimeZone(timeZone)) {
+        out("That is not an IANA time zone name, for example Europe/Budapest or UTC.\n");
+        timeZone = await io.ask("Time zone (IANA)", defaultTimeZone());
+      }
+      let name = await io.ask("Assistant name", "Pedellus");
+      while (!ASSISTANT_NAME.test(name)) {
+        out("Use 1-40 printable characters.\n");
+        name = await io.ask("Assistant name", "Pedellus");
+      }
+      const fileTools = await io.confirm("Let the assistant read and edit workspace files (read, write, edit)?", true);
+      out(
+        "The shell tool (bash) runs commands as your user; restrictToWorkspace narrows its working directory\n" +
+        "but it is not a sandbox. Enable it only if you trust the model with your account.\n",
+      );
+      const shell = await io.confirm("Enable the bash shell tool?", false);
+
+      const basics: TemplateBasics = { name, timeZone, fileTools };
+      const rawConfig = {
+        workspace: "./workspace",
+        dataDir: "./data",
+        modelPresets: {
+          fast: preset(providerId, fast, "off"),
+          deep: preset(providerId, deep, "high"),
+        },
+        modelPreset: "deep",
+        workspaceContext: { memoryFiles: ["memory/MEMORY.md"], memoryManifest: true, skills: {} },
+        toolAllowlist: [...(fileTools ? ["read", "write", "edit"] : []), ...(shell ? ["bash"] : [])],
+        followUpMode: "followUp",
+        cron: { enabled: true, timeZone },
+        episodeSummary: { enabled: true },
+        digest: { preset: "fast" },
+      };
+      // Validate the parsed config, resolved chat models, and (on Linux) the actual workspace snapshot
+      // before publishing config.json so a success receipt implies a startable configuration.
+      const parsedConfig = parseConfig(rawConfig, root);
+      resolveModelChoices(models, parsedConfig.allowedModels ?? [parsedConfig.model]);
+      const created = await writeStarterFiles(workspace, basics);
+      if (platform === "linux" && process.platform === "linux") {
+        await loadWorkspaceContextSnapshot({
+          workspaceRoot: workspace,
+          memoryFiles: parsedConfig.workspaceContext?.memoryFiles ?? [],
+        });
+      }
+      if (!await publishExclusive(configPath, `${JSON.stringify(rawConfig, null, 2)}\n`, 0o600)) {
+        throw new InitError("a configuration file appeared at the target path during setup; it was left untouched");
+      }
+      out("\nWrote the configuration (no secrets; credentials stay in the private data directory).\n\n");
+
+      // Step 2: the optional interview. Every cancellation, refusal or failure after config creation
+      // falls back to the first-chat onboarding note so the setup is always complete.
+      let outcome: InitOutcome = "onboarding";
+      try {
+        let interviewed = false;
+        if (!options.skipInterview) {
+          out("Step 2 of 2: get acquainted\n");
+          interviewed = await io.confirm("Run a quick setup interview with Pedellus now to personalize your profile?", true);
+        }
+        if (interviewed) {
+          let profile: StructuredProfile | undefined;
+          try {
+            profile = await interview(models, deep.model, basics, io, out, storedSecrets, terminal.signal);
+          } catch (error) {
+            if (isCancellation(error, terminal.signal)) throw error;
+            out("\nThe interview could not continue (model or network error; details suppressed).\n");
+          }
+          if (profile !== undefined) {
+            const rendered = renderProfileFiles(basics, profile);
+            out("\nProposed files (full preview):\n");
+            for (const [relative, body] of rendered) {
+              out(`\n--- ${relative} ---\n${body}`);
+            }
+            out("\n");
+            if (await io.confirm("Save these personalized files?", true)) {
+              const { written, kept } = await savePersonalized(workspace, created, rendered);
+              if (kept.length > 0) out(`Kept your existing or modified ${kept.join(", ")} unchanged.\n`);
+              if (written.length > 0) outcome = "personalized";
+            }
+          }
+        }
+      } catch (error) {
+        await writeOnboarding(workspace, basics);
+        throw error;
+      }
+
+      if (outcome !== "personalized") {
+        await writeOnboarding(workspace, basics);
+        out(`${name} will introduce itself and finish getting to know you in your first chat.\n`);
+      }
+
+      out(
+        "\nNext steps:\n" +
+        "  pedellus doctor    check the setup\n" +
+        "  pedellus gateway   start the assistant (keep it running)\n" +
+        "  pedellus agent     chat from another terminal\n",
+      );
+      if (!isDefaultConfigPath(configPath)) {
+        out("Pass --config <path> to each command, since this is not the default configuration path.\n");
+      }
+      return { outcome, configPath };
+    } finally {
+      if (lockHeld) await rm(initLockDir, { recursive: true, force: true }).catch(() => undefined);
     }
-    return { outcome, configPath };
   } finally {
     terminal.close();
   }
@@ -622,7 +648,7 @@ const PROFILE_BLOCKS_ALL = new RegExp("```" + PROFILE_FENCE + "[^\\n]*\\n[\\s\\S
 
 function cleanLine(value: unknown, maxChars: number, secretValues: readonly string[]): string | undefined {
   if (typeof value !== "string") return undefined;
-  if (ANSI_ESCAPE.test(value) || DISALLOWED_CONTROLS.test(value)) return undefined;
+  if (HAS_ANSI_ESCAPE.test(value) || HAS_DISALLOWED_CONTROLS.test(value)) return undefined;
   const trimmed = value.replace(/\r?\n/g, " ").trim();
   if (trimmed === "" || trimmed.length > maxChars) return undefined;
   if (containsKnownSecret(trimmed, secretValues)) return undefined;

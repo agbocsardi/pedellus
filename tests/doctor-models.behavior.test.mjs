@@ -130,17 +130,28 @@ test("doctor reports safe field-level config errors and never echoes secret keys
   assert.match(invalid.text, /\[FAIL\] config file: .*telegram\.tokenEnv must be an environment variable name/);
   assert.ok(!invalid.text.includes("AAFsynthetic"), invalid.text);
 
-  // An unknown key carrying a secret must NOT be echoed back.
+  // An unknown key (including dotted keys) or invalid dynamic provider key must NOT be echoed back.
   await writeFile(path, JSON.stringify({
     workspace: "ws",
     dataDir: "data",
     model: { provider: "openai", modelId: OPENAI },
-    app: { port: 43190, staticRoot: "/tmp", "sk-synthetic-key-42": true },
+    app: { port: 43190, staticRoot: "/tmp", "foo.sk-synthetic-key-42": true },
   }));
   const unknownKey = await doctor(path);
   assert.equal(unknownKey.ok, false);
   assert.match(unknownKey.text, /app contains an unrecognized option/);
   assert.ok(!unknownKey.text.includes("sk-synthetic-key-42"), unknownKey.text);
+
+  await writeFile(path, JSON.stringify({
+    workspace: "ws",
+    dataDir: "data",
+    model: { provider: "openai", modelId: OPENAI },
+    providers: { "sk-synthetic-key-42": "not-an-object" },
+  }));
+  const badProviderKey = await doctor(path);
+  assert.equal(badProviderKey.ok, false);
+  assert.match(badProviderKey.text, /providers contains an invalid entry/);
+  assert.ok(!badProviderKey.text.includes("sk-synthetic-key-42"), badProviderKey.text);
 
   // A secret pasted into workspace path must NOT be echoed back when missing.
   await writeFile(path, JSON.stringify({
@@ -213,11 +224,16 @@ test("doctor catches missing memory files, symlinked memory dirs, unknown provid
   assert.equal(symRes.ok, false);
   assert.match(symRes.text, /\[FAIL\] .*: refused by context loader \(symlink\)/);
 
-  // Unknown provider must fail rather than report "no providers".
+  // Unknown provider (in model OR in credentials) must fail rather than silently pass.
   const { path: typoCfg } = await setup((config) => ({ ...config, model: { provider: "bogus-provider", modelId: "m1" } }));
   const typoRes = await doctor(typoCfg);
   assert.equal(typoRes.ok, false);
   assert.match(typoRes.text, /\[FAIL\] bogus-provider: unknown provider/);
+
+  const { path: credTypoCfg } = await setup((config) => ({ ...config, credentials: { "openaai": "OPENAI_API_KEY" } }));
+  const credTypoRes = await doctor(credTypoCfg, { env: { OPENAI_API_KEY: "x" } });
+  assert.equal(credTypoRes.ok, false);
+  assert.match(credTypoRes.text, /\[FAIL\] openaai: unknown provider/);
 
   // Missing app build index.html fails with build hint.
   const { path: appCfg } = await setup((config, root) => ({ ...config, app: { port: 8787, staticRoot: join(root, "pwa") } }));

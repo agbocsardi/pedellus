@@ -11,8 +11,8 @@ import { constants } from "node:fs";
 import { access, lstat, open, readFile, realpath, stat } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
-import type { AuthCheck, Models } from "@earendil-works/pi-ai";
-import { authStorePath, FileCredentialStore } from "../auth/store.js";
+import type { AuthCheck, Credential, CredentialInfo, CredentialStore, Models } from "@earendil-works/pi-ai";
+import { authStorePath } from "../auth/store.js";
 import { defaultConfigPath, parseConfig, type PortConfig } from "../config.js";
 import { loadWorkspaceContextSnapshot, WorkspaceContextFileError, WorkspaceContextInputError, WorkspaceContextPlatformError } from "../context/workspace.js";
 import { probeSocket, type SocketProbeState } from "../local/server.js";
@@ -160,7 +160,8 @@ function errorCode(error: unknown): string | undefined {
 }
 
 /**
- * Nonblocking, bounded regular-file read so a FIFO, device or huge file cannot hang or OOM doctor.
+ * Nonblocking, strictly bounded regular-file read so a FIFO, device or growing file cannot hang or
+ * exceed `maxBytes`.
  */
 async function readRegularFileBounded(path: string, options: { noFollow?: boolean; maxBytes?: number } = {}): Promise<string> {
   const flags = constants.O_RDONLY
@@ -180,36 +181,95 @@ async function readRegularFileBounded(path: string, options: { noFollow?: boolea
       error.code = "EFBIG";
       throw error;
     }
-    return await handle.readFile("utf8");
+    const chunks: Buffer[] = [];
+    let total = 0;
+    const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, maxBytes + 1));
+    for (;;) {
+      const { bytesRead } = await handle.read(chunk, 0, Math.min(chunk.length, maxBytes - total + 1), null);
+      if (bytesRead === 0) break;
+      total += bytesRead;
+      if (total > maxBytes) {
+        const error = new Error("file exceeds size bound") as NodeJS.ErrnoException;
+        error.code = "EFBIG";
+        throw error;
+      }
+      chunks.push(Buffer.from(chunk.subarray(0, bytesRead)));
+    }
+    return Buffer.concat(chunks, total).toString("utf8");
   } finally {
     await handle.close();
   }
 }
 
+/** Strict allowlist of trusted static configuration field names; never echoes dynamic keys. */
+const TRUSTED_CONFIG_FIELDS = new Set([
+  "workspace", "dataDir", "extraAllowedDirs", "model", "allowedModels", "modelPresets", "modelPreset",
+  "classifierModel", "toolAllowlist", "toolSandbox", "bwrapPath", "toolTimeoutSeconds", "followUpMode",
+  "workspaceContext", "workspaceContext.memoryFiles", "workspaceContext.memoryManifest", "workspaceContext.skills",
+  "workspaceContext.skills.builtinSkillsRoot", "workspaceContext.skills.disabledSkills",
+  "cron", "cron.enabled", "cron.timeZone", "episodeSummary", "episodeSummary.enabled", "episodeSummary.preset",
+  "episodeSummary.model", "workers", "workers.enabled", "workers.maxConcurrent", "workers.preset", "workers.toolAllowlist",
+  "digest", "digest.preset", "digest.model", "digest.episodesPerRun", "digest.entriesPerBatch", "digest.charsPerBatch",
+  "digest.maxToolCalls", "digest.maxRequests", "digest.maxInputTokens", "digest.runTimeoutSeconds",
+  "digest.maxChangedFiles", "digest.maxDiffChars", "credentials", "providers",
+  "telegram", "telegram.tokenEnv", "telegram.allowFrom", "telegram.pollTimeoutSeconds",
+  "discord", "discord.tokenEnv", "discord.allowFrom", "discord.dmAllowFrom", "discord.allowChannels",
+  "discord.groupPolicy", "discord.streaming", "discord.receipts", "discord.receipts.read",
+  "discord.receipts.working", "discord.receipts.delayMs",
+  "app", "app.port", "app.staticRoot", "app.autoArchiveDays", "app.agentName",
+  "app.push", "app.push.subject", "app.push.publicKey", "app.push.privateKeyEnv",
+  "media", "media.directory", "media.transcription", "media.transcription.enabled", "media.transcription.language",
+  "media.transcription.maxDurationSeconds", "media.transcription.timeoutMs", "media.transcription.backend",
+  "media.transcription.whisperCli", "media.transcription.hex",
+  "web", "web.search", "web.search.keyEnv", "web.fetch",
+  "mcp", "mcp.enabled", "mcp.servers", "codemode", "codemode.enabled",
+  "idleRollover", "idleRollover.afterMinutes", "visionHandoff", "visionHandoff.describerPreset",
+  "visionHandoff.maxRawImages", "visionHandoff.maxDescriptionTokens", "visionHandoff.prompt",
+]);
+
+/** Sections that hold dynamic owner-chosen keys (never echoed in diagnostics). */
+const DYNAMIC_KEY_SECTIONS = ["providers", "credentials", "modelPresets", "mcp.servers"] as const;
+
+/** Sections that use `rejectUnknownKeys(...)`. */
+const STRICT_OPTION_SECTIONS = [
+  "app.push", "app", "discord.receipts", "discord", "workspaceContext.skills", "workspaceContext",
+  "media.transcription.whisperCli", "media.transcription.hex", "media.transcription", "media",
+  "web.search", "web", "mcp", "codemode", "idleRollover", "visionHandoff", "cron", "workers", "digest",
+  "episodeSummary", "telegram",
+] as const;
+
 /**
- * Trusted field-level configuration diagnostic. Never echoes arbitrary user keys, configured
- * path/string values, or raw JSON fragments — unknown-key errors are rewritten to name only the
- * trusted parent section, and unrecognized messages collapse to a fixed safe summary.
+ * Trusted field-level configuration diagnostic. Only emits names from `TRUSTED_CONFIG_FIELDS` or
+ * `STRICT_OPTION_SECTIONS` / `DYNAMIC_KEY_SECTIONS`; arbitrary user keys (dotted or undotted) and
+ * configured values are never echoed.
  */
 export function safeConfigMessage(error: unknown): string {
   const raw = error instanceof Error ? error.message.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").trim() : "";
   if (raw === "") return "invalid configuration (details suppressed)";
 
-  // Never echo an arbitrary JSON key from rejectUnknownKeys (`<section>.<userKey> is not a recognized option`).
-  const unknownOption = /^([a-zA-Z][a-zA-Z0-9_.]*)\.[^.\s]+ is not a recognized option$/.exec(raw);
-  if (unknownOption !== null) return `${unknownOption[1]} contains an unrecognized option`;
-
-  // Known safe field-name messages from parseConfig (no quoted user values or arbitrary paths).
-  const safeField = /^([a-zA-Z][a-zA-Z0-9_.[\]-]{0,60}) (must be [a-zA-Z0-9 ,./_:'"()<>-]+|is required|is invalid|cannot be [a-zA-Z0-9 ,./_-]+|requires [a-zA-Z0-9 ,./_-]+)$/.exec(raw);
-  if (safeField !== null && safeField[0].length <= 160 && !/[A-Za-z0-9_\-+/=]{24,}/.test(safeField[0])) {
-    return safeField[0];
+  // 1. Unknown option in any strict section (handles dotted arbitrary keys too).
+  if (raw.endsWith(" is not a recognized option")) {
+    for (const section of STRICT_OPTION_SECTIONS) {
+      if (raw.startsWith(`${section}.`)) return `${section} contains an unrecognized option`;
+    }
+    return "configuration contains an unrecognized option";
   }
 
-  // Known safe top-level parseConfig sentences (fixed text, no user interpolation).
-  if (/^(configuration|config) must be a JSON object$/i.test(raw)) return raw;
-  if (/^(modelPreset|modelPresets|allowedModels|model)\b/.test(raw) && raw.length <= 160 && !/[`"'\\/:]/.test(raw)) {
-    return raw;
+  // 2. Dynamic-key sections (`providers.<key>...`, `credentials.<key>...`, etc.): never echo `<key>`.
+  for (const section of DYNAMIC_KEY_SECTIONS) {
+    if (raw.startsWith(`${section}.`) || raw.startsWith(`${section}[`)) {
+      return `${section} contains an invalid entry`;
+    }
   }
+
+  // 3. Exact trusted static field followed by a safe static constraint phrase (no quotes or paths).
+  const fieldMatch = /^([a-zA-Z][a-zA-Z0-9_.]*) ((?:must be|is required|is invalid|cannot be|requires) [a-zA-Z0-9 ,._():+-]+|is required|is invalid)$/.exec(raw);
+  if (fieldMatch !== null && TRUSTED_CONFIG_FIELDS.has(fieldMatch[1]!) && fieldMatch[0].length <= 140) {
+    return fieldMatch[0];
+  }
+
+  // 4. Known fixed top-level parseConfig sentences.
+  if (/^(configuration|config) must be a JSON object$/i.test(raw)) return "configuration must be a JSON object";
   return "invalid configuration; check required fields and documented formats (details suppressed)";
 }
 
@@ -285,13 +345,26 @@ async function checkDirectories(
   platform: NodeJS.Platform,
 ): Promise<DirectoryCheckResult> {
   const workspace = await existingDirectory(config.workspace);
-  if ("path" in workspace) report.check("ok", "workspace", "exists and is a directory");
-  else report.check("fail", "workspace", `configured workspace ${workspace.reason}`);
-  const roots = "path" in workspace ? [workspace.path] : [];
+  let allRootsValid = true;
+  const roots: string[] = [];
+  if ("path" in workspace) {
+    report.check("ok", "workspace", "exists and is a directory");
+    roots.push(workspace.path);
+  } else {
+    report.check("fail", "workspace", `configured workspace ${workspace.reason}`);
+    allRootsValid = false;
+    roots.push(await canonicalOrSelf(config.workspace));
+  }
   for (let index = 0; index < (config.extraAllowedDirs ?? []).length; index += 1) {
-    const root = await existingDirectory(config.extraAllowedDirs![index]!);
-    if ("path" in root) roots.push(root.path);
-    else report.check("fail", `extraAllowedDirs[${index}]`, `configured directory ${root.reason}`);
+    const rawExtra = config.extraAllowedDirs![index]!;
+    const root = await existingDirectory(rawExtra);
+    if ("path" in root) {
+      roots.push(root.path);
+    } else {
+      report.check("fail", `extraAllowedDirs[${index}]`, `configured directory ${root.reason}`);
+      allRootsValid = false;
+      roots.push(await canonicalOrSelf(rawExtra));
+    }
   }
 
   let dataDir: string;
@@ -312,14 +385,14 @@ async function checkDirectories(
       if (entry.isDirectory()) {
         report.check("ok", "dataDir", "exists and is disjoint from workspace");
         existingDataDir = dataDir;
-        dataDirValid = true;
+        dataDirValid = allRootsValid;
       } else {
         report.check("fail", "dataDir", "configured dataDir is not a directory");
       }
     } catch (error) {
       if (errorCode(error) === "ENOENT") {
         report.check("ok", "dataDir", "valid path (will be created at first gateway start)");
-        dataDirValid = true;
+        dataDirValid = allRootsValid;
       } else {
         report.check("fail", "dataDir", `configured dataDir cannot be read (${errorCode(error) ?? "error"})`);
       }
@@ -409,21 +482,53 @@ async function checkWorkspaceFiles(
   }
 }
 
-/** Every provider spelling referenced by model selection, presets or classifier. */
-function referencedProviders(config: PortConfig): readonly { readonly spelling: string; readonly id: string; readonly kind: "native" | "custom" | "unknown" }[] {
+/** Parse an already-read bounded credentials.json snapshot into a read-only in-memory store. */
+function parseReadOnlyCredentialStore(text: string): CredentialStore {
+  const parsed = JSON.parse(text) as unknown;
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("invalid store");
+  const record = parsed as Record<string, unknown>;
+  if (record.version !== 1 || typeof record.credentials !== "object" || record.credentials === null || Array.isArray(record.credentials)) {
+    throw new Error("invalid store");
+  }
+  const entries = new Map<string, Credential>();
+  for (const [providerId, value] of Object.entries(record.credentials as Record<string, unknown>)) {
+    if (providerId.length === 0 || typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("invalid entry");
+    const entry = value as Record<string, unknown>;
+    if (entry.type !== "api_key" && entry.type !== "oauth") throw new Error("invalid entry");
+    entries.set(providerId, value as Credential);
+  }
+  return {
+    async read(providerId) { return entries.get(providerId); },
+    async modify() { throw new Error("read-only credential store"); },
+    async delete() { throw new Error("read-only credential store"); },
+    async list(): Promise<readonly CredentialInfo[]> {
+      return [...entries.entries()].map(([providerId, cred]) => ({ providerId, type: cred.type }));
+    },
+  };
+}
+
+/** Every provider spelling referenced by model selection, presets, classifier or credentials. */
+function referencedProviders(config: PortConfig): readonly { readonly spelling: string; readonly id: string; readonly kind: "native" | "custom" | "unknown"; readonly authRequired: boolean }[] {
   const builtin = new Set(builtinProviders().map((provider) => provider.id));
   const custom = new Set(Object.keys(config.providers ?? {}));
-  const spellings = [
+  const modelSpellings = new Set([
     ...(config.allowedModels ?? [config.model]).map((model) => model.provider),
     ...Object.values(config.modelPresets ?? {}).map((preset) => preset.provider),
     ...(config.classifierModel === undefined ? [] : [config.classifierModel.provider]),
-  ];
-  const seen = new Map<string, { readonly spelling: string; readonly id: string; readonly kind: "native" | "custom" | "unknown" }>();
-  for (const spelling of spellings) {
+  ]);
+  const allSpellings = [...modelSpellings, ...Object.keys(config.credentials ?? {})];
+  const seen = new Map<string, { readonly spelling: string; readonly id: string; readonly kind: "native" | "custom" | "unknown"; readonly authRequired: boolean }>();
+  for (const spelling of allSpellings) {
     const id = nativeProviderId(spelling);
-    if (seen.has(id)) continue;
     const kind = builtin.has(id) ? "native" : custom.has(spelling) ? "custom" : "unknown";
-    seen.set(id, { spelling, id: kind === "custom" ? spelling : id, kind });
+    const key = kind === "custom" ? spelling : id;
+    const authRequired = modelSpellings.has(spelling);
+    const existing = seen.get(key);
+    if (existing !== undefined) {
+      if (!existing.authRequired && authRequired) seen.set(key, { ...existing, authRequired: true });
+      continue;
+    }
+    seen.set(key, { spelling, id: key, kind, authRequired });
   }
   return [...seen.values()].sort((a, b) => a.id.localeCompare(b.id));
 }
@@ -450,35 +555,26 @@ async function checkCredentials(
   const providers = referencedProviders(config);
   const unknown = providers.filter((entry) => entry.kind === "unknown");
   for (const entry of unknown) {
-    report.check("fail", entry.id, "unknown provider (not a native Pi AI provider or custom providers entry)");
+    const label = /^[A-Za-z0-9._-]{1,40}$/.test(entry.id) ? entry.id : "provider";
+    report.check("fail", label, "unknown provider (not a native Pi AI provider or custom providers entry)");
   }
-  const known = providers.filter((entry) => entry.kind !== "unknown");
+  const known = providers.filter((entry) => entry.kind !== "unknown" && entry.authRequired);
   if (known.length === 0) {
     if (unknown.length === 0) report.check("ok", "providers", "no providers referenced");
     return;
   }
 
-  let store: FileCredentialStore | undefined;
+  let store: CredentialStore | undefined;
   if (!dirs.dataDirValid) {
-    report.check("warn", "credential store", "skipped because dataDir is invalid");
+    report.check("warn", "credential store", "skipped because workspace or dataDir is invalid");
   } else if (dirs.existingDataDir !== undefined) {
     const credPath = authStorePath(dirs.existingDataDir);
-    let readableRegular = false;
     try {
-      await readRegularFileBounded(credPath, { noFollow: true, maxBytes: 1024 * 1024 });
-      readableRegular = true;
+      const text = await readRegularFileBounded(credPath, { noFollow: true, maxBytes: 1024 * 1024 });
+      store = parseReadOnlyCredentialStore(text);
     } catch (error) {
       if (errorCode(error) !== "ENOENT") {
-        report.check("fail", "credential store", "unreadable or not a regular file; run `pedellus login <provider>` to replace it");
-      }
-    }
-    if (readableRegular) {
-      const candidate = new FileCredentialStore(credPath);
-      try {
-        await candidate.list();
-        store = candidate;
-      } catch {
-        report.check("fail", "credential store", "invalid credential store; run `pedellus login <provider>` to replace it");
+        report.check("fail", "credential store", "unreadable or invalid credential store; run `pedellus login <provider>` to replace it");
       }
     }
   }

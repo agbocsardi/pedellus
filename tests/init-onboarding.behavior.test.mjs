@@ -217,8 +217,10 @@ test("a failed, skipped or adversarial interview falls back to starter files and
   const skippedSetup = await assertConfigAndContext(skipping);
   await stat(join(skippedSetup.config.workspace, "memory/system/onboarding.md"));
 
-  // Profiles carrying terminal escapes or secrets are rejected by parseProfile.
+  // Profiles carrying terminal escapes, bidi controls (repeatedly, proving stateless regex), or secrets are rejected.
   assert.equal(parseProfile(`\`\`\`pedellus-profile\n${JSON.stringify({ ...PROFILE, ownerName: "\x1b[31mAda" })}\n\`\`\``), undefined);
+  assert.equal(parseProfile(`\`\`\`pedellus-profile\n${JSON.stringify({ ...PROFILE, ownerName: "Ada\u202e" })}\n\`\`\``), undefined);
+  assert.equal(parseProfile(`\`\`\`pedellus-profile\n${JSON.stringify({ ...PROFILE, ownerName: "Ada\u202e" })}\n\`\`\``), undefined);
   assert.equal(parseProfile(`\`\`\`pedellus-profile\n${JSON.stringify({ ...PROFILE, standingPreferences: [SECRET] })}\n\`\`\``, [SECRET]), undefined);
 });
 
@@ -270,8 +272,9 @@ test("a /mnt path on WSL warns and can be aborted with nothing written", { timeo
   assert.match(io.transcript(), /DrvFs/);
 });
 
-test("terminalInteraction never retains secrets in TTY history and settles on EOF and Ctrl-C", { timeout: 10_000 }, async () => {
-  // TTY history check: pressing Up after a secret prompt must never reveal the secret.
+test("terminalInteraction never retains secrets in TTY history or kill ring and aborts signal on Ctrl-C", { timeout: 10_000 }, async () => {
+  // TTY history & kill-ring check: deleting a mistyped secret with Ctrl-U then pressing Up or Ctrl-Y
+  // at the next prompt must never reveal any secret characters.
   const input = new PassThrough();
   input.isTTY = true;
   let captured = "";
@@ -280,18 +283,19 @@ test("terminalInteraction never retains secrets in TTY history and settles on EO
   const tty = terminalInteraction({ input, output });
   try {
     const first = tty.interaction.prompt({ type: "secret", message: "API key" });
-    input.write(`${SECRET}\r`);
+    input.write(`sk-MISTYPED-SECRET-99999\x15${SECRET}\r`);
     assert.equal(await first, SECRET);
     const second = tty.interaction.prompt({ type: "text", message: "Name" });
-    // Send Up-arrow escape sequence, then Enter.
-    input.write("\x1b[A\r");
+    // Send Up-arrow and Ctrl-Y (yank kill ring), then Enter.
+    input.write("\x1b[A\x19\r");
     assert.equal(await second, "");
     assert.doesNotMatch(captured, new RegExp(SECRET), "secret must never appear in TTY output or history");
+    assert.doesNotMatch(captured, /MISTYPED-SECRET/, "killed secret must never survive into Ctrl-Y kill ring");
 
-    // Raw-TTY Ctrl-C settles the pending prompt instead of hanging.
-    const third = tty.interaction.prompt({ type: "text", message: "Cancelled" });
+    // Raw-TTY Ctrl-C between prompts aborts `tty.signal` immediately.
+    assert.equal(tty.signal.aborted, false);
     input.write("\x03");
-    await assert.rejects(third, /cancelled|closed/i);
+    assert.equal(tty.signal.aborted, true, "Ctrl-C between prompts must abort the shared operation signal");
   } finally {
     tty.close();
   }

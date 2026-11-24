@@ -44,21 +44,23 @@ export interface LoginChoice {
  */
 export function terminalInteraction(options: AuthTerminalOptions): {
   interaction: AuthInteraction;
+  /** Aborts when `options.signal` aborts or when raw-TTY Ctrl-C (`SIGINT`) is pressed. */
+  readonly signal: AbortSignal;
   close: () => void;
 } {
   const isTerminal = Boolean((options.input as NodeJS.ReadStream).isTTY && (options.output as NodeJS.WriteStream).isTTY);
-  const readline: ReadlineInterface = createInterface({
-    input: options.input,
-    output: options.output,
-    terminal: isTerminal,
-    // Never retain prompt answers (especially secrets) in readline history.
-    historySize: 0,
-  });
-  const signal = options.signal;
+  const localAbort = new AbortController();
+  const forwardExternalAbort = () => {
+    if (!localAbort.signal.aborted) localAbort.abort(options.signal?.reason ?? new DOMException("input cancelled", "AbortError"));
+  };
+  if (options.signal?.aborted) forwardExternalAbort();
+  else options.signal?.addEventListener("abort", forwardExternalAbort, { once: true });
+
   // Buffer lines for non-TTY piped inputs so multi-line chunks are never dropped between prompts.
   const bufferedLines: string[] = [];
   let pendingLine: ((line: string) => void) | undefined;
   let closedError: Error | undefined;
+  let recreating = false;
   const abortWaiters = new Set<(error: Error) => void>();
 
   const failWaiters = (error: Error): void => {
@@ -68,33 +70,60 @@ export function terminalInteraction(options: AuthTerminalOptions): {
     abortWaiters.clear();
   };
 
-  if (!isTerminal) {
-    readline.on("line", (line) => {
-      if (pendingLine !== undefined) {
-        const resolveLine = pendingLine;
-        pendingLine = undefined;
-        resolveLine(line);
-      } else {
-        bufferedLines.push(line);
-      }
+  const makeReadline = (): ReadlineInterface => {
+    const rl = createInterface({
+      input: options.input,
+      output: options.output,
+      terminal: isTerminal,
+      // Never retain prompt answers (especially secrets) in readline history.
+      historySize: 0,
     });
-  }
-  readline.on("SIGINT", () => {
-    const error = new DOMException("input cancelled", "AbortError");
-    failWaiters(error);
-    readline.close();
-  });
-  readline.on("close", () => {
-    failWaiters(new Error("input closed"));
-  });
+    if (!isTerminal) {
+      rl.on("line", (line) => {
+        if (pendingLine !== undefined) {
+          const resolveLine = pendingLine;
+          pendingLine = undefined;
+          resolveLine(line);
+        } else {
+          bufferedLines.push(line);
+        }
+      });
+    }
+    rl.on("SIGINT", () => {
+      const error = new DOMException("input cancelled", "AbortError");
+      if (!localAbort.signal.aborted) localAbort.abort(error);
+      failWaiters(error);
+      rl.close();
+    });
+    rl.on("close", () => {
+      if (recreating) return;
+      failWaiters(new Error("input closed"));
+    });
+    return rl;
+  };
+
+  let readline: ReadlineInterface = makeReadline();
+
+  /**
+   * Discard the entire readline instance after a TTY secret prompt so no internal editing state
+   * (history, kill ring / Ctrl-Y buffer, undo state) from the secret can survive to later prompts.
+   */
+  const resetTerminalReadline = (): void => {
+    if (!isTerminal || closedError !== undefined) return;
+    recreating = true;
+    try {
+      readline.close();
+      readline = makeReadline();
+    } finally {
+      recreating = false;
+    }
+  };
 
   const question = (query: string, secret: boolean, promptSignal?: AbortSignal): Promise<string> => new Promise((resolve, reject) => {
     const active = promptSignal === undefined
-      ? signal
-      : signal === undefined
-        ? promptSignal
-        : AbortSignal.any([signal, promptSignal]);
-    if (active?.aborted) {
+      ? localAbort.signal
+      : AbortSignal.any([localAbort.signal, promptSignal]);
+    if (active.aborted) {
       reject(active.reason);
       return;
     }
@@ -108,7 +137,8 @@ export function terminalInteraction(options: AuthTerminalOptions): {
       return;
     }
     let settled = false;
-    const hidden = readline as ReadlineInterface & { _writeToOutput?: (text: string) => void; history?: string[] };
+    const rl = readline;
+    const hidden = rl as ReadlineInterface & { _writeToOutput?: (text: string) => void; history?: string[] };
     const originalWrite = hidden._writeToOutput;
     const restoreEcho = () => {
       if (originalWrite === undefined) delete hidden._writeToOutput;
@@ -116,7 +146,7 @@ export function terminalInteraction(options: AuthTerminalOptions): {
       if (Array.isArray(hidden.history) && hidden.history.length > 0) hidden.history.length = 0;
     };
     const cleanup = () => {
-      active?.removeEventListener("abort", onAbort);
+      active.removeEventListener("abort", onAbort);
       abortWaiters.delete(onClosed);
     };
     const onAbort = () => {
@@ -125,18 +155,18 @@ export function terminalInteraction(options: AuthTerminalOptions): {
       pendingLine = undefined;
       cleanup();
       restoreEcho();
-      reject(active?.reason);
+      reject(active.reason);
     };
     const onClosed = (error: Error) => {
       if (settled) return;
       settled = true;
       pendingLine = undefined;
       cleanup();
-      if (secret && readline.terminal) options.output.write("\n");
+      if (secret && rl.terminal) options.output.write("\n");
       restoreEcho();
       reject(error);
     };
-    active?.addEventListener("abort", onAbort, { once: true });
+    active.addEventListener("abort", onAbort, { once: true });
     abortWaiters.add(onClosed);
 
     if (!isTerminal) {
@@ -151,24 +181,26 @@ export function terminalInteraction(options: AuthTerminalOptions): {
       return;
     }
 
-    if (secret && readline.terminal) {
+    if (secret && rl.terminal) {
       hidden._writeToOutput = (text: string) => {
-        if (text === query) originalWrite?.call(readline, text);
+        if (text === query) originalWrite?.call(rl, text);
       };
     }
     try {
-      readline.question(query, (answer) => {
+      rl.question(query, (answer) => {
         if (settled) return;
         settled = true;
         cleanup();
-        if (secret && readline.terminal) options.output.write("\n");
+        if (secret && rl.terminal) options.output.write("\n");
         restoreEcho();
+        if (secret) resetTerminalReadline();
         resolve(answer);
       });
     } catch (error) {
       settled = true;
       cleanup();
       restoreEcho();
+      if (secret) resetTerminalReadline();
       reject(error);
     }
   });
@@ -219,11 +251,15 @@ export function terminalInteraction(options: AuthTerminalOptions): {
 
   return {
     interaction: {
-      ...(signal === undefined ? {} : { signal }),
+      signal: localAbort.signal,
       prompt,
       notify,
     },
-    close: () => readline.close(),
+    signal: localAbort.signal,
+    close: () => {
+      options.signal?.removeEventListener("abort", forwardExternalAbort);
+      readline.close();
+    },
   };
 }
 
