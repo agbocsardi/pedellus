@@ -354,7 +354,6 @@ export class Store {
     const dropped: number[] = [];
     /** User echoes being retired, with the thread that must match their outbox row. */
     const echoes: { key: string; thread: ThreadId }[] = [];
-    const fileIds: string[] = [];
     /** Retire `thread`'s oldest retirable events, in cursor order, while `take` accepts them. */
     const cut = (thread: ThreadId, take: (ev: ChatEvent, taken: number) => boolean) => {
       const events = this.events.get(thread);
@@ -366,16 +365,18 @@ export class Store {
         if (ev.cursor > floor || !take(ev, out.size)) break;
         if (!open.has(ev.cursor)) out.add(i);
       }
-      // Never split a long message: all its parts go when every one is at or below the
-      // checkpoint, otherwise none does.
+      // Never split a long message: its parts go only when every expected distinct part is
+      // here and each is at or below the checkpoint — an interrupted replay must be able to
+      // complete the message later, so an incomplete split retires nothing at all.
       const parts = new Map<string, number[]>();
       events.forEach((ev, i) => {
         const id = splitId(ev);
         if (id !== undefined) parts.set(id, [...parts.get(id) ?? [], i]);
       });
-      for (const [, indices] of parts) {
+      for (const [id, indices] of parts) {
         if (!indices.some((i) => out.has(i))) continue;
-        const whole = indices.every((i) => events[i].cursor <= floor);
+        const whole = indices.every((i) => events[i].cursor <= floor) &&
+          this.splitMessage(thread, id)?.complete === true;
         for (const i of indices) {
           if (whole) out.add(i);
           else out.delete(i);
@@ -384,7 +385,7 @@ export class Store {
       if (!out.size) return;
       const removed = events.filter((_, i) => out.has(i));
       this.events.set(thread, events.filter((_, i) => !out.has(i)));
-      dropped.push(...this.forget(thread, removed, echoes, fileIds));
+      dropped.push(...this.forget(thread, removed, echoes));
     };
     for (const thread of [...this.events.keys()]) {
       const excess = (this.events.get(thread)?.length ?? 0) - RETENTION.perThread;
@@ -415,18 +416,17 @@ export class Store {
       return [];
     });
     if (echoes.length) this.queueChanges?.postMessage(null);
-    const ids = [...fileIds, ...pruned];
-    if (ids.length) await this.deleteFiles(ids);
+    if (pruned.length) await this.deleteFiles(pruned);
   }
 
   /**
    * Forget the derived state of retired events; returns their cursors. A user echo also names its
    * outbox row by key for `retireRecords` to delete — by thread identity, straight from the
-   * transaction, never by this store's possibly stale in-memory copy.
+   * transaction, never by this store's possibly stale in-memory copy. Cached bytes are cleaned
+   * from what that committed transaction deleted, never from the in-memory row: a retry under a
+   * new key may still reference them.
    */
-  private forget(
-    thread: ThreadId, removed: ChatEvent[], echoes: { key: string; thread: ThreadId }[], fileIds: string[],
-  ): number[] {
+  private forget(thread: ThreadId, removed: ChatEvent[], echoes: { key: string; thread: ThreadId }[]): number[] {
     this.searchCache = undefined;
     for (const ev of removed) {
       this.seenCursors.delete(ev.cursor);
@@ -435,10 +435,7 @@ export class Store {
       if (ev.event === "message" && ev.role === "user" && ev.key !== undefined) {
         echoes.push({ key: ev.key, thread });
         const m = this.outbox.get(ev.key);
-        if (m && m.thread === thread) {
-          fileIds.push(...m.fileIds ?? []);
-          this.outbox.delete(ev.key);
-        }
+        if (m && m.thread === thread) this.outbox.delete(ev.key);
       }
       if (ev.event === "reaction" && this.reactions.get(thread)?.get(ev.message)?.cursor === ev.cursor) {
         this.reactions.get(thread)!.delete(ev.message);

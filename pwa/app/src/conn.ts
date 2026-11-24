@@ -343,11 +343,17 @@ export class Connection {
           await this.store.setOutgoingState(m.key, "failed", step.note);
           return;
         }
-        if (!await this.store.setPendingUploadId(m.key, file.id, step.id) || this.disposed) return;
+        const saved = await this.store.setPendingUploadId(m.key, file.id, step.id);
+        // The id is on the row now (or the row is gone), so it is no longer the uploader's to
+        // hand out: a retry under a new key uploads afresh instead of reusing it, and the
+        // eager upload that landed it was still POSTed exactly once.
+        releaseUpload(file.id);
+        if (!saved || this.disposed) return;
       }
       const promoted = await this.store.promotePending(m.key);
       if (promoted) {
         // These ids are frozen on the entry now; the uploader must not hand them out again.
+        // (Most were already released one by one above; this is the belt to that suspenders.)
         for (const file of promoted.pending ?? []) releaseUpload(file.id);
         if (!this.disposed) this.sendOutgoing(promoted);
       }
@@ -533,8 +539,11 @@ export class Connection {
           console.error("malformed durable event refused; acks stay below it", f.event);
           break;
         }
-        if (!await this.store.applyDurable(ev)) this.ackFrozen = true;
+        // The store write is store-level and always completes (wire order kept); only the
+        // fencing below is this socket's, so a replacement stream decides its own.
+        const stored = await this.store.applyDurable(ev);
         if (this.ws !== ws) break;
+        if (!stored) this.ackFrozen = true;
         if (ev.event === "thread" && !ev.thread.archived) this.flushOutgoing(ev.thread.id);
         this.ack(ws);
         break;
@@ -691,7 +700,11 @@ export class Connection {
         if (this.write({ type: "req", id: this.id(), op: "ack", cursor })) this.store.setAcked(cursor);
       }
     } catch (err) {
-      this.ackFrozen = true;
+      // A failed checkpoint is a store-level problem, but the freeze is this socket's: a
+      // replacement stream re-freezes itself through its own writes (applyDurable's
+      // durableWriteFailed, or its own flushAck failing here), so an old socket's error never
+      // poisons the stream that replaced it.
+      if (this.ws === ws) this.ackFrozen = true;
       console.error("replay checkpoint not persisted; acks stop", err);
     }
   }

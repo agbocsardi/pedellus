@@ -86,7 +86,9 @@ export async function loadSnapshot(db: AppDb) {
  * transaction. Each row is matched by durable echo key and thread identity — never by any
  * store's in-memory copy, which another window may have changed: the persisted row the echo
  * points at goes, whatever its state, so an admitted send can never come back as "Not sent"
- * after a reload. Returns the file-byte ids of the rows deleted, for the caller to clean up.
+ * after a reload. Cached file bytes are cleaned only for rows this transaction actually deletes,
+ * and only when no surviving row (a retry under a new key keeps the old row's file ids) still
+ * references them.
  */
 export async function retireRecords(
   db: AppDb, cursors: readonly number[], echoes: readonly { key: string; thread: ThreadId }[],
@@ -94,14 +96,26 @@ export async function retireRecords(
   if (!cursors.length && !echoes.length) return [];
   const tx = db.transaction(["events", "outbox"], "readwrite");
   const outbox = tx.objectStore("outbox");
+  // The transaction's own snapshot of the persisted rows.
+  const rows = await outbox.getAll();
+  const byKey = new Map(rows.map((row) => [row.key, row]));
+  const doomed = echoes.flatMap((echo) => {
+    const saved = byKey.get(echo.key);
+    return saved !== undefined && (saved.thread ?? MAIN_THREAD) === echo.thread ? [echo] : [];
+  });
+  const doomedKeys = new Set(doomed.map((echo) => echo.key));
+  const kept = new Set<string>();
+  for (const row of rows) {
+    if (doomedKeys.has(row.key)) continue;
+    for (const id of row.fileIds ?? []) kept.add(id);
+  }
   const fileIds: string[] = [];
   await Promise.all([
     ...cursors.map((cursor) => tx.objectStore("events").delete(cursor)),
-    ...echoes.map(async (echo) => {
-      const saved = await outbox.get(echo.key);
-      if (!saved || (saved.thread ?? MAIN_THREAD) !== echo.thread) return;
+    ...doomed.map(async (echo) => {
+      const saved = byKey.get(echo.key)!;
       await outbox.delete(echo.key);
-      fileIds.push(...saved.fileIds ?? []);
+      for (const id of saved.fileIds ?? []) if (!kept.has(id)) fileIds.push(id);
     }),
     tx.done,
   ]);
