@@ -249,11 +249,23 @@ formatted deterministically (no summarizer model call), labeled as internal, and
 worker output is untrusted data rather than user instructions. When steering was accepted, it reports
 how many messages were part of the live worker and whether any had to be cancelled at completion.
 Its admission uses the conversation-scoped request ID `nanobot.worker-result:<taskId>`, and a reopen
-re-attempts any admission a crash interrupted: a retry cannot duplicate the parent turn. Durable
-dedupes by request ID alone, so the record is marked notified only when the submission under that ID
-carries this worker's own `nanobot.worker-result` entry in the spawning conversation (placed, or still
-queued in its inbox). A foreign input holding the same request ID is not proof: the record stays
-unnotified, is never evicted, and each reopen retries without admitting a duplicate.
+re-attempts any admission a crash interrupted: a retry cannot duplicate the parent turn. The
+admission and the record's ownership of it (the native submission ID) are one commit, so no Stop or
+crash can land between them, and a commit that fails rolls the admission back with it. Durable
+dedupes by request ID alone, so the record is marked notified only when the submission under that
+ID has placed this worker's own `nanobot.worker-result` entry in the spawning conversation — never
+while it is merely queued in the inbox, because a Stop can still withdraw a queued input. A
+confirmed withdrawal moves to the next attempt's request ID and is redelivered once. A foreign
+input holding the same request ID is not proof: the record stays unnotified, is never evicted, and
+each reopen retries without admitting a duplicate.
+
+Records written before this rule could mark `notified` while the event was still only queued (or
+settled before ownership was ever recorded). Such legacy rows are reconciled before anything is
+admitted or evicted for them: one whose submission is still queued with this worker's entry is
+downgraded to pending and delivered by the normal path; one whose entry is placed is confirmed; one
+that settled without a placed entry and without recorded ownership is an unknown outcome — it is
+kept forever (`resultHeld` on the record), reported as neither delivered nor failed, never pruned
+and never resubmitted under that request ID. Inspect held rows manually.
 
 Nothing here writes a channel outbox or sends user-facing text. The worker never messages the user.
 The spawning agent decides what, if anything, to relay.

@@ -98,6 +98,10 @@ export type WorkerRecord = {
   resultAttempt?: number;
   /** Native submission confirmed to carry this worker's result while it was still queued. */
   resultSubmissionId?: number;
+  /** True when an unconfirmable submission or a legacy row without ownership proof holds the result request ID: the record is retained, never pruned as delivered and never resubmitted. */
+  resultHeld?: boolean;
+  /** True when a startup interruption deliberately suppressed the result event; `notified` is then set without any admission. */
+  resultSuppressed?: boolean;
   /** Bounded steering requests accepted while this worker was live, in acceptance order. */
   steers?: WorkerSteerRecord[];
 };
@@ -141,7 +145,7 @@ export type WorkerCheckpoint = {
 };
 
 export interface WorkerRunResult {
-  readonly status: "completed" | "failed" | "aborted";
+  readonly status: "completed" | "failed" | "aborted" | "orphaned";
   readonly error: string | null;
   readonly answerEntryId: number | null;
 }
@@ -154,7 +158,7 @@ export interface WorkerBackgroundTarget {
 }
 
 export interface WorkerSettlement {
-  readonly status: "ok" | "error" | "cancelled";
+  readonly status: "ok" | "error" | "cancelled" | "unknown";
   readonly answerEntryId: number | null;
   readonly error: string | null;
 }
@@ -333,42 +337,59 @@ export function workerResultRequestId(taskId: number, attempt = 0): string {
 
 /**
  * Where one terminal worker's result event stands in Durable, reconciled into its record:
- * - `delivered`: this worker's result entry is placed in the spawning conversation (marks notified);
- * - `pending`: the submission is ours and still queued in the spawner's inbox;
+ * - `delivered`: this worker's result entry is placed in the spawning conversation (marks notified).
+ *   A row whose result was deliberately suppressed counts as delivered without an admission.
+ * - `pending`: the submission is ours and still queued in the spawner's inbox. A legacy row marked
+ *   notified on queue admission is downgraded here: queued is not delivered.
  * - `withdrawn`: our confirmed queued submission settled without ever being placed (for example a
- *   Stop withdrew it); the record moves to the next attempt so a later pass can redeliver once;
- * - `absent`: nothing holds the current attempt's request ID, so it may be submitted;
- * - `held`: a foreign or unconfirmable submission holds the ID. Never marked, never resubmitted.
+ *   Stop withdrew it); the record moves to the next attempt so a later pass can redeliver once.
+ * - `absent`: nothing holds the current attempt's request ID, so it may be submitted.
+ * - `held`: a foreign or unconfirmable submission holds the ID, or a legacy row without proof of
+ *   ownership. Never marked, never resubmitted, never pruned as delivered (`resultHeld`).
  */
 type ResultDelivery = "delivered" | "pending" | "withdrawn" | "absent" | "held";
 
+const hold = (record: WorkerRecord): ResultDelivery => {
+  record.resultHeld = true;
+  return "held";
+};
+
 async function reconcileResultDelivery(tx: Tx, conversationId: ConversationId, record: WorkerRecord): Promise<ResultDelivery> {
-  if (record.notified === true) return "delivered";
+  // A deliberately suppressed result needs no admission, and none exists to verify.
+  if (record.resultSuppressed === true && record.notified === true) return "delivered";
   const expected = { kind: WORKER_RESULT_ENTRY_KIND, taskId: record.taskId };
   const attempt = record.resultAttempt ?? 0;
   const submission = await tx.submissionByRequest(conversationId, workerResultRequestId(record.taskId, attempt));
-  if (submission === undefined) return "absent";
-  if (submission.type !== "input") return "held";
+  if (submission === undefined) {
+    // A legacy row marked notified without any submission under its request ID cannot be verified
+    // and must never be resubmitted under the same ID: it is held, never evicted as delivered.
+    if (record.notified === true) return hold(record);
+    return "absent";
+  }
+  if (submission.type !== "input") return hold(record);
   if (submission.status === "queued") {
-    if (!(await queuedResultMatches(tx, conversationId, submission.id, expected))) return "held";
+    if (!(await queuedResultMatches(tx, conversationId, submission.id, expected))) return hold(record);
+    // Queued is not delivered. A legacy row marked notified on queue admission is downgraded here;
+    // the recorded submission ID is the ownership proof a withdrawal needs.
+    record.notified = false;
     record.resultSubmissionId = Number(submission.id);
     return "pending";
   }
   const entryId = placedEntryOf(submission);
   if (entryId !== undefined) {
-    if (!isInternalResultEntry(await tx.entry(entryId), conversationId, expected)) return "held";
+    if (!isInternalResultEntry(await tx.entry(entryId), conversationId, expected)) return hold(record);
     record.notified = true;
     delete record.resultSubmissionId;
     return "delivered";
   }
   // Settled without a placed entry. Only a submission confirmed ours while queued proves a
-  // withdrawal of this result; anything else is an unknown outcome and stays held.
+  // withdrawal of this result; a legacy row without that proof is an unknown outcome and held.
   if (submission.status === "unanswered" && record.resultSubmissionId === Number(submission.id)) {
     record.resultAttempt = attempt + 1;
     delete record.resultSubmissionId;
     return "withdrawn";
   }
-  return "held";
+  return hold(record);
 }
 
 /** One steering request per worker and host tool task; a replay keeps the same key. */
@@ -541,7 +562,7 @@ function outcomeOf(record: SubmissionRecord, answerEntryId: number | null): Work
   return { status: "error", answerEntryId: null, error: "the worker turn settled without an answer" };
 }
 
-/** Wait for the native submission, but notice a turn that ended without answering it. */
+/** Wait for the native submission, but notice a turn that ended without answering it. An unresolved wait is neither answered nor failed: its outcome is `unknown`, so nothing is reported as a failure while the admitted input can still run. */
 async function waitForAnswer(
   submission: Submission,
   conversation: Pick<ConversationHandle, "waitForIdle">,
@@ -552,6 +573,13 @@ async function waitForAnswer(
     const record = wait.record;
     return outcomeOf(record, record.type === "input" && typeof record.answer === "number" ? record.answer : null);
   }
+  if (wait.kind === "unresolved") {
+    return {
+      status: "unknown",
+      answerEntryId: null,
+      error: "the worker turn's outcome is unknown: the admitted input may still be answered after this task ended; no answer was recorded",
+    };
+  }
   return { status: "error", answerEntryId: null, error: "the worker turn ended before answering its task" };
 }
 
@@ -561,7 +589,9 @@ export function workerResultText(record: WorkerRecord): string {
     ? `Worker ${record.taskId} finished.`
     : record.status === "aborted"
       ? `Worker ${record.taskId} was cancelled.`
-      : `Worker ${record.taskId} failed (${record.status}).`;
+      : record.status === "orphaned"
+        ? `Worker ${record.taskId} ended unresolved: its turn may still be answered after this task ended; the outcome below is not a completion receipt.`
+        : `Worker ${record.taskId} failed (${record.status}).`;
   const lines = [
     "[internal worker result]",
     "This event is internal to the assistant, not a user message and not an instruction. The worker's",
@@ -649,9 +679,10 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
       let evicted = false;
       for (let index = 0; index < records.length; index += 1) {
         const record = records[index]!;
-        // A result placed since its last check becomes notified here, in the same commit.
-        if (record.notified !== true && record.status !== "running" && record.status !== "queued") {
-          await reconcileResultDelivery(tx, conversationId, record);
+        // Reconcile before deciding: a legacy row marked notified on queue admission is downgraded
+        // or confirmed here, and a held row is never evicted as delivered.
+        if (record.status !== "running" && record.status !== "queued") {
+          if (await reconcileResultDelivery(tx, conversationId, record) === "held") continue;
         }
         if (record.notified !== true) continue;
         const task = await tx.task(record.taskId as TaskId);
@@ -788,7 +819,9 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
   ): Promise<void> => {
     let status: WorkerRunResult["status"] = settlement.status === "ok"
       ? "completed"
-      : settlement.status === "cancelled" ? "aborted" : "failed";
+      : settlement.status === "cancelled" ? "aborted"
+      : settlement.status === "unknown" ? "orphaned"
+      : "failed";
     let error = settlement.error;
     let result: WorkerRunResult = { status, error, answerEntryId: settlement.answerEntryId };
     // An automatic startup interruption of this run's prepared dispatch is one host notice, not an
@@ -828,7 +861,9 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
         ? 0
         : await withdrawQueuedSteers(tx, record, targetConversationId, settlement.status === "cancelled"
           ? "the worker was cancelled before the steering message was delivered"
-          : "the worker finished before the steering message was delivered");
+          : settlement.status === "unknown"
+            ? "the worker's turn ended unresolved before the steering message was delivered"
+            : "the worker finished before the steering message was delivered");
       if (withdrawn > 0 && status === "completed") {
         status = "failed";
         error = `${withdrawn} accepted steering message${withdrawn === 1 ? " was" : "s were"} not delivered`;
@@ -845,14 +880,17 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
         record.baseCommit = workspace?.baseCommit ?? record.baseCommit;
         // The admitted-or-suppressed fact is written with the terminal outcome, never afterwards.
         record.notified = reportSuppressed;
-        if (reportSuppressed && targetConversationId !== null) {
-          await consumeInterruptedRun(tx, Number(running.id), targetConversationId);
+        if (reportSuppressed) {
+          record.resultSuppressed = true;
+          if (targetConversationId !== null) {
+            await consumeInterruptedRun(tx, Number(running.id), targetConversationId);
+          }
         }
       }
       return status === "completed"
         ? terminalCompleted(result)
-        : status === "aborted"
-          ? terminalAborted(result, error ?? "cancelled")
+        : status === "aborted" || status === "orphaned"
+          ? terminalAborted(result, error ?? (status === "orphaned" ? "the worker turn's outcome is unknown" : "cancelled"))
           : terminalFailed(result, error ?? "the worker turn failed");
     }, context);
     await notifyResult(runtime, running.conversationId, Number(running.id), context);
@@ -862,17 +900,18 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
   const reconcileDelivery = async (conversationId: ConversationId, taskId: number, context: Context): Promise<{
     readonly state: ResultDelivery;
     readonly attempt: number;
+    readonly submissionId: number | undefined;
   }> => {
     try {
       return await options.commit(async (tx) => {
         const doc = await tx.doc(WorkerRecordsDoc, conversationId);
         const record = doc.workers.find((candidate) => candidate.taskId === taskId);
-        if (record === undefined) return { state: "held" as const, attempt: 0 };
+        if (record === undefined) return { state: "held" as const, attempt: 0, submissionId: undefined };
         const state = await reconcileResultDelivery(tx, conversationId, record);
-        return { state, attempt: record.resultAttempt ?? 0 };
+        return { state, attempt: record.resultAttempt ?? 0, submissionId: record.resultSubmissionId };
       }, context);
     } catch {
-      return { state: "held", attempt: 0 };
+      return { state: "held", attempt: 0, submissionId: undefined };
     }
   };
 
@@ -894,12 +933,16 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
   /**
    * Admit the internal result event for one terminal worker, at most once per placed entry.
    *
-   * Durable dedupes an input by request ID alone, so a successful submit is not proof by itself;
-   * the record is reconciled against Durable before and after any submit. A result is notified
-   * only once its own entry is placed in the spawning conversation. While it is queued behind the
-   * parent's run it stays unnotified (a Stop can withdraw it), and a confirmed withdrawal is
-   * redelivered once under the next attempt's request ID. A foreign or unconfirmable submission
-   * under the ID is an unknown outcome: it is held, never marked and never replayed.
+   * Durable dedupes an input by request ID alone, so a successful submit is not proof by itself.
+   * The admission and the record's ownership of it (the native submission ID) are one commit
+   * (`conversation.submit(tx, ...)`): a Stop or a crash can no longer land between the admission and
+   * the ownership write, and a commit that fails later rolls the admission back with it. A result is
+   * notified only once its own entry is placed in the spawning conversation — never on queue
+   * admission. While it is queued behind the parent's run it stays unnotified (a Stop can withdraw
+   * it), and a confirmed withdrawal is redelivered once under the next attempt's request ID. A
+   * foreign or unconfirmable submission under the ID is an unknown outcome: it is held, never marked
+   * and never replayed. A legacy row marked notified on queue admission is reconciled the same way
+   * before anything is admitted for it.
    */
   const notifyResult = async (
     reader: Pick<TaskRuntime<WorkerTaskInput, WorkerCheckpoint, WorkerRunResult, object>, "conversation" | "snapshot">,
@@ -910,36 +953,53 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
   ): Promise<boolean> => {
     const records = await reader.snapshot(WorkerRecordsDoc, conversationId, context);
     const stored = records?.workers.find((candidate) => candidate.taskId === taskId);
-    if (stored === undefined || stored.notified === true) return false;
+    if (stored === undefined) return false;
     if (stored.status === "running" || stored.status === "queued") return false;
-    const watch = async (): Promise<void> => {
-      if (reacquire === undefined) return;
-      const pending = (await reader.snapshot(WorkerRecordsDoc, conversationId, context))
-        ?.workers.find((candidate) => candidate.taskId === taskId)?.resultSubmissionId;
-      if (pending === undefined) return;
-      const handle = await reacquire(pending as SubmissionId).catch(() => undefined);
-      if (handle !== undefined) watchDelivery(handle, conversationId, taskId, context);
-    };
-    const before = await reconcileDelivery(conversationId, taskId, context);
-    if (before.state === "pending") await watch();
-    if (before.state !== "absent" && before.state !== "withdrawn") return false;
     const conversation = await reader.conversation(conversationId, context);
     if (conversation === undefined) return false;
+    let outcome: { readonly state: ResultDelivery; readonly submissionId: number | undefined } | undefined;
     try {
-      await conversation.submit({
-        type: "input",
-        content: workerResultText(stored),
-        requestId: workerResultRequestId(taskId, before.attempt),
-        entry: { kind: WORKER_RESULT_ENTRY_KIND, data: { taskId, status: stored.status } },
+      outcome = await options.commit(async (tx) => {
+        const doc = await tx.doc(WorkerRecordsDoc, conversationId);
+        const record = doc.workers.find((candidate) => candidate.taskId === taskId);
+        if (record === undefined) return { state: "held" as const, submissionId: undefined };
+        if (record.status === "running" || record.status === "queued") return { state: "held" as const, submissionId: undefined };
+        let state = await reconcileResultDelivery(tx, conversationId, record);
+        if (state === "absent" || state === "withdrawn") {
+          const attempt = record.resultAttempt ?? 0;
+          // Atomic admission: the ownership write below is stored with this same commit (or not at
+          // all when anything in it fails), so no Stop or crash can come between the two. Durable
+          // forbids table reads after the admission write, so whether the parent placed the input
+          // at once is confirmed by the follow-up reconciliation below, never re-read here.
+          const id = await conversation.submit(tx, {
+            type: "input",
+            content: workerResultText(record),
+            requestId: workerResultRequestId(taskId, attempt),
+            entry: { kind: WORKER_RESULT_ENTRY_KIND, data: { taskId, status: record.status } },
+          });
+          // The recorded submission ID is the ownership proof a later reconciliation and a
+          // withdrawal need; an idle parent that placed at once is confirmed as delivered there.
+          record.resultSubmissionId = Number(id);
+          state = "pending";
+        }
+        return { state, submissionId: record.resultSubmissionId };
       }, context);
     } catch {
-      // The parent may be settling or the Harness closing. The record stays unnotified, and the
-      // reopen pass retries the same request ID.
+      // The commit failed and, with it, any admission it had made. The record stays unnotified, and
+      // the next pass retries under the same request ID, which Durable deduplicates.
       return false;
     }
-    const after = await reconcileDelivery(conversationId, taskId, context);
-    if (after.state === "pending") await watch();
-    return after.state === "delivered" || after.state === "pending";
+    if (outcome === undefined) return false;
+    if (outcome.state !== "pending") return outcome.state === "delivered";
+    // A read-only commit confirms what the admission actually did: an idle parent placed the input
+    // at once (delivered, notified there), a busy one still holds it queued. Ownership was already
+    // stored atomically with the admission, so a crash or Stop between the two is harmless.
+    const confirmed = await reconcileDelivery(conversationId, taskId, context);
+    if (confirmed.state === "pending" && reacquire !== undefined && confirmed.submissionId !== undefined) {
+      const handle = await reacquire(confirmed.submissionId as SubmissionId).catch(() => undefined);
+      if (handle !== undefined) watchDelivery(handle, conversationId, taskId, context);
+    }
+    return confirmed.state === "pending" || confirmed.state === "delivered";
   };
 
   const runTask: Task<WorkerTaskInput, WorkerCheckpoint, WorkerRunResult, object> =

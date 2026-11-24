@@ -940,7 +940,7 @@ export type MemoryDigestCheckpoint = {
   readonly usageUnknown?: boolean;
 };
 
-export type MemoryDigestOutcome = "digested" | "noop" | "consumed" | "failed" | "aborted";
+export type MemoryDigestOutcome = "digested" | "noop" | "consumed" | "failed" | "aborted" | "unknown";
 
 /** Bounded, value-only outcome. The run's own transcript keeps the full answer. */
 export interface MemoryDigestRunResult {
@@ -1370,7 +1370,7 @@ function consumedThrough(cursor: DigestCursor, input: MemoryDigestTaskInput): bo
 }
 
 interface Settlement {
-  readonly status: "ok" | "error";
+  readonly status: "ok" | "error" | "unknown";
   /** Committed input entry of the turn, when the submission placed one. */
   readonly entryId: EntryId | null;
   readonly answerEntryId: EntryId | null;
@@ -1397,7 +1397,7 @@ function settlementOf(record: SubmissionRecord): Settlement {
   return { status: "error", entryId: null, answerEntryId: null, error: "the digest turn settled without an answer" };
 }
 
-/** Wait for the native submission, but notice a turn that ended without answering it. */
+/** Wait for the native submission, but notice a turn that ended without answering it. An unresolved wait is neither answered nor failed: its outcome is `unknown`, so nothing is reported as a failure and no captured authority is withdrawn while the admitted input can still run. */
 async function waitForAnswer(
   submission: Submission,
   conversation: Pick<ConversationHandle, "waitForIdle">,
@@ -1405,6 +1405,14 @@ async function waitForAnswer(
 ): Promise<Settlement> {
   const wait = await waitForTurnAnswer(submission, conversation, context);
   if (wait.kind === "settled") return settlementOf(wait.record);
+  if (wait.kind === "unresolved") {
+    return {
+      status: "unknown",
+      entryId: typeof wait.record.entry === "number" ? wait.record.entry as EntryId : null,
+      answerEntryId: null,
+      error: "the digest turn's outcome is unknown: the admitted input may still be answered after this task ended; the batch was not acknowledged",
+    };
+  }
   return {
     status: "error",
     entryId: typeof wait.record.entry === "number" ? wait.record.entry as EntryId : null,
@@ -2097,7 +2105,8 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
 
           /** Terminal commit: retire captured authority and record the bounded outcome. */
           const finish = async (
-            settle: { readonly status: "completed" } | { readonly status: "failed"; readonly message: string },
+            settle: { readonly status: "completed" } | { readonly status: "failed"; readonly message: string }
+              | { readonly status: "unknown"; readonly message: string },
             result: MemoryDigestRunResult,
             answerEntryId: EntryId | null,
           ): Promise<void> => {
@@ -2186,7 +2195,9 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
               };
               return settle.status === "completed"
                 ? terminalCompleted(next)
-                : terminalFailed(next, settle.message);
+                : settle.status === "unknown"
+                  ? terminalAborted(next, settle.message)
+                  : terminalFailed(next, settle.message);
             }, context);
             if (nextInput !== undefined) return;
             try {
@@ -2211,6 +2222,28 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
               answer: null,
             };
             await finish({ status: "failed", message: result.error ?? "failed" }, result, settlement.answerEntryId);
+          };
+
+          /** An unresolved turn is held, not failed: the batch stays unacknowledged and the target keeps its captured authority for the reopen pass to prune. */
+          const holdUnknown = async (error: string | null): Promise<void> => {
+            const result: MemoryDigestRunResult = {
+              outcome: "unknown",
+              error: error === null ? null : bounded(error, MEMORY_DIGEST_LIMITS.maxErrorChars),
+              sessionKey: parsed?.sessionKey ?? null,
+              conversationId: parsed?.conversationId ?? null,
+              throughEntryId: parsed?.throughEntryId ?? null,
+              complete: parsed?.complete ?? null,
+              evidenceEntries: 0,
+              consumed: false,
+              targetConversationId: target === null ? null : Number(target),
+              answerEntryId: settlement.answerEntryId === null ? null : Number(settlement.answerEntryId),
+              answer: null,
+            };
+            await finish(
+              { status: "unknown", message: result.error ?? "the digest turn's outcome is unknown" },
+              result,
+              settlement.answerEntryId,
+            );
           };
 
           if (parsed === undefined) {
@@ -2464,7 +2497,7 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
               } finally {
                 disarm?.();
               }
-              if (settlement.status !== "ok") await withdrawTargetWork(runtime, targetId, context);
+              if (settlement.status === "error") await withdrawTargetWork(runtime, targetId, context);
             }
           } catch (error) {
             if (runtime.signal.aborted) return;
@@ -2476,6 +2509,14 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
             };
           }
           if (runtime.signal.aborted) return;
+
+          if (settlement.status === "unknown") {
+            // Hold: the admitted input may still answer in the target conversation, so the batch is
+            // not acknowledged, no failure is reported, and the target's captured authority is
+            // left for the reopen pass to prune once the task is terminal.
+            await holdUnknown(settlement.error);
+            return;
+          }
 
           if (settlement.status !== "ok") {
             const transcript = await digestTranscriptUse(options.harness(), targetId, parsed.limits, context)

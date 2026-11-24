@@ -96,7 +96,8 @@ export interface CronOutcome {
   readonly [key: string]: JsonValue;
   readonly scheduledAtMs: number;
   readonly finishedAtMs: number;
-  readonly status: "ok" | "error";
+  /** `unknown` is an unresolved wait: the admitted input may still be answered after the run ended. */
+  readonly status: "ok" | "error" | "unknown";
   readonly error: string | null;
   readonly conversationId: number;
 }
@@ -242,7 +243,8 @@ export interface CronRunResult {
   readonly [key: string]: JsonValue;
   readonly jobId: string;
   readonly scheduledAtMs: number;
-  readonly outcome: "ok" | "error" | "cancelled" | "superseded" | "missing";
+  /** `unknown` is an unresolved wait: the admitted input may still be answered after the run ended. */
+  readonly outcome: "ok" | "error" | "unknown" | "cancelled" | "superseded" | "missing";
   readonly error: string | null;
 }
 
@@ -602,7 +604,7 @@ const runResult = (
 const zeroInput: CronOccurrenceInput = { jobId: "", scheduledAtMs: 0, generation: 0 };
 
 interface WaitSettlement {
-  readonly status: "ok" | "error";
+  readonly status: "ok" | "error" | "unknown";
   readonly error: string | null;
   readonly answerEntryId: EntryId | null;
 }
@@ -649,13 +651,22 @@ async function chatIdleForOccurrence(
  * Wait for the native submission, but also notice a run that ended without answering it.
  * Durable's default `afterFailedRun: "keep"` leaves the input queued, so waiting only on
  * `submission.wait()` would never finish. Once the target is idle, a still-queued input has no
- * run left to answer it: withdraw it, record the error, and let the next timer continue.
+ * run left to answer it: withdraw it, record the error, and let the next timer continue. An
+ * unresolved wait is neither: the admitted input may still be answered later, so the occurrence
+ * records `unknown`, withdraws nothing and never retries the same input.
  */
 async function waitForAnswer(
   submission: Submission, conversation: ConversationHandle, context: Context,
 ): Promise<WaitSettlement> {
   const wait = await waitForTurnAnswer(submission, conversation, context);
   if (wait.kind === "settled") return outcomeOf(wait.record);
+  if (wait.kind === "unresolved") {
+    return {
+      status: "unknown",
+      error: `run outcome unknown: the admitted input can still be answered (submission is ${wait.record.status}); nothing was withdrawn or retried`,
+      answerEntryId: null,
+    };
+  }
   return {
     status: "error",
     error: `run ended before answering (submission is ${wait.record.status})`,
@@ -1504,14 +1515,19 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
       // retired; the origin-mode target is the origin conversation itself and keeps its policy.
       // A digest occurrence queues no user/channel delivery: only a failed or cancelled digest run's
       // internal issue report reaches the origin agent, a successful run is silent, and the job
-      // record keeps this bounded status for `cron list`.
-      await retireTarget(tx, conversationId, targetConversationId, copyJob(job), input, intentOf(job) === "digest" ? null : {
+      // record keeps this bounded status for `cron list`. An unresolved wait delivers nothing: the
+      // admitted input may still be answered, and a delivered failure receipt would misreport it.
+      await retireTarget(tx, conversationId, targetConversationId, copyJob(job), input, intentOf(job) === "digest" || settlement.status === "unknown" ? null : {
         status: settlement.status,
         error: settlement.error,
         answerEntryId: settlement.answerEntryId,
       }, context);
       return terminalCompleted<CronRunCheckpoint, CronRunResult>(
-        runResult(input, settlement.status === "ok" ? "ok" : "error", settlement.error),
+        runResult(
+          input,
+          settlement.status === "ok" ? "ok" : settlement.status === "unknown" ? "unknown" : "error",
+          settlement.error,
+        ),
       );
     }, context);
   }

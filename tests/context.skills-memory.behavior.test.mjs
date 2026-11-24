@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { readdirSync, readlinkSync } from "node:fs";
 import { link, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { registerHooks } from "node:module";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -248,4 +250,73 @@ test("a notes description line with an embedded line separator keeps the heading
     page.hits.map((hit) => [hit.source.path, hit.excerpt]),
     [["memory/plain.md", "Quoted plain"], ["memory/separated.md", "Heading Fallback"]],
   );
+});
+
+function fdTargetExists(target) {
+  let entries;
+  try {
+    entries = readdirSync("/proc/self/fd");
+  } catch {
+    return false;
+  }
+  for (const entry of entries) {
+    try {
+      if (readlinkSync(`/proc/self/fd/${entry}`) === target) return true;
+    } catch {
+      // The descriptor may close between readdir and readlink.
+    }
+  }
+  return false;
+}
+
+test("a failed parent close never leaks the open note descriptor", async (t) => {
+  if (typeof registerHooks !== "function") {
+    t.skip("module.registerHooks is unavailable on this runtime");
+    return;
+  }
+  const root = await tempRoot(t);
+  const note = join(root, "memory", "note.md");
+  await writeFiles(root, { "memory/note.md": "---\ndescription: leak probe\n---\n# Leak Probe\nbody" });
+  // Node gives every FileHandle a per-instance `close`, so a prototype patch cannot inject a
+  // failure. Route a fresh copy of the notes backend to a shim whose first created handle fails
+  // its close for real after closing: that first handle is the note's parent directory, closed in
+  // `noteHandle`'s cleanup while the note descriptor is already open.
+  const shim = `data:text/javascript,${encodeURIComponent([
+    'import * as real from "node:fs/promises";',
+    "export * from 'node:fs/promises';",
+    "let armed = true;",
+    "export const open = async (...args) => {",
+    "  const handle = await real.open(...args);",
+    "  if (armed) {",
+    "    armed = false;",
+    "    const close = handle.close;",
+    "    handle.close = async () => {",
+    "      await close.call(handle);",
+    '      throw Object.assign(new Error("synthetic parent close failure"), { code: "EIO" });',
+    "    };",
+    "  }",
+    "  return handle;",
+    "};",
+  ].join("\n"))}`;
+  const marker = "notes.js?close-failure";
+  const hooks = registerHooks({
+    resolve(specifier, context, nextResolve) {
+      if (specifier === "node:fs/promises" && String(context.parentURL).includes(marker)) {
+        return { url: shim, shortCircuit: true };
+      }
+      return nextResolve(specifier, context);
+    },
+  });
+  t.after(() => hooks.deregister());
+  const notesModule = await import(new URL(`../dist/memory/notes.js?close-failure`, import.meta.url).href);
+  const backend = notesModule.createNotesBackend();
+  t.after(() => backend.close());
+  const scope = { storeId: "synthetic", workspaceRoot: root, memoryFiles: [], sessions: [] };
+  const ref = { kind: "note", path: "memory/note.md", fingerprint: "synthetic" };
+  await assert.rejects(
+    backend.read({ ref, limit: 64 }, ref, scope),
+    /Note is unsafe, changed, unreadable or no longer available/,
+  );
+  assert.equal(fdTargetExists(note), false, "the note descriptor does not survive the failed parent close");
+  assert.equal(fdTargetExists(join(root, "memory")), false, "the parent directory is closed behind its failing close");
 });

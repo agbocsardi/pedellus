@@ -61,13 +61,16 @@ export const terminalFailed = <S, R>(result: R, message: string): NextTaskState<
 /* ------------------------------------------------------------------------ */
 
 /**
- * `settled`: the submission reached `done` or `unanswered`. `ended`: the target went idle and the
- * submission was withdrawn while still queued (its record is the queued state that was withdrawn),
- * or it stayed unsettled across the bounded re-waits below.
+ * `settled`: the submission reached `done` or `unanswered`. `ended`: the target went idle and a
+ * confirmed withdrawal (`abort()` returned `"aborted"`) removed the still-queued input. `unresolved`:
+ * the bounded wait ended without either proof — a persistent queued or placed-but-unanswered input,
+ * or a withdrawal whose own outcome is unknown. The input may still run, so a caller must neither
+ * report a failure nor retry as if it never happened.
  */
 export type TurnWait =
   | { readonly kind: "settled"; readonly record: SubmissionRecord }
-  | { readonly kind: "ended"; readonly record: SubmissionRecord };
+  | { readonly kind: "ended"; readonly record: SubmissionRecord }
+  | { readonly kind: "unresolved"; readonly record: SubmissionRecord };
 
 /** Idle observations tolerated while a newly placed submission is still being answered. */
 const TURN_WAIT_ROUNDS = 4;
@@ -83,7 +86,10 @@ const isSettled = (record: SubmissionRecord): boolean => record.status === "done
  * Idle and the status read are not atomic with the withdrawal: a successor run may place (and even
  * answer) the input in between. The abort result is therefore authoritative, and any state other
  * than a confirmed withdrawal is re-read fresh: `settled` returns that settlement, and a placed
- * input is waited for again instead of being reported as unanswered.
+ * input is waited for again instead of being reported as unanswered. Only a confirmed withdrawal
+ * is `ended`; a rejected withdrawal, or a submission that is still queued or placed after the
+ * bounded re-waits, stays `unresolved` — the input may still run, so the caller must hold, not
+ * report a failure and not retry.
  */
 export async function waitForTurnAnswer(
   submission: Submission,
@@ -110,15 +116,18 @@ export async function waitForTurnAnswer(
     if (isSettled(record)) return { kind: "settled", record };
     if (record.status === "queued") {
       let outcome: Awaited<ReturnType<Submission["abort"]>> | undefined;
-      try { outcome = await submission.abort(context); } catch { outcome = undefined; }
+      let rejected = false;
+      try { outcome = await submission.abort(context); } catch { rejected = true; }
       if (outcome === "aborted") return { kind: "ended", record };
-      // Placed or settled since the read (or the abort failed): trust only a fresh record.
+      // Placed or settled since the read: trust only a fresh record.
       record = await submission.status(context);
       if (isSettled(record)) return { kind: "settled", record };
+      // A rejected withdrawal is itself unknown: the input may still be queued or placed.
+      if (rejected) return { kind: "unresolved", record };
     }
     // Placed by a successor run: wait for that run to answer it.
   }
-  return { kind: "ended", record: record ?? await submission.status(context) };
+  return { kind: "unresolved", record: record ?? await submission.status(context) };
 }
 
 /** The visible text of an entry's first model message (an assistant answer), joined without separators. */

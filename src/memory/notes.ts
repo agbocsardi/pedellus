@@ -59,14 +59,27 @@ async function noteHandle(root: string, path: string): Promise<FileHandle> {
   if (!validPath(path)) return fail("Note path is outside the memory scope");
   const parts = path.split("/"); const name = parts.pop()!;
   const parent = await beneath(root, parts.join("/"));
+  let handle: FileHandle | undefined;
+  let failure: unknown; let failed = false;
   try {
-    const handle = await open(childPath(parent, name), FILE_FLAGS);
-    try {
-      const info = await handle.stat({ bigint: true });
-      if (!info.isFile() || info.nlink !== 1n) fail("Note is not a safe regular file");
-      return handle;
-    } catch (error) { await handle.close().catch(() => undefined); throw error; }
-  } finally { await parent.close(); }
+    handle = await open(childPath(parent, name), FILE_FLAGS);
+    const info = await handle.stat({ bigint: true });
+    if (!info.isFile() || info.nlink !== 1n) fail("Note is not a safe regular file");
+  } catch (error) {
+    failed = true; failure = error;
+    await handle?.close().catch(() => undefined);
+    handle = undefined;
+  }
+  try {
+    await parent.close();
+  } catch (closeError) {
+    // The already-open note descriptor must not leak behind a failed parent close, and the note's
+    // own error, when there was one, stays the propagated one instead of being masked.
+    await handle?.close().catch(() => undefined);
+    if (!failed) throw closeError;
+  }
+  if (failed) throw failure;
+  return handle!;
 }
 /** A manifest is captured fully on the first call. Bounds refuse explicitly, never claim partial enumeration is complete. */
 async function manifest(root: string, configured: readonly string[]): Promise<{ notes: Note[]; unreadable: number }> {
