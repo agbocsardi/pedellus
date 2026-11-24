@@ -1,6 +1,6 @@
-# Durable — app
+# Pedellus — app
 
-The installable web app (PWA) that is the chat channel of the Durable agent
+The installable web app (PWA) that is the chat channel of the Pedellus
 gateway. Vite + TypeScript + React 19, Streamdown for rendering answer markdown,
 `vite-plugin-pwa` (injectManifest) + Workbox for the service worker, `idb` for
 IndexedDB. The normative wire contract is
@@ -21,7 +21,7 @@ npm run dev    # vite on http://localhost:5173, proxying /v1 (incl. ws) to it
 `npm run mock` accepts an explicit code as an argument (`node
 dev/mock-gateway.mjs MYC2DE23`). For a different mock port, set `PORT` on the
 mock and the same value as `MOCK_PORT` on Vite (dev or preview). Set
-`AGENT_NAME` on the mock to override the default display name, "Durable"
+`AGENT_NAME` on the mock to override the default display name, "Pedellus"
 (rejected over 40 characters). Set `IDLE_ARCHIVE_MS=3000` to try automatic
 archiving after three seconds of idleness. Mock credentials, threads, cursors
 and uploads are in memory; after a mock restart use a fresh browser profile or
@@ -91,9 +91,10 @@ answer). Default is 10 runs.
 
 `vite build` writes the complete app to `app/dist/` — `index.html`,
 `manifest.webmanifest`, `sw.js`, `registerSW.js`, hashed assets and the icons.
-The gateway serves this directory statically from a configured absolute path
-on the same origin as `/v1` (behind `tailscale serve`), so app and API share
-one origin and one cookie jar.
+From the repository root, `npm run install:pwa && npm run build:pwa` produces
+it; point `app.staticRoot` at `<checkout>/pwa/app/dist` (absolute). The gateway
+serves this directory statically on the same origin as `/v1` (behind
+`tailscale serve`), so app and API share one origin and one cookie jar.
 
 ## Notes
 

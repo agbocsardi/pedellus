@@ -16,8 +16,8 @@ installed pi-ai's bundled model data, is revalidated with its ETag, and replaces
 bundled entries by model type and ID.
 
 ```bash
-durable-nanobot models refresh [--config <path>] [provider...]
-durable-nanobot models list    [--config <path>] [provider...]
+pedellus models refresh [--config <path>] [provider...]
+pedellus models list    [--config <path>] [provider...]
 ```
 
 Without providers, both use the native providers this configuration names
@@ -60,7 +60,7 @@ A refreshed catalog only makes model metadata resolvable. It never adds a model 
 `allowedModels`, presets, a classifier grant or a worker capture. Practical
 adoption:
 
-1. `durable-nanobot models refresh`, then `durable-nanobot models list <provider>`
+1. `pedellus models refresh`, then `pedellus models list <provider>`
    to confirm the model is really listed (a model absent from pi.dev cannot be
    used, and listing is not evidence that the service accepts it).
 2. Add the exact pair to `allowedModels` or a preset in the config file.

@@ -6,14 +6,14 @@ in-memory trace archive. Logging is enabled by default and source changes requir
 a gateway restart to take effect.
 
 ```sh
-journalctl --user -u durable-nanobot.service --since "15 minutes ago" -o cat
-journalctl --user -u durable-nanobot.service -f -o cat
+journalctl --user -u pedellus.service --since "15 minutes ago" -o cat
+journalctl --user -u pedellus.service -f -o cat
 ```
 
 ## Records and correlation
 
-New records begin with `durable-nanobot journal: ` followed by JSON. Existing
-`durable-nanobot diagnostic:` failures and fixed channel warnings remain intact.
+New records begin with `pedellus journal: ` followed by JSON. Existing
+`pedellus diagnostic:` failures and fixed channel warnings remain intact.
 
 - `span.started` / `span.finished`: operation, trace/span/parent IDs, elapsed
   milliseconds, projected attributes, status, and a safe diagnostic on a throw.
@@ -24,7 +24,7 @@ New records begin with `durable-nanobot journal: ` followed by JSON. Existing
   Native input/continue admissions start their own traces by design.
 - `pi.durable.checkpoint` / `pi.durable.replay`: content-free phase-change and tool-replay
   events. Entry/submission commits are not echoed (the durable store already holds them),
-  and durable reports appear once, as the existing `durable-nanobot diagnostic:` line.
+  and durable reports appear once, as the existing `pedellus diagnostic:` line.
 - `pi.ai.first_chunk`: first normalized stream event latency, not necessarily the
   first visible text token. Model finishes include stop reason and reported token
   usage/cost. No token deltas or content-block events are emitted.
@@ -44,10 +44,10 @@ Filter by the trace ID, follow `span.link` to the native submission trace, or us
 `submission.id` / `task.id` to follow a specific native operation. Example:
 
 ```sh
-journalctl --user -u durable-nanobot.service --since "1 hour ago" -o cat \
+journalctl --user -u pedellus.service --since "1 hour ago" -o cat \
   | grep '"update.id":903180346'
 # Substitute the traceId from the matching delivery span:
-journalctl --user -u durable-nanobot.service --since "1 hour ago" -o cat \
+journalctl --user -u pedellus.service --since "1 hour ago" -o cat \
   | grep '"traceId":"TRACE_ID"'
 ```
 

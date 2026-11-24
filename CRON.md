@@ -363,16 +363,16 @@ operation even though the run itself completed.
 
 ## Operator controls
 
-`durable-nanobot cron` is the owner's scheduling console. It is a process subcommand, not a chat
+`pedellus cron` is the owner's scheduling console. It is a process subcommand, not a chat
 slash command, and it attaches to the running gateway over the private local socket, so every
 runtime decision stays in the one owner process:
 
 ```sh
-durable-nanobot cron list
-durable-nanobot cron show <jobId>
-durable-nanobot cron cancel <jobId>
-durable-nanobot cron create --origin <sessionKey> --key <requestKey> --after 600 --message "Stretch"
-durable-nanobot cron create --key daily-1 --cron "0 9 * * 1-5" --tz Europe/Budapest \
+pedellus cron list
+pedellus cron show <jobId>
+pedellus cron cancel <jobId>
+pedellus cron create --origin <sessionKey> --key <requestKey> --after 600 --message "Stretch"
+pedellus cron create --key daily-1 --cron "0 9 * * 1-5" --tz Europe/Budapest \
   --origin telegram:<identity>:chat:<chatId> --message "Morning check"
 ```
 
@@ -569,7 +569,7 @@ fault document is itself ignored rather than replacing job or outbox data.
 
 - No migration of the parked probe document versions or stores. They are not supported.
 - No chat command surface, model selection, or misfire policy. A chat schedules through the agent's
-  `cron` tool; the owner's terminal uses [`durable-nanobot cron`](#operator-controls). One run
+  `cron` tool; the owner's terminal uses [`pedellus cron`](#operator-controls). One run
   submits one agent turn to a Durable conversation (the job's automation conversation, or the origin
   conversation in `origin` mode).
 - Delivery covers both modes and is currently only consumed by the Telegram adapter. An origin-mode
@@ -834,6 +834,6 @@ identical retry deduping to the same job with no second timer; a conflicting pay
 key refused with the record unchanged; a cancelled original reported and never re-armed by an
 identical replay; exact-ID cancellation of another chat's job; `already_terminal` and `not_found`
 results; compact paginated listings and read-only operator connections that create no chat;
-the CLI's create/list/show rendering and a spawned `durable-nanobot cron` process; and closing
+the CLI's create/list/show rendering and a spawned `pedellus cron` process; and closing
 the server before a cancel, asserted to produce the CLI's unknown-outcome text
 instead of a claimed failure or a claimed cancellation.

@@ -1,20 +1,45 @@
-# Nanobot on Pi Durable (experimental)
+# Pedellus
 
-TypeScript port requiring Node >=22.19 and the pinned Pi 1.5.0 packages. This is not a production-ready replacement for the Python fork.
+**Pedellus** is a personal, durable AI assistant that you run on your own
+machine. One long-running gateway owns the conversation history and your
+workspace, and you talk to it from wherever is handy:
 
-Config-selected coding tools, named model presets, optional bwrap shell, opt-in
-memory/skills, compaction plumbing, owner-invoked closed-episode memory
-digestion, configured vision handoff, MCP, native Code Mode composition, native
-Brave web search plus safe public fetch, and opt-in media ingress (Telegram and
-local CLI attachments) are integrated.
-Agent-callable
-cron scheduling and Telegram delivery are available. WebUI, migration and cutover are
-deferred. [Historical handoffs](plan/) preserve evidence, not a standing
-implementation queue.
+- **Surfaces:** a terminal CLI, a private Telegram bot, a Discord bot, and an
+  installable web app (PWA) for phone and desktop over your tailnet.
+- **Long-term memory** in plain Markdown files you can read and edit, plus
+  searchable conversation history and closed-episode summaries.
+- **Reminders and scheduled work** (cron), **background workers**, owner
+  questions, file and voice-note attachments.
+- **Tools on your terms:** opt-in coding tools, MCP servers, Code Mode, Brave
+  web search and safe public fetch. The config file is the only authority; every
+  capability is off until you turn it on.
+- Survives restarts: accepted work, queued messages and the transcript live in a
+  local SQLite store and resume when the gateway comes back.
+
+**New here?** Start with **[Getting started](./GETTING_STARTED.md)** (Linux or
+Windows with WSL2, about five minutes to a first chat). Prefer to let a coding
+agent drive? Copy the **[setup prompt](./SETUP_PROMPT.md)** into Claude Code,
+Codex, Cursor or similar inside this checkout.
+
+> **Status: experimental, personal use.** Pedellus is the TypeScript port of
+> Nanobot on the pinned Pi 1.5.0 stack (Node >= 22.19). It is not a
+> production-ready replacement for the Python fork, and several surfaces are
+> offline-verified only; each topic doc says what has and has not been
+> exercised live. Migration from the Python fork and cutover are deferred.
+> [Historical handoffs](plan/) preserve evidence, not a work queue.
+
+## Docs
+
+| Start | Channels | Capabilities | Operations |
+| --- | --- | --- | --- |
+| [Getting started](./GETTING_STARTED.md) | [Telegram](./TELEGRAM.md) | [Memory recall](./MEMORY_RECALL.md) | [User services](./SERVICE.md) |
+| [Setup prompt](./SETUP_PROMPT.md) | [Discord](./DISCORD.md) | [Cron](./CRON.md) | [Providers and auth](./PROVIDERS.md) |
+| [Manual setup](./SETUP.md) | [Web app](./APP.md) | [Workers](./WORKERS.md) | [Models](./MODELS.md) |
+| [CLI](./CLI.md) | | [MCP](./MCP.md), [Code Mode](./CODEMODE.md), [Web](./WEB.md) | [Storage](./STORAGE.md), [Observability](./OBSERVABILITY.md) |
 
 ## Run
 
-[`SETUP.md`](./SETUP.md) is the short walkthrough: install dependencies, create a synthetic
+[`SETUP.md`](./SETUP.md) is the manual walkthrough: install dependencies, create a synthetic
 workspace with memory and skills, enable tools in the config, then add Telegram
 as a separate step. The example uses named `fast`/`deep` model presets; the default
 comes from config. A local `/model <name>` switch is temporary: reattaching a CLI
@@ -26,35 +51,36 @@ Copy `config.example.json` to a private explicit config file and edit the worksp
 
 ```sh
 npm ci
-node bin/durable-nanobot.mjs gateway --config /path/to/config.json
-node bin/durable-nanobot.mjs agent --config /path/to/config.json
+node bin/pedellus.mjs gateway --config /path/to/config.json
+node bin/pedellus.mjs agent --config /path/to/config.json
 ```
 
-The optional checkout-linked command is **`durable-nanobot`**, not Python's
+The optional checkout-linked command is **`pedellus`**, not Python's
 `nanobot`: after installing dependencies, run `npm link --offline` to expose it.
 The command and service use pinned `tsx` to load source in-process. Restart after
 TypeScript edits: no full build, watcher or hot reload is required. Run
-`npm run typecheck` separately for type errors. The `durable-nanobot.service` /
-`durable-nanobot@.service` templates use that same launcher without needing a
+`npm run typecheck` separately for type errors. The `pedellus.service` /
+`pedellus@.service` templates use that same launcher without needing a
 command link. `npm run build` remains available for compiled output/tests. See
 [checkout and service updates](./SERVICE.md#checkout-command-and-build-workflow).
 
-Without `--config`, `gateway`, `agent`, `login`, `logout`, `models`, `recovery` and `cron` use the fixed primary file
-`~/.durable-nanobot/config.json`, resolved from the runtime user home rather than
+Without `--config`, `gateway`, `agent`, `login`, `logout`, `models`, `recovery`, `cron` and `app` use the fixed primary file
+`~/.pedellus/config.json`, resolved from the runtime user home rather than
 the working directory. A secondary instance passes its own explicit `--config`.
 [User services](./SERVICE.md) documents the shipped foreground systemd user
 units; this repository does not install or start them.
 
 The gateway is the single owner: it opens storage, config tools, cron and, when
 configured, the restricted Telegram adapter (explicit decimal user allowlist
-only) and the opt-in Discord adapter. Every configured channel starts
+only), the opt-in Discord adapter and the opt-in loopback app (PWA) listener
+([APP.md](./APP.md)). Every configured channel starts
 concurrently and none is awaited before another starts. Discord needs its own
 explicit sender/channel allowlists, a bot token environment reference and the
 privileged message-content intent; a mapped Discord chat can also ask the model
 for bounded, read-only channel/thread history under that sender's own Discord
 permissions; see [Discord](./DISCORD.md). One or more
 `agent` CLIs attach to it as conversation surfaces; the
-historical bare `node bin/durable-nanobot.mjs --config ...` is the same attach and never opens
+historical bare `node bin/pedellus.mjs --config ...` is the same attach and never opens
 a second runtime. A CLI disconnect leaves the gateway, Telegram polling, admitted
 turns and queued work running; a gateway restart stops all of them. Do not use
 live bot polling for offline checks. Known startup/configuration failures print

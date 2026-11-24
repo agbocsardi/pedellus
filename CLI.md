@@ -3,9 +3,9 @@
 For a first-time walkthrough of workspace, memory, skills and config-enabled
 tools, start with [setup](./SETUP.md).
 
-The package exposes `durable-nanobot`, leaving Python's `nanobot` untouched.
+The package exposes `pedellus`, leaving Python's `nanobot` untouched.
 After installing pinned dependencies, optionally run `npm link --offline` from
-the checkout to expose the command. Without linking, `node bin/durable-nanobot.mjs`
+the checkout to expose the command. Without linking, `node bin/pedellus.mjs`
 or `npm start --` uses the same source entry point. Restart after TypeScript edits;
 no build is required, while `npm run typecheck` remains a useful separate check.
 The optional compiled `node dist/cli.js` alternative still needs a build;
@@ -15,14 +15,14 @@ The gateway is the single agent/Durable owner. A CLI is one conversation
 surface over it, like Telegram and future channels, not a runtime:
 
 ```sh
-durable-nanobot gateway                    # uses ~/.durable-nanobot/config.json
-durable-nanobot gateway --config /path/to/config.json   # one owner: storage, tools, cron, Telegram
-durable-nanobot agent                      # attaches to the same default gateway
-durable-nanobot agent --config /path/to/config.json     # attach a terminal to that gateway
+pedellus gateway                    # uses ~/.pedellus/config.json
+pedellus gateway --config /path/to/config.json   # one owner: storage, tools, cron, Telegram
+pedellus agent                      # attaches to the same default gateway
+pedellus agent --config /path/to/config.json     # attach a terminal to that gateway
 ```
 
 Without `--config`, `gateway`, `agent`, `login`, `logout`, `models`, `recovery`, `cron` and
-`app` read exactly `~/.durable-nanobot/config.json`, resolved from the runtime user home rather than
+`app` read exactly `~/.pedellus/config.json`, resolved from the runtime user home rather than
 the shell's working directory. A secondary instance passes its own explicit
 `--config`. There is no config discovery, merging, search, auto-generation or
 migration, and a missing default file fails with a fixed message. See
@@ -35,16 +35,16 @@ configuration, opening a socket or starting a runtime, so it works in a fresh
 checkout:
 
 ```sh
-durable-nanobot --help            # overview: commands, config default, slash commands
-durable-nanobot help gateway      # the same page as `gateway --help`
-durable-nanobot gateway --help
-durable-nanobot agent --help
-durable-nanobot login --help
-durable-nanobot logout --help
-durable-nanobot models --help
-durable-nanobot recovery --help
-durable-nanobot cron --help
-durable-nanobot app --help
+pedellus --help            # overview: commands, config default, slash commands
+pedellus help gateway      # the same page as `gateway --help`
+pedellus gateway --help
+pedellus agent --help
+pedellus login --help
+pedellus logout --help
+pedellus models --help
+pedellus recovery --help
+pedellus cron --help
+pedellus app --help
 ```
 
 A per-command page carries that command's exact usage line, its own options, at
@@ -80,11 +80,11 @@ Authentication is explicit and terminal-only; the gateway never logs in at
 startup, and no model or Telegram chat can start a login flow:
 
 ```sh
-durable-nanobot login
-durable-nanobot login openai
-durable-nanobot login openai --auth oauth
-durable-nanobot logout
-durable-nanobot logout openai
+pedellus login
+pedellus login openai
+pedellus login openai --auth oauth
+pedellus logout
+pedellus logout openai
 ```
 
 `login` presents the native provider list and each provider's native API-key or
@@ -105,7 +105,7 @@ A gateway request resolves stored OAuth and refreshes it natively. `/restart`
 keeps the current process environment, so a changed systemd environment file needs
 a service restart.
 
-`durable-nanobot --config /path/to/config.json` remains the historical terminal command.
+`pedellus --config /path/to/config.json` remains the historical terminal command.
 It now attaches exactly like `agent` and never opens an implicit gateway or a
 second runtime; start `gateway` with the same configuration first. The bare
 historical form still takes an explicit path. `agent --conversation <name>` attaches a
@@ -195,9 +195,9 @@ store already owned by another live process, and an automatic interrupted-turn
 recovery that could not complete safely. These messages never include configuration
 values, environment values, filesystem paths, provider/dependency error text or
 the underlying exception. Unexpected failures keep the generic
-`durable-nanobot: command failed; diagnostic details suppressed` summary.
+`pedellus: command failed; diagnostic details suppressed` summary.
 
-Failures additionally emit a bounded `durable-nanobot diagnostic:` JSON record to
+Failures additionally emit a bounded `pedellus diagnostic:` JSON record to
 stderr (journald in the shipped units). It records the failure stage, stable
 fingerprint, allowlisted error class/code/reason, a task ID and report reason when
 Durable supplies them, bounded restart counts, code-relative stack locations and
@@ -233,19 +233,19 @@ may then never see the notice it held.
 
 An `agent` (or legacy default) launch additionally fails closed when no gateway
 answers on the configured endpoint, or when the endpoint's socket path cannot be
-used. Its fixed message says to start `durable-nanobot gateway --config <path>` with the
+used. Its fixed message says to start `pedellus gateway --config <path>` with the
 same configuration. The CLI does not fall back to opening a store or starting a
 second runtime.
 
 For live-owner lock contention, the fixed message says to stop the other running
-durable-nanobot gateway process. If automatic interrupted-turn recovery cannot
+pedellus gateway process. If automatic interrupted-turn recovery cannot
 complete, the fixed message says to run
-`durable-nanobot recovery [--config <path>]` with the same configuration to inspect and
+`pedellus recovery [--config <path>]` with the same configuration to inspect and
 cancel the blocked task, then start again. Normal startup cancels only the exact
 startup-blocking prepared dispatch and never rewrites its checkpoint; the recovery
 command remains the stopped-store fallback.
 
-Recovery operation errors keep their dedicated `durable-nanobot recovery:` text and
+Recovery operation errors keep their dedicated `pedellus recovery:` text and
 remain governed by recovery's existing disclosure contract, not this startup
 policy. This section does not broaden or change that behavior. Configuration
 loading for a recovery invocation still uses the fixed startup messages above.
@@ -279,16 +279,16 @@ notice, and cancelled or superseded runs are not. See
 
 ## Operator scheduling
 
-`durable-nanobot cron` is the owner's scheduling console. It attaches to the running
+`pedellus cron` is the owner's scheduling console. It attaches to the running
 gateway over the same private local socket as `agent`, so the gateway resolves every
 origin, owner and cancellation; the command itself schedules nothing:
 
 ```sh
-durable-nanobot cron list
-durable-nanobot cron show <jobId>
-durable-nanobot cron cancel <jobId>
-durable-nanobot cron create --origin <sessionKey> --key <requestKey> --after 600 --message "Stretch"
-durable-nanobot cron create --key daily-1 --cron "0 9 * * 1-5" --tz Europe/Budapest \
+pedellus cron list
+pedellus cron show <jobId>
+pedellus cron cancel <jobId>
+pedellus cron create --origin <sessionKey> --key <requestKey> --after 600 --message "Stretch"
+pedellus cron create --key daily-1 --cron "0 9 * * 1-5" --tz Europe/Budapest \
   --origin telegram:<identity>:chat:<chatId> --message "Morning check"
 ```
 
@@ -324,9 +324,9 @@ reported as a lock conflict. Inspection may perform Durable's native
 `Harness.open()` crash reconciliation but never resumes task execution:
 
 ```sh
-node bin/durable-nanobot.mjs recovery                         # default primary configuration
-node bin/durable-nanobot.mjs recovery --config /path/to/config.json
-node bin/durable-nanobot.mjs recovery --config /path/to/config.json --cancel <taskId> --fingerprint <sha256>
+node bin/pedellus.mjs recovery                         # default primary configuration
+node bin/pedellus.mjs recovery --config /path/to/config.json
+node bin/pedellus.mjs recovery --config /path/to/config.json --cancel <taskId> --fingerprint <sha256>
 ```
 
 Inspection prints JSON with task ID, kind, phase, pinned entry, and fingerprint.

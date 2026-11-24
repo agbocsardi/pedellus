@@ -7,15 +7,15 @@ commands below are operator steps; none were run by this project's checks.
 
 The gateway itself remains an ordinary foreground process. These units do not
 add a daemon, supervisor, background shell, restart loop or npm-start wrapper:
-systemd runs one `node bin/durable-nanobot.mjs gateway` process per instance and stops it with
+systemd runs one `node bin/pedellus.mjs gateway` process per instance and stops it with
 the existing SIGTERM/SIGINT teardown.
 
 ## Units
 
 | File | Use |
 | --- | --- |
-| [`systemd/durable-nanobot.service`](systemd/durable-nanobot.service) | The primary instance uses the default config `~/.durable-nanobot/config.json`. |
-| [`systemd/durable-nanobot@.service`](systemd/durable-nanobot@.service) | One named secondary instance uses `~/.durable-nanobot/instances/i-<name>/config.json`. |
+| [`systemd/pedellus.service`](systemd/pedellus.service) | The primary instance uses the default config `~/.pedellus/config.json`. |
+| [`systemd/pedellus@.service`](systemd/pedellus@.service) | One named secondary instance uses `~/.pedellus/instances/i-<name>/config.json`. |
 
 Both are user units. Copy or symlink them into the user unit directory, for
 example `~/.config/systemd/user/`, after editing the launch paths.
@@ -25,13 +25,16 @@ machine:
 
 - `/usr/bin/node` — the Node >= 22.19 executable. Use the absolute path from
   `command -v node`; do not rely on a shell `PATH` or either global CLI command.
-- `/opt/durable-nanobot` — this checkout. The unit runs
-  `<checkout>/bin/durable-nanobot.mjs` through Node after `npm ci`, independently
+- `/opt/pedellus` — this checkout. The unit runs
+  `<checkout>/bin/pedellus.mjs` through Node after `npm ci`, independently
   of `npm link`. The launcher loads source TypeScript through pinned `tsx`.
 
-The TypeScript command and units are named `durable-nanobot`; Python keeps
-`nanobot`. These templates neither replace nor stop an installed Python unit.
-The existing runtime home and storage/protocol identities are unchanged.
+The command and units are named `pedellus`; Python keeps `nanobot`. These
+templates neither replace nor stop an installed Python unit. The default config
+home is `~/.pedellus/`; storage and protocol identities (for example
+`nanobot.sqlite` and the `nanobot.*` documents) are unchanged. Nothing migrates an
+install made under the earlier `~/.durable-nanobot/` home: keep passing its
+explicit `--config`, or move the stopped directory deliberately.
 
 Because the unit file cannot expand shell variables in `ExecStart`, those two
 paths are edited directly in the copy. Everything else uses systemd specifiers:
@@ -61,7 +64,7 @@ To add a bound, use an operator drop-in rather than editing the shipped unit,
 for example:
 
 ```ini
-# ~/.config/systemd/user/durable-nanobot.service.d/memory.conf
+# ~/.config/systemd/user/pedellus.service.d/memory.conf
 [Service]
 MemoryHigh=2G
 # MemoryMax=3G
@@ -71,18 +74,18 @@ MemoryHigh=2G
 can end the gateway or an in-flight child. Committed Durable work, queued input
 and the transcript stay in the store and reopen after a restart, but an
 interrupted model turn or tool call is not replayed. Choose a value from observed
-`systemctl --user show durable-nanobot.service -p MemoryCurrent` or
+`systemctl --user show pedellus.service -p MemoryCurrent` or
 `systemd-cgtop` on this host; do not copy a number from another deployment. Run
 `systemctl --user daemon-reload` after changing a unit or drop-in.
 
 ## Checkout command and build workflow
 
-The package exposes only `durable-nanobot` as its executable. From the checkout,
+The package exposes only `pedellus` as its executable. From the checkout,
 after installing the pinned dependencies, these are optional operator steps:
 
 ```sh
 npm link --offline
-durable-nanobot agent
+pedellus agent
 ```
 
 The linked command, `npm start -- ...` and the service all use the same small
@@ -93,7 +96,7 @@ execve restart. Loading it is independent of the process working directory.
 
 `npm link` does not copy the code, run a gateway, install a service or claim
 Python's `nanobot` command. Without linking, use
-`node bin/durable-nanobot.mjs agent` or `npm start -- agent`. The agent attaches
+`node bin/pedellus.mjs agent` or `npm start -- agent`. The agent attaches
 to an already-running gateway with the same configuration.
 
 For source edits, restart the gateway: **no build is needed**. Checking types
@@ -101,7 +104,7 @@ first is recommended because runtime transpilation does not typecheck:
 
 ```sh
 npm run typecheck
-systemctl --user restart durable-nanobot.service
+systemctl --user restart pedellus.service
 ```
 
 A supported owner `/restart` also reloads source through the same launcher and
@@ -125,7 +128,7 @@ remove Durable state. The authoritative SQLite store remains under the configure
 private config outside a checkout you may delete or replace. Continue using the
 same `dataDir` after reinstalling: selecting a different directory opens a different
 store, not the old history. The database and its storage identities are not renamed
-by the `durable-nanobot` command/unit rename.
+by the `pedellus` command/unit rename.
 
 ## Logs
 
@@ -133,18 +136,18 @@ The shipped units already send stdout and stderr to journald. Inspect the gatewa
 without starting another process:
 
 ```sh
-journalctl --user -u durable-nanobot.service --since "1 hour ago"
-journalctl --user -u durable-nanobot.service -f
+journalctl --user -u pedellus.service --since "1 hour ago"
+journalctl --user -u pedellus.service -f
 ```
 
 The gateway also emits content-free structured lifecycle/timing records with the
-`durable-nanobot journal:` prefix: native submission/task/model/tool spans plus
+`pedellus journal:` prefix: native submission/task/model/tool spans plus
 host preparation/queue/delivery boundaries, ten-second slow-work warnings, and
 safe transient-failure and typing-recovery visibility. See
 [OBSERVABILITY.md](OBSERVABILITY.md) for correlation, coverage and privacy limits.
 
 Durable report callbacks and gateway/CLI failure boundaries emit bounded
-`durable-nanobot diagnostic:` records: stages, safe error classes/codes, cause
+`pedellus diagnostic:` records: stages, safe error classes/codes, cause
 chains, code-relative stack locations, task IDs, report reasons/bounded restart
 counts where available, and a fingerprint.
 No raw request payloads, credentials or transcript text are logged. Only known
@@ -167,13 +170,13 @@ The default launch path is fixed and independent of the process working
 directory:
 
 ```text
-~/.durable-nanobot/config.json
+~/.pedellus/config.json
 ```
 
 Keep the primary instance's persistent layout outside the checkout:
 
 ```text
-~/.durable-nanobot/
+~/.pedellus/
   config.json
   data/                # Durable SQLite store, derived indexes and private socket
   workspace/           # Markdown memory, skills and attachments
@@ -181,17 +184,17 @@ Keep the primary instance's persistent layout outside the checkout:
 
 Place the example configuration at that primary config path with
 `"workspace": "./workspace"` and `"dataDir": "./data"`. Relative paths resolve
-from the config file, so the primary store is `~/.durable-nanobot/data/nanobot.sqlite`,
+from the config file, so the primary store is `~/.pedellus/data/nanobot.sqlite`,
 independent of the checkout or working directory. This layout is explicit config,
 not an implicit data-directory fallback. JSON paths do not expand `~`; use these
 relative paths or an absolute path. Secondary configs should similarly use their
 own `./data` and `./workspace` under their instance directory. Preserve an existing
 store's configured location until a deliberate stopped-store migration is approved.
 
-`durable-nanobot gateway` without `--config` reads exactly that file. `durable-nanobot agent`
-without `--config`, `durable-nanobot recovery` without `--config` and `durable-nanobot cron`
+`pedellus gateway` without `--config` reads exactly that file. `pedellus agent`
+without `--config`, `pedellus recovery` without `--config` and `pedellus cron`
 without `--config` use it too, and the
-historical `durable-nanobot --config <path>` still attaches an agent with the explicit
+historical `pedellus --config <path>` still attaches an agent with the explicit
 path. There is no discovery, merge, search, auto-generation, migration or
 implicit runtime activation: create the file and its workspace/data directories
 yourself. A missing default file fails with a fixed message that names no
@@ -205,7 +208,7 @@ After editing the copy:
 
 ```sh
 systemctl --user daemon-reload
-systemctl --user enable --now durable-nanobot.service
+systemctl --user enable --now pedellus.service
 ```
 
 Those commands are the operator's; they are not part of any offline check here.
@@ -215,7 +218,7 @@ Those commands are the operator's; they are not part of any offline check here.
 The template maps the instance name into one fixed directory pattern:
 
 ```text
-~/.durable-nanobot/instances/i-<instance>/config.json
+~/.pedellus/instances/i-<instance>/config.json
 ```
 
 `<instance>` is a systemd unit instance name, not a filesystem path. The literal
@@ -230,8 +233,8 @@ config only on that instance's command line (the unit already does):
 
 ```sh
 systemctl --user daemon-reload
-systemctl --user start 'durable-nanobot@work.service'
-journalctl --user -u 'durable-nanobot@work.service'
+systemctl --user start 'pedellus@work.service'
+journalctl --user -u 'pedellus@work.service'
 ```
 
 Use a separate `dataDir` and `workspace` in every instance config. The store
@@ -273,13 +276,13 @@ process environment; MCP has the same explicit environment-name convention.
 closed provider list. An explicit reference pins that variable and fails closed
 when it is unset or blank, without falling back to native ambient variables; with
 no reference, native providers use their documented variables. A provider
-credential stored by `durable-nanobot login` is used first. There is no blanket `${VAR}` substitution in JSON and no automatic environment-file
+credential stored by `pedellus login` is used first. There is no blanket `${VAR}` substitution in JSON and no automatic environment-file
 loader in the CLI. A manually launched gateway must inherit its environment by
 another explicit launch mechanism; an attaching agent uses the running gateway
 and does not need provider credentials locally. The gateway's shell tools keep
 their separate filtered environment and do not inherit all gateway credentials.
 
-`durable-nanobot login` and `logout` are explicit terminal commands. They load and
+`pedellus login` and `logout` are explicit terminal commands. They load and
 validate the same configuration as the gateway (workspace and `dataDir` boundary
 included), prepare the canonical private `dataDir`, write Durable's own credential
 store there, and never open the gateway, the Durable store or contact a model. A
@@ -311,7 +314,7 @@ journal output also contains systemd's own unit messages.
   replace the process image with the same executable, argv and environment. It
   keeps the same PID and service process, so systemd does not see a second
   gateway; the old process completes its normal teardown first.
-- `journalctl --user -u durable-nanobot.service` (or the instance unit) shows output.
+- `journalctl --user -u pedellus.service` (or the instance unit) shows output.
   Startup failures use the fixed, value-free diagnostics described in
   [interactive CLI](./CLI.md#startup-diagnostics).
 

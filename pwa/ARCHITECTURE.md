@@ -13,7 +13,7 @@ come for free.
 │  service worker (push,     │            └──────────┬───────────┘
 │  app shell cache)          │                       │ 127.0.0.1
 │  IndexedDB store           │            ┌──────────▼───────────┐
-└────────────▲───────────────┘            │ durable-nanobot      │
+└────────────▲───────────────┘            │ pedellus             │
              │ Web Push (encrypted,       │  app listener        │
              │ content-free)              │  src/channels/app*.ts│
       Apple / browser push service ◄──────┤  durable outbox      │
@@ -134,7 +134,7 @@ this one (stay quiet while hidden), anything else is a network-class reconnect.
 
 ### Authentication
 
-- `durable-nanobot app pair` prints a short-lived one-time code and a QR code in
+- `pedellus app pair` prints a short-lived one-time code and a QR code in
   the owner's terminal.
 - The app exchanges it for a long random device token. The gateway stores only
   a hash with a device label and can revoke by label.

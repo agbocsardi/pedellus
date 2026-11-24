@@ -37,7 +37,7 @@ A normal CLI start does not print the task ID, pinned entry, path, provider/mode
 or context text. If automatic recovery cannot complete safely (a full interruption
 record after its settled entries were drained, a native abort that failed or did
 not persist, or a prepared model outside `allowedModels`), it fails with one fixed,
-value-free diagnostic naming `durable-nanobot recovery --config <path>` as the next
+value-free diagnostic naming `pedellus recovery --config <path>` as the next
 action. SDK callers retain the detailed error message for inspection. The explicit
 recovery command below is the fallback, while the stopped-store recovery operation
 remains available for unsupported or failed cases.

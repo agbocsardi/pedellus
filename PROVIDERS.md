@@ -18,7 +18,7 @@ The gateway registers only providers referenced by `allowedModels`, named
 Native provider factories and catalogs come directly from
 `@earendil-works/pi-ai@1.5.0`; there is no second hand-maintained provider list,
 model discovery, fallback chain or automatic substitution. The explicit
-`durable-nanobot models refresh` command can overlay newer native model metadata
+`pedellus models refresh` command can overlay newer native model metadata
 from pi.dev ([catalog updates](./MODELS.md#catalog-updates)); it grants nothing.
 
 Existing configuration keeps working through these explicit legacy spellings.
@@ -79,11 +79,11 @@ Authentication is an explicit terminal operation, never startup, model-triggered
 or Telegram-triggered:
 
 ```sh
-durable-nanobot login                  # list and choose a native provider and method
-durable-nanobot login openai           # one provider; prompts for its available method
-durable-nanobot login openai --auth oauth
-durable-nanobot logout                 # choose a stored credential
-durable-nanobot logout openai
+pedellus login                  # list and choose a native provider and method
+pedellus login openai           # one provider; prompts for its available method
+pedellus login openai --auth oauth
+pedellus logout                 # choose a stored credential
+pedellus logout openai
 ```
 
 Both commands take the same optional `--config <path>` as the gateway, validate
@@ -168,7 +168,7 @@ entries in this block.
 
 Omit `credentials.<key>` for a keyless local compatible endpoint. A custom
 provider still needs model metadata and an absolute `http(s)` base URL without
-embedded credentials or a fragment. `durable-nanobot login <key>` can store a key
+embedded credentials or a fragment. `pedellus login <key>` can store a key
 for such a provider; a stored key wins and the endpoint is keyless otherwise.
 
 ## Classifiers and image generation
