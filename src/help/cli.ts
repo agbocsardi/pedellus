@@ -31,7 +31,7 @@ const DEFAULT_CONFIG_FILE = "~/.pedellus/config.json";
 
 /** The one sentence the usage block adds after its synopses, because it is the only configuration default. */
 const DEFAULT_CONFIG_NOTE =
-  `Without --config, gateway, agent, login, logout, models, recovery, cron, app and doctor use ${DEFAULT_CONFIG_FILE}.`;
+  `Without --config, init, gateway, agent, login, logout, models, recovery, cron, app and doctor use ${DEFAULT_CONFIG_FILE}.`;
 
 const CONFIG_OPTION: HelpOption = {
   flags: "--config <path>",
@@ -67,6 +67,23 @@ export const COMMANDS: readonly CommandHelp[] = [
       "Without a running gateway it fails with one fixed diagnostic.",
     ],
     examples: ["pedellus agent", "pedellus agent --conversation work"],
+  },
+  {
+    name: "init",
+    synopsis: "pedellus init [--config <path>] [--skip-interview]",
+    summary: "Create a starter configuration and workspace, log in, and get acquainted",
+    options: [
+      {
+        flags: "--config <path>",
+        text: `Create exactly this file; without it, ${DEFAULT_CONFIG_FILE} is created.`,
+      },
+      { flags: "--skip-interview", text: "Skip the terminal interview; the assistant onboards you in your first chat." },
+    ],
+    details: [
+      "Never overwrites an existing configuration; credentials go to the private data directory, not the config.",
+      "The optional interview talks to the model you just picked; /done wraps up, /skip finishes later.",
+    ],
+    examples: ["pedellus init", "pedellus init --config /path/to/config.json --skip-interview"],
   },
   {
     name: "login",

@@ -5,6 +5,7 @@ import { stdin, stderr, stdout } from "node:process";
 import type { AuthType } from "@earendil-works/pi-ai";
 import { BACKGROUND_CONTEXT, withAbortSignal, withoutAbortSignal } from "@earendil-works/chord/context";
 import { runLogin, runLogout } from "./auth/cli.js";
+import { InitError, runInit } from "./init/index.js";
 import {
   CronCommandError,
   CronUsageError,
@@ -72,6 +73,11 @@ type AuthInvocation =
       readonly auth?: AuthType;
     }
   | { readonly kind: "logout"; readonly config: ConfigSource; readonly provider?: string };
+
+interface InitInvocation {
+  readonly configPath?: string;
+  readonly skipInterview: boolean;
+}
 
 type LaunchInvocation =
   | { readonly kind: "gateway"; readonly config: ConfigSource }
@@ -254,6 +260,26 @@ function authInvocation(args: readonly string[]): AuthInvocation | undefined {
     : { kind, config, ...(provider === undefined ? {} : { provider }) };
 }
 
+function initInvocation(args: readonly string[]): InitInvocation | undefined {
+  if (args[0] !== "init") return undefined;
+  let configPath: string | undefined;
+  let skipInterview = false;
+  const rest = args.slice(1);
+  for (let index = 0; index < rest.length;) {
+    const argument = rest[index];
+    if (argument === "--config" && configPath === undefined && rest[index + 1]) {
+      configPath = rest[index + 1];
+      index += 2;
+    } else if (argument === "--skip-interview" && !skipInterview) {
+      skipInterview = true;
+      index += 1;
+    } else {
+      throw new UsageError();
+    }
+  }
+  return { ...(configPath === undefined ? {} : { configPath }), skipInterview };
+}
+
 function modelsInvocation(args: readonly string[]): { readonly invocation: ModelsInvocation; readonly config: ConfigSource } | undefined {
   if (args[0] !== "models") return undefined;
   const action = args[1];
@@ -363,12 +389,44 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     await runAuthCommand(auth, await readConfig(auth.config));
     return;
   }
+  const init = initInvocation(args);
+  if (init !== undefined) {
+    await runInitCommand(init);
+    return;
+  }
   const invocation = launchInvocation(args);
   const config = await readConfig(invocation.config);
   if (invocation.kind === "gateway") {
     await runGateway(config);
   } else {
     await runAgent(config, invocation.conversation);
+  }
+}
+
+/** Guided first-run setup. It never opens the gateway; it writes only a configuration that does not exist yet. */
+async function runInitCommand(invocation: InitInvocation): Promise<void> {
+  const stop = new AbortController();
+  const shutdown = () => stop.abort(new Error("init cancelled"));
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
+  try {
+    // Resolved inside the boundary so a missing HOME keeps its fixed diagnostic.
+    const configPath = invocation.configPath ?? defaultConfigPath();
+    const result = await runInit({
+      configPath,
+      skipInterview: invocation.skipInterview,
+      input: stdin,
+      output: stdout,
+      signal: stop.signal,
+    });
+    if (result.outcome === "aborted") process.exitCode = 1;
+  } catch (error) {
+    // Init and login failures keep their fixed text; anything else may embed paths or provider payloads.
+    if (error instanceof StartupDiagnosticError || error instanceof InitError || error instanceof UsageError) throw error;
+    throw new StartupDiagnosticError(stop.signal.aborted ? "initCanceled" : "initFailed", { cause: error });
+  } finally {
+    process.off("SIGINT", shutdown);
+    process.off("SIGTERM", shutdown);
   }
 }
 
@@ -925,6 +983,8 @@ export function runCli(): Promise<void> {
       console.error(error.message);
     } else if (error instanceof AppCommandError) {
       console.error(`pedellus app: ${error.message}`);
+    } else if (error instanceof InitError) {
+      console.error(`pedellus init: ${error.message}`);
     } else if (error instanceof UnknownCommandError) {
       // Only a safe command-shaped token is echoed; any other supplied argument stays private.
       const echo = SAFE_COMMAND_NAME.test(error.token) ? `: ${error.token}` : "";

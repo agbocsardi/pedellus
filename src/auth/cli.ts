@@ -29,14 +29,20 @@ export interface LoginSelection {
   readonly auth?: AuthType;
 }
 
-interface LoginChoice {
+/** One provider/method pair offered by an interactive login. */
+export interface LoginChoice {
   readonly provider: Provider;
   readonly type: AuthType;
   readonly label: string;
   readonly subscription: boolean;
 }
 
-function terminalInteraction(options: AuthTerminalOptions): {
+/**
+ * One readline-backed `AuthInteraction` over the given streams. Every prompt (text, secret,
+ * select) goes through it, so a caller that needs its own questions reuses this interface
+ * instead of opening a second readline on the same input.
+ */
+export function terminalInteraction(options: AuthTerminalOptions): {
   interaction: AuthInteraction;
   close: () => void;
 } {
@@ -149,7 +155,8 @@ function terminalInteraction(options: AuthTerminalOptions): {
   };
 }
 
-function interactiveChoices(models: Models): LoginChoice[] {
+/** Every provider/method pair with an interactive login, sorted by provider ID. */
+export function interactiveChoices(models: Models): LoginChoice[] {
   const choices: LoginChoice[] = [];
   for (const provider of [...models.getProviders()].sort((left, right) => left.id.localeCompare(right.id))) {
     if (provider.auth.oauth?.login !== undefined) {
@@ -174,7 +181,7 @@ function interactiveChoices(models: Models): LoginChoice[] {
   return choices;
 }
 
-async function chooseLogin(choices: readonly LoginChoice[], interaction: AuthInteraction): Promise<LoginChoice> {
+export async function chooseLogin(choices: readonly LoginChoice[], interaction: AuthInteraction): Promise<LoginChoice> {
   if (choices.length === 0) throw new StartupDiagnosticError("authProvider");
   if (choices.length === 1) return choices[0]!;
   const answer = await interaction.prompt({
@@ -220,15 +227,25 @@ export async function runLogin(
       }
     }
     const choice = await chooseLogin(choices, interaction);
-    const deviceId = choice.type === "oauth" ? await installationDeviceId(prepared.canonicalDataDir) : undefined;
-    await models.login(choice.provider.id, choice.type, interaction, {
-      agentName: "pedellus",
-      ...(deviceId === undefined ? {} : { getDeviceId: () => deviceId }),
-    });
+    await loginWithChoice(models, choice, prepared.canonicalDataDir, interaction);
     terminal.output.write(`Logged in to ${choice.provider.id} using ${choice.label}.\n`);
   } finally {
     close();
   }
+}
+
+/** Complete one chosen login into the `Models` credential store; OAuth gets the installation ID. */
+export async function loginWithChoice(
+  models: Models,
+  choice: LoginChoice,
+  canonicalDataDir: string,
+  interaction: AuthInteraction,
+): Promise<void> {
+  const deviceId = choice.type === "oauth" ? await installationDeviceId(canonicalDataDir) : undefined;
+  await models.login(choice.provider.id, choice.type, interaction, {
+    agentName: "pedellus",
+    ...(deviceId === undefined ? {} : { getDeviceId: () => deviceId }),
+  });
 }
 
 export async function runLogout(

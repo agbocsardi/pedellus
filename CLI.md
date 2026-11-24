@@ -25,9 +25,41 @@ Without `--config`, `gateway`, `agent`, `login`, `logout`, `models`, `recovery`,
 `app` and `doctor` read exactly `~/.durable-nanobot/config.json`, resolved from the runtime user home rather than
 the shell's working directory. A secondary instance passes its own explicit
 `--config`. There is no config discovery, merging, search, auto-generation or
-migration, and a missing default file fails with a fixed message (`models list`
+migration (only the explicit `init` below creates a file, and never over an
+existing one), and a missing default file fails with a fixed message (`models list`
 alone falls back to the bundled catalog; see [models](./MODELS.md)). See
 [user services](./SERVICE.md) for the shipped systemd unit pattern.
+
+## First-run setup
+
+```sh
+pedellus init                                   # creates ~/.pedellus/config.json
+pedellus init --config /path/to/config.json --skip-interview
+```
+
+`init` refuses (exit 1) when the target configuration already exists. Otherwise it:
+
+1. warns on a non-Linux platform, or on WSL when the path is under `/mnt/` (DrvFs
+   breaks private permissions, Unix sockets and SQLite WAL), and lets you abort;
+2. creates the private `data/` (`0700`) and `workspace/` with `memory/`,
+   `memory/system/` and `skills/`, copying the `memory`, `cron` and `skill-creator`
+   starter skills from the checkout when absent;
+3. runs the same native login as `login` into `data/credentials.json` (`0600`), then
+   picks the `deep` and `fast` presets from that provider's models (thinking level
+   clamped to the model), the time zone, assistant name, file tools (default on) and
+   `bash` (default off);
+4. writes a config with relative `./workspace`/`./data`, named presets, workspace
+   context, cron, episode summaries and digest — no secrets and no `credentials`
+   references — plus starter `AGENTS.md`, `SOUL.md`, `USER.md`, `memory/MEMORY.md`;
+5. offers a short terminal interview (at most 8 replies; `/done` wraps up, `/skip`
+   defers) with the `deep` model. Its fenced `pedellus-profile` JSON replaces the
+   starter `USER.md`/`SOUL.md`/`memory/MEMORY.md` this run created, after you confirm.
+   Existing files are never replaced.
+
+When the interview is skipped, declined, cancelled or fails, `init` writes
+`memory/system/onboarding.md` instead: the first chat on any surface greets you, asks a
+few questions, updates those files and empties the note, so later sessions no longer
+load it. Model errors are reported without provider payloads.
 
 ## Help
 

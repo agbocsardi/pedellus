@@ -37,6 +37,12 @@ export const STARTUP_DIAGNOSTICS = Object.freeze({
   authFailed:
     "login or logout failed; check the provider selection, network access for an OAuth flow, and the private " +
     "credential store under dataDir (diagnostic details suppressed)",
+  initCanceled:
+    "setup was cancelled; whatever was already written is kept and an existing configuration is never replaced " +
+    "(diagnostic details suppressed)",
+  initFailed:
+    "setup failed; check that the configuration directory is writable and on a Linux filesystem, then run " +
+    "`pedellus init` again with a path that has no configuration yet (diagnostic details suppressed)",
   telegramToken:
     "missing Telegram bot token; set the environment variable named by telegram.tokenEnv (diagnostic details suppressed)",
   discordToken:
