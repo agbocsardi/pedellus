@@ -1368,6 +1368,25 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
             );
             return;
           }
+          // A legacy persisted input can name a deadline no `Date` can represent. Durable recovery
+          // re-runs this phase for a pending, interrupted or restored timer, so such a deadline
+          // must never reach `sleepUntil` — the task would park on a sleep that is never due and
+          // never settle — and must never arm or run an occurrence. The timer settles as failed
+          // with fixed text and without touching the job record, which stays inspectable and
+          // cancellable through the same paths as any other failed timer; a sleeping deadline
+          // beyond the bound written by an older build can never become due, so it is equally
+          // inert and remains cancellable through the abort path.
+          if (input.scheduledAtMs < 0 || input.scheduledAtMs > MAX_DATE_MS) {
+            const reason = "the persisted timer deadline is not a representable time";
+            await runtime.commit(
+              () => terminalFailed<CronTimerCheckpoint, CronTimerResult>(
+                timerResult(input, "missing", reason),
+                reason,
+              ),
+              context,
+            );
+            return;
+          }
           const now = runtime.now();
           if (input.scheduledAtMs > now) {
             await runtime.sleepUntil(input.scheduledAtMs, { phase: "fire" }, context);

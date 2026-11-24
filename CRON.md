@@ -488,7 +488,13 @@ refused before any job or timer state is written, because no receipt or renderer
 operator wire holds the same bound. A legacy record that already holds such a time is never
 fabricated into a valid schedule: its next time projects as "none" and its schedule line reads
 `once at an unrepresentable time` (or `every Ns from an unrepresentable time`), while the job
-itself stays inspectable and cancellable.
+itself stays inspectable and cancellable. A legacy timer task whose persisted input names such a
+deadline settles as failed with fixed text the moment Durable runs its phase — it never reaches
+the sleep, arms no occurrence and leaves the job cancellable; a sleep beyond the bound written by
+an older build can never come due, so it stays equally inert. Arithmetic overflow while following
+an interval is the absence of a next slot, never a failure of the occurrence that is due right
+now: the timer admits that occurrence exactly once and the job simply stops re-arming, instead of
+the overflow discarding the whole terminal commit.
 
 ## Channel outbox
 

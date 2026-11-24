@@ -309,12 +309,12 @@ export function nextCronOccurrence(schedule: CronSchedule, afterMs: number): num
       ? 0
       : Math.floor((afterMs - schedule.anchorMs) / schedule.everyMs) + 1;
     const next = schedule.anchorMs + periods * schedule.everyMs;
-    if (!Number.isSafeInteger(next)) {
-      throw new CronScheduleError("the next occurrence exceeds the safe integer range");
-    }
-    // A recurrence beyond the renderable range cannot be armed or printed; the job settles
-    // instead of carrying an unrenderable timer instant forward.
-    return next > MAX_DATE_MS ? null : next;
+    // Following-slot arithmetic overflow is the absence of a next slot, never a failure of the
+    // occurrence that is due right now: this function runs inside the timer's terminal commit,
+    // where a throw would discard the valid due occurrence along with the re-arm. Overflow and
+    // the unrenderable bound both mean the job settles after this occurrence instead.
+    if (!Number.isSafeInteger(next) || next > MAX_DATE_MS) return null;
+    return next;
   }
 
   const zone = validateTimeZone(schedule.timeZone);
