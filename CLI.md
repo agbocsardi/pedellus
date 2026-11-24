@@ -21,11 +21,12 @@ durable-nanobot agent                      # attaches to the same default gatewa
 durable-nanobot agent --config /path/to/config.json     # attach a terminal to that gateway
 ```
 
-Without `--config`, `gateway`, `agent`, `login`, `logout`, `models`, `recovery`, `cron` and
-`app` read exactly `~/.durable-nanobot/config.json`, resolved from the runtime user home rather than
+Without `--config`, `gateway`, `agent`, `login`, `logout`, `models`, `recovery`, `cron`,
+`app` and `doctor` read exactly `~/.durable-nanobot/config.json`, resolved from the runtime user home rather than
 the shell's working directory. A secondary instance passes its own explicit
 `--config`. There is no config discovery, merging, search, auto-generation or
-migration, and a missing default file fails with a fixed message. See
+migration, and a missing default file fails with a fixed message (`models list`
+alone falls back to the bundled catalog; see [models](./MODELS.md)). See
 [user services](./SERVICE.md) for the shipped systemd unit pattern.
 
 ## Help
@@ -182,6 +183,25 @@ bounded newline-delimited JSON protocol over that socket:
 Telegram runs inside the same gateway process, so a local CLI and Telegram can be
 used at the same time. Disconnecting the CLI does not stop Telegram polling, and
 vice versa; stopping the gateway stops both.
+
+## Doctor
+
+`pedellus doctor [--config <path>]` is a read-only setup check. It prints one
+`[OK]`/`[WARN]`/`[FAIL]` line per check and exits 1 only when a check fails:
+Node.js >= 22.19.0, Linux and `/proc/self/fd`; on WSL2, paths under `/mnt/`
+(DrvFs breaks private modes, Unix sockets, `O_NOFOLLOW` and SQLite WAL) and a
+PID 1 that is not systemd; the config file (missing, invalid JSON, or the
+bounded, redacted `parseConfig` field message); workspace, `extraAllowedDirs`,
+`dataDir` disjointness and socket-path length; with `workspaceContext`, the
+bootstrap files (missing is a warning) and each `memoryFiles` entry (missing
+fails, as startup does), plus pending onboarding; each referenced native
+provider's credential source (`stored credential`, `env (<VAR>)` or missing);
+the token variables of configured Telegram, Discord, app push and web search,
+noting a `secrets.env` beside the config without reading it; the app
+`staticRoot/index.html`; and whether a gateway answers on the local socket.
+
+It creates no file or directory, opens no database, makes no network or model
+call, and never prints a credential, variable value or raw exception text.
 
 ## Startup diagnostics
 

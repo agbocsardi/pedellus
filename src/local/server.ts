@@ -91,7 +91,7 @@ export function gatewaySocketPath(canonicalDataDir: string): string {
 }
 
 /** True when some process answers on the socket; an unresponsive listener still owns it. */
-function socketIsLive(path: string): Promise<boolean> {
+export function socketIsLive(path: string): Promise<boolean> {
   return new Promise((resolveLive) => {
     const socket = connect({ path });
     let settled = false;

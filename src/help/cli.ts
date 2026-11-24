@@ -30,7 +30,8 @@ export const COMPATIBILITY_SYNOPSIS = "pedellus --config <path>   (agent, compat
 const DEFAULT_CONFIG_FILE = "~/.pedellus/config.json";
 
 /** The one sentence the usage block adds after its synopses, because it is the only configuration default. */
-const DEFAULT_CONFIG_NOTE = `Without --config, gateway, agent, login, logout, models, recovery, cron and app use ${DEFAULT_CONFIG_FILE}.`;
+const DEFAULT_CONFIG_NOTE =
+  `Without --config, gateway, agent, login, logout, models, recovery, cron, app and doctor use ${DEFAULT_CONFIG_FILE}.`;
 
 const CONFIG_OPTION: HelpOption = {
   flags: "--config <path>",
@@ -98,6 +99,7 @@ export const COMMANDS: readonly CommandHelp[] = [
     details: [
       "refresh is the only catalog network path; list is offline. Neither grants a model: edit allowedModels.",
       "A refreshed catalog applies at gateway restart or the next /reload that changes model config.",
+      "Without a configuration file, list shows the bundled catalog and creates nothing.",
     ],
     examples: ["pedellus models refresh", "pedellus models list openai-codex"],
   },
@@ -168,6 +170,17 @@ export const COMMANDS: readonly CommandHelp[] = [
       "pedellus app shortcut revoke morning",
       "pedellus app push-keys",
     ],
+  },
+  {
+    name: "doctor",
+    synopsis: "pedellus doctor [--config <path>]",
+    summary: "Check setup and health read-only: runtime, WSL2, config, files, credentials",
+    options: [CONFIG_OPTION],
+    details: [
+      "Read-only: creates nothing, opens no database, makes no network or model call, prints no secret.",
+      "Exits 1 when any check fails; warnings do not fail.",
+    ],
+    examples: ["pedellus doctor", "pedellus doctor --config /path/to/config.json"],
   },
 ];
 

@@ -35,7 +35,7 @@ raw exceptions/payloads.
 - `src/local/` — private Unix-socket CLI protocol; no public listener.
 - `src/channels/` — Telegram, Discord, `app` (see TELEGRAM.md, DISCORD.md, APP.md).
 - `src/mcp/`, `src/workers/`, `src/automation/`, `src/history/`, `src/media/`,
-  `src/context/`, `src/execution/`, `src/auth/`, `src/help/` — one subsystem each.
+  `src/context/`, `src/execution/`, `src/auth/`, `src/help/`, `src/doctor/` — one subsystem each.
 - `pwa/` — the installable web app for the `app` channel and the shared wire
   protocol (`pwa/protocol/`); its own notes are in `pwa/AGENTS.md`.
 - `plan/` — historical evidence, not a work queue.

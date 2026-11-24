@@ -23,6 +23,7 @@ import {
 } from "./channels/app-operator-cli.js";
 import { resolvePushOptions } from "./channels/app-push.js";
 import { runModelsCommand, type ModelsInvocation } from "./model-catalog-cli.js";
+import { runDoctor } from "./doctor/index.js";
 import { workspaceContextGatewayOptions } from "./context/workspace-host.js";
 import { COMMANDS, commandUsage, findCommandHelp, renderCommandHelp, renderOverview, renderUsage } from "./help/cli.js";
 import { SAFE_COMMAND_NAME } from "./help/commands.js";
@@ -294,6 +295,23 @@ async function readConfig(source: ConfigSource): Promise<Awaited<ReturnType<type
   }
 }
 
+/**
+ * `models list` needs no setup: with no `--config` and no default file it lists the bundled
+ * catalog. An explicit path, an unreadable or invalid default file, and `refresh` still fail closed.
+ */
+async function readModelsConfig(
+  invocation: ModelsInvocation,
+  source: ConfigSource,
+): Promise<Awaited<ReturnType<typeof loadConfig>> | undefined> {
+  if (invocation.action !== "list" || source.kind !== "default") return readConfig(source);
+  try {
+    return await readConfig(source);
+  } catch (cause) {
+    if (cause instanceof StartupDiagnosticError && cause.code === "defaultConfigFile") return undefined;
+    throw cause;
+  }
+}
+
 function missingFile(cause: unknown): boolean {
   return typeof cause === "object" && cause !== null && (cause as NodeJS.ErrnoException).code === "ENOENT";
 }
@@ -330,7 +348,14 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   }
   const models = modelsInvocation(args);
   if (models !== undefined) {
-    await runModels(models.invocation, await readConfig(models.config));
+    await runModels(models.invocation, await readModelsConfig(models.invocation, models.config));
+    return;
+  }
+  if (leading === "doctor") {
+    // Read-only and self-reporting: every check prints its own safe line, including config failures.
+    const config: ConfigSource = args.length === 1 ? { kind: "default" } : configPath(args, 1);
+    const result = await runDoctor({ output: stdout, ...(config.kind === "path" ? { configPath: config.path } : {}) });
+    if (!result.ok) process.exitCode = 1;
     return;
   }
   const auth = authInvocation(args);
@@ -380,7 +405,7 @@ async function runAuthCommand(
 /** Explicit terminal catalog command. It never opens the gateway, reads credentials or edits config. */
 async function runModels(
   invocation: ModelsInvocation,
-  config: Awaited<ReturnType<typeof loadConfig>>,
+  config: Awaited<ReturnType<typeof loadConfig>> | undefined,
 ): Promise<void> {
   const stop = new AbortController();
   const shutdown = () => stop.abort(new Error("models command cancelled"));

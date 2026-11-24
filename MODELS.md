@@ -26,7 +26,14 @@ gateway startup, `/reload` and chat turns never fetch. Each request is a plain G
 with no credentials or cookies, no redirects, a 10-second deadline and a 4 MiB body
 cap. A validated result is written atomically (`0600`) to `model-catalog.json`
 under the canonical `dataDir`; `list` is offline and marks `bundled`/`refreshed`
-entries and the chat models `allowedModels` grants.
+entries and the chat models `allowedModels` grants. `list` reads the catalog file
+without preparing the data directory, so it creates nothing.
+
+Before setup, with no `--config` and no default configuration file, `list` uses the
+bundled catalog only: without providers it prints each bundled native provider ID
+with its chat model count, and with providers it lists their bundled models (no
+`allowed` markers). An explicit `--config` that is missing or invalid, an invalid
+default file, and `refresh` still fail closed.
 
 Refresh is fail-safe per provider. An unreachable, timed-out, redirected, non-2xx,
 oversized, non-JSON, malformed, duplicate-ID or older-than-stored response keeps

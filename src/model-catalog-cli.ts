@@ -1,13 +1,22 @@
 /**
  * Terminal `models refresh|list`. Refresh is the only network path for the model catalog; list is
  * offline. Neither opens the gateway, reads a credential, changes configuration or grants a model.
+ * List reads the overlay without preparing the data directory, and without a configuration it shows
+ * the bundled catalog only, so it works before setup and creates nothing.
  */
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import type { PortConfig } from "./config.js";
 import { modelKey } from "./config.js";
-import { loadModelCatalog, refreshModelCatalog, withCatalogOverlay, type RefreshOptions, type RefreshOutcome } from "./model-catalog.js";
+import {
+  loadModelCatalog,
+  refreshModelCatalog,
+  withCatalogOverlay,
+  type LoadedCatalog,
+  type RefreshOptions,
+  type RefreshOutcome,
+} from "./model-catalog.js";
 import { nativeProviderId } from "./providers.js";
-import { prepareDataDirectory } from "./store.js";
+import { canonicalFuturePath, prepareDataDirectory } from "./store.js";
 
 export interface ModelsInvocation {
   readonly action: "refresh" | "list";
@@ -48,20 +57,40 @@ function describe(outcome: RefreshOutcome): string {
   }
 }
 
+/** Bundled native provider IDs with their chat model counts, for a listing with no configuration. */
+function writeProviderSummary(terminal: ModelsTerminal): void {
+  const providers = [...builtinProviders()].sort((a, b) => a.id.localeCompare(b.id));
+  const width = Math.max(...providers.map((provider) => provider.id.length));
+  for (const provider of providers) {
+    const chat = (provider.getAllModels?.() ?? provider.getModels()).filter((model) => (model.type ?? "chat") === "chat");
+    terminal.output.write(`${provider.id.padEnd(width)}  ${chat.length} chat models\n`);
+  }
+  terminal.output.write("Run `pedellus models list <provider>` to see models for one provider.\n");
+}
+
+/**
+ * Run one models command. `config` is undefined only for a `list` with no configuration file:
+ * that listing uses the bundled catalog, with no overlay and no `allowed` markers.
+ */
 export async function runModelsCommand(
-  config: PortConfig,
+  config: PortConfig | undefined,
   invocation: ModelsInvocation,
   terminal: ModelsTerminal,
 ): Promise<{ readonly ok: boolean }> {
-  const prepared = await prepareDataDirectory(config);
+  if (config === undefined && invocation.action === "refresh") throw new Error("models refresh requires a configuration");
+  if (config === undefined && invocation.providers.length === 0) {
+    writeProviderSummary(terminal);
+    return { ok: true };
+  }
   const providers = invocation.providers.length > 0
     ? [...new Set(invocation.providers.map(nativeProviderId))]
-    : configuredNativeProviders(config);
+    : configuredNativeProviders(config!);
   if (providers.length === 0) {
     terminal.output.write("No native providers to refresh; name one, for example `pedellus models refresh openai`.\n");
     return { ok: true };
   }
   if (invocation.action === "refresh") {
+    const prepared = await prepareDataDirectory(config!);
     const outcomes = await refreshModelCatalog(prepared.canonicalDataDir, providers, {
       ...terminal.refresh,
       ...(terminal.signal === undefined ? {} : { signal: terminal.signal }),
@@ -71,9 +100,12 @@ export async function runModelsCommand(
     const ok = outcomes.every((outcome) => !["failed", "rejected", "unknown-provider"].includes(outcome.status));
     return { ok };
   }
-  const loaded = await loadModelCatalog(prepared.canonicalDataDir);
+  // Read-only: a missing data directory simply has no overlay; nothing is created or chmod-ed.
+  const loaded: LoadedCatalog = config === undefined
+    ? { overlay: new Map() }
+    : await loadModelCatalog(await canonicalFuturePath(config.dataDir));
   if (loaded.issue !== undefined) terminal.output.write(`Model catalog file is ${loaded.issue}; showing the bundled catalog.\n`);
-  const allowed = new Set((config.allowedModels ?? [config.model]).map((model) =>
+  const allowed = new Set((config === undefined ? [] : config.allowedModels ?? [config.model]).map((model) =>
     modelKey({ provider: nativeProviderId(model.provider), modelId: model.modelId })));
   const builtins = new Map(builtinProviders().map((provider) => [provider.id, provider]));
   let ok = true;
