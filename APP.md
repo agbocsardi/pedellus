@@ -25,7 +25,7 @@ listener is loaded.
 
 ```json
 {
-  "app": { "port": 43190, "staticRoot": "/home/owner/deploy/durable-pwa/dist" }
+  "app": { "port": 43190, "staticRoot": "/opt/pedellus/pwa/app/dist" }
 }
 ```
 
@@ -34,7 +34,7 @@ listener is loaded.
 | `port` | Required explicit integer 1–65535. The listener binds `127.0.0.1` only; no other bind is configurable, and `tailscale serve` is the only publisher. Never Funnel, port forwarding or a wildcard bind. |
 | `staticRoot` | Required absolute directory holding the built PWA. Files are served with safe path resolution (no traversal, no directory listing, encoded separators are not structure), correct MIME types and `index.html` for the root; `sw.js` is always served `no-store`. |
 | `autoArchiveDays` | Optional integer ≥1, default 14. Automatically archive inactive side threads, but never while they have running or queued work. |
-| `agentName` | Optional agent display name, 1–40 printable characters, default `Durable`. Sent as `agent` in every `hello` reply; display only, no authority. |
+| `agentName` | Optional agent display name, 1–40 printable characters, default `Pedellus`. Sent as `agent` in every `hello` reply; display only, no authority. |
 | `push` | Optional Web Push block: `{subject, publicKey, privateKeyEnv}`. Absent (or a private key variable that is unset at start) leaves every `push.*` request `unsupported` and sends nothing. `subject` is a `mailto:` or `https:` contact, `publicKey` is the base64url uncompressed P-256 VAPID public key, and `privateKeyEnv` names the environment variable holding the private key — the key itself is never in config. |
 
 Uploads and attachments are the existing top-level `media` opt-in — the same block Telegram uses —
@@ -48,8 +48,9 @@ can reach the loopback port and forge them, so the device token is the only auth
 ## Setup
 
 ```sh
-# On the tailnet host, with the built PWA checked out and `npm run build` run there:
-durable-nanobot gateway --config config.json
+# On the tailnet host, from the checkout: build the PWA once (and after each update)
+npm run install:pwa && npm run build:pwa
+pedellus gateway
 tailscale serve --bg 43190
 ```
 
@@ -60,7 +61,7 @@ Web Push is optional. Generate one VAPID key pair from the owner's terminal (no 
 file is involved; the pair is printed once and written nowhere):
 
 ```sh
-durable-nanobot app push-keys
+pedellus app push-keys
 ```
 
 Put the private key in the gateway's environment file (never the repository) and reference it by
@@ -70,11 +71,11 @@ name in the config:
 {
   "app": {
     "port": 43190,
-    "staticRoot": "/home/owner/deploy/durable-pwa/dist",
+    "staticRoot": "/opt/pedellus/pwa/app/dist",
     "push": {
       "subject": "mailto:owner@example.org",
       "publicKey": "<the printed public key>",
-      "privateKeyEnv": "NANOBOT_APP_PUSH_PRIVATE_KEY"
+      "privateKeyEnv": "PEDELLUS_APP_PUSH_PRIVATE_KEY"
     }
   }
 }
@@ -86,9 +87,9 @@ one terse startup diagnostic naming only the variable; the rest of the gateway s
 Pair a device from the owner's terminal:
 
 ```sh
-durable-nanobot app pair --label iphone     # prints one 8-character code, valid ten minutes
-durable-nanobot app devices                 # labels, created times, revoked state
-durable-nanobot app revoke iphone           # closes the live stream; the token is dead
+pedellus app pair --label iphone     # prints one 8-character code, valid ten minutes
+pedellus app devices                 # labels, created times, revoked state
+pedellus app revoke iphone           # closes the live stream; the token is dead
 ```
 
 These commands attach to the running gateway over the private local socket, like the `cron`
@@ -183,7 +184,7 @@ keys at 1–64 characters of `[A-Za-z0-9_-]`.
 Durable egress is one adapter-wide cursor log — `message` (roles `user`, `assistant`, `notice`),
 `settled`, `divider`, `thread` and `question` — across all threads. Each event names its thread; lifecycle
 events carry its full metadata. `hello` replies with the protocol version, the device label, the
-durable head cursor, the configured agent display name (`app.agentName`, default `Durable`) and
+durable head cursor, the configured agent display name (`app.agentName`, default `Pedellus`) and
 `commands` (the shared catalogue's `app` surface this host implements, in catalogue order), and replays
 events with `cursor > hello.cursor` (oldest first, at most 500 per batch; the app re-`hello`s for
 more), live sockets are pushed every event after their own position, and `ack` records each
@@ -432,9 +433,9 @@ agent one question and read the answer back. It is off until the owner creates a
 over the same private local socket as `app pair`:
 
 ```bash
-durable-nanobot app shortcut add --label morning   # prints the token once
-durable-nanobot app shortcut list                  # labels, created, revoked
-durable-nanobot app shortcut revoke morning        # immediate
+pedellus app shortcut add --label morning   # prints the token once
+pedellus app shortcut list                  # labels, created, revoked
+pedellus app shortcut revoke morning        # immediate
 ```
 
 The token is 32 random bytes (base64url), printed exactly once and stored durably only as its

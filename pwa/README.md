@@ -1,6 +1,6 @@
-# Durable App
+# Pedellus app
 
-Installable web app (PWA) for a personal [Durable Nanobot](../README.md)
+Installable web app (PWA) for a personal [Pedellus](../README.md)
 gateway, reached over the tailnet with `tailscale serve`. Personal use only,
 one owner.
 
@@ -25,6 +25,8 @@ The gateway also serves `POST /v1/ask` for iOS Shortcuts (APP.md, *Shortcuts*).
   route, storage, security model, known gaps.
 - [app/README.md](./app/README.md) — dev workflow and the mock gateway's
   affordances.
+- [../GETTING_STARTED.md](../GETTING_STARTED.md#installable-web-app-pwa) — build,
+  serve and pair it on a real gateway.
 - [2026-11-18_pwa_TODO.md](./2026-11-18_pwa_TODO.md) — plan and work log.
 - [docs/native-ios/](./docs/native-ios/) — parked native SwiftUI plan, kept for
   a possible later iOS app.

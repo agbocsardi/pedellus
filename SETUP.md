@@ -6,6 +6,9 @@ The config owns persistent settings and policy; the CLI and Telegram are utility
 surfaces over it. Changing the config takes effect on restart — there is no hot
 reload, and no command is a prerequisite for enabling a capability.
 
+New to Pedellus? [Getting started](./GETTING_STARTED.md) is the quicker
+beginner path (including WSL2); this page is the manual, config-first route.
+
 This does not claim live-model success; what you can verify offline is in
 [Current status and checks](./README.md#current-status-and-checks).
 
@@ -18,8 +21,8 @@ npm ci
 ```
 
 Optionally run `npm link --offline` from this checkout to expose
-**`durable-nanobot`**. Python's `nanobot` command is not replaced. Without linking,
-the `node bin/durable-nanobot.mjs` examples below load TypeScript source directly
+**`pedellus`**. Python's `nanobot` command is not replaced. Without linking,
+the `node bin/pedellus.mjs` examples below load TypeScript source directly
 through pinned `tsx`. A process restart picks up source edits without a build or
 watcher; `npm run typecheck` remains a separate recommended check. The systemd
 units use that same launcher, without requiring a command link. Compiled output
@@ -33,9 +36,9 @@ working directory. Keep `dataDir` outside `workspace`: the gateway rejects a dat
 directory that resolves inside the workspace or an extra allowed root.
 
 For the persistent primary instance, keep the config at
-`~/.durable-nanobot/config.json` and use `"dataDir": "./data"` and
+`~/.pedellus/config.json` and use `"dataDir": "./data"` and
 `"workspace": "./workspace"` as in the shipped example. This places Durable state
-under `~/.durable-nanobot/data/`, separate from the workspace and the checkout.
+under `~/.pedellus/data/`, separate from the workspace and the checkout.
 JSON does not expand `~`; those relative paths resolve from the config file.
 See [primary service layout](SERVICE.md#primary-instance). Do not change an existing
 store's path without deliberately migrating its stopped state.
@@ -102,8 +105,8 @@ export OPENAI_API_KEY=...
 Or store a provider credential explicitly, without putting it in config:
 
 ```sh
-durable-nanobot login            # choose a native provider and auth method
-durable-nanobot login openai --auth oauth
+pedellus login            # choose a native provider and auth method
+pedellus login openai --auth oauth
 ```
 
 `login` validates the same configuration as the gateway, writes Durable's private
@@ -128,24 +131,24 @@ The gateway owns storage, tools, cron and Telegram; the CLI attaches to it as a
 conversation surface. Start the gateway in one terminal:
 
 ```sh
-node bin/durable-nanobot.mjs gateway --config demo/config.json
+node bin/pedellus.mjs gateway --config demo/config.json
 ```
 
 Then attach a terminal in another:
 
 ```sh
-node bin/durable-nanobot.mjs agent --config demo/config.json
+node bin/pedellus.mjs agent --config demo/config.json
 ```
 
 This walkthrough uses an explicit demo config. Without `--config`, `gateway`,
 `agent`, `recovery` and `cron` read the fixed primary file
-`~/.durable-nanobot/config.json`, resolved from the runtime user home rather than
+`~/.pedellus/config.json`, resolved from the runtime user home rather than
 the working directory; there is no discovery, merge or auto-generation. A
 secondary instance passes its own `--config`. See [user services](./SERVICE.md)
 for the shipped foreground systemd user units.
 
 The agent resumes the `cli:default` conversation and prints a prompt. The
-historical `node bin/durable-nanobot.mjs --config demo/config.json` is the same attach; it
+historical `node bin/pedellus.mjs --config demo/config.json` is the same attach; it
 fails with a fixed message when no gateway is running and never opens a second
 runtime. `agent --conversation <name>` uses a separate `cli:<name>`
 conversation in the same gateway; conversations are separate by default and

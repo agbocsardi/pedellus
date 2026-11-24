@@ -1,14 +1,14 @@
-# Durable Nanobot
+# Pedellus
 
-TypeScript port of Nanobot on the Pi 1.5.0 stack (`@earendil-works/pi-ai`,
-`pi-durable`, `chord`). The agent loop is Durable's; this repo is the
-nanobot-specific layer (context, tools, execution, automation, channels,
-providers).
+Pedellus (formerly Durable Nanobot): a TypeScript port of Nanobot on the Pi
+1.5.0 stack (`@earendil-works/pi-ai`, `pi-durable`, `chord`). The agent loop is
+Durable's; this repo is the nanobot-specific layer (context, tools, execution,
+automation, channels, providers).
 
 - Independent project: the Python fork at `~/projects/pi-nanobot` is reference
   only — never merge/rebase onto it; port changes by hand.
 - Experimental. Never stop or replace Python's production bot during checks.
-- Never install a `nanobot` alias; the executable is `durable-nanobot`.
+- Never install a `nanobot` alias; the executable is `pedellus`.
 
 ## Commands
 
@@ -23,7 +23,7 @@ npm start -- gateway --config config.json
 npm start -- agent --config config.json
 ```
 
-`bin/durable-nanobot.mjs` runs source via pinned `tsx`; code edits need only a
+`bin/pedellus.mjs` runs source via pinned `tsx`; code edits need only a
 restart (unit edits also need daemon-reload). Keep the error boundary in
 `src/cli.ts:runCli` and diagnostics in `src/failure-diagnostics.ts` — never log
 raw exceptions/payloads.
@@ -40,9 +40,10 @@ raw exceptions/payloads.
   protocol (`pwa/protocol/`); its own notes are in `pwa/AGENTS.md`.
 - `plan/` — historical evidence, not a work queue.
 
-Topic docs (MCP.md, WORKERS.md, CRON.md, MEMORY_RECALL.md, HISTORY.md,
-MODELS.md, PROVIDERS.md, CODEMODE.md, WEB.md, TOOLS.md, EXECUTION.md, …) hold
-the detailed contracts. Read the relevant one before changing a subsystem and
+User onboarding lives in GETTING_STARTED.md and SETUP_PROMPT.md; keep them in
+sync with CLI/config changes. Topic docs (MCP.md, WORKERS.md, CRON.md,
+MEMORY_RECALL.md, HISTORY.md, MODELS.md, PROVIDERS.md, CODEMODE.md, WEB.md,
+TOOLS.md, EXECUTION.md, …) hold the detailed contracts. Read the relevant one before changing a subsystem and
 keep it in sync.
 
 ## Core invariants
