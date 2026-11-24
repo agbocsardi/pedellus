@@ -8,7 +8,7 @@
  */
 
 import type { Cursor } from "@earendil-works/pi-durable";
-import type { CronOperatorCancelOutcome, CronOperatorCreateOutcome, CronOperatorJob, CronOperatorListing } from "../automation/operator.js";
+import type { CronOperatorCancelOutcome, CronOperatorCreateOutcome, CronOperatorJob, CronOperatorListing, CronOperatorRow } from "../automation/operator.js";
 import type { CronScheduleInput } from "../automation/cron.js";
 import type { BackgroundStatus } from "../background-status.js";
 import type { AppDeviceListing, AppPairingCreated, AppPairingRefusal } from "../channels/app.js";
@@ -236,6 +236,165 @@ function revokeResult(what: string) {
   };
 }
 
+/** One bounded timestamp field; `null` is the wire spelling of "none yet". */
+function cronTimestamp(value: unknown, what: string): number | null {
+  if (value === null) return null;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) unexpected(what);
+  return value;
+}
+
+function boundedJobText(value: unknown, maxChars: number, what: string): string {
+  if (typeof value !== "string" || value.length === 0 || value.length > maxChars) unexpected(what);
+  return value;
+}
+
+/** Task summaries a job view may carry; `null` means the task does not exist. */
+function cronTaskSummary(value: unknown, what: string): CronOperatorJob["timer"] {
+  if (value === null) return null;
+  const task = resultObject(value, what);
+  const status = boundedJobText(task.status, 32, what);
+  const taskId = cronTimestamp(task.taskId, what);
+  if (taskId === null) unexpected(what);
+  const optionalText = (field: unknown): string | null => {
+    if (field === null) return null;
+    if (field === undefined || typeof field !== "string" || field.length > 400) unexpected(what);
+    return field;
+  };
+  const scheduledAtMs = cronTimestamp(task.scheduledAtMs, what);
+  if (scheduledAtMs === null) unexpected(what);
+  return {
+    taskId,
+    status: status as NonNullable<CronOperatorJob["timer"]>["status"],
+    scheduledAtMs,
+    error: optionalText(task.error),
+    reason: optionalText(task.reason),
+  };
+}
+
+/** A job view exactly as the terminal renders it: every required field is checked, so a malformed
+ * view fails the call and the operator command holds its outcome as unknown instead of rendering
+ * a success built from garbage. */
+function cronJobView(value: unknown, what: string): CronOperatorJob {
+  const job = resultObject(value, what);
+  const id = boundedJobText(job.id, 64, what);
+  const origin = boundedJobText(job.origin, 200, what);
+  const name = boundedJobText(job.name, 200, what);
+  const mode = job.mode;
+  if (mode !== "background" && mode !== "origin") unexpected(what);
+  const intent = job.intent;
+  if (intent !== "message" && intent !== "digest") unexpected(what);
+  const schedule = boundedJobText(job.schedule, 200, what);
+  const status = boundedJobText(job.status, 32, what) as CronOperatorJob["status"];
+  const nextAtMs = cronTimestamp(job.nextAtMs, what);
+  const message = boundedJobText(job.message, 300, what);
+  const lastOutcome = job.lastOutcome === null ? null : (() => {
+    const record = resultObject(job.lastOutcome, what);
+    if (record.status !== "ok" && record.status !== "error") unexpected(what);
+    const outcomeStatus: "ok" | "error" = record.status;
+    return {
+      status: outcomeStatus,
+      finishedAtMs: cronTimestamp(record.finishedAtMs, what) ?? unexpected(what),
+      error: record.error === null ? null
+        : record.error === undefined ? unexpected(what)
+          : typeof record.error === "string" && record.error.length <= 400 ? record.error : unexpected(what),
+    };
+  })();
+  const lastSkip = job.lastSkip === null ? null : (() => {
+    const record = resultObject(job.lastSkip, what);
+    return {
+      skippedAtMs: cronTimestamp(record.skippedAtMs, what) ?? unexpected(what),
+      reason: boundedJobText(record.reason, 400, what),
+    };
+  })();
+  const lastFault = job.lastFault === null ? null : (() => {
+    const record = resultObject(job.lastFault, what);
+    return {
+      recordedAtMs: cronTimestamp(record.recordedAtMs, what) ?? unexpected(what),
+      error: boundedJobText(record.error, 400, what),
+    };
+  })();
+  const deliveryFault = job.deliveryFault === null ? null : (() => {
+    const record = resultObject(job.deliveryFault, what);
+    return {
+      recordedAtMs: cronTimestamp(record.recordedAtMs, what) ?? unexpected(what),
+      message: boundedJobText(record.message, 400, what),
+    };
+  })();
+  const timer = cronTaskSummary(job.timer, what);
+  const execution = cronTaskSummary(job.execution, what);
+  const target = job.target === null ? null : (() => {
+    const record = resultObject(job.target, what);
+    const taskStatus = record.status;
+    if (typeof taskStatus !== "string" || taskStatus.length === 0 || taskStatus.length > 32) unexpected(what);
+    return {
+      taskId: cronTimestamp(record.taskId, what) ?? unexpected(what),
+      status: taskStatus as NonNullable<CronOperatorJob["target"]>["status"],
+      error: record.error === null ? null
+        : record.error === undefined ? unexpected(what)
+          : typeof record.error === "string" && record.error.length <= 400 ? record.error : unexpected(what),
+      reason: record.reason === null ? null
+        : record.reason === undefined ? unexpected(what)
+          : typeof record.reason === "string" && record.reason.length <= 400 ? record.reason : unexpected(what),
+    };
+  })();
+  return {
+    id, origin, name, mode, intent, schedule, status, nextAtMs, message,
+    lastOutcome, lastSkip, lastFault, deliveryFault, timer, execution, target,
+  };
+}
+
+function cronJobOrNull(value: unknown, what: string): CronOperatorJob | null {
+  return value === null ? null : cronJobView(value, what);
+}
+
+/** The create reply's required fields; a wrong shape fails the call instead of printing a success. */
+function cronCreateOutcome(value: unknown, what: string): CronOperatorCreateOutcome {
+  const result = resultObject(value, what);
+  if (result.status === "unknown_origin") return { status: "unknown_origin" };
+  if (result.status !== "scheduled") unexpected(what);
+  const jobId = boundedJobText(result.jobId, 64, what);
+  const nextAtMs = cronTimestamp(result.nextAtMs, what);
+  if (typeof result.deduplicated !== "boolean") unexpected(what);
+  return {
+    status: "scheduled",
+    job: cronJobOrNull(result.job, what),
+    jobId,
+    nextAtMs,
+    deduplicated: result.deduplicated,
+  };
+}
+
+/** The cancel reply's required fields, per outcome. */
+function cronCancelOutcome(value: unknown, what: string): CronOperatorCancelOutcome {
+  const result = resultObject(value, what);
+  switch (result.status) {
+    case "not_found":
+    case "ambiguous":
+    case "forbidden":
+      return { status: result.status };
+    case "already_terminal":
+      return { status: "already_terminal", job: cronJobView(result.job, what) };
+    case "cancelled": {
+      const withdrawn = result.withdrawn;
+      if (withdrawn !== null && withdrawn !== undefined
+        && withdrawn !== "aborted" && withdrawn !== "already_placed" && withdrawn !== "settled" && withdrawn !== "not_found") {
+        unexpected(what);
+      }
+      const abortError = result.abortError;
+      if (abortError !== null && abortError !== undefined
+        && (typeof abortError !== "string" || abortError.length > 400)) unexpected(what);
+      return {
+        status: "cancelled",
+        job: cronJobOrNull(result.job, what),
+        withdrawn: withdrawn ?? null,
+        abortError: abortError ?? null,
+      };
+    }
+    default:
+      unexpected(what);
+  }
+}
+
 function labelledRows<T>(key: string, what: string) {
   return (value: unknown): T[] => {
     const rows = resultObject(value, what)[key];
@@ -299,17 +458,42 @@ function attachResult(value: unknown): LocalAttachResult {
 export const LOCAL_RESULT_CHECKS: { readonly [M in LocalMethod]: (value: unknown) => LocalResult<M> } = Object.freeze({
   attach: attachResult,
   cronList: (value: unknown) => {
-    const result = resultObject(value, "job listing");
-    if (!Array.isArray(result.jobs) || !Array.isArray(result.origins)) unexpected("job listing");
-    return result as unknown as CronOperatorListing;
+    const what = "job listing";
+    const result = resultObject(value, what);
+    if (!Array.isArray(result.origins)
+      || result.origins.some((entry) => typeof entry !== "string" || entry.length === 0 || entry.length > 200)) {
+      unexpected(what);
+    }
+    if (!Array.isArray(result.jobs) || result.jobs.length > 100) unexpected(what);
+    const total = result.total;
+    if (typeof total !== "number" || !Number.isSafeInteger(total) || total < 0) unexpected(what);
+    const nextOffset = result.nextOffset;
+    if (nextOffset !== null && nextOffset !== undefined
+      && (typeof nextOffset !== "number" || !Number.isSafeInteger(nextOffset) || nextOffset < 0)) unexpected(what);
+    return {
+      origins: result.origins as string[],
+      jobs: result.jobs.map((row) => {
+        const record = resultObject(row, what);
+        return {
+          id: boundedJobText(record.id, 64, what),
+          origin: boundedJobText(record.origin, 200, what),
+          name: boundedJobText(record.name, 200, what),
+          schedule: boundedJobText(record.schedule, 200, what),
+          status: boundedJobText(record.status, 32, what) as CronOperatorRow["status"],
+          nextAtMs: cronTimestamp(record.nextAtMs, what),
+        };
+      }),
+      total,
+      nextOffset: nextOffset ?? null,
+    };
   },
   cronShow: (value: unknown) => {
     const jobs = resultObject(value, "job listing").jobs;
-    if (!Array.isArray(jobs)) unexpected("job listing");
-    return { jobs: jobs as CronOperatorJob[] };
+    if (!Array.isArray(jobs) || jobs.length > 100) unexpected("job listing");
+    return { jobs: jobs.map((job) => cronJobView(job, "job listing")) };
   },
-  cronCreate: objectResult<CronOperatorCreateOutcome>("job result"),
-  cronCancel: objectResult<CronOperatorCancelOutcome>("job result"),
+  cronCreate: (value: unknown) => cronCreateOutcome(value, "job result"),
+  cronCancel: (value: unknown) => cronCancelOutcome(value, "job result"),
   appPair: (value: unknown) => {
     const what = "pairing result";
     const result = resultObject(value, what);

@@ -384,6 +384,25 @@ export function createExecutionPolicy(options: ExecutionPolicyOptions): Executio
 			}
 			const environment = policy.shellEnvironment();
 			const base = resolve(options?.cwd ?? roots[0]!);
+			// An argv array preserves element boundaries: every element is exactly one token the
+			// command receives, so it is resolved against the cwd and checked whole. This catches a
+			// protected-root (or a confined out-of-root) argument that quoting or spacing could hide
+			// from the joined-text scan below, which stays best-effort for shell strings and for text
+			// inside argv elements.
+			if (Array.isArray(command)) {
+				for (const element of command) {
+					if (typeof element !== "string" || element === "") continue;
+					const target = resolve(base, element);
+					if (isBenignDevicePath(target)) continue;
+					if (protectedPath(target) !== undefined) {
+						return `Error: Command blocked by safety guard (path is managed gateway data; use the owning gateway APIs)${SHELL_BOUNDARY_NOTE}`;
+					}
+					if (restrictToWorkspace && !roots.some((root) => isPathWithin(root, target))) {
+						return `Error: Command blocked by safety guard (path outside working dir) [target_path="${target}"]${SHELL_BOUNDARY_NOTE}`;
+					}
+				}
+			}
+			// The joined-text scan is the shell-string guard: lexical and best-effort by design.
 			for (const raw of extractAbsolutePaths(trimmed)) {
 				const expanded = expandVariables(raw, environment);
 				if (isBenignDevicePath(expanded)) continue;

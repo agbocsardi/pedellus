@@ -175,6 +175,10 @@ export function buildDirectBwrapArgs(options: DirectBwrapOptions): string[] {
 /**
  * The same argv with a binary the caller already resolved through `resolveDirectBwrapPath` (for
  * example once per environment), so a long-lived shell does not re-resolve it on every command.
+ *
+ * Only the executable is reused: the workspace, cwd and media paths are revalidated on every call —
+ * each is re-resolved through `realpath` and re-checked immediately before the argv is built — so
+ * launching still revalidates the paths it binds even though the binary resolution happened earlier.
  */
 export function buildDirectBwrapArgsWithBinary(
 	bwrap: string,

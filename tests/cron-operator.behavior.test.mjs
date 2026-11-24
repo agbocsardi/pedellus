@@ -351,6 +351,80 @@ test("the CLI surface creates, lists and reports a lost response as unknown", { 
   );
 });
 
+test("malformed cron mutation replies are held as unknown, never rendered as success", { timeout: 30_000 }, async (t) => {
+  const { createServer } = await import("node:net");
+  const directory = await mkdtemp(join(tmpdir(), "nanobot-cron-malformed-"));
+  await mkdir(join(directory, "state"), { recursive: true, mode: 0o700 });
+  const socketPath = join(directory, "state", "gateway.sock");
+  // A minimal wire peer: one scripted reply per request, in order.
+  const replies = [];
+  const server = createServer((socket) => {
+    socket.setEncoding("utf8");
+    let buffer = "";
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      let newline;
+      while ((newline = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        if (line.trim() === "") continue;
+        const request = JSON.parse(line);
+        const reply = replies.length > 0
+          ? replies.shift()
+          : { error: { code: "failed", message: "no scripted reply" } };
+        socket.write(`${JSON.stringify({ id: request.id, ...reply })}\n`);
+      }
+    });
+  });
+  await new Promise((resolveListen) => server.listen(socketPath, resolveListen));
+  const client = await connectLocalGateway({ socketPath, operatorOnly: true, context });
+  t.after(async () => {
+    await client.close().catch(() => undefined);
+    await new Promise((resolveClose) => server.close(resolveClose));
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  // A cancel reply with no recognized outcome: the CLI must not print a cancellation it cannot
+  // confirm; the outcome stays unknown.
+  replies.push({ result: {} });
+  const cancelled = capture();
+  await assert.rejects(
+    () => runCronCommand({ client, command: { kind: "cancel", jobId: "cron-x" }, output: cancelled.output, context }),
+    (error) => error instanceof CronCommandError && /outcome is unknown/.test(error.message),
+  );
+  assert.equal(cancelled.text(), "");
+
+  // A create reply that claims success but omits its required fields: never rendered as scheduled.
+  replies.push({ result: { status: "scheduled", jobId: "cron-x" } });
+  const created = capture();
+  await assert.rejects(
+    () => runCronCommand({
+      client,
+      command: { kind: "create", origin: CLI_CHAT, request: schedule({ idempotencyKey: "malformed-1" }) },
+      output: created.output,
+      context,
+    }),
+    (error) => error instanceof CronCommandError && /outcome is unknown/.test(error.message),
+  );
+  assert.equal(created.text(), "");
+
+  // A cancelled reply missing its own required fields is equally untrusted.
+  replies.push({ result: { status: "cancelled" } });
+  const partial = capture();
+  await assert.rejects(
+    () => runCronCommand({ client, command: { kind: "cancel", jobId: "cron-x" }, output: partial.output, context }),
+    (error) => error instanceof CronCommandError && /outcome is unknown/.test(error.message),
+  );
+  assert.equal(partial.text(), "");
+
+  // A well-formed refusal stays a definitive, exact report.
+  replies.push({ result: { status: "not_found" } });
+  await assert.rejects(
+    () => runCronCommand({ client, command: { kind: "cancel", jobId: "cron-x" }, output: capture().output, context }),
+    (error) => error instanceof CronCommandError && /no scheduled job with id cron-x/.test(error.message),
+  );
+});
+
 test("the cron command refuses ambiguous and incomplete forms before anything is sent", () => {
   const list = parseCronInvocation(["list"]);
   assert.deepEqual(list.command, { kind: "list" });

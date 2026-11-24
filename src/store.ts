@@ -63,6 +63,12 @@ export async function assertExistingDatabaseFileForRecovery(dbPath: string): Pro
  * Validate configured roots and dataDir disjointness without creating or modifying anything.
  * Missing roots are still resolved via `canonicalFuturePath` so read-only commands like
  * `models list` work before workspace creation while still failing closed on overlapping roots.
+ *
+ * An existing data directory must already meet the same private-owner contract the gateway
+ * enforces when it creates it: a directory owned by the current user with no group or other
+ * access. The check is read-only — nothing is created, chmodded or repaired — so a client
+ * command either connects to an owner-private directory or fails closed; a shared or
+ * foreign-owned directory could carry anyone's socket and is never used.
  */
 export async function validateDataDirectoryReadOnly(config: PortConfig): Promise<string> {
   const roots = await Promise.all([config.workspace, ...(config.extraAllowedDirs ?? [])].map(async (path) => {
@@ -79,7 +85,15 @@ export async function validateDataDirectoryReadOnly(config: PortConfig): Promise
     throw new Error("dataDir must be disjoint from workspace and extraAllowedDirs");
   }
   try {
-    if (!(await stat(dataDir)).isDirectory()) throw new Error("dataDir must be a directory");
+    const dataDirStat = await stat(dataDir);
+    if (!dataDirStat.isDirectory()) throw new Error("dataDir must be a directory");
+    if ((dataDirStat.mode & 0o077) !== 0) {
+      throw new Error("dataDir must be owner-private (no group or other access; mode 0700)");
+    }
+    const owner = process.getuid?.();
+    if (owner !== undefined && dataDirStat.uid !== owner) {
+      throw new Error("dataDir must be owned by the current user");
+    }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }

@@ -289,7 +289,9 @@ built by `createHostExecutionEnv`:
   tools; only shell commands are wrapped.
 - `restrictToWorkspace: true` applies Python's practical shell guard: textual
   `../`/`..\\` and absolute or home paths outside the roots are refused with
-  the workspace-boundary note.
+  the workspace-boundary note. Managed-data paths are refused in either mode,
+  including at exact argv element boundaries; the shell-string scan itself is
+  best-effort and lexical.
 - The shell gets only the policy environment (`HOME` is the workspace in scoped
   mode and the OS user home in full-host mode, private
   per-conversation `TMPDIR`, `PATH`/`LANG`/`TERM`); caller `env` and

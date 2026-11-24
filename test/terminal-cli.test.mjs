@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -574,6 +574,24 @@ test("client commands never create the data directory when no gateway is running
       assert.match(result.stderr, /no running gateway answers/, args.join(" "));
       await assert.rejects(stat(dataDir), { code: "ENOENT" }, `${args.join(" ")} must not create dataDir`);
     }
+
+    // An existing but non-private data directory is refused, never repaired: the read-only lookup
+    // enforces the gateway's owner-private contract without creating or chmodping anything.
+    await mkdir(dataDir, { mode: 0o755 });
+    const shared = spawnSync(process.execPath, [cli, "agent", "--config", configPath], {
+      encoding: "utf8", timeout: 25_000, input: "",
+    });
+    assert.equal(shared.status, 1, shared.stderr);
+    assert.match(shared.stderr, /cannot prepare the configured workspace or data directory/, shared.stderr);
+    assert.equal((await stat(dataDir)).mode & 0o777, 0o755, "the client must not chmod a shared dataDir");
+
+    // An owner-private data directory still reaches the honest no-gateway diagnostic.
+    await chmod(dataDir, 0o700);
+    const privateDir = spawnSync(process.execPath, [cli, "agent", "--config", configPath], {
+      encoding: "utf8", timeout: 25_000, input: "",
+    });
+    assert.equal(privateDir.status, 1, privateDir.stderr);
+    assert.match(privateDir.stderr, /no running gateway answers/, privateDir.stderr);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

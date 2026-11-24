@@ -539,13 +539,29 @@ function configuredEnvName(config: PortConfig, providerId: string): string | und
   return Object.entries(config.credentials ?? {}).find(([spelling]) => nativeProviderId(spelling) === providerId || spelling === providerId)?.[1];
 }
 
+/** A provider label safe to echo: bounded and printable. Anything else prints as `provider`. */
+function providerLabel(id: string): string {
+  return /^[A-Za-z0-9._-]{1,40}$/.test(id) ? id : "provider";
+}
+
+/** An environment variable name safe to echo; a configured but unprintable reference stays unnamed. */
+function echoableEnvName(name: string): string | undefined {
+  return /^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(name) ? name : undefined;
+}
+
 function describeAuth(auth: AuthCheck, configuredEnv: string | undefined): string {
   if (auth.type === "oauth") return "stored credential (OAuth)";
   const source = auth.source ?? "";
   if (source === "stored credential" || source === "keyless") return source;
-  if (source.startsWith("credentials.") && configuredEnv !== undefined) return `env (${configuredEnv})`;
-  if (/^[A-Z][A-Z0-9_]*$/.test(source)) return `env (${source})`;
-  return source === "" ? "available" : source;
+  const env = echoableEnvName(source);
+  if (source.startsWith("credentials.")) {
+    // A credential-store reference is echoed only through its already-validated env mapping.
+    return configuredEnv !== undefined ? `env (${configuredEnv})` : "stored credential reference";
+  }
+  if (env !== undefined && /^[A-Z][A-Z0-9_]*$/.test(env)) return `env (${env})`;
+  // Any other source text is not echoed: it may name an owner-chosen spelling, and the
+  // check has already succeeded, so the safe summary is that auth is available.
+  return "available";
 }
 
 async function checkCredentials(
@@ -557,8 +573,8 @@ async function checkCredentials(
   const providers = referencedProviders(config);
   const unknown = providers.filter((entry) => entry.kind === "unknown");
   for (const entry of unknown) {
-    const label = /^[A-Za-z0-9._-]{1,40}$/.test(entry.id) ? entry.id : "provider";
-    report.check("fail", label, "unknown provider (not a native Pi AI provider or custom providers entry)");
+    // Even a pre-validated spelling is echoed only after the bounded-printable guard.
+    report.check("fail", providerLabel(entry.id), "unknown provider (not a native Pi AI provider or custom providers entry)");
   }
   const known = providers.filter((entry) => entry.kind !== "unknown" && entry.authRequired);
   if (known.length === 0) {
@@ -589,19 +605,23 @@ async function checkCredentials(
     return;
   }
   for (const entry of known) {
+    // The id can be an owner-chosen custom provider spelling and the env name an owner-chosen
+    // credential reference; both are echoed only through the bounded-printable guards so a
+    // hostile value never reaches the report, even from a hand-built SDK config.
     const id = entry.id;
-    const configuredEnv = configuredEnvName(config, id);
+    const label = providerLabel(id);
+    const configuredEnv = echoableEnvName(configuredEnvName(config, id) ?? "");
     let auth: AuthCheck | undefined;
     try {
       auth = await models.checkAuth(id);
     } catch {
-      report.check("fail", id, configuredEnv === undefined
-        ? `credential check failed (details suppressed); run \`pedellus login ${id}\``
-        : `missing — ${configuredEnv} is not set; set it or run \`pedellus login ${id}\``);
+      report.check("fail", label, configuredEnv === undefined
+        ? `credential check failed (details suppressed); run \`pedellus login ${label}\``
+        : `missing — ${configuredEnv} is not set; set it or run \`pedellus login ${label}\``);
       continue;
     }
-    if (auth === undefined) report.check("fail", id, `missing — run \`pedellus login ${id}\``);
-    else report.check("ok", id, describeAuth(auth, configuredEnv));
+    if (auth === undefined) report.check("fail", label, `missing — run \`pedellus login ${label}\``);
+    else report.check("ok", label, describeAuth(auth, configuredEnv));
   }
 }
 

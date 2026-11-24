@@ -586,6 +586,12 @@ class LocalConnection {
     const token = conversationToken(record.conversation);
     const sessionKey = `cli:${token}`;
     const conversation = await this.options.gateway.conversationFor(sessionKey, this.scope.context);
+    // `conversationFor` is the one await before registration. If the socket died while it ran,
+    // teardown already cancelled this scope and detached every surface: registering now would
+    // attach an unreachable session surface that nothing ever detaches. Fail the attach instead.
+    if (this.finished) {
+      throw new LocalRequestError("unavailable", "the local attachment is no longer connected");
+    }
     this.gatewayConversation = conversation;
     this.sessionKey = sessionKey;
     this.surface = inProcessTerminalConversation(conversation, this.options.followUpMode ?? "followUp", {

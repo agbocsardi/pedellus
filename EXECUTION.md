@@ -75,8 +75,12 @@ same policy and the direct-workspace argv builder rather than a second policy.
   practical guard: textual `../`/`..\` and absolute or home paths outside the
   roots are refused with the workspace-boundary note. In either mode, an
   absolute or home path inside a protected root (the managed `dataDir`) is
-  refused, even when an allowed root such as full-host `/` contains it. This is
-  an accidental-damage guardrail, not confinement; command substitution, shell
+  refused, even when an allowed root such as full-host `/` contains it. The
+  shell-string path scan is best-effort and lexical; an argv invocation is
+  additionally checked at exact element boundaries (each element resolved
+  against the cwd), so a protected-root or out-of-root argument is caught as
+  one token even when quoting hides it from the text scan. This is still an
+  accidental-damage guardrail, not confinement; command substitution, shell
   expansion and permitted programs can still reach outside paths.
 - The native bash tool keeps its own output window, streaming callbacks, spill
   file and structured output. The host env passes those options and results

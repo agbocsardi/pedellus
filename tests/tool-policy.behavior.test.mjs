@@ -110,6 +110,18 @@ test('exclusive create stays in a verified parent and never follows a link out o
     assert.equal(again.error.message, 'the file already exists');
     assert.equal(await env.readTextFile('nested/new.md', BACKGROUND_CONTEXT).then((r) => r.value), 'one');
 
+    // Missing directories are created one component at a time, but never into a protected root:
+    // a create under managed data with a missing tail is refused before any directory is created.
+    const protectedCreate = await env.createFileExclusive('managed/deeper/new.md', 'x', BACKGROUND_CONTEXT);
+    assert.equal(protectedCreate.ok, false);
+    assert.deepEqual(await readdir(managed), []);
+
+    // A dangling symlink component in the parent chain is refused, not resolved or created through.
+    await symlink(join(privateDir, 'never-created'), join(workspace, 'dang'));
+    const dangling = await env.createFileExclusive('dang/new.md', 'x', BACKGROUND_CONTEXT);
+    assert.equal(dangling.ok, false);
+    assert.equal(await env.readTextFile(join(privateDir, 'never-created', 'new.md'), BACKGROUND_CONTEXT).then((r) => r.ok), false);
+
     // A final-component link is the name O_EXCL refuses; a parent link out of the roots is denied.
     await symlink(join(privateDir, 'leaf.md'), join(workspace, 'leaf.md'));
     await symlink(privateDir, join(workspace, 'out'));
@@ -156,6 +168,12 @@ test('shell commands naming managed data are refused even inside an allowed root
     shell: { environment: { HOME: '/srv/data' } },
   });
   assert.match(host.checkCommand('cat /srv/data/nanobot.sqlite'), /managed gateway data/);
+  // An argv array keeps element boundaries: every element is checked whole, so a protected-root
+  // argument is refused as exactly one token.
+  assert.match(host.checkCommand(['cat', '/srv/data/nanobot.sqlite']), /managed gateway data/);
+  assert.equal(host.checkCommand(['cat', '/srv/ws/notes.md']), undefined);
+  // The joined-text scan stays as the best-effort shell-string guard, including inside argv elements.
+  assert.match(host.checkCommand(['printf', '%s', ' /srv/data/x ']), /managed gateway data/);
   assert.match(host.checkCommand('ls ~/backups'), /managed gateway data/);
   assert.equal(host.checkCommand('cat /srv/ws/notes.md && ls /home/owner/projects'), undefined);
   assert.equal(host.checkCommand('ls /srv/database'), undefined);
@@ -166,6 +184,18 @@ test('shell commands naming managed data are refused even inside an allowed root
     shell: { restrictToWorkspace: true, environment: { HOME: '/srv' } },
   });
   assert.match(scoped.checkCommand('echo x > /srv/data/x'), /managed gateway data/);
+  assert.match(scoped.checkCommand(['cp', 'notes.md', '/srv/data/notes.md']), /managed gateway data/);
+  assert.match(scoped.checkCommand(['cp', 'notes.md', '/outside/notes.md']), /path outside working dir/);
+  assert.equal(scoped.checkCommand(['cp', 'notes.md', '/srv/ws/notes.md']), undefined);
+  // A relative argv element is resolved against the cwd: only the element-boundary check can see
+  // that it names managed data, because the joined text holds no absolute path at all.
+  const cwdScoped = createExecutionPolicy({
+    roots: ['/srv/ws'],
+    protectedRoots: ['/srv/ws/data'],
+    shell: { restrictToWorkspace: true, environment: { HOME: '/srv/ws' } },
+  });
+  assert.match(cwdScoped.checkCommand(['cp', 'data/secret.md', 'out.md'], { cwd: '/srv/ws' }), /managed gateway data/);
+  assert.equal(cwdScoped.checkCommand('cp data/secret.md out.md', { cwd: '/srv/ws' }), undefined);
   assert.equal(scoped.checkCommand('echo x > /srv/ws/x'), undefined);
   assert.match(scoped.checkCommand('cat /etc/hosts'), /path outside working dir/);
   assert.doesNotMatch(scoped.checkCommand('cat /etc/hosts'), /restrict_to_workspace/);

@@ -362,10 +362,11 @@ export class HostExecutionEnv implements ExecutionEnv {
 	 * truncating write: a concurrent create by this process or by an outside editor makes the call fail
 	 * with `invalid` ("the file already exists") and nothing is overwritten. It stays inside the same
 	 * guarded roots as `writeFile`. `O_EXCL` never follows a final symbolic link, so the guard checks
-	 * the parent directory rather than a link target. Missing parent directories are created first,
-	 * matching the native write; the parent is then pinned by a descriptor and its real location is
-	 * checked through `/proc/self/fd`, and the file is created inside that exact directory, so a parent
-	 * swapped for a symbolic link after the check cannot redirect the create. It is not a lock and does
+	 * the parent directory rather than a link target. Missing parent directories are created one
+	 * component at a time through a descriptor-pinned, policy-verified ancestor: each new component is
+	 * created inside the directory the previous descriptor verified and is itself re-verified before
+	 * the next one is created, so no directory is ever created before its parent is verified and a
+	 * component swapped for a symbolic link after the check cannot redirect the chain. It is not a lock and does
 	 * not join another tool's in-process mutation queue; callers that need ordering with a concurrent
 	 * `write` keep the exclusive result, not a substitute write.
 	 */
@@ -376,8 +377,6 @@ export class HostExecutionEnv implements ExecutionEnv {
 	): Promise<Result<void, FileError>> {
 		return this.#guarded(path, context, false, async (absolute) => {
 			if (context.abortSignal?.aborted) return err<void, FileError>(new FileError("aborted", "aborted", absolute));
-			const prepared = await ensureParent(absolute);
-			if (prepared !== undefined) return err<void, FileError>(prepared);
 			return this.#inVerifiedParent(absolute, context, async (target) => {
 				try {
 					await writeFileHost(target, content, { flag: "wx" });
@@ -395,7 +394,11 @@ export class HostExecutionEnv implements ExecutionEnv {
 	/**
 	 * Run one create against the parent directory pinned by a descriptor, after checking where that
 	 * descriptor really is. `target` names the final component inside the pinned directory, so a later
-	 * swap of any parent path component cannot move the create elsewhere. Without procfs the guard
+	 * swap of any parent path component cannot move the create elsewhere. Missing parent components
+	 * below the nearest existing ancestor are created one at a time, each through the descriptor of
+	 * the last verified directory and re-verified before the next is created, so a missing directory
+	 * is never created before its parent is verified; a component a concurrent process created in the
+	 * meantime is accepted only after the same descriptor verification. Without procfs the guard
 	 * keeps its resolved-path check, as the module docs say.
 	 */
 	async #inVerifiedParent<T>(
@@ -404,15 +407,73 @@ export class HostExecutionEnv implements ExecutionEnv {
 		run: (target: string) => Promise<Result<T, FileError>>,
 	): Promise<Result<T, FileError>> {
 		const root = this.#descriptorRoot;
-		if (root === undefined) return run(absolute);
+		if (root === undefined) {
+			const prepared = await ensureParent(absolute);
+			return prepared === undefined ? run(absolute) : err<T, FileError>(prepared);
+		}
+		const leaf = basename(absolute);
 		let handle: FileHandle | undefined;
+		let actualParent: string | undefined;
+		const missing: string[] = [];
 		try {
-			handle = await open(dirname(absolute), constants.O_RDONLY | constants.O_DIRECTORY);
-			const actualParent = await readlink(`${root}/${handle.fd}`);
-			const denied = this.#policy.checkPath(join(actualParent, basename(absolute)));
-			if (denied !== undefined) return err<T, FileError>(denied);
+			// Nearest existing ancestor of the parent, and the still-missing components below it
+			// (deepest first). A component that exists but cannot be resolved (for example a dangling
+			// symbolic link) is refused rather than guessed at.
+			let current = dirname(absolute);
+			let canonical: string | undefined;
+			while (true) {
+				try {
+					canonical = await realpath(current);
+					break;
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+				}
+				const info = await lstat(current).then((value) => value, (error: NodeJS.ErrnoException) => {
+					if (error.code === "ENOENT") return undefined;
+					throw error;
+				});
+				if (info !== undefined) {
+					throw new FileError(
+						"permission_denied",
+						`Path contains a symbolic link that cannot be resolved: ${current}`,
+						current,
+					);
+				}
+				const ancestor = dirname(current);
+				if (ancestor === current) throw new FileError("not_found", "parent directory does not exist", absolute);
+				missing.push(basename(current));
+				current = ancestor;
+			}
+			// Pin the nearest existing ancestor and verify where the descriptor really points, so a
+			// component swapped for a symlink between the walk and the open is caught here.
+			handle = await open(canonical!, constants.O_RDONLY | constants.O_DIRECTORY);
+			actualParent = await readlink(`${root}/${handle.fd}`);
+			const deniedAncestor = this.#policy.checkPath(actualParent);
+			if (deniedAncestor !== undefined) return err<T, FileError>(deniedAncestor);
+			// Create the missing components shallowest first, each inside the descriptor of the last
+			// verified directory, and re-verify each new descriptor before the next component is
+			// created: no directory exists before its parent is verified.
+			while (missing.length > 0) {
+				const name = missing.pop()!;
+				try {
+					await mkdir(`${root}/${handle!.fd}/${name}`);
+				} catch (error) {
+					// A concurrent creator may have made this component; nothing is descended into before
+					// the descriptor verification below, which refuses a swapped or redirected directory.
+					if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+				}
+				const next = await open(`${root}/${handle!.fd}/${name}`, constants.O_RDONLY | constants.O_DIRECTORY);
+				const actual = await readlink(`${root}/${next.fd}`);
+				const denied = this.#policy.checkPath(actual);
+				await handle!.close().catch(() => undefined);
+				handle = next;
+				actualParent = actual;
+				if (denied !== undefined) return err<T, FileError>(denied);
+			}
+			const deniedLeaf = this.#policy.checkPath(join(actualParent!, leaf));
+			if (deniedLeaf !== undefined) return err<T, FileError>(deniedLeaf);
 			if (context.abortSignal?.aborted) return err<T, FileError>(new FileError("aborted", "aborted", absolute));
-			return await run(`${root}/${handle.fd}/${basename(absolute)}`);
+			return await run(`${root}/${handle!.fd}/${leaf}`);
 		} catch (error) {
 			return err<T, FileError>(openError(error, absolute));
 		} finally {
@@ -556,7 +617,9 @@ export class HostExecutionEnv implements ExecutionEnv {
 
 		let argv: string[];
 		try {
-			// The binary was resolved and validated once when this environment was created.
+			// The binary was resolved and validated once when this environment was created; the argv
+			// builder still re-resolves and re-checks the workspace, cwd and media paths right here,
+			// so pre-launch path revalidation keeps happening on every command.
 			argv = buildDirectBwrapArgsWithBinary(this.#bwrap.binary, {
 				workspace: this.#workspaceRoot,
 				cwd: cwd.value,
