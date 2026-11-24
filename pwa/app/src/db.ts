@@ -80,9 +80,13 @@ export async function loadSnapshot(db: AppDb) {
   return { events, outbox, threads, creates, view, openThread, resumeCursor, identity, push };
 }
 
-/** Drop retired event records; a failure only leaves them for the next pass. */
-export async function deleteEvents(db: AppDb, cursors: readonly number[]) {
-  if (!cursors.length) return;
-  const tx = db.transaction("events", "readwrite");
-  await Promise.all([...cursors.map((cursor) => tx.store.delete(cursor)), tx.done]);
+/** Drop retired event records and the outbox rows retired with them, together. */
+export async function retireRecords(db: AppDb, cursors: readonly number[], outboxKeys: readonly string[]) {
+  if (!cursors.length && !outboxKeys.length) return;
+  const tx = db.transaction(["events", "outbox"], "readwrite");
+  await Promise.all([
+    ...cursors.map((cursor) => tx.objectStore("events").delete(cursor)),
+    ...outboxKeys.map((key) => tx.objectStore("outbox").delete(key)),
+    tx.done,
+  ]);
 }

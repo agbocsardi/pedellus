@@ -218,19 +218,31 @@ export type ResponseMap = {
 
 /** Bidirectional overrides and isolates: never in a label, name or title. */
 const BIDI = /[\u202a-\u202e\u2066-\u2069]/u;
+/**
+ * Code points U+0020–U+007E and U+00A0–U+FFFF: no C0/C1 controls or DEL, and nothing outside
+ * the Basic Multilingual Plane (so no emoji such as U+1F600). Other format characters (e.g.
+ * U+200B) and U+2028/U+2029 are not excluded by this class; the gateway has always accepted them.
+ */
 const PRINTABLE = /^[\x20-\x7e\u00a0-\uffff]+$/u;
 
 export function validThreadId(value: unknown): value is ThreadId {
   return typeof value === "string" && LIMITS.threadIdPattern.test(value);
 }
 
-/** A thread title: 1–80 characters, not blank, no control, format or line/paragraph separators. */
+/**
+ * A thread title: 1–80 code points, not blank, and no character of Unicode category C (controls,
+ * format characters such as ZWJ, private use, unassigned, lone surrogates) or Zl/Zp. Emoji are
+ * allowed unless they need a joiner or variation selector of category Cf.
+ */
 export function validThreadTitle(value: unknown): value is string {
   return typeof value === "string" && Array.from(value).length <= LIMITS.threadTitleChars &&
     value.trim() !== "" && !/[\p{C}\p{Zl}\p{Zp}]/u.test(value);
 }
 
-/** A printable device label: 1–40 characters, no control or format characters, no outer spaces. */
+/**
+ * A device label: 1–40 UTF-16 units of `PRINTABLE` (BMP only, no C0/C1 controls), no bidi
+ * override or isolate, and no leading or trailing whitespace.
+ */
 export function validDeviceLabel(value: unknown): value is string {
   if (typeof value !== "string") return false;
   if (value.length < LIMITS.labelMinChars || value.length > LIMITS.labelMaxChars) return false;
@@ -239,7 +251,10 @@ export function validDeviceLabel(value: unknown): value is string {
   return PRINTABLE.test(value) && !BIDI.test(value);
 }
 
-/** `hello.agent`, the gateway's display name: 1–40 printable characters (spaces allowed). */
+/**
+ * `hello.agent`, the gateway's display name: 1–40 UTF-16 units of `PRINTABLE` (BMP only, no C0/C1
+ * controls), no bidi override or isolate, not blank; inner and outer spaces are allowed.
+ */
 export function validAgentName(value: unknown): value is string {
   if (typeof value !== "string" || value.length === 0) return false;
   if (value.length > LIMITS.agentNameMaxChars || value.trim() === "") return false;
@@ -256,10 +271,13 @@ export function validPairCode(value: unknown): value is string {
     [...value].every((c) => PAIR_ALPHABET.includes(c));
 }
 
-/** A preset `name` or `model`: 1–`max` characters, no whitespace, control or bidi characters. */
+/**
+ * A preset `name` or `model`: 1–`max` UTF-16 units, with no whitespace (`\s`), no C0 or C1
+ * control character or DEL (U+0000–U+001F, U+007F–U+009F, e.g. U+0085) and no bidi control.
+ */
 export function validPresetToken(value: unknown, max: number): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= max &&
-    !/[\u0000-\u001f\u007f\s]/u.test(value) && !BIDI.test(value);
+    !/[\u0000-\u001f\u007f-\u009f\s]/u.test(value) && !BIDI.test(value);
 }
 
 /**

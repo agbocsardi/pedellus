@@ -1,6 +1,6 @@
 import { DEFAULT_AGENT_NAME, QUEUE_CHANNEL } from "./db-constants";
 import {
-  deleteEvents, loadSnapshot, openAppDb, RETENTION,
+  loadSnapshot, openAppDb, retireRecords, RETENTION,
   type AppDb, type Identity, type Outgoing, type OutgoingState, type PushState, type StoredFile, type ThreadCreate,
 } from "./db";
 import {
@@ -38,6 +38,13 @@ export function openableLoginUrl(url: string): boolean {
   if (parsed.protocol === "https:") return true;
   if (parsed.protocol !== "http:") return false;
   return parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1";
+}
+
+/** Cursors of the questions still open: the latest event for each id, in state `open`. */
+function openQuestionCursors(events: readonly ChatEvent[]): Set<number> {
+  const latest = new Map<string, Extract<ChatEvent, { event: "question" }>>();
+  for (const ev of events) if (ev.event === "question") latest.set(ev.id, ev);
+  return new Set([...latest.values()].filter((q) => q.state === "open").map((q) => q.cursor));
 }
 
 /** The id of a split message part; `undefined` for anything else. */
@@ -154,6 +161,8 @@ export class Store {
    */
   init(): Promise<void> {
     this.disposed = false;
+    // Already open: never a second handle over the first.
+    if (this.db && this.loaded) return Promise.resolve();
     return this.opening ??= this.open().finally(() => { this.opening = undefined; });
   }
 
@@ -187,6 +196,7 @@ export class Store {
     this.storageBlocked = false;
     this.queueChanges ??= typeof BroadcastChannel === "undefined" ? undefined : new BroadcastChannel(QUEUE_CHANNEL);
     if (this.loaded) {
+      if (this.db && this.db !== db) this.db.close();
       this.db = db;
       this.changed();
       return;
@@ -333,42 +343,63 @@ export class Store {
 
   /**
    * Keep local history bounded (`RETENTION`): drop the oldest events at or below the replay
-   * checkpoint, which the gateway never resends, from memory and from IndexedDB. A split message
-   * goes as a whole, and superseded `thread` snapshots go too.
+   * checkpoint, which the gateway never resends, from memory and from IndexedDB. What the UI still
+   * acts on stays: an open question's card, and a long message unless all its parts go. A user
+   * message's outbox row goes with its echo, so an admitted send can never come back as "Not
+   * sent" once the echo that hid it is gone. Superseded `thread` snapshots go too.
    */
   private async retire() {
     const floor = this.resumeCursor ?? 0;
     if (!this.db || this.durableWriteFailed || floor === 0) return;
     const dropped: number[] = [];
-    const cut = (thread: ThreadId, keepAbove: (ev: ChatEvent, index: number, length: number) => boolean) => {
+    const outboxKeys: string[] = [];
+    const fileIds: string[] = [];
+    /** Retire `thread`'s oldest retirable events, in cursor order, while `take` accepts them. */
+    const cut = (thread: ThreadId, take: (ev: ChatEvent, taken: number) => boolean) => {
       const events = this.events.get(thread);
       if (!events) return;
-      let n = 0;
-      while (n < events.length && events[n].cursor <= floor && !keepAbove(events[n], n, events.length)) n++;
-      // Never split a long message: its other parts go with it, or the cut stops before it.
-      const split = n > 0 ? splitId(events[n - 1]) : undefined;
-      if (split !== undefined) {
-        while (n < events.length && splitId(events[n]) === split) {
-          if (events[n].cursor > floor) {
-            while (n > 0 && splitId(events[n - 1]) === split) n--;
-            break;
-          }
-          n++;
+      const open = openQuestionCursors(events);
+      const out = new Set<number>();
+      for (let i = 0; i < events.length; i++) {
+        const ev = events[i];
+        if (ev.cursor > floor || !take(ev, out.size)) break;
+        if (!open.has(ev.cursor)) out.add(i);
+      }
+      // Never split a long message: all its parts go when every one is at or below the
+      // checkpoint, otherwise none does.
+      const parts = new Map<string, number[]>();
+      events.forEach((ev, i) => {
+        const id = splitId(ev);
+        if (id !== undefined) parts.set(id, [...parts.get(id) ?? [], i]);
+      });
+      for (const [, indices] of parts) {
+        if (!indices.some((i) => out.has(i))) continue;
+        const whole = indices.every((i) => events[i].cursor <= floor);
+        for (const i of indices) {
+          if (whole) out.add(i);
+          else out.delete(i);
         }
       }
-      if (n > 0) dropped.push(...this.forget(thread, events.splice(0, n)));
+      if (!out.size) return;
+      const removed = events.filter((_, i) => out.has(i));
+      this.events.set(thread, events.filter((_, i) => !out.has(i)));
+      dropped.push(...this.forget(thread, removed, outboxKeys, fileIds));
     };
     for (const thread of [...this.events.keys()]) {
-      cut(thread, (_ev, index, length) => length - index <= RETENTION.perThread);
+      const excess = (this.events.get(thread)?.length ?? 0) - RETENTION.perThread;
+      if (excess > 0) cut(thread, (_ev, taken) => taken < excess);
     }
     let total = 0;
     for (const events of this.events.values()) total += events.length;
     if (total > RETENTION.total) {
       const old: number[] = [];
-      for (const events of this.events.values()) for (const ev of events) if (ev.cursor <= floor) old.push(ev.cursor);
+      for (const events of this.events.values()) {
+        const open = openQuestionCursors(events);
+        for (const ev of events) if (ev.cursor <= floor && !open.has(ev.cursor)) old.push(ev.cursor);
+      }
       old.sort((a, b) => a - b);
       const threshold = old[Math.min(total - RETENTION.total, old.length) - 1];
-      if (threshold !== undefined) for (const thread of [...this.events.keys()]) cut(thread, (ev) => ev.cursor > threshold);
+      if (threshold !== undefined) for (const thread of [...this.events.keys()]) cut(thread, (ev) => ev.cursor <= threshold);
     }
     const stale = this.staleThreadEvents.filter((cursor) => cursor <= floor);
     this.staleThreadEvents = this.staleThreadEvents.filter((cursor) => cursor > floor);
@@ -376,16 +407,23 @@ export class Store {
     dropped.push(...stale);
     if (!dropped.length) return;
     if (dropped.length > stale.length) this.changed();
-    await deleteEvents(this.db, dropped);
+    await retireRecords(this.db, dropped, outboxKeys);
+    if (outboxKeys.length) this.queueChanges?.postMessage(null);
+    if (fileIds.length) await this.deleteFiles(fileIds);
   }
 
-  /** Forget the derived state of retired events; returns their cursors. */
-  private forget(thread: ThreadId, removed: ChatEvent[]): number[] {
+  /** Forget the derived state of retired events (and their outbox rows); returns their cursors. */
+  private forget(thread: ThreadId, removed: ChatEvent[], outboxKeys: string[], fileIds: string[]): number[] {
     this.searchCache = undefined;
     for (const ev of removed) {
       this.seenCursors.delete(ev.cursor);
       this.searchText.delete(ev.cursor);
       if (ev.event === "message" && ev.part) this.splitMessages.delete(`${thread}\u0000${ev.id}`);
+      if (ev.event === "message" && ev.role === "user" && ev.key !== undefined && this.outgoing(thread, ev.key)) {
+        fileIds.push(...this.outbox.get(ev.key)!.fileIds ?? []);
+        this.outbox.delete(ev.key);
+        outboxKeys.push(ev.key);
+      }
       if (ev.event === "reaction" && this.reactions.get(thread)?.get(ev.message)?.cursor === ev.cursor) {
         this.reactions.get(thread)!.delete(ev.message);
       }

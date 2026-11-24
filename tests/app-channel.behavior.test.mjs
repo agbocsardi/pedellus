@@ -2443,6 +2443,10 @@ test('hello.presets at the gateway bounds survive the app parser; past them they
   assert.deepEqual(parsePresets(projected), projected, 'the app keeps every preset the gateway sends');
   assert.deepEqual(parsePresets([...projected, { name, model: 'dup/model' }]), projected, 'duplicate names are dropped');
   assert.equal(parsePresets(undefined), undefined);
+  // C1 controls (U+0080–U+009F, e.g. NEL U+0085) and DEL are refused on both sides.
+  assert.deepEqual(appPresetInfos([{ name: 'nel\u0085x', provider, modelId: 'alpha' },
+    { name: 'ok', provider, modelId: 'a\u009fb' }, { name: 'del\u007f', provider, modelId: 'alpha' }]), []);
+  assert.deepEqual(parsePresets([{ name: 'nel\u0085x', model: 'a/b' }, { name: 'ok', model: 'a/\u0080b' }]), []);
   assert.equal(parsePresets(Array.from({ length: LIMITS.maxPresets + 5 }, (_, i) => ({ name: `p${i}`, model: 'a/b' }))).length,
     LIMITS.maxPresets);
 });

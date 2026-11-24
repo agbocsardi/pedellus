@@ -10,7 +10,7 @@ import { canRecord } from "./recorder";
 import type { NewAttachment, Store } from "./store";
 import { archivedLabel } from "./ThreadList";
 import { AUDIO_ICON, CommandItem, FILE_ICON, Icon, IMAGE_ICON, PLUS_ICON, REMOVE_ICON, SEND_ICON } from "./ui";
-import { attachmentKind, formatBytes, uploadLocal } from "./uploads";
+import { attachmentKind, forgetUpload, formatBytes, uploadLocal } from "./uploads";
 import { useVoiceRecorder } from "./useVoiceRecorder";
 
 const WRENCH_ICON = "M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.8-3.8a6 6 0 0 1-7.9 7.9l-6.9 6.9a2.1 2.1 0 0 1-3-3l6.9-6.9a6 6 0 0 1 7.9-7.9l-3.8 3.8Z";
@@ -169,12 +169,18 @@ export function Composer({
     if (saving.current || !store.canWrite(thread)) return;
     saving.current = true;
     setError("");
+    // Pin first: `createOutgoing` publishes the new row, and the list may commit it before the
+    // await below resumes; a pin set after that would leave the bubble out of view.
+    pinned.current = true;
     try {
-      const m = await store.createOutgoing(thread, value, retryKey, attach?.map(toNewAttachment));
+      const sent = attach?.map(toNewAttachment);
+      const m = await store.createOutgoing(thread, value, retryKey, sent);
+      // An id the entry already carries is owned by it now; one that finished uploading after the
+      // snapshot stays with the uploader, which the outbox pass asks before uploading again.
+      for (const file of sent ?? []) if (file.uploadId) forgetUpload(file.id);
       if (!retryKey) setDrafts((prev) => prev[thread] === text ? { ...prev, [thread]: "" } : prev);
       // The files now live in the outbox (blob and ids), so the composer row goes.
       if (attach?.length) dropPicks(thread, attach);
-      pinned.current = true;
       conn.sendOutgoing(m);
     } catch (err) {
       setError(err instanceof DOMException && err.name === "QuotaExceededError"
@@ -263,6 +269,7 @@ export function Composer({
 
   function removePick(threadId: string, id: string) {
     releasePreviews((picks[threadId] ?? []).filter((pick) => pick.id === id));
+    forgetUpload(id);
     setPicks((prev) => ({
       ...prev,
       [threadId]: (prev[threadId] ?? []).filter((pick) => pick.id !== id),

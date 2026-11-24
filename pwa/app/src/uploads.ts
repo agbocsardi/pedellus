@@ -78,16 +78,32 @@ export type UploadStep =
   | { kind: "failed"; note: string };
 
 const inflight = new Map<string, Promise<UploadOutcome>>();
+/**
+ * Accepted upload ids by local file id, not yet frozen onto a queued send. An eager upload that
+ * finishes after Send was tapped (but before the outbox entry was saved) lands here, and the
+ * outbox's pass picks it up instead of POSTing the bytes again. Bounded; ids are dropped once
+ * consumed (`forgetUpload`), because an admitted send uses each one up.
+ */
+const accepted = new Map<string, string>();
+const MAX_ACCEPTED = 100;
 
 /**
  * The one upload path for a local file, whether it was picked in the composer or is waiting in
  * the outbox. `fileId` is the local id the file keeps from pick to outbox, so a send queued while
- * its file is still uploading joins that request instead of uploading the bytes a second time.
+ * its file is uploading (or just after) reuses that request's result instead of uploading again.
  */
 export async function uploadLocal(fileId: string, blob: Blob, name: string, type: string): Promise<UploadStep> {
+  const done = accepted.get(fileId);
+  if (done !== undefined) return { kind: "done", id: done };
   let pending = inflight.get(fileId);
   if (!pending) {
-    pending = uploadFile(blob, name, type).finally(() => inflight.delete(fileId));
+    pending = uploadFile(blob, name, type).then((outcome) => {
+      if (outcome.ok) {
+        accepted.set(fileId, outcome.id);
+        if (accepted.size > MAX_ACCEPTED) accepted.delete(accepted.keys().next().value!);
+      }
+      return outcome;
+    }).finally(() => inflight.delete(fileId));
     inflight.set(fileId, pending);
   }
   const outcome = await pending;
@@ -97,6 +113,11 @@ export async function uploadLocal(fileId: string, blob: Blob, name: string, type
     return { kind: "retry", rateLimited, delayMs: rateLimited ? 10_000 : 20_000 };
   }
   return { kind: "failed", note: uploadErrorText(outcome.error, name) };
+}
+
+/** The file's upload id is now owned by a queued send (or the file was dropped): never reuse it. */
+export function forgetUpload(fileId: string): void {
+  accepted.delete(fileId);
 }
 
 /** One owner-facing line for a failed upload; never echoes gateway internals. */
