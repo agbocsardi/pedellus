@@ -336,7 +336,11 @@ interface DirectoryCheckResult {
   readonly existingDataDir?: string;
   /** True when dataDir is disjoint and valid (even if not created yet). */
   readonly dataDirValid: boolean;
-  /** Canonical dataDir usable for a gateway socket probe (exists, valid, <= 100 bytes). */
+  /**
+   * Canonical dataDir usable for a gateway socket probe. Requires the full read-only validation
+   * the CLI's socket lookup performs — configured roots included — so an endpoint a client
+   * command would refuse (a bad root, a non-private dataDir) is never probed.
+   */
   readonly socketDir?: string;
 }
 
@@ -423,7 +427,9 @@ async function checkDirectories(
   return {
     ...(existingDataDir === undefined ? {} : { existingDataDir }),
     dataDirValid,
-    ...(existingDataDir !== undefined && socketBytes <= SOCKET_PATH_LIMIT ? { socketDir: existingDataDir } : {}),
+    ...(existingDataDir !== undefined && dataDirValid && socketBytes <= SOCKET_PATH_LIMIT
+      ? { socketDir: existingDataDir }
+      : {}),
   };
 }
 

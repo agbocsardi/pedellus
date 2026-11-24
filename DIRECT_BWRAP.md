@@ -44,10 +44,13 @@ with `--` are not parsed as Bubblewrap options.
 `resolveDirectBwrapPath` follows Python's preference for `/usr/bin/bwrap` and then
 PATH when no path is configured. It validates that the binary identifies as
 `bubblewrap` version 0.9 or newer and caches that validation per canonical path —
-pinned by the file's inode, size and mtime, not the pathname alone. Every launch
-rechecks that identity (`revalidateBwrapBinary`): a path that now names a
-different file, or a file overwritten in place, is re-validated in full before it
-is executed, and a binary that cannot be revalidated fails the launch. An explicitly configured path that is
+pinned by the file's inode, size and mtime, not the pathname alone. The version
+answer itself is bound to the file: the identity is observed before and after the
+probe, and a file that changed in between fails closed and caches nothing, so an
+answer can never be attributed to an executable that is no longer the one on disk.
+Every launch rechecks that identity (`revalidateBwrapBinary`): a path that now
+names a different file, or a file overwritten in place, is re-validated in full
+before it is executed, and a binary that cannot be revalidated fails the launch. An explicitly configured path that is
 missing, not executable, or not Bubblewrap throws; a distro path that exists but
 fails validation also throws instead of falling through to an unprofiled PATH
 build. There is no fallback to another binary and no unsandboxed execution path.

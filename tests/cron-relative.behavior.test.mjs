@@ -280,3 +280,26 @@ test("the model-facing cron tool accepts after_seconds and acknowledges the stor
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("times beyond the representable date range are refused at admission and settle when stored", async () => {
+  const { MAX_DATE_MS, cronScheduleText, materializeCronSchedule, nextCronOccurrence } =
+    await load(`${pkg}/dist/automation/cron-schedule.js`);
+  const now = Date.now();
+  // Admission: a one-shot instant or interval anchor beyond the shared bound is refused before
+  // any job or timer state is written; the bound itself is accepted.
+  assert.throws(
+    () => materializeCronSchedule({ kind: "at", at: MAX_DATE_MS + 1 }, now),
+    /representable date range/,
+  );
+  assert.throws(
+    () => materializeCronSchedule({ kind: "every", everyMs: MAX_DATE_MS }, now),
+    /representable date range/,
+  );
+  assert.equal(materializeCronSchedule({ kind: "at", at: MAX_DATE_MS }, now).at, MAX_DATE_MS);
+  // Stored legacy records beyond the bound stay safe: no future slot is armed and the schedule
+  // text renders honestly instead of throwing or fabricating a valid date.
+  assert.equal(nextCronOccurrence({ kind: "at", at: MAX_DATE_MS + 1 }, now), null);
+  assert.equal(nextCronOccurrence({ kind: "every", everyMs: 1_000, anchorMs: MAX_DATE_MS + 1 }, now), null);
+  assert.match(cronScheduleText({ kind: "at", at: MAX_DATE_MS + 1 }), /once at an unrepresentable time/);
+  assert.match(cronScheduleText({ kind: "every", everyMs: 60_000, anchorMs: MAX_DATE_MS + 5 }), /from an unrepresentable time/);
+});

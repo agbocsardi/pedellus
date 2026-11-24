@@ -18,6 +18,7 @@ import type {
 } from "@earendil-works/pi-durable";
 import {
   CRON_DEFAULT_TIME_ZONE,
+  MAX_DATE_MS,
   materializeCronSchedule,
   nextCronOccurrence,
   parseCronScheduleRequest,
@@ -695,6 +696,18 @@ const UNHEALTHY_TASK: ReadonlySet<CronTaskStatus> = new Set([
   "parked", "failed", "aborted", "orphaned", "faulted", "missing",
 ]);
 
+/**
+ * Sanitize one stored instant before it is projected: a legacy or damaged record can carry a time
+ * no renderer, receipt or operator wire bound can print. It projects as `null` — no renderable
+ * time — instead of throwing, so such jobs stay inspectable and cancellable; admission and timer
+ * arming refuse out-of-range times outright, so nothing new is written in that state.
+ */
+function renderableInstant(value: number | null): number | null {
+  return value !== null && Number.isSafeInteger(value) && value >= 0 && value <= MAX_DATE_MS
+    ? value
+    : null;
+}
+
 function taskSummaryOf(
   taskId: number, task: TaskInspection | undefined,
   record: Awaited<ReturnType<Harness["getTask"]>>,
@@ -712,7 +725,9 @@ function taskSummaryOf(
   return {
     taskId,
     status,
-    scheduledAtMs: record === undefined ? null : parseOccurrenceInput(record.input)?.scheduledAtMs ?? null,
+    scheduledAtMs: renderableInstant(
+      record === undefined ? null : parseOccurrenceInput(record.input)?.scheduledAtMs ?? null,
+    ),
     error: blocked?.error !== undefined
       ? errorText(blocked.error)
       : outcome?.status === "failed" || outcome?.status === "faulted" ? outcome.error.message : null,
@@ -802,6 +817,7 @@ async function viewsOf(
       job: copyJob(job),
       status: jobStatusOf(job, timer, execution, target),
       nextAtMs: timer !== null && !TERMINAL_TASK.has(timer.status) ? timer.scheduledAtMs : null,
+      // `timer.scheduledAtMs` above is already `renderableInstant`-sanitized by taskSummaryOf.
       timer,
       execution,
       target,
@@ -1548,7 +1564,9 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
           return {
             jobId: existing.id,
             timerTaskId: existing.timerTaskId,
-            nextAtMs: timer === undefined ? null : parseOccurrenceInput(timer.input)?.scheduledAtMs ?? null,
+            nextAtMs: renderableInstant(
+              timer === undefined ? null : parseOccurrenceInput(timer.input)?.scheduledAtMs ?? null,
+            ),
             deduplicated: true,
           };
         }
@@ -1564,6 +1582,11 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
             ? schedule.anchorMs
             : nextCronOccurrence(schedule, now);
         if (firstAtMs === null) throw new TypeError("schedule has no future occurrence");
+        // The shared renderable bound, enforced before the job record or its timer is written: a
+        // commit beyond it would arm an unrenderable instant no receipt or renderer can print.
+        if (firstAtMs > MAX_DATE_MS) {
+          throw new TypeError("the first occurrence is beyond the representable date range");
+        }
         const jobId = `cron-${randomUUID()}`;
         const generation = 1;
         const timerTaskId = await tx.createTask(

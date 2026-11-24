@@ -481,6 +481,15 @@ rather than rewritten. Stored values are safe integers; a next occurrence that w
 safe-integer range fails visibly instead of wrapping. Croner's own parser supports years 1-9999
 and bounds its search near year 3000/9999; that is a library limit, not an added product cap.
 
+One added product cap does exist: every accepted time — a one-shot instant, an interval anchor,
+an armed timer instant and each recurrence — must stay inside the range a JavaScript `Date` can
+represent (8.64e15 epoch milliseconds, `MAX_DATE_MS` in `cron-schedule.ts`). Anything beyond it is
+refused before any job or timer state is written, because no receipt or renderer can print it; the
+operator wire holds the same bound. A legacy record that already holds such a time is never
+fabricated into a valid schedule: its next time projects as "none" and its schedule line reads
+`once at an unrepresentable time` (or `every Ns from an unrepresentable time`), while the job
+itself stays inspectable and cancellable.
+
 ## Channel outbox
 
 The normal terminal commit of a settled run (success or error), isolated or origin, carries its

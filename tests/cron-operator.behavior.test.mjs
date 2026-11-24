@@ -24,6 +24,7 @@ const [
   { gatewaySocketPath, serveLocalGateway },
   { connectLocalGateway, LocalRemoteError },
   { CronCommandError, CronUsageError, parseCronInvocation, runCronCommand },
+  { MAX_DATE_MS },
   { createModels, fauxAssistantMessage, fauxProvider },
   { BACKGROUND_CONTEXT },
 ] = await Promise.all([
@@ -34,6 +35,7 @@ const [
   import(new URL("../dist/local/server.js", import.meta.url).href),
   import(new URL("../dist/local/client.js", import.meta.url).href),
   import(new URL("../dist/automation/operator-cli.js", import.meta.url).href),
+  import(new URL("../dist/automation/cron-schedule.js", import.meta.url).href),
   import(`${modules}/pi-ai/dist/index.js`),
   import(`${modules}/chord/dist/context/index.js`),
 ]);
@@ -472,6 +474,64 @@ test("malformed cron mutation replies are held as unknown, never rendered as suc
     () => runCronCommand({ client, command: { kind: "cancel", jobId: "cron-x" }, output: capture().output, context }),
     (error) => error instanceof CronCommandError && /no scheduled job with id cron-x/.test(error.message),
   );
+});
+
+test("out-of-range times are refused before commit, and legacy out-of-range jobs stay usable", { timeout: 60_000 }, async (t) => {
+  const store = await syntheticGateway(t, "range");
+  const origin = await store.gateway.conversationFor(CLI_CHAT, context);
+  const client = await store.connect("operator");
+
+  // A one-shot instant and an interval anchor beyond the shared bound are refused definitively,
+  // before any job or timer state is written.
+  await assert.rejects(
+    () => client.cronCreate(CLI_CHAT, schedule({
+      idempotencyKey: "range-at",
+      schedule: { kind: "at", at: MAX_DATE_MS + 1 },
+    }), context),
+    (error) => error instanceof LocalRemoteError && error.code === "invalid"
+      && /representable date range/.test(error.message),
+  );
+  await assert.rejects(
+    () => client.cronCreate(CLI_CHAT, schedule({
+      idempotencyKey: "range-every",
+      schedule: { kind: "every", everyMs: MAX_DATE_MS },
+    }), context),
+    (error) => error instanceof LocalRemoteError && error.code === "invalid"
+      && /representable date range/.test(error.message),
+  );
+  // The refusals committed nothing: no job, no timer, no receipt.
+  assert.equal((await store.harness.snapshot(CronJobsDoc, origin.id, context))?.jobs.length ?? 0, 0);
+
+  // A legacy record with an out-of-range stored schedule (written before the bound existed)
+  // stays inspectable and cancellable end-to-end: list, show and cancel agree on it.
+  const created = await client.cronCreate(CLI_CHAT, schedule({ idempotencyKey: "range-legacy" }), context);
+  assert.equal(created.status, "scheduled");
+  await store.harness.commit(async (tx) => {
+    const doc = await tx.doc(CronJobsDoc, origin.id, context);
+    const job = doc.jobs.find((entry) => entry.id === created.jobId);
+    job.schedule = { kind: "at", at: MAX_DATE_MS + 1 };
+  }, context);
+
+  const listed = capture();
+  await runCronCommand({ client, command: { kind: "list" }, output: listed.output, context });
+  assert.match(listed.text(), new RegExp(`${created.jobId}  scheduled .*\(once at an unrepresentable time\)`));
+
+  const shown = capture();
+  await runCronCommand({ client, command: { kind: "show", jobId: created.jobId }, output: shown.output, context });
+  assert.match(shown.text(), /schedule: once at an unrepresentable time/);
+  assert.match(shown.text(), /status: scheduled/);
+
+  const cancelled = capture();
+  await runCronCommand({
+    client,
+    command: { kind: "cancel", jobId: created.jobId },
+    output: cancelled.output,
+    context,
+  });
+  assert.match(cancelled.text(), new RegExp(`^Cancelled ${created.jobId}\.`));
+  const after = capture();
+  await runCronCommand({ client, command: { kind: "list" }, output: after.output, context });
+  assert.match(after.text(), new RegExp(`${created.jobId}  cancelled`));
 });
 
 test("the cron command refuses ambiguous and incomplete forms before anything is sent", () => {

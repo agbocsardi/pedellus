@@ -81,11 +81,31 @@ function isExecutableFile(path: string): boolean {
 function validateBwrapBinary(binary: string, label: string, force = false): string {
 	if (!force && validatedBwrap.has(binary)) return binary;
 	if (!isExecutableFile(binary)) throw new Error(`${label} is not an executable file: ${binary}`);
+	// The version answer must be bound to the same file observed before and after the probe: pin
+	// the identity, run the probe, re-stat, and fail closed on any change before the answer is
+	// even read. A file replaced or overwritten mid-probe is never cached as validated, so the
+	// answer cannot be attributed to an executable that is no longer the one on disk.
+	let before;
+	let after;
+	try {
+		before = statSync(binary);
+	} catch {
+		throw new Error(`${label} is not an executable file: ${binary}`);
+	}
 	const result = spawnSync(binary, ["--version"], {
 		encoding: "utf8",
 		env: { PATH: "/usr/bin:/bin", LANG: "C" },
 		timeout: 5000,
 	});
+	try {
+		after = statSync(binary);
+	} catch {
+		throw new Error(`${label} is not an executable file: ${binary}`);
+	}
+	if (before.dev !== after.dev || before.ino !== after.ino
+		|| before.size !== after.size || before.mtimeMs !== after.mtimeMs) {
+		throw new Error(`${label} changed while being validated: ${binary}`);
+	}
 	const match = /^bubblewrap (\d+)\.(\d+)\.(\d+)/.exec((result.stdout ?? "").trim());
 	if (result.error || result.status !== 0 || !match) {
 		throw new Error(
@@ -95,8 +115,7 @@ function validateBwrapBinary(binary: string, label: string, force = false): stri
 	if (Number(match[1]) === 0 && Number(match[2]) < 9) {
 		throw new Error(`Bubblewrap ${match[0].replace("bubblewrap ", "")} at ${binary} is too old; 0.9 or newer is required`);
 	}
-	const info = statSync(binary);
-	validatedBwrap.set(binary, { dev: info.dev, ino: info.ino, size: info.size, mtimeMs: info.mtimeMs });
+	validatedBwrap.set(binary, { dev: after.dev, ino: after.ino, size: after.size, mtimeMs: after.mtimeMs });
 	return binary;
 }
 
@@ -106,7 +125,9 @@ function validateBwrapBinary(binary: string, label: string, force = false): stri
  * executable itself: this check compares the launch-time file against the inode/size/mtime
  * identity pinned at validation time, and a mismatch (a replaced, hard-linked-over or
  * overwritten binary) re-runs the full version validation against the file that is actually
- * there instead of trusting the pathname cache. Failure semantics stay the established ones: a binary that cannot be revalidated throws,
+ * there instead of trusting the pathname cache. The re-run probe is itself bound: it observes
+ * the file's identity before and after asking for the version, fails closed on any change, and
+ * never caches a mismatch. Failure semantics stay the established ones: a binary that cannot be revalidated throws,
  * and a configured value never falls back to another executable.
  */
 export function revalidateBwrapBinary(binary: string): string {

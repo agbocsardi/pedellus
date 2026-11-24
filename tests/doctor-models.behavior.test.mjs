@@ -289,6 +289,33 @@ test("doctor catches missing memory files, symlinked memory dirs, unknown provid
   assert.match(appRes.text, /npm run install:pwa && npm run build:pwa/);
 });
 
+test("a bad configured root disables gateway probing even while a listener is live", async () => {
+  // The CLI's read-only socket lookup refuses this configuration (a root that is a regular
+  // file), so the doctor must not probe its endpoint either; the listener stays live throughout.
+  const { path } = await setup((config, root) => ({
+    ...config,
+    extraAllowedDirs: ["not-a-dir.txt"],
+  }));
+  await writeFile(join(path, "..", "not-a-dir.txt"), "x\n");
+  const dataDir = join(path, "..", "data");
+  await mkdir(dataDir, { mode: 0o700 });
+  const server = createServer();
+  await new Promise((resolveListen) => server.listen(join(dataDir, "gateway.sock"), resolveListen));
+  let probed = 0;
+  try {
+    const result = await doctor(path, {
+      env: { OPENAI_API_KEY: "sk-SYNTHETIC-ENV" },
+      socketProbe: async () => { probed += 1; return "listening"; },
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.text, /\[FAIL\] extraAllowedDirs\[0\]: configured directory is not a directory/);
+    assert.match(result.text, /\[WARN\] gateway: not running/, "no probe result for a refused endpoint");
+    assert.equal(probed, 0, "an endpoint the CLI would refuse is never probed");
+  } finally {
+    await new Promise((resolveClose) => server.close(resolveClose));
+  }
+});
+
 test("stored credentials, configured env references and missing credentials are named, never shown", async () => {
   const { path, dataDir } = await setup((config) => ({
     ...config,

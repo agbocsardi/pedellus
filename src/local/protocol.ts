@@ -10,6 +10,7 @@
 import type { Cursor } from "@earendil-works/pi-durable";
 import type { CronOperatorCancelOutcome, CronOperatorCreateOutcome, CronOperatorJob, CronOperatorListing, CronOperatorRow } from "../automation/operator.js";
 import { CRON_OPERATOR_LIMITS } from "../automation/operator.js";
+import { MAX_DATE_MS } from "../automation/cron-schedule.js";
 import type { CronScheduleInput } from "../automation/cron.js";
 import type { BackgroundStatus } from "../background-status.js";
 import type { AppDeviceListing, AppPairingCreated, AppPairingRefusal } from "../channels/app.js";
@@ -237,13 +238,11 @@ function revokeResult(what: string) {
   };
 }
 
-/**
- * Every job-view timestamp must be renderable before a success receipt: the operator renderer
- * prints `new Date(ms).toISOString()`, which throws beyond the platform date range. The producer
- * itself refuses dates outside this range (cron-schedule's MAX_DATE_MS), so the same bound here
- * accepts every same-version reply while rejecting one the terminal could not print.
- */
-const RENDERABLE_DATE_MS = 8.64e15;
+// The one shared renderable-time bound (cron-schedule's `MAX_DATE_MS`): the producer refuses it
+// at admission and arming and sanitizes legacy records to null, so a timestamp beyond it in a
+// reply is malformed, not a same-version value, and is rejected before any success receipt —
+// the operator renderer prints `new Date(ms).toISOString()`, which would throw on it.
+const RENDERABLE_DATE_MS = MAX_DATE_MS;
 
 /** Count text in Unicode code points: the producer's `projectedLine` truncates by code point, so
  * a legal line with astral characters can be up to twice its limit in UTF-16 units. */

@@ -237,3 +237,33 @@ test('a replaced bwrap executable is re-validated by identity, not by pathname',
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('a version answer from a file that changes mid-probe is never accepted or cached', { timeout: 30_000 }, async () => {
+  if (process.platform !== 'linux') return; // Bubblewrap resolution is Linux-only.
+  const { mkdir, mkdtemp, readFile, rm, writeFile } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { resolveDirectBwrapPath, buildDirectBwrapArgsWithBinary } =
+    await import(new URL('../dist/execution/direct-bwrap.js', import.meta.url).href);
+  const root = await mkdtemp(join(tmpdir(), 'nanobot-bwrap-midprobe-'));
+  const fake = join(root, 'bwrap');
+  const workspace = join(root, 'ws');
+  const stable = '#!/bin/sh\necho "bubblewrap 0.10.0"\n';
+  // Defensive fixture: executing the probe rewrites the file in place, so the identity observed
+  // after the probe differs from the one observed before it.
+  const selfRewriting = `#!/bin/sh\ncat > "$0" <<'REWRITTEN'\n${stable}REWRITTEN\necho "bubblewrap 0.10.0"\n`;
+  try {
+    await mkdir(workspace);
+    await writeFile(fake, selfRewriting, { mode: 0o755 });
+    // The probe's version answer is bound to the file identity: a file that changed while the
+    // probe ran fails closed and caches nothing, even though the answer looked valid.
+    assert.throws(() => resolveDirectBwrapPath(fake), /changed while being validated/);
+    assert.equal(buildDirectBwrapArgsWithBinary(fake, { workspace, command: ['/bin/sh', '-c', 'true'] }).length > 0, true);
+    // The rewritten, now-stable file validates normally on the next attempt.
+    assert.equal(resolveDirectBwrapPath(fake), fake);
+    assert.equal(buildDirectBwrapArgsWithBinary(fake, { workspace, command: ['/bin/sh', '-c', 'true'] })[0], fake);
+    assert.equal(await readFile(fake, 'utf8'), stable);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
