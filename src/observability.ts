@@ -10,7 +10,7 @@ const NUMBERS = new Set([
   "conversation.id", "submission.id", "task.id", "entry.id", "answer.entry_id", "update.id",
   "message.id", "chat.id", "queue.depth", "attachments", "attempt", "source.age_ms", "cooldown.ms",
   "usage.input", "usage.output", "usage.cache_read", "usage.cache_write", "cost.total",
-  "candidateTopics", "matchedTopics", "latencyMs",
+  "candidateTopics", "matchedTopics", "latencyMs", "topicGate", "historyGate", "topTopicProb",
 ]);
 const IDENTIFIERS = new Set([
   "provider", "model", "api", "reasoning", "task.name", "tool.name", "entry.kind", "phase",

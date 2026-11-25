@@ -33,15 +33,20 @@ inject bodies.
 Proactive mode requires the configured classifier and replaces the system prompt's
 memory tree with a static recall notice. For a new text-bearing owner input in an
 authenticated mapped chat, the host sends the configured classifier up to 4,000
-characters of the new message and up to 6,000 characters of recent owner/assistant
-text (no tool calls, results or images). It also sends paths and descriptions of
-unloaded workspace topic notes discovered on disk, not their bodies, episode
-summaries or other conversations. Startup, background runs, and resets do not
-classify by themselves. This works without Code Mode and grants no tools.
+characters of the new message, up to 8,000 characters of recent owner/assistant
+text (no tool calls, results or images), any topic paths or history-recall nudges
+already hinted earlier in the active episode, and the paths and descriptions of
+remaining unloaded workspace topic notes in shared `state` (so companion gates and
+choice questions see the same topic list, never topic bodies, episode summaries or
+other conversations). Startup, background runs, and resets do not classify by
+themselves. This works without Code Mode and grants no tools.
 
-In one classifier request, a yes/no relevance gate controls whether choice
-probabilities surface topic paths. Lists over 255 notes are split into balanced
-chunks (up to 255 notes each), each paired with its own yes/no relevance gate and
+In one classifier request, a yes/no relevance gate judges whether reading an
+additional topic note from the candidate list would add material new value at this
+point in the conversation; choice probabilities then surface top matching topic
+paths (topics already hinted earlier in the same episode are not re-suggested).
+Lists over 255 notes are split into balanced chunks (up to 255 notes each), each
+paired with its own `availableTopics_<n>` state map and yes/no relevance gate, and
 ranked across passing chunks by `gateProbability * choiceProbability`. When recall
 tools are on, a separate yes/no gate can also suggest looking up prior conversations
 with `memory_search` or `memory_browse` (suppressed if reopened with `agentHistory: false`).

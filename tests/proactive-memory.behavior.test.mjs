@@ -155,8 +155,19 @@ test("one Jev call ranks fresh unloaded notes across choice chunks and replaces 
   assert.equal(classified.length, 1);
   const { latencyMs, ...metadata } = classified[0];
   assert.ok(Number.isFinite(latencyMs));
-  assert.deepEqual(metadata, { candidateTopics: 256, matchedTopics: 3, needsHistoryRecall: true });
-  assert.deepEqual(calls[0].state, { newMessage: "Check our earlier choice" });
+  assert.deepEqual(metadata, {
+    candidateTopics: 256,
+    matchedTopics: 3,
+    needsHistoryRecall: true,
+    topicGate: 0.8,
+    historyGate: 0.9,
+    topTopicProb: 0.95,
+  });
+  assert.equal(calls[0].state.newMessage, "Check our earlier choice");
+  assert.equal(Object.keys(calls[0].state.availableTopics_0).length, 128);
+  assert.equal(Object.keys(calls[0].state.availableTopics_1).length, 128);
+  assert.equal(calls[0].state.availableTopics_0["memory/note-001.md"], "Note 1");
+  assert.equal(calls[0].state.availableTopics_1["memory/note-255.md"], "Note 255");
   const questions = calls[0].questions;
   assert.deepEqual(Object.keys(questions), [
     "hasRelevantTopic_0", "relevantTopic_0", "hasRelevantTopic_1", "relevantTopic_1", "needsHistoryRecall",
@@ -190,7 +201,10 @@ test("hints are stable across tool rounds, identical timestamps, subsequent turn
   let toolIssued = false;
   const { workspace, context, requests, calls, open, close } = await fixture(t, {
     config: { toolAllowlist: ["read"] },
-    classify: ({ questions, state }) => answer(questions, { "memory/topic.md": state.recentConversation === undefined ? 0.93 : 0.81 }),
+    classify: ({ questions, state }) => answer(
+      questions,
+      state.recentConversation === undefined ? { "memory/topic.md": 0.93 } : { "memory/other.md": 0.81 },
+    ),
     generate() {
       if (toolIssued) return;
       toolIssued = true;
@@ -198,6 +212,7 @@ test("hints are stable across tool rounds, identical timestamps, subsequent turn
     },
   });
   await note(workspace, "memory/topic.md", "# Topic");
+  await note(workspace, "memory/other.md", "# Other");
   await note(workspace, "sample.txt", "EXCLUDE TOOL RESULT CONTENT");
   const now = Date.now();
   t.mock.method(Date, "now", () => now);
@@ -208,18 +223,23 @@ test("hints are stable across tool rounds, identical timestamps, subsequent turn
   assert.equal(calls.length, 1);
   assert.equal(requests.length, 2);
   const first = users(requests[0])[0];
-  assert.match(textOf(first), /93%/);
+  assert.match(textOf(first), /memory\/topic\.md" \(93%\)/);
   assert.deepEqual(users(requests[1]), [first]);
 
   await send(conversation, context, input);
   assert.equal(calls.length, 2);
   assert.deepEqual(calls[1].state, {
-    newMessage: "Identical owner text", recentConversation: "Owner: Identical owner text\nAssistant: Fixture answer",
+    newMessage: "Identical owner text",
+    recentConversation: "Owner: Identical owner text\nAssistant: Fixture answer",
+    alreadyHintedTopics: ["memory/topic.md"],
+    historyRecallAlreadySuggested: true,
+    availableTopics: { "memory/other.md": "Other" },
   });
   const next = users(requests.at(-1));
   assert.equal(next[0].timestamp, next[1].timestamp);
   assert.deepEqual(next[0], first);
-  assert.match(textOf(next[1]), /81%/);
+  assert.match(textOf(next[1]), /memory\/other\.md" \(81%\)/);
+  assert.doesNotMatch(textOf(next[1]), /memory\/topic\.md/);
   const entries = await gateway.historyEntries(SESSION, {}, 50, undefined, context);
   const owners = entries.items.filter(({ kind }) => kind === "pi.user");
   assert.equal(owners.length, 2);
@@ -334,6 +354,7 @@ test("reopening with agentHistory: false suppresses stored history nudges and ba
     classify: ({ questions }) => answer(questions, { "memory/topic.md": 0.9 }, { topic: 0.9, history: 0.9 }),
   });
   await note(workspace, "memory/topic.md", "# Topic");
+  await note(workspace, "memory/steered.md", "# Steered");
   let gateway = await open();
   let chat = await gateway.conversationFor(SESSION, context);
   await send(chat, context, "First turn");
@@ -368,7 +389,9 @@ test("reopening with agentHistory: false suppresses stored history nudges and ba
   reopenedModels.setProvider(typesafeProvider());
   reopenedModels.classify = async (model, input) => {
     calls.push({ model: { provider: model.provider, modelId: model.id }, ...input });
-    return answer(input.questions, { "memory/topic.md": 0.85 }, { topic: 0.9 });
+    return input.state.newMessage === "Steered text context"
+      ? answer(input.questions, { "memory/steered.md": 0.85 }, { topic: 0.9 })
+      : answer(input.questions, {}, { topic: 0.1 });
   };
   gateway = await openGateway(reopenedConfig, context, {
     models: reopenedModels,
@@ -398,7 +421,7 @@ test("reopening with agentHistory: false suppresses stored history nudges and ba
   // and attached the hint to the last entry in that batch.
   const batchCall = calls.find(({ state }) => state.newMessage === "Steered text context");
   assert.ok(batchCall !== undefined);
-  assert.match(lastUser(latestRequest), /memory\/topic\.md" \(85%\)/);
+  assert.match(lastUser(latestRequest), /memory\/steered\.md" \(85%\)/);
   await gateway.close(BACKGROUND_CONTEXT);
   gateway = undefined;
 });
