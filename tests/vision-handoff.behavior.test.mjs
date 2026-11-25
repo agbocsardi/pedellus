@@ -239,7 +239,7 @@ test("vision config fails closed on missing, recursive or ambiguous describer se
   }
   assert.throws(
     () => parseConfig({ ...base, visionHandoff: { describerPreset: "eyes", temperature: 1 } }, root),
-    /Unknown visionHandoff field: temperature/,
+    /visionHandoff\.temperature is not a recognized option/,
   );
   assert.throws(
     () => parseConfig({

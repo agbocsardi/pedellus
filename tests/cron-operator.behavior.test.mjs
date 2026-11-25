@@ -24,6 +24,7 @@ const [
   { gatewaySocketPath, serveLocalGateway },
   { connectLocalGateway, LocalRemoteError },
   { CronCommandError, CronUsageError, parseCronInvocation, runCronCommand },
+  { MAX_DATE_MS },
   { createModels, fauxAssistantMessage, fauxProvider },
   { BACKGROUND_CONTEXT },
 ] = await Promise.all([
@@ -34,6 +35,7 @@ const [
   import(new URL("../dist/local/server.js", import.meta.url).href),
   import(new URL("../dist/local/client.js", import.meta.url).href),
   import(new URL("../dist/automation/operator-cli.js", import.meta.url).href),
+  import(new URL("../dist/automation/cron-schedule.js", import.meta.url).href),
   import(`${modules}/pi-ai/dist/index.js`),
   import(`${modules}/chord/dist/context/index.js`),
 ]);
@@ -349,6 +351,187 @@ test("the CLI surface creates, lists and reports a lost response as unknown", { 
       && /outcome is unknown/.test(error.message)
       && /cron show/.test(error.message),
   );
+});
+
+test("malformed cron mutation replies are held as unknown, never rendered as success", { timeout: 30_000 }, async (t) => {
+  const { createServer } = await import("node:net");
+  const directory = await mkdtemp(join(tmpdir(), "nanobot-cron-malformed-"));
+  await mkdir(join(directory, "state"), { recursive: true, mode: 0o700 });
+  const socketPath = join(directory, "state", "gateway.sock");
+  // A minimal wire peer: one scripted reply per request, in order.
+  const replies = [];
+  const server = createServer((socket) => {
+    socket.setEncoding("utf8");
+    let buffer = "";
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      let newline;
+      while ((newline = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        if (line.trim() === "") continue;
+        const request = JSON.parse(line);
+        const reply = replies.length > 0
+          ? replies.shift()
+          : { error: { code: "failed", message: "no scripted reply" } };
+        socket.write(`${JSON.stringify({ id: request.id, ...reply })}\n`);
+      }
+    });
+  });
+  await new Promise((resolveListen) => server.listen(socketPath, resolveListen));
+  const client = await connectLocalGateway({ socketPath, operatorOnly: true, context });
+  t.after(async () => {
+    await client.close().catch(() => undefined);
+    await new Promise((resolveClose) => server.close(resolveClose));
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  // A cancel reply with no recognized outcome: the CLI must not print a cancellation it cannot
+  // confirm; the outcome stays unknown.
+  replies.push({ result: {} });
+  const cancelled = capture();
+  await assert.rejects(
+    () => runCronCommand({ client, command: { kind: "cancel", jobId: "cron-x" }, output: cancelled.output, context }),
+    (error) => error instanceof CronCommandError && /outcome is unknown/.test(error.message),
+  );
+  assert.equal(cancelled.text(), "");
+
+  // A create reply that claims success but omits its required fields: never rendered as scheduled.
+  replies.push({ result: { status: "scheduled", jobId: "cron-x" } });
+  const created = capture();
+  await assert.rejects(
+    () => runCronCommand({
+      client,
+      command: { kind: "create", origin: CLI_CHAT, request: schedule({ idempotencyKey: "malformed-1" }) },
+      output: created.output,
+      context,
+    }),
+    (error) => error instanceof CronCommandError && /outcome is unknown/.test(error.message),
+  );
+  assert.equal(created.text(), "");
+
+  // A cancelled reply missing its own required fields is equally untrusted.
+  replies.push({ result: { status: "cancelled" } });
+  const partial = capture();
+  await assert.rejects(
+    () => runCronCommand({ client, command: { kind: "cancel", jobId: "cron-x" }, output: partial.output, context }),
+    (error) => error instanceof CronCommandError && /outcome is unknown/.test(error.message),
+  );
+  assert.equal(partial.text(), "");
+
+  // Same-version legal shapes are accepted: an unplaced task carries scheduledAtMs: null, and
+  // projected lines are bounded in code points (an astral-character schedule line can be twice
+  // its limit in UTF-16 units), with renderable timestamps only.
+  const astral = "\u{1F31F}".repeat(300);
+  const legalJob = {
+    id: "cron-x", origin: CLI_CHAT, name: "stretch", mode: "background", intent: "message",
+    schedule: astral, status: "scheduled", nextAtMs: Date.now(), message: "Stretch and check the build",
+    lastOutcome: null, lastSkip: null, lastFault: null, deliveryFault: null,
+    timer: { taskId: 1, status: "pending", scheduledAtMs: null, error: null, reason: null },
+    execution: null, target: null,
+  };
+  replies.push({ result: { status: "cancelled", job: legalJob, withdrawn: null, abortError: null } });
+  const cancelledOk = capture();
+  await runCronCommand({ client, command: { kind: "cancel", jobId: "cron-x" }, output: cancelledOk.output, context });
+  assert.match(cancelledOk.text(), /^Cancelled cron-x\./);
+
+  replies.push({ result: { status: "scheduled", job: legalJob, jobId: "cron-x", nextAtMs: null, deduplicated: false } });
+  const scheduled = capture();
+  await runCronCommand({
+    client,
+    command: { kind: "create", origin: CLI_CHAT, request: schedule({ idempotencyKey: "legal-1" }) },
+    output: scheduled.output,
+    context,
+  });
+  assert.match(scheduled.text(), /^Scheduled on cli:operator\./);
+  assert.match(scheduled.text(), new RegExp(astral));
+
+  // A timestamp the renderer could not print is rejected before any success receipt.
+  replies.push({ result: { status: "not_found", job: undefined, bogus: true, never: "checked" } });
+  assert.equal(
+    (await client.cronCancel("cron-x", context)).status,
+    "not_found",
+    "the status check runs before deeper field validation",
+  );
+  const nonRenderable = JSON.parse(JSON.stringify(legalJob));
+  nonRenderable.nextAtMs = 8.65e15;
+  replies.push({ result: { status: "scheduled", job: nonRenderable, jobId: "cron-x", nextAtMs: 8.65e15, deduplicated: false } });
+  const beyond = capture();
+  await assert.rejects(
+    () => runCronCommand({
+      client,
+      command: { kind: "create", origin: CLI_CHAT, request: schedule({ idempotencyKey: "beyond-1" }) },
+      output: beyond.output,
+      context,
+    }),
+    (error) => error instanceof CronCommandError && /outcome is unknown/.test(error.message),
+  );
+  assert.equal(beyond.text(), "");
+
+  // A well-formed refusal stays a definitive, exact report.
+  replies.push({ result: { status: "not_found" } });
+  await assert.rejects(
+    () => runCronCommand({ client, command: { kind: "cancel", jobId: "cron-x" }, output: capture().output, context }),
+    (error) => error instanceof CronCommandError && /no scheduled job with id cron-x/.test(error.message),
+  );
+});
+
+test("out-of-range times are refused before commit, and legacy out-of-range jobs stay usable", { timeout: 60_000 }, async (t) => {
+  const store = await syntheticGateway(t, "range");
+  const origin = await store.gateway.conversationFor(CLI_CHAT, context);
+  const client = await store.connect("operator");
+
+  // A one-shot instant and an interval anchor beyond the shared bound are refused definitively,
+  // before any job or timer state is written.
+  await assert.rejects(
+    () => client.cronCreate(CLI_CHAT, schedule({
+      idempotencyKey: "range-at",
+      schedule: { kind: "at", at: MAX_DATE_MS + 1 },
+    }), context),
+    (error) => error instanceof LocalRemoteError && error.code === "invalid"
+      && /representable date range/.test(error.message),
+  );
+  await assert.rejects(
+    () => client.cronCreate(CLI_CHAT, schedule({
+      idempotencyKey: "range-every",
+      schedule: { kind: "every", everyMs: MAX_DATE_MS },
+    }), context),
+    (error) => error instanceof LocalRemoteError && error.code === "invalid"
+      && /representable date range/.test(error.message),
+  );
+  // The refusals committed nothing: no job, no timer, no receipt.
+  assert.equal((await store.harness.snapshot(CronJobsDoc, origin.id, context))?.jobs.length ?? 0, 0);
+
+  // A legacy record with an out-of-range stored schedule (written before the bound existed)
+  // stays inspectable and cancellable end-to-end: list, show and cancel agree on it.
+  const created = await client.cronCreate(CLI_CHAT, schedule({ idempotencyKey: "range-legacy" }), context);
+  assert.equal(created.status, "scheduled");
+  await store.harness.commit(async (tx) => {
+    const doc = await tx.doc(CronJobsDoc, origin.id, context);
+    const job = doc.jobs.find((entry) => entry.id === created.jobId);
+    job.schedule = { kind: "at", at: MAX_DATE_MS + 1 };
+  }, context);
+
+  const listed = capture();
+  await runCronCommand({ client, command: { kind: "list" }, output: listed.output, context });
+  assert.match(listed.text(), new RegExp(`${created.jobId}  scheduled .*\(once at an unrepresentable time\)`));
+
+  const shown = capture();
+  await runCronCommand({ client, command: { kind: "show", jobId: created.jobId }, output: shown.output, context });
+  assert.match(shown.text(), /schedule: once at an unrepresentable time/);
+  assert.match(shown.text(), /status: scheduled/);
+
+  const cancelled = capture();
+  await runCronCommand({
+    client,
+    command: { kind: "cancel", jobId: created.jobId },
+    output: cancelled.output,
+    context,
+  });
+  assert.match(cancelled.text(), new RegExp(`^Cancelled ${created.jobId}\.`));
+  const after = capture();
+  await runCronCommand({ client, command: { kind: "list" }, output: after.output, context });
+  assert.match(after.text(), new RegExp(`${created.jobId}  cancelled`));
 });
 
 test("the cron command refuses ambiguous and incomplete forms before anything is sent", () => {

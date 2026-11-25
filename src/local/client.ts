@@ -38,13 +38,19 @@ import type {
 } from "../terminal/conversation.js";
 import {
   LOCAL_PROTOCOL_LIMITS,
-  LOCAL_PROTOCOL_VERSION,
+  LOCAL_RESULT_CHECKS,
   LocalGatewayError,
   asObject,
   parseServerLine,
   type LocalErrorBody,
   type LocalErrorCode,
+  type LocalHostNotice,
+  type LocalMethod,
+  type LocalParams,
+  type LocalResult,
 } from "./protocol.js";
+
+export type { LocalHostNotice } from "./protocol.js";
 
 /** A server-side busy rejection keeps its native name so the terminal prints its busy text. */
 class RemoteConversationBusy extends Error {
@@ -64,11 +70,6 @@ export class LocalRemoteError extends Error {
   }
 }
 
-export interface LocalHostNotice {
-  readonly id: string;
-  readonly text: string;
-}
-
 /** Owner pairing outcome: one created code, or one fixed refusal reason. */
 export type AppPairingResult = AppPairingCreated | { readonly refused: AppPairingRefusal };
 /** One paired device row as the terminal prints it. */
@@ -78,7 +79,30 @@ export type AppShortcutResult = AppShortcutCreated | { readonly refused: AppShor
 /** One shortcut row as the terminal prints it; never the token. */
 export type AppShortcutRow = AppShortcutListing;
 
-export interface LocalGatewayClient extends TerminalConversation {
+/**
+ * Store-wide owner controls over the private socket. No chat is attached or created, so nothing here
+ * reaches a conversation: `connectLocalGateway({ operatorOnly: true })` returns exactly this surface.
+ */
+export interface LocalOperatorClient {
+  /** Owner controls for scheduled work: store-wide reads and exact-ID create/cancel. */
+  cronList(context: Context, offset?: number): Promise<CronOperatorListing>;
+  cronShow(id: string, context: Context): Promise<CronOperatorJob[]>;
+  cronCreate(origin: string, request: CronScheduleInput, context: Context): Promise<CronOperatorCreateOutcome>;
+  cronCancel(id: string, context: Context): Promise<CronOperatorCancelOutcome>;
+  /** Owner controls for the app channel: pairing, device listing and exact-label revocation. */
+  appPair(label: string | undefined, context: Context): Promise<AppPairingResult>;
+  appDevices(context: Context): Promise<readonly AppDeviceRow[]>;
+  appRevoke(label: string, context: Context): Promise<"revoked" | "missing">;
+  /** Shortcut credentials: create one (token answered once), list and revoke by exact label. */
+  appShortcutAdd(label: string, context: Context): Promise<AppShortcutResult>;
+  appShortcutList(context: Context): Promise<readonly AppShortcutRow[]>;
+  appShortcutRevoke(label: string, context: Context): Promise<"revoked" | "missing">;
+  /** Close this connection only; the gateway and already admitted turns keep running. */
+  close(): Promise<void>;
+}
+
+/** One attached `cli:<name>` conversation plus the operator controls of the same socket. */
+export interface LocalSessionClient extends TerminalConversation, LocalOperatorClient {
   readonly sessionKey: string;
   readonly tools: readonly string[];
   readonly contextRefresh: boolean;
@@ -118,19 +142,6 @@ export interface LocalGatewayClient extends TerminalConversation {
   /** Direct, transient owner delivery from the gateway; never a transcript or durable outbox entry. */
   onMcpAuthorization?: ((authorization: McpAuthorizationLink) => void) | undefined;
   onMcpNotice?: ((text: string) => void) | undefined;
-  /** Owner controls for scheduled work: store-wide reads and exact-ID create/cancel. */
-  cronList(context: Context, offset?: number): Promise<CronOperatorListing>;
-  cronShow(id: string, context: Context): Promise<CronOperatorJob[]>;
-  cronCreate(origin: string, request: CronScheduleInput, context: Context): Promise<CronOperatorCreateOutcome>;
-  cronCancel(id: string, context: Context): Promise<CronOperatorCancelOutcome>;
-  /** Owner controls for the app channel: pairing, device listing and exact-label revocation. */
-  appPair(label: string | undefined, context: Context): Promise<AppPairingResult>;
-  appDevices(context: Context): Promise<readonly AppDeviceRow[]>;
-  appRevoke(label: string, context: Context): Promise<"revoked" | "missing">;
-  /** Shortcut credentials: create one (token answered once), list and revoke by exact label. */
-  appShortcutAdd(label: string, context: Context): Promise<AppShortcutResult>;
-  appShortcutList(context: Context): Promise<readonly AppShortcutRow[]>;
-  appShortcutRevoke(label: string, context: Context): Promise<"revoked" | "missing">;
   historySearch(query: HistoryQuery, context: Context): Promise<HistoryPage>;
   listEpisodes(sessionKey: string, query: HistoryEpisodeQuery, context: Context): Promise<HistoryEpisodePage>;
   episode(sessionKey: string, startEntryId: number, context: Context): Promise<HistoryEpisode | undefined>;
@@ -146,6 +157,12 @@ export interface LocalGatewayClient extends TerminalConversation {
   /** Close this attachment only; the gateway and already admitted turns keep running. */
   close(): Promise<void>;
 }
+
+/**
+ * Either connection kind. Without narrowing only the operator surface both share is reachable, which
+ * is all an operator command needs.
+ */
+export type LocalGatewayClient = LocalOperatorClient | LocalSessionClient;
 
 export interface ConnectLocalGatewayOptions {
   readonly socketPath: string;
@@ -168,7 +185,15 @@ interface SettlementWaiter {
   readonly detach: () => void;
 }
 
+/** Connect for store-wide operator controls only; no chat is attached. */
+export function connectLocalGateway(
+  options: ConnectLocalGatewayOptions & { readonly operatorOnly: true },
+): Promise<LocalOperatorClient>;
 /** Attach one terminal surface to an already running gateway over its private socket. */
+export function connectLocalGateway(
+  options: ConnectLocalGatewayOptions & { readonly operatorOnly?: false },
+): Promise<LocalSessionClient>;
+export function connectLocalGateway(options: ConnectLocalGatewayOptions): Promise<LocalGatewayClient>;
 export async function connectLocalGateway(options: ConnectLocalGatewayOptions): Promise<LocalGatewayClient> {
   const socket = connect({ path: options.socketPath });
   await new Promise<void>((resolveConnect, rejectConnect) => {
@@ -197,14 +222,14 @@ export async function connectLocalGateway(options: ConnectLocalGatewayOptions): 
   return client;
 }
 
-class LocalGatewayConnection implements LocalGatewayClient {
+class LocalGatewayConnection implements LocalSessionClient {
   id = 0;
   sessionKey = "";
   onMcpAuthorization: ((authorization: McpAuthorizationLink) => void) | undefined;
   onMcpNotice: ((text: string) => void) | undefined;
   onAskQuestion: ((question: AskQuestionView) => void) | undefined;
   askQuestions: readonly AskQuestionView[] = [];
-  pendingNotices: LocalHostNotice[] = [];
+  pendingNotices: readonly LocalHostNotice[] = [];
   tools: readonly string[] = [];
   contextRefresh = false;
   presets = false;
@@ -234,53 +259,19 @@ class LocalGatewayConnection implements LocalGatewayClient {
   }
 
   async attach(conversation: string | undefined, context: Context): Promise<void> {
-    const result = await this.call<Record<string, unknown>>("attach", conversation === undefined ? {} : { conversation }, context);
-    const protocol = result.protocol;
-    if (protocol !== LOCAL_PROTOCOL_VERSION) throw new LocalGatewayError("unavailable", "local gateway protocol mismatch");
-    if (typeof result.sessionKey !== "string" || result.sessionKey.length === 0
-      || !Number.isSafeInteger(result.conversationId)) {
-      throw new LocalGatewayError("unavailable", "local gateway sent an unexpected attach result");
-    }
-    const tools = result.tools;
-    if (!Array.isArray(tools) || tools.some((tool) => typeof tool !== "string")) {
-      throw new LocalGatewayError("unavailable", "local gateway sent an unexpected attach result");
-    }
-    this.id = result.conversationId as number;
+    const result = await this.call("attach", conversation === undefined ? {} : { conversation }, context);
+    this.id = result.conversationId;
     this.sessionKey = result.sessionKey;
-    this.tools = tools as string[];
-    this.contextRefresh = result.contextRefresh === true;
-    this.presets = result.presets === true;
-    this.reloadSupported = result.reload === true;
-    this.attachments = result.attachments === true;
-    this.digest = result.digest === true;
-    this.mcp = result.mcp === true;
-    this.restartSupported = result.restart === true;
-    const questions = result.questions;
-    if (questions !== undefined) {
-      if (!Array.isArray(questions) || questions.some((entry) => !validAskQuestionView(entry))) {
-        throw new LocalGatewayError("unavailable", "local gateway sent an unexpected attach result");
-      }
-      this.askQuestions = questions as AskQuestionView[];
-    } else {
-      this.askQuestions = [];
-    }
-    const notices = result.notices;
-    if (notices === undefined) {
-      this.pendingNotices = [];
-    } else {
-      if (!Array.isArray(notices) || notices.length > LOCAL_PROTOCOL_LIMITS.maxNoticeIds) {
-        throw new LocalGatewayError("unavailable", "local gateway sent an unexpected attach result");
-      }
-      this.pendingNotices = notices.map((entry) => {
-        const notice = asObject(entry);
-        if (notice === undefined || typeof notice.id !== "string" || notice.id.length === 0
-          || typeof notice.text !== "string" || notice.text.trim() === ""
-          || notice.text.length > LOCAL_PROTOCOL_LIMITS.maxNoticeTextChars) {
-          throw new LocalGatewayError("unavailable", "local gateway sent an unexpected attach result");
-        }
-        return { id: notice.id, text: notice.text };
-      });
-    }
+    this.tools = result.tools;
+    this.contextRefresh = result.contextRefresh;
+    this.presets = result.presets;
+    this.reloadSupported = result.reload;
+    this.attachments = result.attachments;
+    this.digest = result.digest;
+    this.mcp = result.mcp;
+    this.restartSupported = result.restart;
+    this.askQuestions = result.questions;
+    this.pendingNotices = result.notices;
   }
 
   async ackNotices(ids: readonly string[], context: Context): Promise<void> {
@@ -307,41 +298,21 @@ class LocalGatewayConnection implements LocalGatewayClient {
     if (typeof content !== "string") {
       throw new Error("local attachments must be submitted through the gateway attachment request");
     }
-    const result = await this.call<{ readonly id: number }>("submit", { content }, context);
-    if (!Number.isSafeInteger(result.id)) throw new LocalGatewayError("unavailable", "local gateway sent an unexpected submission");
-    const id = result.id;
-    return {
-      id,
-      wait: (waitContext) => this.waitSettlement(id, waitContext),
-      status: (statusContext) => this.call("submissionStatus", { id }, statusContext),
-    };
+    const { id } = await this.call("submit", { content }, context);
+    return this.submission(id);
   }
 
   async submitAttachment(path: string, content: string, context: Context): Promise<TerminalAttachmentSubmission> {
     if (!this.attachments) throw new Error("local attachments are not configured");
-    const result = await this.call<Record<string, unknown>>(
-      "submitAttachment",
-      content === "" ? { path } : { path, content },
-      context,
-    );
-    const id = result.id;
-    if (typeof id !== "number" || !Number.isSafeInteger(id) || id < 1) {
-      throw new LocalGatewayError("unavailable", "local gateway sent an unexpected attachment submission");
-    }
-    const attachment = asObject(result.attachment);
-    const relativePath = attachment?.relativePath;
-    const bytes = attachment?.bytes;
-    if (typeof relativePath !== "string" || relativePath.length === 0
-      || typeof bytes !== "number" || !Number.isSafeInteger(bytes) || bytes < 0) {
-      throw new LocalGatewayError("unavailable", "local gateway sent an unexpected attachment submission");
-    }
+    const result = await this.call("submitAttachment", content === "" ? { path } : { path, content }, context);
+    return { attachment: result.attachment, submission: this.submission(result.id) };
+  }
+
+  private submission(id: number): TerminalSubmission {
     return {
-      attachment: { relativePath, bytes },
-      submission: {
-        id,
-        wait: (waitContext) => this.waitSettlement(id, waitContext),
-        status: (statusContext) => this.call("submissionStatus", { id }, statusContext),
-      },
+      id,
+      wait: (waitContext) => this.waitSettlement(id, waitContext),
+      status: (statusContext) => this.call("submissionStatus", { id }, statusContext),
     };
   }
 
@@ -363,9 +334,7 @@ class LocalGatewayConnection implements LocalGatewayClient {
   }
 
   async compact(context: Context): Promise<number> {
-    const result = await this.call<{ readonly taskId: number }>("compact", {}, context);
-    if (!Number.isSafeInteger(result.taskId)) throw new LocalGatewayError("unavailable", "local gateway sent an unexpected compaction result");
-    return result.taskId;
+    return (await this.call("compact", {}, context)).taskId;
   }
 
   async abort(context: Context): Promise<void> {
@@ -373,7 +342,7 @@ class LocalGatewayConnection implements LocalGatewayClient {
   }
 
   async reset(context: Context): Promise<void> {
-    const result = await this.call<{ readonly status: string }>("reset", {}, context);
+    const result = await this.call("reset", {}, context);
     if (result.status === "busy") throw new RemoteConversationBusy("conversation is busy");
   }
 
@@ -382,15 +351,15 @@ class LocalGatewayConnection implements LocalGatewayClient {
     await this.call("restart", {}, context);
   }
 
-  async listModels(context: Context): Promise<GatewayModelList> {
+  listModels(context: Context): Promise<GatewayModelList> {
     return this.call("listModels", {}, context);
   }
 
-  async selectModel(selection: GatewayModelSelectionRequest, context: Context): Promise<GatewayModelSelection> {
+  selectModel(selection: GatewayModelSelectionRequest, context: Context): Promise<GatewayModelSelection> {
     return this.call("selectModel", { selection }, context);
   }
 
-  async selectModelPreset(name: string, context: Context): Promise<GatewayModelSelection> {
+  selectModelPreset(name: string, context: Context): Promise<GatewayModelSelection> {
     return this.call("selectModelPreset", { name }, context);
   }
 
@@ -399,39 +368,32 @@ class LocalGatewayConnection implements LocalGatewayClient {
     return this.call("reloadModels", {}, context);
   }
 
-  async refreshContext(context: Context): Promise<{ readonly skills: number }> {
+  refreshContext(context: Context): Promise<{ readonly skills: number }> {
     return this.call("refreshContext", {}, context);
   }
 
-  async digestStart(context: Context): Promise<MemoryDigestStartResult> {
+  digestStart(context: Context): Promise<MemoryDigestStartResult> {
     return this.call("digestStart", {}, context);
   }
 
-  async digestStatus(context: Context): Promise<MemoryDigestStatusView> {
+  digestStatus(context: Context): Promise<MemoryDigestStatusView> {
     return this.call("digestStatus", {}, context);
   }
 
   async mcpList(context: Context): Promise<McpAdminListing> {
-    const result = await this.call<{ readonly listing: McpAdminListing }>("mcpList", {}, context);
-    return result.listing;
+    return (await this.call("mcpList", {}, context)).listing;
   }
 
-  async mcpSubmitCallback(text: string, context: Context): Promise<McpCallbackResult> {
+  mcpSubmitCallback(text: string, context: Context): Promise<McpCallbackResult> {
     return this.call("mcpCallback", { text }, context);
   }
 
-  async cronList(context: Context, offset = 0): Promise<CronOperatorListing> {
-    const result = await this.call<CronOperatorListing>("cronList", { offset }, context);
-    if (!Array.isArray(result.jobs) || !Array.isArray(result.origins)) {
-      throw new LocalGatewayError("unavailable", "local gateway sent an unexpected job listing");
-    }
-    return result;
+  cronList(context: Context, offset = 0): Promise<CronOperatorListing> {
+    return this.call("cronList", { offset }, context);
   }
 
   async cronShow(id: string, context: Context): Promise<CronOperatorJob[]> {
-    const result = await this.call<{ readonly jobs: CronOperatorJob[] }>("cronShow", { id }, context);
-    if (!Array.isArray(result.jobs)) throw new LocalGatewayError("unavailable", "local gateway sent an unexpected job listing");
-    return result.jobs;
+    return (await this.call("cronShow", { id }, context)).jobs;
   }
 
   cronCreate(origin: string, request: CronScheduleInput, context: Context): Promise<CronOperatorCreateOutcome> {
@@ -442,87 +404,43 @@ class LocalGatewayConnection implements LocalGatewayClient {
     return this.call("cronCancel", { id }, context);
   }
 
-  async appPair(label: string | undefined, context: Context): Promise<AppPairingResult> {
-    const result = await this.call<Record<string, unknown>>("appPair",
-      label === undefined ? {} : { label }, context);
-    if (typeof result.refused === "string") {
-      if (result.refused !== "label-in-use" && result.refused !== "device-limit" &&
-          result.refused !== "pairing-limit" && result.refused !== "invalid-label") {
-        throw new LocalGatewayError("unavailable", "local gateway sent an unexpected pairing result");
-      }
-      return { refused: result.refused };
-    }
-    if (typeof result.code !== "string" || typeof result.expiresAtMs !== "number") {
-      throw new LocalGatewayError("unavailable", "local gateway sent an unexpected pairing result");
-    }
-    return { code: result.code, expiresAtMs: result.expiresAtMs };
+  appPair(label: string | undefined, context: Context): Promise<AppPairingResult> {
+    return this.call("appPair", label === undefined ? {} : { label }, context);
   }
 
   async appDevices(context: Context): Promise<readonly AppDeviceRow[]> {
-    const result = await this.call<{ readonly devices?: unknown }>("appDevices", {}, context);
-    if (!Array.isArray(result.devices) || result.devices.some((entry) =>
-      entry === null || typeof entry !== "object" || typeof (entry as Record<string, unknown>).label !== "string" ||
-      typeof (entry as Record<string, unknown>).createdAtMs !== "number")) {
-      throw new LocalGatewayError("unavailable", "local gateway sent an unexpected device listing");
-    }
-    return result.devices as AppDeviceRow[];
+    return (await this.call("appDevices", {}, context)).devices;
   }
 
   async appRevoke(label: string, context: Context): Promise<"revoked" | "missing"> {
-    const result = await this.call<{ readonly result?: unknown }>("appRevoke", { label }, context);
-    if (result.result !== "revoked" && result.result !== "missing") {
-      throw new LocalGatewayError("unavailable", "local gateway sent an unexpected revoke result");
-    }
-    return result.result;
+    return (await this.call("appRevoke", { label }, context)).result;
   }
 
-  async appShortcutAdd(label: string, context: Context): Promise<AppShortcutResult> {
-    const result = await this.call<Record<string, unknown>>("appShortcutAdd", { label }, context);
-    if (typeof result.refused === "string") {
-      if (result.refused !== "invalid-label" && result.refused !== "label-in-use" &&
-          result.refused !== "shortcut-limit") {
-        throw new LocalGatewayError("unavailable", "local gateway sent an unexpected shortcut result");
-      }
-      return { refused: result.refused };
-    }
-    if (typeof result.token !== "string" || typeof result.label !== "string" ||
-        typeof result.createdAtMs !== "number") {
-      throw new LocalGatewayError("unavailable", "local gateway sent an unexpected shortcut result");
-    }
-    return { label: result.label, token: result.token, createdAtMs: result.createdAtMs };
+  appShortcutAdd(label: string, context: Context): Promise<AppShortcutResult> {
+    return this.call("appShortcutAdd", { label }, context);
   }
 
   async appShortcutList(context: Context): Promise<readonly AppShortcutRow[]> {
-    const result = await this.call<{ readonly shortcuts?: unknown }>("appShortcutList", {}, context);
-    if (!Array.isArray(result.shortcuts) || result.shortcuts.some((entry) =>
-      entry === null || typeof entry !== "object" || typeof (entry as Record<string, unknown>).label !== "string" ||
-      typeof (entry as Record<string, unknown>).createdAtMs !== "number")) {
-      throw new LocalGatewayError("unavailable", "local gateway sent an unexpected shortcut listing");
-    }
-    return result.shortcuts as AppShortcutRow[];
+    return (await this.call("appShortcutList", {}, context)).shortcuts;
   }
 
   async appShortcutRevoke(label: string, context: Context): Promise<"revoked" | "missing"> {
-    const result = await this.call<{ readonly result?: unknown }>("appShortcutRevoke", { label }, context);
-    if (result.result !== "revoked" && result.result !== "missing") {
-      throw new LocalGatewayError("unavailable", "local gateway sent an unexpected shortcut revoke result");
-    }
-    return result.result;
+    return (await this.call("appShortcutRevoke", { label }, context)).result;
   }
 
-  async historySearch(query: HistoryQuery, context: Context): Promise<HistoryPage> {
+  historySearch(query: HistoryQuery, context: Context): Promise<HistoryPage> {
     return this.call("historySearch", { query }, context);
   }
 
-  async listEpisodes(sessionKey: string, query: HistoryEpisodeQuery, context: Context): Promise<HistoryEpisodePage> {
+  listEpisodes(sessionKey: string, query: HistoryEpisodeQuery, context: Context): Promise<HistoryEpisodePage> {
     return this.call("historyEpisodes", { session: sessionKey, query }, context);
   }
 
   async episode(sessionKey: string, startEntryId: number, context: Context): Promise<HistoryEpisode | undefined> {
-    return this.call("historyEpisode", { session: sessionKey, startEntryId }, context);
+    return (await this.call("historyEpisode", { session: sessionKey, startEntryId }, context)) ?? undefined;
   }
 
-  async historyEntries(
+  historyEntries(
     sessionKey: string,
     query: TerminalEntryQuery,
     limit: number,
@@ -555,13 +473,19 @@ class LocalGatewayConnection implements LocalGatewayClient {
     this.fail(new Error("local gateway connection closed"));
   }
 
-  private call<T>(method: string, params: unknown, context: Context): Promise<T> {
+  /** One typed request; its result passes the method's shape check before any caller sees it. */
+  private async call<M extends LocalMethod>(method: M, params: LocalParams<M>, context: Context): Promise<LocalResult<M>> {
+    const check: (value: unknown) => LocalResult<M> = LOCAL_RESULT_CHECKS[method];
+    return check(await this.send(method, params, context));
+  }
+
+  private send(method: LocalMethod, params: unknown, context: Context): Promise<unknown> {
     if (this.closed) return Promise.reject(new Error("local gateway connection is closed"));
     if (this.pending.size >= LOCAL_PROTOCOL_LIMITS.maxPendingRequests) {
       return Promise.reject(new Error("local gateway request limit reached"));
     }
     const id = ++this.nextId;
-    return new Promise<T>((resolve, reject) => {
+    return new Promise<unknown>((resolve, reject) => {
       const signal = context.abortSignal;
       const onAbort = (): void => {
         this.pending.delete(id);
@@ -576,7 +500,7 @@ class LocalGatewayConnection implements LocalGatewayClient {
       this.pending.set(id, {
         resolve: (value) => {
           detach();
-          resolve(value as T);
+          resolve(value);
         },
         reject: (error) => {
           detach();

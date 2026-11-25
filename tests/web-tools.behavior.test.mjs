@@ -167,7 +167,7 @@ test("web configuration is opt-in and a missing search key fails startup", { tim
     assert.equal(config(store).codemode, undefined);
     assert.equal(config(store, { codemode: { enabled: true } }).codemode.enabled, true);
     assert.throws(() => config(store, { codemode: { enabled: "yes" } }), /codemode\.enabled/);
-    assert.throws(() => config(store, { codemode: { unknown: true } }), /Unknown codemode field/);
+    assert.throws(() => config(store, { codemode: { unknown: true } }), /codemode\.unknown is not a recognized option/);
 
     const missingKey = config(store, {
       web: { search: { keyEnv: "NANOBOT_SYNTHETIC_WEB_KEY" }, fetch: true },
@@ -178,14 +178,10 @@ test("web configuration is opt-in and a missing search key fails startup", { tim
         && !error.message.includes("NANOBOT_SYNTHETIC_WEB_KEY"),
     );
 
-    // The coding allowlist cannot be used as a second web grant.
-    await assert.rejects(
-      openGateway(
-        config(store, { toolAllowlist: ["web_search"], web: { fetch: true } }),
-        context,
-        { models: syntheticModels().models },
-      ),
-      /no approved registered tools/,
+    // The coding allowlist cannot be used as a second web grant: config refuses it before any open.
+    assert.throws(
+      () => config(store, { toolAllowlist: ["web_search"], web: { fetch: true } }),
+      /toolAllowlist must name only coding tools/,
     );
 
     // Search alone installs only the search tool, with the key resolved from its named variable.

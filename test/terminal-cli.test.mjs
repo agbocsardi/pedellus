@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -553,6 +553,48 @@ test("startup errors do not disclose sensitive paths", { timeout: timeoutMs + 2_
   assert.equal(result.status, 1);
   assert.match(result.stderr, /diagnostic details suppressed/);
   assert.doesNotMatch(result.stderr + result.stdout, new RegExp(secret));
+});
+
+test("client commands never create the data directory when no gateway is running", { timeout: 90_000 }, async () => {
+  const { stat, writeFile } = await import("node:fs/promises");
+  const root = await mkdtemp(join(tmpdir(), "nanobot-cli-readonly-"));
+  try {
+    const workspace = join(root, "workspace");
+    const dataDir = join(root, "data");
+    await mkdir(workspace);
+    const configPath = join(root, "config.json");
+    await writeFile(configPath, JSON.stringify({ workspace, dataDir, model: { provider: "faux", modelId: "faux-1" } }));
+    const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
+    for (const args of [["agent"], ["cron", "list"], ["app", "devices"]]) {
+      // Three cold CLI starts; the bound only has to survive a loaded parallel test run.
+      const result = spawnSync(process.execPath, [cli, ...args, "--config", configPath], {
+        encoding: "utf8", timeout: 25_000, input: "",
+      });
+      assert.equal(result.status, 1, `${args.join(" ")}: ${result.stderr}`);
+      assert.match(result.stderr, /no running gateway answers/, args.join(" "));
+      await assert.rejects(stat(dataDir), { code: "ENOENT" }, `${args.join(" ")} must not create dataDir`);
+    }
+
+    // An existing but non-private data directory is refused, never repaired: the read-only lookup
+    // enforces the gateway's owner-private contract without creating or chmodping anything.
+    await mkdir(dataDir, { mode: 0o755 });
+    const shared = spawnSync(process.execPath, [cli, "agent", "--config", configPath], {
+      encoding: "utf8", timeout: 25_000, input: "",
+    });
+    assert.equal(shared.status, 1, shared.stderr);
+    assert.match(shared.stderr, /cannot prepare the configured workspace or data directory/, shared.stderr);
+    assert.equal((await stat(dataDir)).mode & 0o777, 0o755, "the client must not chmod a shared dataDir");
+
+    // An owner-private data directory still reaches the honest no-gateway diagnostic.
+    await chmod(dataDir, 0o700);
+    const privateDir = spawnSync(process.execPath, [cli, "agent", "--config", configPath], {
+      encoding: "utf8", timeout: 25_000, input: "",
+    });
+    assert.equal(privateDir.status, 1, privateDir.stderr);
+    assert.match(privateDir.stderr, /no running gateway answers/, privateDir.stderr);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("local model command lists, selects, rejects invalid input without disclosure, and persists through Gateway", { timeout: timeoutMs + 2_000 }, async () => {

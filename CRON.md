@@ -481,6 +481,35 @@ rather than rewritten. Stored values are safe integers; a next occurrence that w
 safe-integer range fails visibly instead of wrapping. Croner's own parser supports years 1-9999
 and bounds its search near year 3000/9999; that is a library limit, not an added product cap.
 
+One added product cap does exist: every accepted time — a one-shot instant, an interval anchor,
+an armed timer instant and each recurrence — must stay inside the range a JavaScript `Date` can
+represent (8.64e15 epoch milliseconds, `MAX_DATE_MS` in `cron-schedule.ts`). Anything beyond it is
+refused before any job or timer state is written, because no receipt or renderer can print it; the
+operator wire holds the same bound. A legacy record that already holds such a time is never
+fabricated into a valid schedule: its next time projects as "none" and its schedule line reads
+`once at an unrepresentable time` (or `every Ns from an unrepresentable time`), while the job
+itself stays inspectable and cancellable. A legacy timer task whose persisted input names such a
+deadline settles as failed with fixed text the moment Durable runs its phase — it never reaches
+the sleep, arms no occurrence and leaves the job cancellable. A sleep beyond the bound written by
+an older build can never come due, so it is inert — its residual is a clamped native wakeup
+reference that fires and re-arms without dispatching anything, never an executed occurrence — and
+it remains cancellable through the abort path. Because such a restored sleep would otherwise sit
+on that residual forever, the gateway start (`runGateway`) runs one recovery sweep
+(`disarmInvalidSleepingCronTimers`) over the public task APIs: it scans sleeping cron timers,
+commits an abort mark on exactly those whose persisted deadline is out of range, and touches
+nothing else; valid timers, job records and owner cancellation are unaffected. Durable's contract
+is that an abort mark does not wait for a sleep, so the committed mark ends the sleep and the
+task's own abort handler settles it "cancelled" through the ordinary scheduler; the sweep does not
+wait for that. The sweep is not best-effort: a scan, commit or abort failure (such as a storage
+failure that fails the Durable session) or a shutdown during open or recovery stops startup with
+a fixed diagnostic before the local socket, any channel or `gateway.surfaces.started`. A timer
+that settled meanwhile is the one benign race and is skipped. Durable restores the sleep at open,
+before host code runs, so until the sweep its clamped native wakeup reference still exists; that
+window is inert, and the SDK has no earlier seam. Arithmetic overflow while following
+an interval is the absence of a next slot, never a failure of the occurrence that is due right
+now: the timer admits that occurrence exactly once and the job simply stops re-arming, instead of
+the overflow discarding the whole terminal commit.
+
 ## Channel outbox
 
 The normal terminal commit of a settled run (success or error), isolated or origin, carries its

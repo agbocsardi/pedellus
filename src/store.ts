@@ -1,10 +1,11 @@
 import { chmod, lstat, mkdir, realpath, stat } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { relative, resolve } from "node:path";
 import type { PortConfig } from "./config.js";
+import { isPathWithin } from "./execution/policy.js";
 
+/** `path` is `root` or lexically below it; the one shared containment check. */
 export function inside(path: string, root: string): boolean {
-  const rel = relative(root, path);
-  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+  return isPathWithin(root, path);
 }
 
 export async function canonicalFuturePath(path: string): Promise<string> {
@@ -59,9 +60,33 @@ export async function assertExistingDatabaseFileForRecovery(dbPath: string): Pro
 }
 
 /**
+ * The private-owner contract the gateway installs at dataDir creation: a directory owned by the
+ * current user with no group or other access. The gateway, the CLI's read-only socket lookup and
+ * `doctor` all require it before using a path inside the directory, because a shared or
+ * foreign-owned directory could carry anyone's socket or file. The reason strings are fixed and
+ * path-free so any caller can report them directly.
+ */
+export function ownerPrivateDirectoryReason(
+  identity: { isDirectory(): boolean; readonly mode: number; readonly uid: number },
+): string | undefined {
+  if ((identity.mode & 0o077) !== 0) {
+    return "is not owner-private (mode must be 0700: no group or other access)";
+  }
+  const owner = process.getuid?.();
+  if (owner !== undefined && identity.uid !== owner) return "is owned by another user";
+  return undefined;
+}
+
+/**
  * Validate configured roots and dataDir disjointness without creating or modifying anything.
  * Missing roots are still resolved via `canonicalFuturePath` so read-only commands like
  * `models list` work before workspace creation while still failing closed on overlapping roots.
+ *
+ * An existing data directory must already meet the same private-owner contract the gateway
+ * enforces when it creates it (`ownerPrivateDirectoryReason`). The check is read-only — nothing
+ * is created, chmodded or repaired — so a client command either connects to an owner-private
+ * directory or fails closed; a shared or foreign-owned directory could carry anyone's socket and
+ * is never used.
  */
 export async function validateDataDirectoryReadOnly(config: PortConfig): Promise<string> {
   const roots = await Promise.all([config.workspace, ...(config.extraAllowedDirs ?? [])].map(async (path) => {
@@ -78,7 +103,10 @@ export async function validateDataDirectoryReadOnly(config: PortConfig): Promise
     throw new Error("dataDir must be disjoint from workspace and extraAllowedDirs");
   }
   try {
-    if (!(await stat(dataDir)).isDirectory()) throw new Error("dataDir must be a directory");
+    const dataDirStat = await stat(dataDir);
+    if (!dataDirStat.isDirectory()) throw new Error("dataDir must be a directory");
+    const privateReason = ownerPrivateDirectoryReason(dataDirStat);
+    if (privateReason !== undefined) throw new Error(`dataDir ${privateReason}`);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }

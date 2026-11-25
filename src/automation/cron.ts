@@ -4,6 +4,7 @@ import { AssistantEntry, ConversationBusy, InboxDoc, LiveDoc, ResetEntry, define
 import type {
   ConversationHandle,
   ConversationId,
+  Cursor,
   EntryId,
   Extension,
   Harness,
@@ -13,11 +14,13 @@ import type {
   Task,
   TaskId,
   TaskInspection,
+  TaskRecord,
   TaskRuntime,
   Tx,
 } from "@earendil-works/pi-durable";
 import {
   CRON_DEFAULT_TIME_ZONE,
+  MAX_DATE_MS,
   materializeCronSchedule,
   nextCronOccurrence,
   parseCronScheduleRequest,
@@ -695,6 +698,18 @@ const UNHEALTHY_TASK: ReadonlySet<CronTaskStatus> = new Set([
   "parked", "failed", "aborted", "orphaned", "faulted", "missing",
 ]);
 
+/**
+ * Sanitize one stored instant before it is projected: a legacy or damaged record can carry a time
+ * no renderer, receipt or operator wire bound can print. It projects as `null` — no renderable
+ * time — instead of throwing, so such jobs stay inspectable and cancellable; admission and timer
+ * arming refuse out-of-range times outright, so nothing new is written in that state.
+ */
+function renderableInstant(value: number | null): number | null {
+  return value !== null && Number.isSafeInteger(value) && value >= 0 && value <= MAX_DATE_MS
+    ? value
+    : null;
+}
+
 function taskSummaryOf(
   taskId: number, task: TaskInspection | undefined,
   record: Awaited<ReturnType<Harness["getTask"]>>,
@@ -712,7 +727,9 @@ function taskSummaryOf(
   return {
     taskId,
     status,
-    scheduledAtMs: record === undefined ? null : parseOccurrenceInput(record.input)?.scheduledAtMs ?? null,
+    scheduledAtMs: renderableInstant(
+      record === undefined ? null : parseOccurrenceInput(record.input)?.scheduledAtMs ?? null,
+    ),
     error: blocked?.error !== undefined
       ? errorText(blocked.error)
       : outcome?.status === "failed" || outcome?.status === "faulted" ? outcome.error.message : null,
@@ -802,6 +819,7 @@ async function viewsOf(
       job: copyJob(job),
       status: jobStatusOf(job, timer, execution, target),
       nextAtMs: timer !== null && !TERMINAL_TASK.has(timer.status) ? timer.scheduledAtMs : null,
+      // `timer.scheduledAtMs` above is already `renderableInstant`-sanitized by taskSummaryOf.
       timer,
       execution,
       target,
@@ -1352,6 +1370,25 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
             );
             return;
           }
+          // A legacy persisted input can name a deadline no `Date` can represent. Durable recovery
+          // re-runs this phase for a pending, interrupted or restored timer, so such a deadline
+          // must never reach `sleepUntil` — the task would park on a sleep that is never due and
+          // never settle — and must never arm or run an occurrence. The timer settles as failed
+          // with fixed text and without touching the job record, which stays inspectable and
+          // cancellable through the same paths as any other failed timer; a sleeping deadline
+          // beyond the bound written by an older build can never become due, so it is equally
+          // inert and remains cancellable through the abort path.
+          if (input.scheduledAtMs < 0 || input.scheduledAtMs > MAX_DATE_MS) {
+            const reason = "the persisted timer deadline is not a representable time";
+            await runtime.commit(
+              () => terminalFailed<CronTimerCheckpoint, CronTimerResult>(
+                timerResult(input, "missing", reason),
+                reason,
+              ),
+              context,
+            );
+            return;
+          }
           const now = runtime.now();
           if (input.scheduledAtMs > now) {
             await runtime.sleepUntil(input.scheduledAtMs, { phase: "fire" }, context);
@@ -1548,7 +1585,9 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
           return {
             jobId: existing.id,
             timerTaskId: existing.timerTaskId,
-            nextAtMs: timer === undefined ? null : parseOccurrenceInput(timer.input)?.scheduledAtMs ?? null,
+            nextAtMs: renderableInstant(
+              timer === undefined ? null : parseOccurrenceInput(timer.input)?.scheduledAtMs ?? null,
+            ),
             deduplicated: true,
           };
         }
@@ -1564,6 +1603,11 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
             ? schedule.anchorMs
             : nextCronOccurrence(schedule, now);
         if (firstAtMs === null) throw new TypeError("schedule has no future occurrence");
+        // The shared renderable bound, enforced before the job record or its timer is written: a
+        // commit beyond it would arm an unrenderable instant no receipt or renderer can print.
+        if (firstAtMs > MAX_DATE_MS) {
+          throw new TypeError("the first occurrence is beyond the representable date range");
+        }
         const jobId = `cron-${randomUUID()}`;
         const generation = 1;
         const timerTaskId = await tx.createTask(
@@ -1699,4 +1743,56 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
       return viewsOf(harness, conversationId, actor, context);
     },
   };
+}
+
+/**
+ * Recovery sweep for legacy damage, run once by the host that owns the process before it serves
+ * anything: a timer task persisted by an older build can sleep on a deadline beyond the shared
+ * renderable bound. Durable restores such a sleep at open and, because the deadline can never come
+ * due, nothing would ever run the phase that settles it. The sweep commits an abort mark on exactly
+ * those timers through the supported `abortTask` path. Durable's public task contract is that an
+ * abort mark does not wait for a sleep's `until`, so the committed mark itself ends the sleep: the
+ * task leaves the wake computation and becomes runnable, and the timer's own abort handler later
+ * settles it "cancelled" through the ordinary scheduler without arming an occurrence. The sweep
+ * therefore does not wait for that settlement (an unbounded wait, which as `waitForTask` would also
+ * resume scheduling early). Valid timers are untouched (the filter is exact), already-marked timers
+ * are skipped, and job records are not mutated.
+ *
+ * Nothing here is best-effort: a scan, commit or abort failure (for example a storage failure that
+ * fails the Durable session) and a cancelled `context` reject, so the caller can refuse to serve. A
+ * timer that settled after the scan is the one benign race, and `abortTask` reports it as
+ * `"terminal"` rather than throwing.
+ *
+ * Known limitation: Durable restores the sleep at open, before any host code can run, so between
+ * open and this sweep the restored sleep still contributes its clamped native wakeup reference.
+ * That window is inert (the due check holds forever for an out-of-range deadline, and the
+ * fire-phase guard settles the task if it is ever run), and the SDK offers no earlier seam.
+ */
+export async function disarmInvalidSleepingCronTimers(
+  harness: Pick<Harness, "commit" | "abortTask">,
+  context: Context,
+): Promise<number> {
+  const invalid: TaskRecord<JsonValue, JsonValue, JsonValue>[] = [];
+  let cursor: Cursor | undefined;
+  do {
+    context.abortSignal?.throwIfAborted();
+    const page = await harness.commit(
+      (tx) => tx.scanTasks({ kind: CRON_TIMER_TASK_NAME, status: "sleeping" }, 1_000, cursor),
+      context,
+    );
+    for (const record of page.items) {
+      if (record.abortRequested) continue;
+      const input = parseOccurrenceInput(record.input);
+      if (input !== undefined && (input.scheduledAtMs < 0 || input.scheduledAtMs > MAX_DATE_MS)) {
+        invalid.push(record);
+      }
+    }
+    cursor = page.next;
+  } while (cursor !== undefined);
+  let disarmed = 0;
+  for (const record of invalid) {
+    context.abortSignal?.throwIfAborted();
+    if (await harness.abortTask(record.id as TaskId<CronTimerResult>, context) === "marked") disarmed += 1;
+  }
+  return disarmed;
 }

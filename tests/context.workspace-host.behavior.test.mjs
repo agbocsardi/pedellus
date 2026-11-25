@@ -283,7 +283,7 @@ test("workspaceContext config rejects unsafe, duplicate, and unknown selections"
   );
   assert.throws(
     () => parseConfig({ ...base, workspaceContext: { bootstrapFiles: ["AGENTS.md"] } }),
-    /Unknown workspaceContext field/,
+    /workspaceContext\.bootstrapFiles is not a recognized option/,
   );
   assert.deepEqual(parseConfig({ ...base, workspaceContext: {} }).workspaceContext, {
     memoryFiles: [],

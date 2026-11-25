@@ -185,7 +185,7 @@ test('config rejects ambiguous or partial whisper-cli selection', async () => {
         ...base,
         media: { directory: 'media', transcription: { backend: 'whisper-cli', whisperCli: { ...engine, extra: '/x' } } },
       }, area.directory),
-      /Unknown media\.transcription\.whisperCli field: extra/,
+      /media\.transcription\.whisperCli\.extra is not a recognized option/,
     );
     assert.throws(
       () => parseConfig({
@@ -622,7 +622,7 @@ test('config accepts an explicit hex engine and rejects a partial one', async ()
         ...base,
         media: { directory: 'media', transcription: { backend: 'hex', hex: { ...engine, extra: '/x' } } },
       }, area.directory),
-      /Unknown media\.transcription\.hex field: extra/,
+      /media\.transcription\.hex\.extra is not a recognized option/,
     );
     assert.throws(
       () => parseConfig({

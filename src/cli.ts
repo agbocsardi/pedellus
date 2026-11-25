@@ -3,7 +3,7 @@ import { createInterface } from "node:readline";
 import { resolve } from "node:path";
 import { stdin, stderr, stdout } from "node:process";
 import type { AuthType } from "@earendil-works/pi-ai";
-import { BACKGROUND_CONTEXT, withAbortSignal, withoutAbortSignal } from "@earendil-works/chord/context";
+import { BACKGROUND_CONTEXT, withAbortSignal, withoutAbortSignal, type Context } from "@earendil-works/chord/context";
 import { runLogin, runLogout } from "./auth/cli.js";
 import { InitError, runInit } from "./init/index.js";
 import {
@@ -13,7 +13,7 @@ import {
   runCronCommand,
   type CronInvocation,
 } from "./automation/operator-cli.js";
-import { loadConfig, defaultConfigPath } from "./config.js";
+import { loadConfig, defaultConfigPath, PROVIDER_ID_PATTERN } from "./config.js";
 import {
   AppCommandError,
   AppUsageError,
@@ -28,10 +28,10 @@ import { runDoctor } from "./doctor/index.js";
 import { workspaceContextGatewayOptions } from "./context/workspace-host.js";
 import { COMMANDS, commandUsage, findCommandHelp, renderCommandHelp, renderOverview, renderUsage } from "./help/cli.js";
 import { SAFE_COMMAND_NAME } from "./help/commands.js";
-import { connectLocalGateway } from "./local/client.js";
+import { connectLocalGateway, type LocalOperatorClient, type LocalSessionClient } from "./local/client.js";
 import { renderQuestionText, type AskQuestionView } from "./questions/index.js";
 import { gatewaySocketPath, serveLocalGateway } from "./local/server.js";
-import { LocalGatewayError } from "./local/protocol.js";
+import { CONVERSATION_NAME_PATTERN, LocalGatewayError } from "./local/protocol.js";
 import { createMediaStore } from "./media/attachments.js";
 import { LOCAL_ATTACHMENT_DIRECTORY } from "./media/local.js";
 import { cancelPreparedContextBlock, listPreparedContextBlocks, PreparedContextRecoveryError } from "./recovery/index.js";
@@ -39,7 +39,8 @@ import { createRestartCoordinator, replaceProcess, restartPlan, restartSupported
 import { runTerminalConversation } from "./terminal/index.js";
 import { ownerDisplay } from "./terminal/display.js";
 import { openGateway } from "./runtime.js";
-import { prepareDataDirectory } from "./store.js";
+import { disarmInvalidSleepingCronTimers } from "./automation/cron.js";
+import { prepareDataDirectory, validateDataDirectoryReadOnly } from "./store.js";
 import { StartupDiagnosticError, startupDiagnostic } from "./startup-diagnostics.js";
 import { reportFailure, type FailureStage } from "./failure-diagnostics.js";
 import { journalEvent, observeOperation } from "./observability.js";
@@ -50,8 +51,6 @@ const USAGE = renderUsage();
 /** The subcommands this process accepts, excluding the historical bare `--config` attach. */
 const SUBCOMMANDS = new Set(COMMANDS.map((command) => command.name));
 
-const CONVERSATION_NAME = /^[a-z0-9](?:[a-z0-9_-]{0,30})[a-z0-9]$|^[a-z0-9]$/;
-
 /**
  * Where a launch reads its configuration. `default` resolves the owner's fixed
  * primary file at call time; `path` preserves the explicit `--config` argument
@@ -60,6 +59,23 @@ const CONVERSATION_NAME = /^[a-z0-9](?:[a-z0-9_-]{0,30})[a-z0-9]$|^[a-z0-9]$/;
 type ConfigSource =
   | { readonly kind: "default" }
   | { readonly kind: "path"; readonly path: string };
+
+const DEFAULT_CONFIG: ConfigSource = Object.freeze({ kind: "default" });
+
+function configSource(path: string | undefined): ConfigSource {
+  return path === undefined ? DEFAULT_CONFIG : { kind: "path", path };
+}
+
+/**
+ * One `--config <path>` at `args[index]`, accepted only once per command. Undefined means the
+ * argument is not a (first) config option, so the caller tries its other flags.
+ */
+function configOption(args: readonly string[], index: number, current: ConfigSource | undefined): ConfigSource | undefined {
+  if (current !== undefined || args[index] !== "--config" || !args[index + 1]) return undefined;
+  return { kind: "path", path: args[index + 1]! };
+}
+
+type LoadedConfig = Awaited<ReturnType<typeof loadConfig>>;
 
 type RecoveryInvocation =
   | { readonly kind: "list"; readonly config: ConfigSource }
@@ -140,69 +156,57 @@ function configPath(args: readonly string[], start: number): ConfigSource {
  */
 function launchInvocation(args: readonly string[]): LaunchInvocation {
   if (args[0] === "gateway") {
-    return { kind: "gateway", config: args.length === 1 ? { kind: "default" } : configPath(args, 1) };
+    return { kind: "gateway", config: args.length === 1 ? DEFAULT_CONFIG : configPath(args, 1) };
   }
   if (args[0] === "agent") return agentInvocation(args.slice(1));
   return { kind: "agent", config: configPath(args, 0) };
 }
 
 function agentInvocation(args: readonly string[]): LaunchInvocation {
-  let config: ConfigSource = { kind: "default" };
-  let configSeen = false;
+  let config: ConfigSource | undefined;
   let conversation: string | undefined;
   for (let index = 0; index < args.length;) {
     const argument = args[index];
-    if (argument === "--config" && !configSeen && args[index + 1]) {
-      config = { kind: "path", path: args[index + 1]! };
-      configSeen = true;
+    const explicit = configOption(args, index, config);
+    if (explicit !== undefined) {
+      config = explicit;
       index += 2;
     } else if (argument === "--conversation" && conversation === undefined && args[index + 1] &&
-        CONVERSATION_NAME.test(args[index + 1]!)) {
+        CONVERSATION_NAME_PATTERN.test(args[index + 1]!)) {
       conversation = args[index + 1];
       index += 2;
     } else {
       throw new UsageError();
     }
   }
-  return { kind: "agent", config, ...(conversation === undefined ? {} : { conversation }) };
+  return { kind: "agent", config: config ?? DEFAULT_CONFIG, ...(conversation === undefined ? {} : { conversation }) };
 }
 
 /** `app` reads its configuration like every other process command and attaches to the gateway. */
 function appInvocation(args: readonly string[]): { readonly invocation: AppInvocation; readonly config: ConfigSource } | undefined {
   if (args[0] !== "app") return undefined;
   const invocation = parseAppInvocation(args.slice(1));
-  return {
-    invocation,
-    config: invocation.configPath === undefined
-      ? { kind: "default" }
-      : { kind: "path", path: invocation.configPath },
-  };
+  return { invocation, config: configSource(invocation.configPath) };
 }
 
 /** `cron` reads its configuration like every other process command and attaches to the gateway. */
 function cronInvocation(args: readonly string[]): { readonly invocation: CronInvocation; readonly config: ConfigSource } | undefined {
   if (args[0] !== "cron") return undefined;
   const invocation = parseCronInvocation(args.slice(1));
-  return {
-    invocation,
-    config: invocation.configPath === undefined
-      ? { kind: "default" }
-      : { kind: "path", path: invocation.configPath },
-  };
+  return { invocation, config: configSource(invocation.configPath) };
 }
 
 function recoveryInvocation(args: readonly string[]): RecoveryInvocation | undefined {
   if (args[0] !== "recovery") return undefined;
-  let config: ConfigSource = { kind: "default" };
-  let configSeen = false;
+  let explicitConfig: ConfigSource | undefined;
   let cancel: string | undefined;
   let fingerprint: string | undefined;
   const rest = args.slice(1);
   for (let index = 0; index < rest.length;) {
     const argument = rest[index];
-    if (argument === "--config" && !configSeen && rest[index + 1]) {
-      config = { kind: "path", path: rest[index + 1]! };
-      configSeen = true;
+    const explicit = configOption(rest, index, explicitConfig);
+    if (explicit !== undefined) {
+      explicitConfig = explicit;
       index += 2;
     } else if (argument === "--cancel" && cancel === undefined && rest[index + 1]) {
       cancel = rest[index + 1];
@@ -214,6 +218,7 @@ function recoveryInvocation(args: readonly string[]): RecoveryInvocation | undef
       throw new PreparedContextRecoveryError(commandUsage("recovery"));
     }
   }
+  const config = explicitConfig ?? DEFAULT_CONFIG;
   if (cancel === undefined && fingerprint === undefined) return { kind: "list", config };
   if (cancel === undefined || fingerprint === undefined) throw new PreparedContextRecoveryError(commandUsage("recovery"));
   const taskId = Number(cancel);
@@ -223,33 +228,31 @@ function recoveryInvocation(args: readonly string[]): RecoveryInvocation | undef
   return { kind: "cancel", config, taskId, fingerprint };
 }
 
-const PROVIDER_ARGUMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
-
 function authInvocation(args: readonly string[]): AuthInvocation | undefined {
   const kind = args[0];
   if (kind !== "login" && kind !== "logout") return undefined;
-  let config: ConfigSource = { kind: "default" };
-  let configSeen = false;
+  let explicitConfig: ConfigSource | undefined;
   let provider: string | undefined;
   let auth: AuthType | undefined;
   const rest = args.slice(1);
   for (let index = 0; index < rest.length;) {
     const argument = rest[index];
-    if (argument === "--config" && !configSeen && rest[index + 1]) {
-      config = { kind: "path", path: rest[index + 1]! };
-      configSeen = true;
+    const explicit = configOption(rest, index, explicitConfig);
+    if (explicit !== undefined) {
+      explicitConfig = explicit;
       index += 2;
     } else if (kind === "login" && argument === "--auth" && auth === undefined && rest[index + 1]) {
       if (rest[index + 1] !== "api_key" && rest[index + 1] !== "oauth") throw new UsageError();
       auth = rest[index + 1] as AuthType;
       index += 2;
-    } else if (provider === undefined && argument !== undefined && PROVIDER_ARGUMENT.test(argument)) {
+    } else if (provider === undefined && argument !== undefined && PROVIDER_ID_PATTERN.test(argument)) {
       provider = argument;
       index += 1;
     } else {
       throw new UsageError();
     }
   }
+  const config = explicitConfig ?? DEFAULT_CONFIG;
   return kind === "login"
     ? {
         kind,
@@ -284,24 +287,23 @@ function modelsInvocation(args: readonly string[]): { readonly invocation: Model
   if (args[0] !== "models") return undefined;
   const action = args[1];
   if (action !== "refresh" && action !== "list") throw new UsageError();
-  let config: ConfigSource = { kind: "default" };
-  let configSeen = false;
+  let config: ConfigSource | undefined;
   const providers: string[] = [];
   const rest = args.slice(2);
   for (let index = 0; index < rest.length;) {
     const argument = rest[index];
-    if (argument === "--config" && !configSeen && rest[index + 1]) {
-      config = { kind: "path", path: rest[index + 1]! };
-      configSeen = true;
+    const explicit = configOption(rest, index, config);
+    if (explicit !== undefined) {
+      config = explicit;
       index += 2;
-    } else if (argument !== undefined && PROVIDER_ARGUMENT.test(argument) && providers.length < 64) {
+    } else if (argument !== undefined && PROVIDER_ID_PATTERN.test(argument) && providers.length < 64) {
       providers.push(argument);
       index += 1;
     } else {
       throw new UsageError();
     }
   }
-  return { invocation: { action, providers }, config };
+  return { invocation: { action, providers }, config: config ?? DEFAULT_CONFIG };
 }
 
 /**
@@ -309,7 +311,7 @@ function modelsInvocation(args: readonly string[]): { readonly invocation: Model
  * diagnostic; an explicit path keeps the existing unreadable/invalid text and
  * relative-path semantics. No discovery, merge or file creation happens here.
  */
-async function readConfig(source: ConfigSource): Promise<Awaited<ReturnType<typeof loadConfig>>> {
+async function readConfig(source: ConfigSource): Promise<LoadedConfig> {
   if (source.kind === "path") return loadConfig(source.path);
   try {
     return await loadConfig(defaultConfigPath());
@@ -328,7 +330,7 @@ async function readConfig(source: ConfigSource): Promise<Awaited<ReturnType<type
 async function readModelsConfig(
   invocation: ModelsInvocation,
   source: ConfigSource,
-): Promise<Awaited<ReturnType<typeof loadConfig>> | undefined> {
+): Promise<LoadedConfig | undefined> {
   if (invocation.action !== "list" || source.kind !== "default") return readConfig(source);
   try {
     return await readConfig(source);
@@ -379,7 +381,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   }
   if (leading === "doctor") {
     // Read-only and self-reporting: every check prints its own safe line, including config failures.
-    const config: ConfigSource = args.length === 1 ? { kind: "default" } : configPath(args, 1);
+    const config: ConfigSource = args.length === 1 ? DEFAULT_CONFIG : configPath(args, 1);
     const result = await runDoctor({ output: stdout, ...(config.kind === "path" ? { configPath: config.path } : {}) });
     if (!result.ok) process.exitCode = 1;
     return;
@@ -403,12 +405,24 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   }
 }
 
+/**
+ * Run `shutdown` on the first SIGINT or SIGTERM until the returned release runs. Callers release at
+ * the exact point their teardown starts, so a later signal keeps Node's default behavior.
+ */
+function onShutdownSignals(shutdown: () => void): () => void {
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
+  return () => {
+    process.off("SIGINT", shutdown);
+    process.off("SIGTERM", shutdown);
+  };
+}
+
 /** Guided first-run setup. It never opens the gateway; it writes only a configuration that does not exist yet. */
 async function runInitCommand(invocation: InitInvocation): Promise<void> {
   const stop = new AbortController();
   const shutdown = () => stop.abort(new Error("init cancelled"));
-  process.once("SIGINT", shutdown);
-  process.once("SIGTERM", shutdown);
+  const releaseSignals = onShutdownSignals(shutdown);
   try {
     // Resolved inside the boundary so a missing HOME keeps its fixed diagnostic.
     const configPath = invocation.configPath ?? defaultConfigPath();
@@ -425,20 +439,18 @@ async function runInitCommand(invocation: InitInvocation): Promise<void> {
     if (error instanceof StartupDiagnosticError || error instanceof InitError || error instanceof UsageError) throw error;
     throw new StartupDiagnosticError(stop.signal.aborted ? "initCanceled" : "initFailed", { cause: error });
   } finally {
-    process.off("SIGINT", shutdown);
-    process.off("SIGTERM", shutdown);
+    releaseSignals();
   }
 }
 
 /** Explicit terminal authentication. It never opens the gateway or starts a model turn. */
 async function runAuthCommand(
   invocation: AuthInvocation,
-  config: Awaited<ReturnType<typeof loadConfig>>,
+  config: LoadedConfig,
 ): Promise<void> {
   const stop = new AbortController();
   const shutdown = () => stop.abort(new Error("login cancelled"));
-  process.once("SIGINT", shutdown);
-  process.once("SIGTERM", shutdown);
+  const releaseSignals = onShutdownSignals(shutdown);
   try {
     if (invocation.kind === "login") {
       await runLogin(config, {
@@ -455,20 +467,18 @@ async function runAuthCommand(
     if (error instanceof StartupDiagnosticError || error instanceof UsageError) throw error;
     throw new StartupDiagnosticError(stop.signal.aborted ? "authCanceled" : "authFailed", { cause: error });
   } finally {
-    process.off("SIGINT", shutdown);
-    process.off("SIGTERM", shutdown);
+    releaseSignals();
   }
 }
 
 /** Explicit terminal catalog command. It never opens the gateway, reads credentials or edits config. */
 async function runModels(
   invocation: ModelsInvocation,
-  config: Awaited<ReturnType<typeof loadConfig>> | undefined,
+  config: LoadedConfig | undefined,
 ): Promise<void> {
   const stop = new AbortController();
   const shutdown = () => stop.abort(new Error("models command cancelled"));
-  process.once("SIGINT", shutdown);
-  process.once("SIGTERM", shutdown);
+  const releaseSignals = onShutdownSignals(shutdown);
   try {
     let result;
     try {
@@ -479,17 +489,15 @@ async function runModels(
     }
     if (!result.ok) process.exitCode = 1;
   } finally {
-    process.off("SIGINT", shutdown);
-    process.off("SIGTERM", shutdown);
+    releaseSignals();
   }
 }
 
-async function runRecovery(recovery: RecoveryInvocation, config: Awaited<ReturnType<typeof loadConfig>>): Promise<void> {
+async function runRecovery(recovery: RecoveryInvocation, config: LoadedConfig): Promise<void> {
   const stop = new AbortController();
   const context = withAbortSignal(stop.signal, BACKGROUND_CONTEXT);
   const shutdown = () => stop.abort();
-  process.once("SIGINT", shutdown);
-  process.once("SIGTERM", shutdown);
+  const releaseSignals = onShutdownSignals(shutdown);
   try {
     if (recovery.kind === "list") {
       const blocked = await listPreparedContextBlocks(config, context);
@@ -502,64 +510,55 @@ async function runRecovery(recovery: RecoveryInvocation, config: Awaited<ReturnT
     }, context);
     stdout.write(`${JSON.stringify(result)}\n`);
   } finally {
-    process.off("SIGINT", shutdown);
-    process.off("SIGTERM", shutdown);
+    releaseSignals();
   }
 }
 
 /**
- * Owner scheduling controls: one connection to the running gateway, no chat attachment.
- * Nothing is scheduled or cancelled in this process; the gateway owns every runtime decision.
+ * One operator-only connection to the running gateway, closed afterwards. No chat is attached and
+ * nothing runs in this process: the gateway owns every runtime decision.
  */
-async function runCron(invocation: CronInvocation, config: Awaited<ReturnType<typeof loadConfig>>): Promise<void> {
+async function withOperatorClient(
+  config: LoadedConfig,
+  run: (client: LocalOperatorClient, context: Context) => Promise<void>,
+): Promise<void> {
   const stop = new AbortController();
   const context = withAbortSignal(stop.signal, BACKGROUND_CONTEXT);
-  const shutdown = () => stop.abort();
-  process.once("SIGINT", shutdown);
-  process.once("SIGTERM", shutdown);
-  let client: Awaited<ReturnType<typeof connectLocalGateway>> | undefined;
+  const releaseSignals = onShutdownSignals(() => stop.abort());
+  let client: LocalOperatorClient | undefined;
   try {
     client = await connectLocalGateway({ socketPath: await localSocketPath(config), operatorOnly: true, context });
-    await runCronCommand({ client, command: invocation.command, output: stdout, context });
+    await run(client, context);
   } finally {
-    process.off("SIGINT", shutdown);
-    process.off("SIGTERM", shutdown);
+    releaseSignals();
     await client?.close();
   }
 }
 
+/** Owner scheduling controls: store-wide reads and exact-ID create/cancel over the operator socket. */
+function runCron(invocation: CronInvocation, config: LoadedConfig): Promise<void> {
+  return withOperatorClient(config, (client, context) =>
+    runCronCommand({ client, command: invocation.command, output: stdout, context }));
+}
+
 /**
- * Owner app-channel controls: one connection to the running gateway, no chat attachment. The
- * running app adapter owns every decision (label uniqueness, device limits, revocation); this
- * process only parses flags and renders the bounded answer.
+ * Owner app-channel controls. The running app adapter owns every decision (label uniqueness, device
+ * limits, revocation); this process only parses flags and renders the bounded answer.
  */
-async function runAppOperator(invocation: AppInvocation, config: Awaited<ReturnType<typeof loadConfig>>): Promise<void> {
-  const stop = new AbortController();
-  const context = withAbortSignal(stop.signal, BACKGROUND_CONTEXT);
-  const shutdown = () => stop.abort();
-  process.once("SIGINT", shutdown);
-  process.once("SIGTERM", shutdown);
-  let client: Awaited<ReturnType<typeof connectLocalGateway>> | undefined;
-  try {
-    client = await connectLocalGateway({ socketPath: await localSocketPath(config), operatorOnly: true, context });
-    await runAppCommand({ client, command: invocation.command, output: stdout, context });
-  } finally {
-    process.off("SIGINT", shutdown);
-    process.off("SIGTERM", shutdown);
-    await client?.close();
-  }
+function runAppOperator(invocation: AppInvocation, config: LoadedConfig): Promise<void> {
+  return withOperatorClient(config, (client, context) =>
+    runAppCommand({ client, command: invocation.command, output: stdout, context }));
 }
 
 /**
  * The gateway is the sole Durable/storage/runtime owner. It serves the local CLI
  * endpoint and, when configured, Telegram, until SIGINT/SIGTERM.
  */
-async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promise<void> {
+async function runGateway(config: LoadedConfig): Promise<void> {
   const stop = new AbortController();
   const context = withAbortSignal(stop.signal, BACKGROUND_CONTEXT);
   const shutdown = () => stop.abort();
-  process.once("SIGINT", shutdown);
-  process.once("SIGTERM", shutdown);
+  const releaseSignals = onShutdownSignals(shutdown);
   let gateway: Awaited<ReturnType<typeof openGateway>> | undefined;
   let server: Awaited<ReturnType<typeof serveLocalGateway>> | undefined;
   /** Every channel that started, so a setup failure and a running failure take the same teardown. */
@@ -576,7 +575,8 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
     teardown: shutdown,
   });
   try {
-    const socketPath = await localSocketPath(config);
+    // The gateway is the store owner: it may create the private data directory before binding.
+    const socketPath = await gatewayOwnerSocketPath(config);
     journalEvent("gateway.starting");
     gateway = await observeOperation("gateway.open", {},
       () => openGateway(config, context, {
@@ -585,6 +585,9 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
         // model, chat message or tool can name a path for a reload.
         ...(config.configFile === undefined ? {} : { reloadConfig: () => loadConfig(config.configFile!) }),
       }));
+    // Legacy recovery before serving; a failed recovery or a shutdown requested meanwhile stops
+    // here, before the local socket, any channel or `gateway.surfaces.started`.
+    await recoverBeforeServing(gateway.harness, stop.signal, context);
     stage = "gateway.local";
     // The gateway owns local attachments too: the CLI only names an operator path. CLI
     // originals live in a code-owned child of the validated operator media root, so a
@@ -730,8 +733,7 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
     }
   } finally {
     journalEvent("gateway.stopping");
-    process.off("SIGINT", shutdown);
-    process.off("SIGTERM", shutdown);
+    releaseSignals();
     try {
       await server?.close();
     } catch (error) {
@@ -749,6 +751,25 @@ async function runGateway(config: Awaited<ReturnType<typeof loadConfig>>): Promi
   journalEvent("gateway.stopped", { isError: failure !== undefined });
   if (failure !== undefined) throw failure.error;
   if (restart.accepted()) replaceGatewayProcess();
+}
+
+/**
+ * Startup recovery gate between opening the gateway and serving it. The cron sweep disarms legacy
+ * timers sleeping on unreachable deadlines (see `disarmInvalidSleepingCronTimers`); any failure of
+ * it, and a shutdown requested during open or recovery, rejects with a fixed diagnostic so the
+ * caller tears down instead of binding the socket or starting channels. Nothing is swallowed.
+ */
+export async function recoverBeforeServing(
+  harness: Parameters<typeof disarmInvalidSleepingCronTimers>[0],
+  signal: AbortSignal,
+  context: Context,
+): Promise<void> {
+  try {
+    await disarmInvalidSleepingCronTimers(harness, context);
+  } catch (cause) {
+    throw new StartupDiagnosticError(signal.aborted ? "gatewayCanceled" : "cronRecovery", { cause });
+  }
+  if (signal.aborted) throw new StartupDiagnosticError("gatewayCanceled");
 }
 
 /**
@@ -812,7 +833,7 @@ function replaceGatewayProcess(): void {
  * and the same `cli` conversation is resumed on the next attach.
  */
 async function runAgent(
-  config: Awaited<ReturnType<typeof loadConfig>>,
+  config: LoadedConfig,
   conversation: string | undefined,
 ): Promise<void> {
   const stop = new AbortController();
@@ -823,9 +844,8 @@ async function runAgent(
     stop.abort();
     input?.close();
   };
-  process.once("SIGINT", shutdown);
-  process.once("SIGTERM", shutdown);
-  let client: Awaited<ReturnType<typeof connectLocalGateway>> | undefined;
+  const releaseSignals = onShutdownSignals(shutdown);
+  let client: LocalSessionClient | undefined;
   try {
     const socketPath = await localSocketPath(config);
     client = await connectLocalGateway({
@@ -934,14 +954,27 @@ async function runAgent(
     });
   } finally {
     input?.close();
-    process.off("SIGINT", shutdown);
-    process.off("SIGTERM", shutdown);
+    releaseSignals();
     await client?.close();
   }
 }
 
-/** Canonicalize the configured private data directory and derive the socket path. */
-async function localSocketPath(config: Awaited<ReturnType<typeof loadConfig>>): Promise<string> {
+/**
+ * Socket path for a client command (`agent`, `cron`, `app`). Read-only: a missing data directory is
+ * never created or re-permissioned here; with no gateway running, the connect simply fails.
+ */
+async function localSocketPath(config: LoadedConfig): Promise<string> {
+  let dataDir: string;
+  try {
+    dataDir = await validateDataDirectoryReadOnly(config);
+  } catch (cause) {
+    throw new StartupDiagnosticError("workspace", { cause });
+  }
+  return gatewaySocketPath(dataDir);
+}
+
+/** The gateway owns the store, so it prepares (creates and restricts) the data directory before binding. */
+async function gatewayOwnerSocketPath(config: LoadedConfig): Promise<string> {
   let prepared: Awaited<ReturnType<typeof prepareDataDirectory>>;
   try {
     prepared = await prepareDataDirectory(config);

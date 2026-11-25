@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
 import { connect } from "node:net";
@@ -158,6 +158,67 @@ function terminalIO(client, input) {
     },
   };
 }
+
+test("a disconnect during attach registers no session surfaces and never hangs", { timeout: 30_000 }, async (t) => {
+  const { gateway, socketPath } = await makeEnvironment(t);
+  const attached = [];
+  let release;
+  let entered;
+  let afterGate;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const enteredAttach = new Promise((resolve) => { entered = resolve; });
+  const gateFinished = new Promise((resolve) => { afterGate = resolve; });
+  const surfaces = {
+    attach(handler) { attached.push(handler); return () => undefined; },
+  };
+  // The conversation is pre-opened, so the wrapper can resolve a real one after the disconnect —
+  // the attach then has everything it needs to register late, which only the fence stops.
+  const preopened = await gateway.conversationFor("cli:default", context);
+  // The wrapper holds the attach until the server has actually processed the disconnect: the
+  // connection scope is cancelled during teardown, so this ordering is the real late registration.
+  const waitForAbort = (signal) => new Promise((resolve) => {
+    if (signal === undefined || signal.aborted) resolve();
+    else signal.addEventListener("abort", () => resolve(), { once: true });
+  });
+  const wrapped = {
+    ...gateway,
+    async conversationFor(sessionKey, ctx) {
+      entered();
+      await gate;
+      await waitForAbort(ctx?.abortSignal);
+      afterGate();
+      return preopened;
+    },
+    mcpSurfaces: surfaces,
+    askSurfaces: surfaces,
+  };
+  // A second private endpoint on the same data directory, served through the wrapped gateway.
+  const fenceSocket = join(dirname(socketPath), "gateway-fence.sock");
+  const server = await serveLocalGateway({
+    socketPath: fenceSocket,
+    gateway: wrapped,
+    context,
+    tools: [],
+    contextRefresh: false,
+    presets: false,
+  });
+  t.after(() => server.close().catch(() => undefined));
+
+  const raw = connect({ path: fenceSocket });
+  await new Promise((resolveConnect, rejectConnect) => {
+    raw.once("connect", resolveConnect);
+    raw.once("error", rejectConnect);
+  });
+  raw.write(`${JSON.stringify({ id: 1, method: "attach", params: {} })}\n`);
+  // The client disappears while the gateway is still opening the conversation: the late attach
+  // must register no session surface, send nothing, and leave the connection closed cleanly.
+  await enteredAttach;
+  raw.destroy();
+  release();
+  await gateFinished;
+  await new Promise((resolveTick) => setImmediate(resolveTick));
+  assert.equal(attached.length, 0, "a disconnected attach must not register session surfaces");
+});
 
 test("a CLI attaches, disconnects and resumes while the gateway keeps serving", { timeout: 30_000 }, async (t) => {
   const { gateway, provider, socketPath } = await makeEnvironment(t);
@@ -510,6 +571,23 @@ test("a second local gateway owner is refused without disturbing the live one", 
   assert.notEqual(named.id, client.id);
   await named.close();
   await client.close();
+});
+
+test("an operator-only connection reaches no chat, and a missing episode stays a reply", { timeout: 20_000 }, async (t) => {
+  const { socketPath } = await makeEnvironment(t);
+  const { LocalRemoteError } = await import(pathToFileURL(`${pkg}/dist/local/client.js`).href);
+  const operator = await connectLocalGateway({ socketPath, operatorOnly: true, context });
+  // Its type has no conversation methods; a raw call still reaches no chat on the gateway.
+  await assert.rejects(operator.status(context), (error) => error instanceof LocalRemoteError && error.code === "unavailable");
+  await operator.close();
+  await operator.close();
+
+  const client = await connectLocalGateway({ socketPath, context });
+  // JSON drops `undefined`; the reply must still arrive and leave the connection usable.
+  assert.equal(await client.episode(client.sessionKey, 999_999, context), undefined);
+  assert.equal((await client.status(context)).run, undefined);
+  await client.close();
+  await assert.rejects(client.status(context), /closed/);
 });
 
 test("malformed and out-of-scope requests stay inside the attach scope", { timeout: 20_000 }, async (t) => {

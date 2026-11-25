@@ -30,7 +30,7 @@ import {
 	type FilesystemPathProbe,
 	type ShellPolicyOptions,
 } from "./policy.js";
-import { buildDirectBwrapArgs, resolveDirectBwrapPath } from "./direct-bwrap.js";
+import { buildDirectBwrapArgsWithBinary, resolveDirectBwrapPath } from "./direct-bwrap.js";
 
 /** Optional direct-workspace Bubblewrap shell. Filesystem calls remain the guarded native implementation. */
 export interface BwrapShellOptions {
@@ -127,7 +127,13 @@ function readFlags(flags: string | number): string | number {
  * The shell timeout, environment allowlist, command filters and filesystem checks all come from `./policy.ts`; the
  * Bubblewrap shell uses that same policy and the direct-workspace argv builder rather than a second policy.
  */
-export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
+export class HostExecutionEnv implements ExecutionEnv {
+	/**
+	 * The native implementation every guarded method forwards to. It is held, not inherited, so each
+	 * `ExecutionEnv` method this class exposes is one it wrote: a required method added upstream is a
+	 * compile error here instead of an unguarded inherited path.
+	 */
+	readonly #delegate: NodeExecutionEnv;
 	readonly #policy: ExecutionPolicy;
 	readonly #workspaceRoot: string;
 	readonly #tempRoot: string;
@@ -144,7 +150,7 @@ export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 		ownsTempRoot: boolean;
 		bwrap?: BwrapShell;
 	}) {
-		super({ cwd: options.cwd });
+		this.#delegate = new ScratchNodeExecutionEnv(options.cwd, options.tempRoot);
 		this.#policy = options.policy;
 		this.#workspaceRoot = options.workspaceRoot;
 		this.#tempRoot = options.tempRoot;
@@ -153,15 +159,35 @@ export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 		this.#descriptorRoot = existsSync("/proc/self/fd") ? "/proc/self/fd" : undefined;
 	}
 
+	get id(): string {
+		return this.#delegate.id;
+	}
+
+	get cwd(): string {
+		return this.#delegate.cwd;
+	}
+
+	set cwd(value: string) {
+		this.#delegate.cwd = value;
+	}
+
+	absolutePath(path: string, context: Context): Promise<Result<string, FileError>> {
+		return this.#delegate.absolutePath(path, context);
+	}
+
+	joinPath(parts: string[], context: Context): Promise<Result<string, FileError>> {
+		return this.#delegate.joinPath(parts, context);
+	}
+
 	async #probe(context: Context): Promise<FilesystemPathProbe> {
 		return {
-			canonicalPath: (path) => super.canonicalPath(path, context),
-			fileInfo: (path) => super.fileInfo(path, context),
+			canonicalPath: (path) => this.#delegate.canonicalPath(path, context),
+			fileInfo: (path) => this.#delegate.fileInfo(path, context),
 		};
 	}
 
 	async #absolutePath(path: string, context: Context): Promise<Result<string, FileError>> {
-		return super.absolutePath(path, context);
+		return this.#delegate.absolutePath(path, context);
 	}
 
 	async #guarded<T>(
@@ -232,31 +258,46 @@ export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 		}
 	}
 
-	override readTextFile(path: string, context: Context) {
+	readTextFile(path: string, context: Context) {
 		return this.#guarded(path, context, true, (absolute) =>
-			this.#throughDescriptor(absolute, "r", context, (target) => super.readTextFile(target, context)));
+			this.#throughDescriptor(absolute, "r", context, (target) => this.#delegate.readTextFile(target, context)));
 	}
 
-	override openTextLineReader(path: string, context: Context): Promise<Result<TextLineReader, FileError>> {
+	openTextLineReader(path: string, context: Context): Promise<Result<TextLineReader, FileError>> {
 		return this.#guarded(path, context, true, (absolute) =>
-			this.#throughDescriptor(absolute, "r", context, (target) => super.openTextLineReader(target, context)));
+			this.#throughDescriptor(absolute, "r", context, (target) => this.#delegate.openTextLineReader(target, context)));
 	}
 
-	override readTextLines(
+	async readTextLines(
 		path: string,
 		options: { maxLines?: number } | undefined,
 		context: Context,
 	): Promise<Result<string[], FileError>> {
-		// Delegates to the guarded `openTextLineReader`, so it inherits the same descriptor check.
-		return super.readTextLines(path, options, context);
+		// Built on the guarded `openTextLineReader`, so it gets the same descriptor check. The delegate's
+		// own `readTextLines` would open through its unguarded reader.
+		if (options?.maxLines !== undefined && options.maxLines <= 0) return ok<string[], FileError>([]);
+		const opened = await this.openTextLineReader(path, context);
+		if (!opened.ok) return opened;
+		const lines: string[] = [];
+		try {
+			while (options?.maxLines === undefined || lines.length < options.maxLines) {
+				const line = await opened.value.readLine(context);
+				if (!line.ok) return line;
+				if (line.value === undefined) break;
+				lines.push(line.value.text);
+			}
+			return ok<string[], FileError>(lines);
+		} finally {
+			await opened.value.close(context);
+		}
 	}
 
-	override readBinaryFile(path: string, context: Context): Promise<Result<Uint8Array, FileError>> {
+	readBinaryFile(path: string, context: Context): Promise<Result<Uint8Array, FileError>> {
 		return this.#guarded(path, context, true, (absolute) =>
-			this.#throughDescriptor(absolute, "r", context, (target) => super.readBinaryFile(target, context), true));
+			this.#throughDescriptor(absolute, "r", context, (target) => this.#delegate.readBinaryFile(target, context), true));
 	}
 
-	override openBinaryReader(
+	openBinaryReader(
 		path: string,
 		options: { noFollow?: boolean } | undefined,
 		context: Context,
@@ -270,7 +311,7 @@ export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 				// verified proc entry as a link of its own.
 				noFollow ? constants.O_RDONLY | constants.O_NOFOLLOW : "r",
 				context,
-				(target) => super.openBinaryReader(target, noFollow ? { ...options, noFollow: false } : options, context),
+				(target) => this.#delegate.openBinaryReader(target, noFollow ? { ...options, noFollow: false } : options, context),
 			);
 			if (!verified.ok) return verified;
 			const reader = verified.value;
@@ -285,33 +326,33 @@ export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 		});
 	}
 
-	override writeFile(path: string, content: string | Uint8Array, context: Context): Promise<Result<void, FileError>> {
+	writeFile(path: string, content: string | Uint8Array, context: Context): Promise<Result<void, FileError>> {
 		return this.#guarded(path, context, true, async (absolute) => {
 			// The native write creates missing parents; the descriptor has to exist before it can be opened.
 			const prepared = await ensureParent(absolute);
 			return prepared === undefined
-				? this.#throughDescriptor(absolute, "a", context, (target) => super.writeFile(target, content, context))
+				? this.#throughDescriptor(absolute, "a", context, (target) => this.#delegate.writeFile(target, content, context))
 				: err<void, FileError>(prepared);
 		});
 	}
 
-	override appendFile(path: string, content: string | Uint8Array, context: Context): Promise<Result<void, FileError>> {
+	appendFile(path: string, content: string | Uint8Array, context: Context): Promise<Result<void, FileError>> {
 		return this.#guarded(path, context, true, async (absolute) => {
 			const prepared = await ensureParent(absolute);
 			return prepared === undefined
-				? this.#throughDescriptor(absolute, "a", context, (target) => super.appendFile(target, content, context))
+				? this.#throughDescriptor(absolute, "a", context, (target) => this.#delegate.appendFile(target, content, context))
 				: err<void, FileError>(prepared);
 		});
 	}
 
-	override truncateFile(path: string, size: number, context: Context): Promise<Result<void, FileError>> {
+	truncateFile(path: string, size: number, context: Context): Promise<Result<void, FileError>> {
 		return this.#guarded(path, context, true, (absolute) =>
-			this.#throughDescriptor(absolute, "r+", context, (target) => super.truncateFile(target, size, context)));
+			this.#throughDescriptor(absolute, "r+", context, (target) => this.#delegate.truncateFile(target, size, context)));
 	}
 
-	override flushFile(path: string, context: Context): Promise<Result<void, FileError>> {
+	flushFile(path: string, context: Context): Promise<Result<void, FileError>> {
 		return this.#guarded(path, context, true, (absolute) =>
-			this.#throughDescriptor(absolute, "r+", context, (target) => super.flushFile(target, context)));
+			this.#throughDescriptor(absolute, "r+", context, (target) => this.#delegate.flushFile(target, context)));
 	}
 
 	/**
@@ -320,71 +361,166 @@ export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 	 * This is a real `O_CREAT | O_EXCL` create at the guarded absolute path, not a check followed by a
 	 * truncating write: a concurrent create by this process or by an outside editor makes the call fail
 	 * with `invalid` ("the file already exists") and nothing is overwritten. It stays inside the same
-	 * guarded roots as `writeFile`, and `O_EXCL` never follows a final symbolic link. Missing parent
-	 * directories are created first, matching the native write. It is not a lock and does not join
-	 * another tool's in-process mutation queue; callers that need ordering with a concurrent `write`
-	 * keep the exclusive result, not a substitute write.
+	 * guarded roots as `writeFile`. `O_EXCL` never follows a final symbolic link, so the guard checks
+	 * the parent directory rather than a link target. Missing parent directories are created one
+	 * component at a time through a descriptor-pinned, policy-verified ancestor: each new component is
+	 * created inside the directory the previous descriptor verified and is itself re-verified before
+	 * the next one is created, so no directory is ever created before its parent is verified and a
+	 * component swapped for a symbolic link after the check cannot redirect the chain. It is not a lock and does
+	 * not join another tool's in-process mutation queue; callers that need ordering with a concurrent
+	 * `write` keep the exclusive result, not a substitute write.
 	 */
 	async createFileExclusive(
 		path: string,
 		content: string | Uint8Array,
 		context: Context,
 	): Promise<Result<void, FileError>> {
-		return this.#guarded(path, context, true, async (absolute) => {
+		return this.#guarded(path, context, false, async (absolute) => {
 			if (context.abortSignal?.aborted) return err<void, FileError>(new FileError("aborted", "aborted", absolute));
-			try {
-				await mkdir(dirname(absolute), { recursive: true });
-				await writeFileHost(absolute, content, { flag: "wx" });
-				return ok(undefined);
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException | null)?.code === "EEXIST") {
-					return err<void, FileError>(new FileError("invalid", "the file already exists", absolute));
+			return this.#inVerifiedParent(absolute, context, async (target) => {
+				try {
+					await writeFileHost(target, content, { flag: "wx" });
+					return ok<void, FileError>(undefined);
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException | null)?.code === "EEXIST") {
+						return err<void, FileError>(new FileError("invalid", "the file already exists", absolute));
+					}
+					return err<void, FileError>(toFileError(error));
 				}
-				return err<void, FileError>(toFileError(error));
-			}
+			});
 		});
 	}
 
-	override fileInfo(path: string, context: Context): Promise<Result<FileInfo, FileError>> {
+	/**
+	 * Run one create against the parent directory pinned by a descriptor, after checking where that
+	 * descriptor really is. `target` names the final component inside the pinned directory, so a later
+	 * swap of any parent path component cannot move the create elsewhere. Missing parent components
+	 * below the nearest existing ancestor are created one at a time, each through the descriptor of
+	 * the last verified directory and re-verified before the next is created, so a missing directory
+	 * is never created before its parent is verified; a component a concurrent process created in the
+	 * meantime is accepted only after the same descriptor verification. Without procfs the guard
+	 * keeps its resolved-path check, as the module docs say.
+	 */
+	async #inVerifiedParent<T>(
+		absolute: string,
+		context: Context,
+		run: (target: string) => Promise<Result<T, FileError>>,
+	): Promise<Result<T, FileError>> {
+		const root = this.#descriptorRoot;
+		if (root === undefined) {
+			const prepared = await ensureParent(absolute);
+			return prepared === undefined ? run(absolute) : err<T, FileError>(prepared);
+		}
+		const leaf = basename(absolute);
+		let handle: FileHandle | undefined;
+		let actualParent: string | undefined;
+		const missing: string[] = [];
+		try {
+			// Nearest existing ancestor of the parent, and the still-missing components below it
+			// (deepest first). A component that exists but cannot be resolved (for example a dangling
+			// symbolic link) is refused rather than guessed at.
+			let current = dirname(absolute);
+			let canonical: string | undefined;
+			while (true) {
+				try {
+					canonical = await realpath(current);
+					break;
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+				}
+				const info = await lstat(current).then((value) => value, (error: NodeJS.ErrnoException) => {
+					if (error.code === "ENOENT") return undefined;
+					throw error;
+				});
+				if (info !== undefined) {
+					throw new FileError(
+						"permission_denied",
+						`Path contains a symbolic link that cannot be resolved: ${current}`,
+						current,
+					);
+				}
+				const ancestor = dirname(current);
+				if (ancestor === current) throw new FileError("not_found", "parent directory does not exist", absolute);
+				missing.push(basename(current));
+				current = ancestor;
+			}
+			// Pin the nearest existing ancestor and verify where the descriptor really points, so a
+			// component swapped for a symlink between the walk and the open is caught here.
+			handle = await open(canonical!, constants.O_RDONLY | constants.O_DIRECTORY);
+			actualParent = await readlink(`${root}/${handle.fd}`);
+			const deniedAncestor = this.#policy.checkPath(actualParent);
+			if (deniedAncestor !== undefined) return err<T, FileError>(deniedAncestor);
+			// Create the missing components shallowest first, each inside the descriptor of the last
+			// verified directory, and re-verify each new descriptor before the next component is
+			// created: no directory exists before its parent is verified.
+			while (missing.length > 0) {
+				const name = missing.pop()!;
+				try {
+					await mkdir(`${root}/${handle!.fd}/${name}`);
+				} catch (error) {
+					// A concurrent creator may have made this component; nothing is descended into before
+					// the descriptor verification below, which refuses a swapped or redirected directory.
+					if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+				}
+				const next = await open(`${root}/${handle!.fd}/${name}`, constants.O_RDONLY | constants.O_DIRECTORY);
+				const actual = await readlink(`${root}/${next.fd}`);
+				const denied = this.#policy.checkPath(actual);
+				await handle!.close().catch(() => undefined);
+				handle = next;
+				actualParent = actual;
+				if (denied !== undefined) return err<T, FileError>(denied);
+			}
+			const deniedLeaf = this.#policy.checkPath(join(actualParent!, leaf));
+			if (deniedLeaf !== undefined) return err<T, FileError>(deniedLeaf);
+			if (context.abortSignal?.aborted) return err<T, FileError>(new FileError("aborted", "aborted", absolute));
+			return await run(`${root}/${handle!.fd}/${leaf}`);
+		} catch (error) {
+			return err<T, FileError>(openError(error, absolute));
+		} finally {
+			await handle?.close().catch(() => undefined);
+		}
+	}
+
+	fileInfo(path: string, context: Context): Promise<Result<FileInfo, FileError>> {
 		// `fileInfo` uses lstat-like semantics: a final symlink is reported, not followed.
-		return this.#guarded(path, context, false, (absolute) => super.fileInfo(absolute, context));
+		return this.#guarded(path, context, false, (absolute) => this.#delegate.fileInfo(absolute, context));
 	}
 
-	override listDir(path: string, context: Context): Promise<Result<FileInfo[], FileError>> {
-		return this.#guarded(path, context, true, (absolute) => super.listDir(absolute, context));
+	listDir(path: string, context: Context): Promise<Result<FileInfo[], FileError>> {
+		return this.#guarded(path, context, true, (absolute) => this.#delegate.listDir(absolute, context));
 	}
 
-	override openDirReader(path: string, context: Context): Promise<Result<DirReader, FileError>> {
-		return this.#guarded(path, context, true, (absolute) => super.openDirReader(absolute, context));
+	openDirReader(path: string, context: Context): Promise<Result<DirReader, FileError>> {
+		return this.#guarded(path, context, true, (absolute) => this.#delegate.openDirReader(absolute, context));
 	}
 
-	override canonicalPath(path: string, context: Context): Promise<Result<string, FileError>> {
-		return this.#guarded(path, context, true, (absolute) => super.canonicalPath(absolute, context));
+	canonicalPath(path: string, context: Context): Promise<Result<string, FileError>> {
+		return this.#guarded(path, context, true, (absolute) => this.#delegate.canonicalPath(absolute, context));
 	}
 
-	override exists(path: string, context: Context): Promise<Result<boolean, FileError>> {
-		return this.#guarded(path, context, false, (absolute) => super.exists(absolute, context));
+	exists(path: string, context: Context): Promise<Result<boolean, FileError>> {
+		return this.#guarded(path, context, false, (absolute) => this.#delegate.exists(absolute, context));
 	}
 
-	override createDir(
+	createDir(
 		path: string,
 		options: { recursive?: boolean } | undefined,
 		context: Context,
 	): Promise<Result<void, FileError>> {
 		// mkdir does not follow a final symlink; its parent is the boundary.
-		return this.#guarded(path, context, false, (absolute) => super.createDir(absolute, options, context));
+		return this.#guarded(path, context, false, (absolute) => this.#delegate.createDir(absolute, options, context));
 	}
 
-	override remove(
+	remove(
 		path: string,
 		options: { recursive?: boolean; force?: boolean } | undefined,
 		context: Context,
 	): Promise<Result<void, FileError>> {
 		// Removing a symbolic link removes the link, not what it points at.
-		return this.#guarded(path, context, false, (absolute) => super.remove(absolute, options, context), true);
+		return this.#guarded(path, context, false, (absolute) => this.#delegate.remove(absolute, options, context), true);
 	}
 
-	override async renameFile(
+	async renameFile(
 		sourcePath: string,
 		destinationPath: string,
 		context: Context,
@@ -398,10 +534,10 @@ export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 		if (deniedSource !== undefined) return err<void, FileError>(deniedSource);
 		const deniedDestination = await this.#policy.checkFilesystemPath(destination.value, probe, false, true);
 		if (deniedDestination !== undefined) return err<void, FileError>(deniedDestination);
-		return super.renameFile(source.value, destination.value, context);
+		return this.#delegate.renameFile(source.value, destination.value, context);
 	}
 
-	override async watch(
+	async watch(
 		targets: readonly WatchTarget[],
 		onChange: (change: FileChange) => void,
 		context: Context,
@@ -418,7 +554,109 @@ export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 			if (denied !== undefined) return err<FileWatcher, FileError>(denied);
 			safe.push({ ...target, path: absolute.value });
 		}
-		return super.watch(safe, onChange, context);
+		return this.#delegate.watch(safe, onChange, context);
+	}
+
+	createTempDir(prefix: string | undefined, context: Context): Promise<Result<string, FileError>> {
+		return this.#delegate.createTempDir(prefix, context);
+	}
+
+	createTempFile(
+		options: { prefix?: string; suffix?: string } | undefined,
+		context: Context,
+	): Promise<Result<string, FileError>> {
+		return this.#delegate.createTempFile(options, context);
+	}
+
+	async cleanup(context: Context): Promise<void> {
+		try {
+			await this.#delegate.cleanup(context);
+		} finally {
+			// Owned spill/temp paths are environment-lifetime only; never treat them as durable storage.
+			if (this.#ownsTempRoot) await rm(this.#tempRoot, { recursive: true, force: true }).catch(() => undefined);
+		}
+	}
+
+	async exec(
+		command: string | readonly string[],
+		options: ShellExecOptions | undefined,
+		context: Context,
+	): Promise<Result<ShellExecResult, ExecutionError>> {
+		if (context.abortSignal?.aborted) return err(new ExecutionError("aborted", "aborted"));
+		const cwd = await this.#absolutePath(options?.cwd ?? this.cwd, context);
+		if (!cwd.ok) return err(new ExecutionError("spawn_error", cwd.error.message, cwd.error));
+		const deniedCwd = await this.#policy.checkFilesystemPath(cwd.value, await this.#probe(context), true);
+		if (deniedCwd !== undefined) {
+			return err(new ExecutionError("spawn_error", deniedCwd.message, deniedCwd));
+		}
+		const denied = this.#policy.checkCommand(command, { cwd: cwd.value });
+		if (denied !== undefined) return err(new ExecutionError("spawn_error", denied));
+		const timeout = this.#policy.resolveShellTimeout(options?.timeout);
+		if (!timeout.ok) return err(timeout.error);
+		const safe: ShellExecOptions = {
+			...(options ?? {}),
+			cwd: cwd.value,
+			// Caller env and inheritEnv are ignored: only the shared allowlist reaches the shell.
+			env: this.#policy.shellEnvironment(),
+			inheritEnv: false,
+		};
+		if (timeout.value === undefined) delete safe.timeout;
+		else safe.timeout = timeout.value;
+		if (this.#bwrap === undefined) return this.#delegate.exec(command, safe, context);
+
+		// The sandbox mounts only the workspace; a cwd in an extra allowed root would silently fall back to the
+		// workspace inside the builder, so refuse it instead of running somewhere the caller did not ask for.
+		if (!isPathWithin(this.#workspaceRoot, cwd.value)) {
+			return err(
+				new ExecutionError(
+					"spawn_error",
+					`Bubblewrap shell cwd is outside the workspace: ${cwd.value}`,
+				),
+			);
+		}
+
+		let argv: string[];
+		try {
+			// The binary was resolved and validated once when this environment was created; the argv
+			// builder still re-resolves and re-checks the workspace, cwd and media paths right here,
+			// and revalidates the executable's pinned inode/size/mtime identity, so pre-launch
+			// revalidation keeps happening on every command.
+			argv = buildDirectBwrapArgsWithBinary(this.#bwrap.binary, {
+				workspace: this.#workspaceRoot,
+				cwd: cwd.value,
+				command:
+					typeof command === "string"
+						? [...this.#bwrap.interpreter, command]
+						: [...command],
+			});
+		} catch (error) {
+			const cause = error instanceof Error ? error : new Error(String(error));
+			return err(new ExecutionError("spawn_error", cause.message, cause));
+		}
+		return this.#delegate.exec(
+			argv,
+			{
+				...safe,
+				// The host scratch root is not mounted inside the sandbox. Its `/tmp` is a private writable tmpfs, while
+				// bash spill files are still written by this host process under the private scratch root and stay readable.
+				env: { ...safe.env, TMPDIR: "/tmp" },
+			},
+			context,
+		);
+	}
+}
+
+/**
+ * The native environment behind `HostExecutionEnv`, with temp and spill files in the private scratch
+ * root. The native shell creates its spill file through its own `createTempFile`, so this is where the
+ * scratch root has to apply for the spill to stay readable through the guarded `read`.
+ */
+class ScratchNodeExecutionEnv extends NodeExecutionEnv {
+	readonly #tempRoot: string;
+
+	constructor(cwd: string, tempRoot: string) {
+		super({ cwd });
+		this.#tempRoot = tempRoot;
 	}
 
 	override async createTempDir(prefix: string | undefined, context: Context): Promise<Result<string, FileError>> {
@@ -450,80 +688,6 @@ export class HostExecutionEnv extends NodeExecutionEnv implements ExecutionEnv {
 		} catch (error) {
 			return err<string, FileError>(toFileError(error));
 		}
-	}
-
-	override async cleanup(context: Context): Promise<void> {
-		try {
-			await super.cleanup(context);
-		} finally {
-			// Owned spill/temp paths are environment-lifetime only; never treat them as durable storage.
-			if (this.#ownsTempRoot) await rm(this.#tempRoot, { recursive: true, force: true }).catch(() => undefined);
-		}
-	}
-
-	override async exec(
-		command: string | readonly string[],
-		options: ShellExecOptions | undefined,
-		context: Context,
-	): Promise<Result<ShellExecResult, ExecutionError>> {
-		if (context.abortSignal?.aborted) return err(new ExecutionError("aborted", "aborted"));
-		const cwd = await this.#absolutePath(options?.cwd ?? this.cwd, context);
-		if (!cwd.ok) return err(new ExecutionError("spawn_error", cwd.error.message, cwd.error));
-		const deniedCwd = await this.#policy.checkFilesystemPath(cwd.value, await this.#probe(context), true);
-		if (deniedCwd !== undefined) {
-			return err(new ExecutionError("spawn_error", deniedCwd.message, deniedCwd));
-		}
-		const denied = this.#policy.checkCommand(command, { cwd: cwd.value });
-		if (denied !== undefined) return err(new ExecutionError("spawn_error", denied));
-		const timeout = this.#policy.resolveShellTimeout(options?.timeout);
-		if (!timeout.ok) return err(timeout.error);
-		const safe: ShellExecOptions = {
-			...(options ?? {}),
-			cwd: cwd.value,
-			// Caller env and inheritEnv are ignored: only the shared allowlist reaches the shell.
-			env: this.#policy.shellEnvironment(),
-			inheritEnv: false,
-		};
-		if (timeout.value === undefined) delete safe.timeout;
-		else safe.timeout = timeout.value;
-		if (this.#bwrap === undefined) return super.exec(command, safe, context);
-
-		// The sandbox mounts only the workspace; a cwd in an extra allowed root would silently fall back to the
-		// workspace inside the builder, so refuse it instead of running somewhere the caller did not ask for.
-		if (!isPathWithin(this.#workspaceRoot, cwd.value)) {
-			return err(
-				new ExecutionError(
-					"spawn_error",
-					`Bubblewrap shell cwd is outside the workspace: ${cwd.value}`,
-				),
-			);
-		}
-
-		let argv: string[];
-		try {
-			argv = buildDirectBwrapArgs({
-				workspace: this.#workspaceRoot,
-				cwd: cwd.value,
-				bwrapPath: this.#bwrap.binary,
-				command:
-					typeof command === "string"
-						? [...this.#bwrap.interpreter, command]
-						: [...command],
-			});
-		} catch (error) {
-			const cause = error instanceof Error ? error : new Error(String(error));
-			return err(new ExecutionError("spawn_error", cause.message, cause));
-		}
-		return super.exec(
-			argv,
-			{
-				...safe,
-				// The host scratch root is not mounted inside the sandbox. Its `/tmp` is a private writable tmpfs, while
-				// bash spill files are still written by this host process under the private scratch root and stay readable.
-				env: { ...safe.env, TMPDIR: "/tmp" },
-			},
-			context,
-		);
 	}
 }
 

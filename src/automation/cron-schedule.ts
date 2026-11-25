@@ -54,8 +54,15 @@ export class CronScheduleError extends RangeError {
 const errorText = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
 
-/** The largest epoch-millisecond value a JavaScript `Date` can represent. */
-const MAX_DATE_MS = 8.64e15;
+/**
+ * The largest epoch-millisecond value a JavaScript `Date` can represent: the one shared
+ * renderable-time bound. Nothing outside it is admitted (one-shot instants, interval anchors),
+ * armed as a timer instant, accepted as a recurrence, or trusted from a stored record — no
+ * renderer or receipt can print such a time, and the operator wire refuses it. Legacy stored
+ * records beyond it project as "no renderable time" instead of throwing, so they stay inspectable
+ * and cancellable.
+ */
+export const MAX_DATE_MS = 8.64e15;
 
 function validAfterMs(afterMs: unknown): number {
   if (!Number.isSafeInteger(afterMs) || (afterMs as number) <= 0) {
@@ -117,9 +124,15 @@ function calendarSchedule(expr: string, timeZone: string): CronCalendarSchedule 
  * identically everywhere it is shown.
  */
 export function cronScheduleText(schedule: CronSchedule): string {
-  if (schedule.kind === "at") return `once at ${new Date(schedule.at).toISOString()}`;
+  // A legacy or damaged record can hold a time no Date can print; the text stays honest about
+  // that instead of throwing (which would make the job uninspectable) or fabricating a date.
+  const renderable = (value: number): string =>
+    Number.isSafeInteger(value) && Math.abs(value) <= MAX_DATE_MS
+      ? new Date(value).toISOString()
+      : "an unrepresentable time";
+  if (schedule.kind === "at") return `once at ${renderable(schedule.at)}`;
   if (schedule.kind === "every") {
-    return `every ${schedule.everyMs / 1000}s from ${new Date(schedule.anchorMs).toISOString()}`;
+    return `every ${schedule.everyMs / 1000}s from ${renderable(schedule.anchorMs)}`;
   }
   return `${schedule.expr} in ${schedule.timeZone}`;
 }
@@ -201,6 +214,9 @@ export function materializeCronSchedule(
     if (request.at <= now) {
       throw new CronScheduleError("a one-shot schedule must be in the future");
     }
+    if (request.at > MAX_DATE_MS) {
+      throw new CronScheduleError("a one-shot schedule must be inside the representable date range");
+    }
     return { kind: "at", at: request.at };
   }
   if (request.kind === "after") {
@@ -215,6 +231,9 @@ export function materializeCronSchedule(
     const anchorMs = now + request.everyMs;
     if (!Number.isSafeInteger(anchorMs)) {
       throw new CronScheduleError("the first interval occurrence exceeds the safe integer range");
+    }
+    if (anchorMs > MAX_DATE_MS) {
+      throw new CronScheduleError("the first interval occurrence is beyond the representable date range");
     }
     return { kind: "every", everyMs: request.everyMs, anchorMs };
   }
@@ -275,7 +294,9 @@ export function nextCronOccurrence(schedule: CronSchedule, afterMs: number): num
     if (!Number.isSafeInteger(schedule.at)) {
       throw new CronScheduleError("stored at time is not an integer");
     }
-    return schedule.at > afterMs ? schedule.at : null;
+    // A stored one-shot beyond the renderable range has no printable future slot; it settles
+    // (null) instead of throwing, so a legacy record stays inspectable and cancellable.
+    return schedule.at > afterMs && schedule.at <= MAX_DATE_MS ? schedule.at : null;
   }
   if (schedule.kind === "every") {
     if (!Number.isSafeInteger(schedule.everyMs) || schedule.everyMs <= 0) {
@@ -288,9 +309,11 @@ export function nextCronOccurrence(schedule: CronSchedule, afterMs: number): num
       ? 0
       : Math.floor((afterMs - schedule.anchorMs) / schedule.everyMs) + 1;
     const next = schedule.anchorMs + periods * schedule.everyMs;
-    if (!Number.isSafeInteger(next)) {
-      throw new CronScheduleError("the next occurrence exceeds the safe integer range");
-    }
+    // Following-slot arithmetic overflow is the absence of a next slot, never a failure of the
+    // occurrence that is due right now: this function runs inside the timer's terminal commit,
+    // where a throw would discard the valid due occurrence along with the re-arm. Overflow and
+    // the unrenderable bound both mean the job settles after this occurrence instead.
+    if (!Number.isSafeInteger(next) || next > MAX_DATE_MS) return null;
     return next;
   }
 

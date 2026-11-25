@@ -12,7 +12,7 @@ const load = (path) => import(pathToFileURL(path).href);
 
 const { createCronFoundation, CronJobsDoc } = await load(`${pkg}/dist/automation/cron.js`);
 const { openFullSyncNodeSqliteStorage } = await load(`${pkg}/dist/storage/sqlite.js`);
-const { Harness, createRegistry } = await load(
+const { configure, defineExtension, defineTask, Harness, createRegistry } = await load(
   `${pkg}/node_modules/@earendil-works/pi-durable/dist/index.js`,
 );
 const { BACKGROUND_CONTEXT } = await load(`${chord}/context/index.js`);
@@ -28,14 +28,24 @@ const readJobs = async (harness, conversationId) => {
   const doc = await harness.snapshot(CronJobsDoc, conversationId, context);
   return doc?.jobs ?? [];
 };
-async function openHarness(dbPath, extension, models) {
+async function openHarness(dbPath, extension, models, now) {
   const storage = await openFullSyncNodeSqliteStorage(dbPath, context);
   const registry = createRegistry();
   registry.install(extension);
-  return Harness.open(storage, { models, registry }, context);
+  return Harness.open(storage, { models, registry, ...(now === undefined ? {} : { now }) }, context);
 }
 const owner = { owner: { ownerId: "relative-owner", sessionKey: "relative:session" } };
 const base = { message: "stretch", name: "stretch", mode: "background" };
+/** Await one task's state reaching `status`, draining the event loop between bounded reads. */
+async function awaitTaskStatus(harness, id, status, context) {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    const record = await harness.getTask(id, context);
+    if (record !== undefined && record.state.status === status) return record;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  const record = await harness.getTask(id, context);
+  assert.fail(`task ${id} never reached ${status} (state: ${record?.state.status})`);
+}
 
 test("relative one-shot keeps its admitted deadline across retries, clock jumps and reopen", { timeout: 10_000 }, async () => {
   const dir = await temp("nanobot-cron-relative-");
@@ -279,4 +289,335 @@ test("the model-facing cron tool accepts after_seconds and acknowledges the stor
     if (gateway !== undefined) await gateway.close(context).catch(() => {});
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("times beyond the representable date range are refused at admission and settle when stored", async () => {
+  const { MAX_DATE_MS, cronScheduleText, materializeCronSchedule, nextCronOccurrence } =
+    await load(`${pkg}/dist/automation/cron-schedule.js`);
+  const now = Date.now();
+  // Admission: a one-shot instant or interval anchor beyond the shared bound is refused before
+  // any job or timer state is written; the bound itself is accepted.
+  assert.throws(
+    () => materializeCronSchedule({ kind: "at", at: MAX_DATE_MS + 1 }, now),
+    /representable date range/,
+  );
+  assert.throws(
+    () => materializeCronSchedule({ kind: "every", everyMs: MAX_DATE_MS }, now),
+    /representable date range/,
+  );
+  assert.equal(materializeCronSchedule({ kind: "at", at: MAX_DATE_MS }, now).at, MAX_DATE_MS);
+  // Stored legacy records beyond the bound stay safe: no future slot is armed and the schedule
+  // text renders honestly instead of throwing or fabricating a valid date.
+  assert.equal(nextCronOccurrence({ kind: "at", at: MAX_DATE_MS + 1 }, now), null);
+  assert.equal(nextCronOccurrence({ kind: "every", everyMs: 1_000, anchorMs: MAX_DATE_MS + 1 }, now), null);
+  // Arithmetic overflow while following the interval is the absence of a next slot, never a
+  // throw that would discard the occurrence that is due right now: the anchor's own slot is
+  // valid, and the slot after it overflows the safe-integer range.
+  assert.equal(nextCronOccurrence({ kind: "every", everyMs: 4e15, anchorMs: 8e15 }, now), 8e15);
+  assert.equal(nextCronOccurrence({ kind: "every", everyMs: 4e15, anchorMs: 8e15 }, 8e15), null);
+  assert.match(cronScheduleText({ kind: "at", at: MAX_DATE_MS + 1 }), /once at an unrepresentable time/);
+  assert.match(cronScheduleText({ kind: "every", everyMs: 60_000, anchorMs: MAX_DATE_MS + 5 }), /from an unrepresentable time/);
+});
+
+test("persisted timer state: valid sleeps survive reopen, an invalid deadline never arms or runs", { timeout: 30_000 }, async () => {
+  const dir = await temp("nanobot-cron-persisted-");
+  const db = resolve(dir, "persisted.sqlite");
+  const { MAX_DATE_MS } = await load(`${pkg}/dist/automation/cron-schedule.js`);
+  let harness;
+  try {
+    let clock = Date.now();
+    const foundation = createCronFoundation({ now: () => clock });
+    const models = createModels();
+    const faux = fauxProvider({ provider: "cron-persisted-faux", models: [{ id: "synthetic", name: "Synthetic" }] });
+    faux.setResponses([fauxAssistantMessage("occurrence reply")]);
+    models.setProvider(faux.provider);
+
+    // Harness 1: two valid jobs sleep on their persisted deadlines.
+    harness = await openHarness(db, foundation.extension, models, () => clock);
+    const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const writer = conversationWriter(harness, conversation);
+    const valid = await foundation.schedule(owner, writer, {
+      ...base, schedule: { kind: "after", afterMs: 3_600_000 }, idempotencyKey: "persisted:valid",
+    }, context);
+    const legacy = await foundation.schedule(owner, writer, {
+      ...base, schedule: { kind: "after", afterMs: 3_600_000 }, idempotencyKey: "persisted:legacy",
+    }, context);
+    await harness.waitForIdle(context);
+    const sleeping = await awaitTaskStatus(harness, valid.timerTaskId, "sleeping", context);
+    assert.equal(sleeping.state.until, valid.nextAtMs);
+    // Retire the legacy job's own valid timer; a fabricated out-of-range input replaces it below,
+    // standing in for a timer persisted by an older build before the shared bound existed.
+    await harness.abortTask(legacy.timerTaskId, context);
+    await harness.waitForTask(legacy.timerTaskId, context);
+    await harness.close(context);
+    harness = undefined;
+
+    // Harness 2 (recovery ordering): the valid sleep is restored as a sleep, not re-run early,
+    // and the fabricated invalid timer is committed pending with no progress call to run it.
+    harness = await openHarness(db, foundation.extension, models, () => clock);
+    const timerDefinition = foundation.extension.tasks
+      .find((task) => task.definition.name === "nanobot.cron.timer");
+    assert.ok(timerDefinition !== undefined);
+    const invalidTimerId = await harness.commit(async (tx) => {
+      const id = await tx.createTask(timerDefinition,
+        { jobId: legacy.jobId, scheduledAtMs: MAX_DATE_MS + 1, generation: 1 },
+        { ownership: { kind: "conversation" }, conversationId: conversation.id, background: true });
+      const doc = await tx.doc(CronJobsDoc, conversation.id, context);
+      doc.jobs.find((job) => job.id === legacy.jobId).timerTaskId = id;
+      return id;
+    }, context);
+    const restoredSleep = await harness.getTask(valid.timerTaskId, context);
+    assert.equal(restoredSleep.state.status, "sleeping", "a valid sleep is restored, never re-run early");
+    assert.equal(restoredSleep.state.until, valid.nextAtMs);
+    await harness.close(context);
+    harness = undefined;
+
+    // Harness 3: the resumed invalid timer settles as failed without sleeping, arming or running
+    // an occurrence, and the job stays inspectable and cancellable through the ordinary paths.
+    harness = await openHarness(db, foundation.extension, models, () => clock);
+    const settled = await harness.waitForTask(invalidTimerId, context);
+    assert.equal(settled.state.status, "terminal");
+    assert.equal(settled.state.outcome.status, "failed");
+    assert.match(settled.state.outcome.error.message, /not a representable time/);
+    const jobs = await readJobs(harness, conversation.id);
+    const legacyJob = jobs.find((job) => job.id === legacy.jobId);
+    assert.equal(legacyJob.executionTaskId, null, "no occurrence was armed for the invalid deadline");
+    assert.equal(legacyJob.timerTaskId, invalidTimerId);
+    assert.equal(legacyJob.lastOutcome, null);
+    const stillSleeping = await harness.getTask(valid.timerTaskId, context);
+    assert.equal(stillSleeping.state.status, "sleeping", "the valid timer is untouched");
+    const listed = await foundation.list(harness, conversation.id, owner, context);
+    assert.equal(listed.length, 2, "both jobs stay inspectable");
+    const cancelled = await foundation.cancel(harness, conversation.id, legacy.jobId, owner, context);
+    assert.equal(cancelled.status, "cancelled");
+    assert.notEqual((await readJobs(harness, conversation.id))
+      .find((job) => job.id === legacy.jobId).cancelledAtMs, null);
+    // Cleanup: settle the valid timer so the closed harness leaves nothing live.
+    await harness.abortTask(valid.timerTaskId, context);
+    await harness.waitForTask(valid.timerTaskId, context);
+  } finally {
+    if (harness !== undefined) await harness.close(context).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("the final valid interval occurrence commits exactly once near the boundary", { timeout: 30_000 }, async () => {
+  const dir = await temp("nanobot-cron-boundary-");
+  const db = resolve(dir, "boundary.sqlite");
+  const { MAX_DATE_MS } = await load(`${pkg}/dist/automation/cron-schedule.js`);
+  let harness;
+  try {
+    const start = Date.now();
+    let clock = start;
+    const foundation = createCronFoundation({ now: () => clock });
+    const models = createModels();
+    const faux = fauxProvider({ provider: "cron-boundary-faux", models: [{ id: "synthetic", name: "Synthetic" }] });
+    faux.setResponses([fauxAssistantMessage("boundary occurrence reply")]);
+    models.setProvider(faux.provider);
+    // Every conversation the run machinery creates (the occurrence's own execution conversation)
+    // receives the faux model, exactly as the gateway's default agent policy does.
+    const storage = await openFullSyncNodeSqliteStorage(db, context);
+    const registry = createRegistry();
+    registry.install(foundation.extension);
+    harness = await Harness.open(storage, {
+      models,
+      registry,
+      now: () => clock,
+      conversationCreated: (tx, conversation) =>
+        configure(tx, conversation.id, { model: { provider: faux.provider.id, modelId: "synthetic" } }),
+    }, context);
+    const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const writer = conversationWriter(harness, conversation);
+    // The admitted anchor sits 1000 ms inside the representable bound; the following slot is
+    // arithmetic overflow, so the final valid occurrence must still commit exactly once.
+    const everyMs = MAX_DATE_MS - 1_000 - start;
+    const receipt = await foundation.schedule(owner, writer, {
+      ...base, mode: "origin",
+      schedule: { kind: "every", everyMs }, idempotencyKey: "boundary:final",
+    }, context);
+    assert.equal(receipt.nextAtMs, MAX_DATE_MS - 1_000);
+
+    clock = MAX_DATE_MS - 500;
+    const settled = await harness.waitForTask(receipt.timerTaskId, context);
+    assert.equal(settled.state.status, "terminal");
+    assert.equal(settled.state.outcome.result.outcome, "admitted",
+      "the due occurrence commits instead of the overflow discarding it");
+    const [job] = await readJobs(harness, conversation.id);
+    assert.ok(job.executionTaskId !== null, "the final occurrence was admitted exactly once");
+    assert.equal(job.timerTaskId, null, "the overflowed following slot arms no new timer");
+    const execution = await harness.getTask(job.executionTaskId, context);
+    assert.equal(execution.input.scheduledAtMs, MAX_DATE_MS - 1_000);
+    const runSettled = await harness.waitForTask(job.executionTaskId, context);
+    assert.equal(runSettled.state.status, "terminal");
+    assert.equal(runSettled.state.outcome.status, "completed");
+    assert.equal(runSettled.state.outcome.result.outcome, "ok");
+    const [afterRun] = await readJobs(harness, conversation.id);
+    assert.equal(afterRun.lastOutcome.status, "ok", JSON.stringify(afterRun.lastOutcome));
+    assert.equal(afterRun.executionTaskId, job.executionTaskId);
+    // One occurrence only: no skip, no second execution, no re-arm.
+    assert.equal(afterRun.lastSkip, null);
+    const runTasks = await harness.commit(
+      (tx) => tx.scanTasks({ kind: "nanobot.cron.run" }, 100, undefined), context);
+    assert.equal(runTasks.items.length, 1, "exactly one run task exists for the job");
+  } finally {
+    if (harness !== undefined) await harness.close(context).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("an already-sleeping invalid legacy deadline is disarmed on recovery, never an occurrence", { timeout: 30_000 }, async () => {
+  const dir = await temp("nanobot-cron-sleeping-");
+  const db = resolve(dir, "sleeping.sqlite");
+  const { MAX_DATE_MS, disarmInvalidSleepingCronTimers } =
+    await load(`${pkg}/dist/automation/cron.js`).then(async (cron) => ({
+      ...await load(`${pkg}/dist/automation/cron-schedule.js`),
+      disarmInvalidSleepingCronTimers: cron.disarmInvalidSleepingCronTimers,
+    }));
+  const cron = await load(`${pkg}/dist/automation/cron.js`);
+  let harness;
+  try {
+    let clock = Date.now();
+    const foundation = createCronFoundation({ now: () => clock });
+    const models = createModels();
+    const faux = fauxProvider({ provider: "cron-sleeping-faux", models: [{ id: "synthetic", name: "Synthetic" }] });
+    models.setProvider(faux.provider);
+
+    // Harness A: a valid job sleeps normally; the legacy job gets a fabricated timer whose
+    // persisted input names an out-of-range deadline, committed pending with no progress call.
+    harness = await openHarness(db, foundation.extension, models, () => clock);
+    const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const writer = conversationWriter(harness, conversation);
+    const valid = await foundation.schedule(owner, writer, {
+      ...base, schedule: { kind: "after", afterMs: 3_600_000 }, idempotencyKey: "sleeping:valid",
+    }, context);
+    const legacy = await foundation.schedule(owner, writer, {
+      ...base, schedule: { kind: "after", afterMs: 3_600_000 }, idempotencyKey: "sleeping:legacy",
+    }, context);
+    await harness.waitForIdle(context);
+    await awaitTaskStatus(harness, valid.timerTaskId, "sleeping", context);
+    await harness.abortTask(legacy.timerTaskId, context);
+    await harness.waitForTask(legacy.timerTaskId, context);
+    const timerDefinition = foundation.extension.tasks
+      .find((task) => task.definition.name === "nanobot.cron.timer");
+    const invalidTimerId = await harness.commit(async (tx) => {
+      const id = await tx.createTask(timerDefinition,
+        { jobId: legacy.jobId, scheduledAtMs: MAX_DATE_MS + 1, generation: 1 },
+        { ownership: { kind: "conversation" }, conversationId: conversation.id, background: true });
+      const doc = await tx.doc(CronJobsDoc, conversation.id, context);
+      doc.jobs.find((job) => job.id === legacy.jobId).timerTaskId = id;
+      return id;
+    }, context);
+    await harness.close(context);
+    harness = undefined;
+
+    // Harness B stands in for the older build: the same task kind and version, whose fire phase
+    // sleeps on the raw persisted input with no guard. It commits a genuinely SLEEPING record
+    // with the invalid deadline, exactly what an old process would have left on disk.
+    const legacyStub = defineExtension({
+      name: "cron-legacy-sleep-stub",
+      tasks: [defineTask({
+        name: "nanobot.cron.timer",
+        version: 1,
+        initial: () => ({ phase: "fire" }),
+        phases: {
+          fire: async (running, runtime, phaseContext) => {
+            await runtime.sleepUntil(running.input.scheduledAtMs, { phase: "fire" }, phaseContext);
+          },
+        },
+      })],
+    });
+    harness = await openHarness(db, legacyStub, models, () => clock);
+    await harness.waitForIdle(context);
+    const persistedSleep = await awaitTaskStatus(harness, invalidTimerId, "sleeping", context);
+    assert.equal(persistedSleep.state.until, MAX_DATE_MS + 1,
+      "the invalid deadline is persisted as a sleeping state, not a pending one");
+    await harness.close(context);
+    harness = undefined;
+
+    // Harness C recovers with the real foundation: Durable restores the invalid sleep (it holds a
+    // clamped native wakeup reference, never an executed occurrence), then the recovery sweep
+    // disarms exactly that timer through its own abort handler.
+    harness = await openHarness(db, foundation.extension, models, () => clock);
+    const restored = await harness.getTask(invalidTimerId, context);
+    assert.equal(restored.state.status, "sleeping", "the invalid legacy sleep is restored at open");
+    assert.equal(restored.state.until, MAX_DATE_MS + 1);
+    const wakeBefore = harness.wake();
+    assert.equal(wakeBefore.at, valid.nextAtMs,
+      "the native wakeup references the earliest valid sleep; the invalid one never runs an occurrence");
+    const legacyJobsBefore = await readJobs(harness, conversation.id);
+    assert.equal(legacyJobsBefore.find((job) => job.id === legacy.jobId).executionTaskId, null);
+
+    const disarmed = await cron.disarmInvalidSleepingCronTimers(harness, context);
+    assert.equal(disarmed, 1, "exactly the invalid sleeping timer is disarmed");
+    // The committed abort mark is the disarm postcondition: an abort mark does not wait for a
+    // sleep, so the task already left the wake computation before any settlement.
+    assert.equal((await harness.getTask(invalidTimerId, context)).abortRequested, true);
+    assert.equal(await cron.disarmInvalidSleepingCronTimers(harness, context), 0, "the sweep is idempotent");
+    await harness.waitForTask(invalidTimerId, context);
+    const settled = await harness.getTask(invalidTimerId, context);
+    assert.equal(settled.state.status, "terminal");
+    assert.equal(settled.state.outcome.status, "aborted");
+    assert.equal(settled.state.outcome.result.outcome, "cancelled");
+    const stillValid = await harness.getTask(valid.timerTaskId, context);
+    assert.equal(stillValid.state.status, "sleeping", "valid timers are untouched");
+    assert.equal(stillValid.state.until, valid.nextAtMs);
+    const jobsAfter = await readJobs(harness, conversation.id);
+    assert.equal(jobsAfter.find((job) => job.id === legacy.jobId).executionTaskId, null,
+      "no occurrence was armed or run for the invalid deadline");
+    assert.equal((await foundation.list(harness, conversation.id, owner, context)).length, 2,
+      "both jobs stay inspectable");
+    const cancelled = await foundation.cancel(harness, conversation.id, legacy.jobId, owner, context);
+    assert.equal(cancelled.status, "cancelled", "owner cancellation still settles the legacy job");
+    // Cleanup: settle the valid timer before closing.
+    await harness.abortTask(valid.timerTaskId, context);
+    await harness.waitForTask(valid.timerTaskId, context);
+  } finally {
+    if (harness !== undefined) await harness.close(context).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("legacy timer recovery fails closed: fatal errors and shutdown are never reported as success", async () => {
+  const cron = await load(`${pkg}/dist/automation/cron.js`);
+  const { MAX_DATE_MS } = await load(`${pkg}/dist/automation/cron-schedule.js`);
+  const { recoverBeforeServing } = await load(`${pkg}/dist/cli.js`);
+  const { StartupDiagnosticError } = await load(`${pkg}/dist/startup-diagnostics.js`);
+  const { withAbortSignal } = await load(`${pkg}/node_modules/@earendil-works/chord/dist/context/index.js`);
+  const invalid = { id: 7, abortRequested: false, input: { jobId: "job-1", scheduledAtMs: MAX_DATE_MS + 1, generation: 1 } };
+  const fake = (overrides = {}) => {
+    const calls = { aborts: 0 };
+    return {
+      calls,
+      commit: async (change) => change({ scanTasks: async () => ({ items: [invalid] }) }),
+      abortTask: async () => { calls.aborts += 1; return "marked"; },
+      ...overrides,
+    };
+  };
+
+  // A storage/session failure while committing the abort mark propagates, never a disarm count.
+  const sealed = new Error("synthetic session failure");
+  await assert.rejects(cron.disarmInvalidSleepingCronTimers(fake({ abortTask: async () => { throw sealed; } }), context),
+    (error) => error === sealed);
+  await assert.rejects(cron.disarmInvalidSleepingCronTimers(fake({ commit: async () => { throw sealed; } }), context),
+    (error) => error === sealed);
+  // A timer that settled after the scan is the one benign race.
+  assert.equal(await cron.disarmInvalidSleepingCronTimers(fake({ abortTask: async () => "terminal" }), context), 0);
+
+  // A cancelled context stops before any abort is committed.
+  const stop = new AbortController();
+  stop.abort();
+  const cancelled = fake();
+  await assert.rejects(cron.disarmInvalidSleepingCronTimers(cancelled, withAbortSignal(stop.signal, context)));
+  assert.equal(cancelled.calls.aborts, 0);
+
+  // The startup gate turns every one of these into a fixed refusal instead of serving.
+  await assert.rejects(recoverBeforeServing(fake({ abortTask: async () => { throw sealed; } }), new AbortController().signal, context),
+    (error) => error instanceof StartupDiagnosticError && error.code === "cronRecovery" && error.cause === sealed);
+  await assert.rejects(recoverBeforeServing(fake(), stop.signal, withAbortSignal(stop.signal, context)),
+    (error) => error instanceof StartupDiagnosticError && error.code === "gatewayCanceled");
+  // A shutdown that arrives after a successful sweep still stops startup before serving.
+  const late = new AbortController();
+  await assert.rejects(recoverBeforeServing(fake({ abortTask: async () => { late.abort(); return "marked"; } }), late.signal, context),
+    (error) => error instanceof StartupDiagnosticError && error.code === "gatewayCanceled");
+  await recoverBeforeServing(fake(), new AbortController().signal, context);
 });
