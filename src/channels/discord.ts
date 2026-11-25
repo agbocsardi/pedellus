@@ -1530,14 +1530,18 @@ export async function runDiscord(
     async markRefused(record, text, late) {
       await mutateState((doc) => {
         setControlStatus(doc, record.key, "refused");
-        if (!releaseNotice(doc, record.key, text) && late === true) queueLate(doc, record, text);
+        if (!releaseNotice(doc, record.key, text) && late === true && !queueLate(doc, record, text)) {
+          throw new Error("Discord durable output queue is full");
+        }
         doc.controls = pruneRecords(doc.controls, doc.pending);
       }, cleanupContext);
     },
     async markUnconfirmed(key, text, lateRecord) {
       await mutateState((doc) => {
         setControlStatus(doc, key, "unconfirmed");
-        if (!releaseNotice(doc, key, text) && lateRecord !== undefined) queueLate(doc, lateRecord, text);
+        if (!releaseNotice(doc, key, text) && lateRecord !== undefined && !queueLate(doc, lateRecord, text)) {
+          throw new Error("Discord durable output queue is full");
+        }
       }, cleanupContext);
     },
     async publishLate(record, text) {
@@ -1824,13 +1828,19 @@ export async function runDiscord(
     if (!cooldownOpen()) return "kept";
     let requestStarted = false;
     try {
+      let acquired = false;
       const intent = await outbox.update(sessionKey, recordId, (entry) => {
         if (entry.status !== "pending") return;
         entry.status = "sending";
         entry.sendIntent = { text: chunk, chunkIndex: index, startedAt: Date.now() };
+        acquired = true;
       }, adapterContext);
-      // Only a committed intent on a live pending record may precede the send.
-      if (intent?.status !== "sending" || intent.sendIntent?.chunkIndex !== index) return "kept";
+      // Only a fresh intent acquired by this invocation on a live pending record may precede the send.
+      if (!acquired || intent?.status !== "sending" || intent.sendIntent?.chunkIndex !== index) return "kept";
+      if (!cooldownOpen()) {
+        await clearIntent();
+        return "kept";
+      }
       requestStarted = true;
       await transport.send({ channelId, text: chunk });
       const accepted = await outbox.update(sessionKey, recordId, (entry) => {
@@ -1956,6 +1966,7 @@ export async function runDiscord(
       });
     },
     async deliverNotice(sessionKey, text, _context) {
+      if (!adapterActive()) return;
       const owner = ownerChannelFor(sessionKey);
       if (owner === undefined) return;
       await transport.send({ channelId: owner.channelId, text });
@@ -2039,25 +2050,21 @@ export async function runDiscord(
     if (state.controls.some((entry) => entry.status === "admitted") || state.pending.some((item) => item.hold === true)) {
       let interrupted = 0;
       await mutateState((doc) => {
-        for (const entry of doc.controls) {
-          if (entry.status !== "admitted") continue;
-          const notice = doc.pending.find((item) => item.notice === true && item.key === entry.key);
-          if (notice === undefined || notice.hold === true) continue;
-          // Its "still pending" wording was released but the outcome never followed: an unsent one
-          // becomes the outcome; one whose send is already in flight or ambiguous keeps its record,
-          // and the outcome goes out as a separate notice.
-          const text = unconfirmedControlText(entry.command);
-          if (!noticeInFlight(notice)) notice.text = text;
-          else pushNotice(doc, `unconfirmed:${entry.key}`, notice, text);
-        }
         interrupted = recoverInterruptedControls(doc.controls, doc.pending, {
           controlKey: (entry) => entry.key,
           noticeKey: (item) => item.key,
-          report: (entry, text) => pushNotice(doc, `unconfirmed:${entry.key}`, {
-            channelId: entry.channelId,
-            sessionKey: `discord:${identity}:notice:${entry.channelId}`,
-            senderId: entry.senderId,
-          }, text),
+          report: (entry, text) => {
+            const existing = doc.pending.find((item) => item.notice === true && item.key === entry.key);
+            if (existing !== undefined && !noticeInFlight(existing)) {
+              existing.text = text;
+              return true;
+            }
+            return pushNotice(doc, `unconfirmed:${entry.key}`, existing ?? {
+              channelId: entry.channelId,
+              sessionKey: `discord:${identity}:notice:${entry.channelId}`,
+              senderId: entry.senderId,
+            }, text);
+          },
         });
       }, adapterContext);
       if (interrupted > 0) {
@@ -2093,7 +2100,9 @@ export async function runDiscord(
     }, DISCORD_LIMITS.scheduledScanMs);
     scanTimer.unref?.();
   } catch (error) {
-    // A failed recovery or service start must not leave a half-open Gateway with buffered ingress.
+    // A failed recovery or service start must deactivate retained surface references and tear down.
+    stopping = true;
+    scope.cancel(error instanceof Error ? error : new Error("Discord startup failed"));
     await teardownAdapters();
     throw error;
   }
