@@ -202,6 +202,11 @@ export function createHistorySearcher(host: MemoryHost): { search: MemoryBackend
           const status: "open" | "closed" = currentReset === null || episodeStart >= currentReset ? "open" : "closed";
           if (!stateFilter.includes(status)) return false;
         }
+        if (filter?.time !== undefined && (filter.time.from !== undefined || filter.time.to !== undefined)) {
+          if (typeof hit.timestamp !== "number") return false;
+          if (filter.time.from !== undefined && hit.timestamp < Date.parse(filter.time.from)) return false;
+          if (filter.time.to !== undefined && hit.timestamp >= Date.parse(filter.time.to)) return false;
+        }
         if (query.target === "messages") {
           if (hit.role === "tool") return false;
           if (filter?.roles !== undefined && !filter.roles.includes(hit.role as "user" | "assistant")) return false;

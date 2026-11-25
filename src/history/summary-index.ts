@@ -7,6 +7,7 @@
  * summary query fails, instead of on every page.
  */
 import { Buffer } from "node:buffer";
+import { randomUUID } from "node:crypto";
 import type { Context } from "@earendil-works/chord";
 import type { ConversationId, EntryId } from "@earendil-works/pi-durable";
 import type { NodeSqliteDatabase } from "@earendil-works/pi-durable/storage/sqlite/node";
@@ -511,6 +512,12 @@ async function repairSummarySchema(
       "UPDATE history_meta SET value = CAST(COALESCE("
       + "(SELECT SUM(body_bytes) FROM history_summaries), 0) AS TEXT) WHERE key = 'summary_bytes'",
     );
+    if (!state.contentOk) {
+      // Destructive content-table reset invalidates every prior summary cursor, even after repopulation.
+      const generation = randomUUID();
+      await open.db.run("UPDATE history_meta SET value = ? WHERE key = 'generation'", generation);
+      open.generation = generation;
+    }
     return true;
   } catch {
     return false;
@@ -1413,7 +1420,9 @@ export async function searchSummaryIndex(
   if (repair !== "failed") {
     try {
       if (repair === "repaired-reset") {
-        completedSweep = undefined;
+        if (completedSweep !== undefined) {
+          completedSweep = { ...completedSweep, caughtUp: false };
+        }
         if (query.cursor !== undefined) {
           await verifySummaryCursor(open.db, query.cursor, conversationIds);
         }
