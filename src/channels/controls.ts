@@ -291,7 +291,7 @@ export function renderStatusNotice(input: {
  * A failed background read adds nothing; any other failure is one fixed unavailable notice.
  */
 export async function readStatusNotice(
-  gateway: Pick<ChannelGateway, "conversationFor" | "listModels" | "backgroundStatus">,
+  gateway: Pick<ChannelGateway, "conversationFor" | "harness" | "listModels" | "backgroundStatus">,
   sessionKey: string,
   scope: ChannelScopeNoun,
   context: Context,
@@ -299,7 +299,7 @@ export async function readStatusNotice(
   try {
     const listing = await readModelListing(gateway, sessionKey, context);
     const conversation = await gateway.conversationFor(sessionKey, context);
-    const status = await projectConversationStatus(conversation, context);
+    const status = await projectConversationStatus(conversation, context, gateway.harness);
     let background: string[] = [];
     try {
       if (typeof gateway.backgroundStatus === "function") {
@@ -650,10 +650,18 @@ export interface ControlLedger<Key, Scope, R extends ControlRecord<Key, Scope>> 
   markApplied(record: R): Promise<void>;
   /** Release the held acknowledgement, rewriting it to `text` when given. */
   release(key: Key, text?: string): Promise<void>;
-  /** Commit `refused` and rewrite/release a still-queued acknowledgement to `text`. */
-  markRefused(key: Key, text: string): Promise<void>;
-  /** Commit `unconfirmed` and rewrite/release a still-queued acknowledgement to `text`. */
-  markUnconfirmed(key: Key, text: string): Promise<void>;
+  /**
+   * Commit `refused` and publish `text` in one atomic state commit: rewrite and release a still-
+   * queued acknowledgement when present, or when `late` is true and it is already gone, queue one
+   * fresh notice instead of dropping `text` or emitting a duplicate.
+   */
+  markRefused(record: R, text: string, late?: boolean): Promise<void>;
+  /**
+   * Commit `unconfirmed` and rewrite/release a still-queued acknowledgement to `text` in one atomic
+   * state commit. When `lateRecord` is given and that acknowledgement is already gone, queue one
+   * fresh notice in the same commit instead of dropping `text` or emitting a duplicate.
+   */
+  markUnconfirmed(key: Key, text: string, lateRecord?: R): Promise<void>;
   /**
    * Deliver a final outcome after the still-pending wording was published: replace that
    * acknowledgement while it is still queued, or queue a fresh notice. Never drop the text.
@@ -726,7 +734,10 @@ export interface ControlCoordinator<Key, Scope, R extends ControlRecord<Key, Sco
   idle(): Promise<void>;
 }
 
-type AckState = { value: "waiting" | "pending" | "applied" | "refused" };
+type AckState = {
+  value: "waiting" | "pending" | "applied" | "refused";
+  pendingWrite?: Promise<void>;
+};
 
 export function createControlCoordinator<Key, Scope, R extends ControlRecord<Key, Scope>, Input>(
   options: ControlCoordinatorOptions<Key, Scope, R, Input>,
@@ -761,7 +772,10 @@ export function createControlCoordinator<Key, Scope, R extends ControlRecord<Key
         });
       }
     } catch (error) {
-      if (!options.active()) throw error;
+      if (!options.active()) {
+        forgetRetry(record.key);
+        throw error;
+      }
       const attempts = (failures.get(record.key) ?? 0) + 1;
       if (attempts < maxAttempts) {
         failures.set(record.key, attempts);
@@ -772,10 +786,11 @@ export function createControlCoordinator<Key, Scope, R extends ControlRecord<Key
       forgetRetry(record.key);
       return { kind: "abandoned" };
     }
+    // Earlier inputs are placed: once entering the native effect, the control is no longer
+    // retryable, so a failed effect or confirmation commit goes to recovery instead of rerunning.
+    forgetRetry(record.key);
     const outcome = await options.execute(record);
     if (outcome.kind === "applied") await ledger.markApplied(record);
-    // Only a flush failure defers; any native outcome is final and never retried.
-    if (outcome.kind === "applied" || outcome.kind === "refused") forgetRetry(record.key);
     return outcome;
   };
 
@@ -795,14 +810,12 @@ export function createControlCoordinator<Key, Scope, R extends ControlRecord<Key
     if (outcome.kind === "abandoned") {
       ack.value = "refused";
       const text = unconfirmedControlText(record.command);
-      await ledger.markUnconfirmed(record.key, text).catch(() => undefined);
-      if (late) await ledger.publishLate(record, text).catch(() => undefined);
+      await ledger.markUnconfirmed(record.key, text, late ? record : undefined).catch(() => undefined);
       return;
     }
     if (outcome.kind === "refused") {
       ack.value = "refused";
-      await ledger.markRefused(record.key, outcome.text).catch(() => undefined);
-      if (late) await ledger.publishLate(record, outcome.text).catch(() => undefined);
+      await ledger.markRefused(record, outcome.text, late).catch(() => undefined);
       return;
     }
     ack.value = "applied";
@@ -821,23 +834,43 @@ export function createControlCoordinator<Key, Scope, R extends ControlRecord<Key
   const launch = (record: R, ack: AckState): void => {
     running.add(record.scope);
     runningKeys.add(record.key);
-    const timer = ack.value === "waiting"
+    let timer = ack.value === "waiting"
       ? timers.set(() => {
+          timer = undefined;
           if (ack.value !== "waiting") return;
           ack.value = "pending";
-          void ledger.release(record.key, CONTROL_PENDING[record.command]).catch(() => undefined);
+          ack.pendingWrite = Promise.resolve()
+            .then(() => ledger.release(record.key, CONTROL_PENDING[record.command]))
+            .catch(() => undefined);
         }, pendingNoticeMs)
       : undefined;
+    const clearTimer = (): void => {
+      if (timer !== undefined) {
+        timers.clear(timer);
+        timer = undefined;
+      }
+    };
     let task!: Promise<void>;
     task = Promise.resolve()
       .then(() => apply(record))
-      .then((outcome) => settle(record, outcome, ack), (error: unknown) => {
-        // The record stays admitted and the acknowledgement held: a reopen reports it unconfirmed.
-        if (options.active()) options.onFatal(error);
-      })
+      .then(
+        async (outcome) => {
+          clearTimer();
+          // Serialize any started pending-timer write before settlement so it can never overwrite
+          // the final receipt or outlive `idle()`.
+          if (ack.pendingWrite !== undefined) await ack.pendingWrite;
+          await settle(record, outcome, ack);
+        },
+        async (error: unknown) => {
+          clearTimer();
+          if (ack.pendingWrite !== undefined) await ack.pendingWrite;
+          // The record stays admitted and the acknowledgement held: a reopen reports it unconfirmed.
+          if (options.active()) options.onFatal(error);
+        },
+      )
       .catch(() => undefined)
       .finally(() => {
-        if (timer !== undefined) timers.clear(timer);
+        clearTimer();
         tasks.delete(task);
         running.delete(record.scope);
         runningKeys.delete(record.key);
@@ -884,6 +917,8 @@ export function createControlCoordinator<Key, Scope, R extends ControlRecord<Key
           gate.delete(record.scope);
           continue;
         }
+        // Leave `deferred` before launching: only another transient flush failure re-enqueues it.
+        deferred.delete(key);
         // Its acknowledgement already said "still pending", so any final outcome is late.
         launch(record, { value: "pending" });
       }

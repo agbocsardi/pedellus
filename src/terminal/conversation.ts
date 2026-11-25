@@ -350,7 +350,7 @@ export function inProcessTerminalConversation(
   followUpMode: FollowUpMode = "followUp",
   owner?: {
     readonly sessionKey: string;
-    readonly harness: Pick<Harness, "submission">;
+    readonly harness: Pick<Harness, "submission"> & Partial<Pick<Harness, "snapshot">>;
     /** Decides a prepared idle rollover just before the owner input is submitted. */
     readonly beforeInput?: (content: TerminalInput, context: Context) => Promise<void>;
   },
@@ -416,7 +416,10 @@ export function inProcessTerminalConversation(
       };
     },
     async status(context) {
-      return projectConversationStatus(conversation, context);
+      const reader = typeof owner?.harness.snapshot === "function"
+        ? { snapshot: owner.harness.snapshot.bind(owner.harness) }
+        : undefined;
+      return projectConversationStatus(conversation, context, reader);
     },
     async entries(query, limit, cursor, context) {
       const page = await conversation.entries(query, limit, cursor, context);

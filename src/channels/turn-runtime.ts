@@ -24,29 +24,46 @@ export interface SubmissionSlot {
   release(): void;
 }
 
+interface SlotNode {
+  readonly done: Promise<void>;
+  open(): void;
+}
+
 /**
  * Per-scope FIFO of submission places. A delivery reserves its place when it is dispatched, before
  * any asynchronous preparation, so admission order never depends on how long a lookup, attachment
  * download or watch takes: Durable orders the inbox by submission.
  */
 export class SubmissionOrderQueue<Scope> {
-  readonly #chains = new Map<Scope, Promise<void>>();
+  readonly #scopes = new Map<Scope, SlotNode[]>();
 
   /** Reserve the scope's next place; the caller awaits `prior`, submits, then releases. */
   beginSubmission(scope: Scope): SubmissionSlot {
-    const prior = this.#chains.get(scope) ?? Promise.resolve();
+    let queue = this.#scopes.get(scope);
+    if (queue === undefined) {
+      queue = [];
+      this.#scopes.set(scope, queue);
+    }
+    const prior = queue.length === 0 ? Promise.resolve() : queue[queue.length - 1]!.done;
     let open!: () => void;
     const held = new Promise<void>((resolve) => { open = resolve; });
-    const tail = prior.then(() => held);
-    this.#chains.set(scope, tail);
+    const node: SlotNode = {
+      done: prior.then(() => held),
+      open,
+    };
+    queue.push(node);
     let released = false;
     return {
       prior,
       release: () => {
         if (released) return;
         released = true;
-        open();
-        if (this.#chains.get(scope) === tail) this.#chains.delete(scope);
+        node.open();
+        const current = this.#scopes.get(scope);
+        if (current === undefined) return;
+        const index = current.indexOf(node);
+        if (index >= 0) current.splice(index, 1);
+        if (current.length === 0) this.#scopes.delete(scope);
       },
     };
   }
@@ -64,7 +81,7 @@ export class SubmissionOrderQueue<Scope> {
 
   /** Scopes with a reserved, unreleased place. */
   get activeScopes(): number {
-    return this.#chains.size;
+    return this.#scopes.size;
   }
 }
 
@@ -277,6 +294,7 @@ export async function createPreviewWatcher(options: PreviewWatcherOptions): Prom
   const watch = await options.conversation.watch(options.context);
   let submissionId: number | undefined;
   let stopped = false;
+  let stopping: Promise<void> | undefined;
   let timer: unknown;
   let work: Promise<void> | undefined;
   let dirty = false;
@@ -323,17 +341,23 @@ export async function createPreviewWatcher(options: PreviewWatcherOptions): Prom
     setSubmission(id) {
       submissionId = id;
     },
-    async stop() {
-      if (stopped) return;
+    stop() {
+      if (stopping !== undefined) return stopping;
       stopped = true;
       dirty = false;
       if (timer !== undefined) {
         timers.clear(timer);
         timer = undefined;
       }
-      await watch.stop();
-      await work;
-      if (failure !== undefined && options.publishFailure === "rethrow") throw failure.error;
+      stopping = (async () => {
+        try {
+          await watch.stop();
+        } finally {
+          await work;
+        }
+        if (failure !== undefined && options.publishFailure === "rethrow") throw failure.error;
+      })();
+      return stopping;
     },
   };
 }

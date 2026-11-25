@@ -5,11 +5,14 @@
  */
 
 /**
- * Split rich markdown without leaving a fenced code block unbalanced.
+ * Split rich text into bounded chunks while keeping simple triple-backtick (```) fences balanced.
  *
- * A cut inside a fence closes it and reopens the same fence in the next chunk, so each part is
- * independently valid markdown. Cuts prefer a line boundary, then a word boundary, and never split
- * a surrogate pair. The limit counts UTF-16 units, which is never smaller than a character count.
+ * Fence matching is inherited from Telegram's splitter: it tracks literal ``` markers by parity
+ * rather than full CommonMark fence nesting (tilde ~~~ fences, longer ```` fences and inline
+ * triple-backticks are not parsed as nested fences). A cut inside an open ``` block moves before
+ * its opening marker when possible, or closes and reopens the same fence line in the next chunk.
+ * Cuts prefer a line boundary, then a word boundary, and never split a surrogate pair. The limit
+ * counts UTF-16 units, which is never smaller than a character count.
  */
 export function splitRichText(text: string, limit: number): string[] {
   const chunks: string[] = [];
@@ -34,7 +37,7 @@ export function splitRichText(text: string, limit: number): string[] {
     }
     const fence = openFenceAt(remaining, cut);
     if (fence !== undefined && fence.opening > 0) {
-      // Cutting before the fence keeps it whole in the next chunk, which is valid markdown.
+      // Cutting before the opening ``` keeps that block whole in the next chunk.
       cut = fence.opening;
     } else if (fence !== undefined) {
       // Reopening an almost-limit-sized header can consume almost no original text per chunk,
@@ -58,8 +61,9 @@ export function splitRichText(text: string, limit: number): string[] {
 }
 
 /**
- * The fence this cut falls inside, when any. Only ``` fences are tracked, so a cut inside a ~~~
- * block can split it; the body then renders as text rather than failing the whole message.
+ * The opening ``` marker this cut falls inside, when the prefix contains an odd number of literal
+ * ``` markers. Only simple triple-backtick parity is tracked (not CommonMark ~~~ or nested
+ * longer-backtick fences); any unparsed block falls back to plain text on the channel side.
  */
 function openFenceAt(text: string, cut: number): { opening: number; fence: string } | undefined {
   if ((text.slice(0, cut).split("```").length - 1) % 2 === 0) return undefined;

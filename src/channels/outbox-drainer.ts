@@ -143,7 +143,9 @@ export function createOutboxDrainer<Target>(options: OutboxDrainerOptions<Target
   const activeKeys = new Set<string>();
   const activeScopes = new Set<string | number>();
   const tasks = new Set<Promise<void>>();
+  const releaseEpochs = new Map<string, number>();
   let scanning: Promise<void> | undefined;
+  let pendingScan: Promise<void> | undefined;
 
   const update: OutboxDrainer["update"] = async (sessionKey, id, change, context = options.cleanupContext) => {
     if (outbox === undefined) return undefined;
@@ -192,25 +194,46 @@ export function createOutboxDrainer<Target>(options: OutboxDrainerOptions<Target
     }
   };
 
-  const deliver = async (sessionKey: string, target: Target, record: CronDeliveryRecord): Promise<void> => {
+  const deliver = async (sessionKey: string, target: Target, record: CronDeliveryRecord): Promise<"done" | "rescan"> => {
     if (record.sessionKey !== sessionKey) {
       await markFailed(sessionKey, record.id, "outbox session does not match its origin");
-      return;
+      return "done";
     }
     if (record.text.trim() === "") {
       await markFailed(sessionKey, record.id, "delivery text is empty");
-      return;
+      return "done";
     }
     // The session key is only a candidate locator; durable admission evidence authorizes.
+    const epochBefore = releaseEpochs.get(sessionKey) ?? 0;
     const authorization = options.authorizeOrigin(target, record);
     if (authorization.status === "withheld") {
+      let withheld = false;
       await update(sessionKey, record.id, (entry) => {
+        if (entry.status !== "pending") return;
+        // Fresh admission or a concurrent releaseWithheld() supersedes this stale hold.
+        if ((releaseEpochs.get(sessionKey) ?? 0) !== epochBefore) return;
+        const current = options.authorizeOrigin(target, record);
+        if (current.status !== "withheld") return;
         entry.status = "withheld";
         entry.withheldSince = now();
-        entry.error = authorization.reason;
+        entry.error = current.reason;
+        withheld = true;
       });
+      if (!withheld) return "rescan";
+      // If releaseWithheld() or fresh admission arrived while the withholding commit was in flight
+      // (after the change callback ran), undo the stale hold so the record is never stranded.
+      if ((releaseEpochs.get(sessionKey) ?? 0) !== epochBefore ||
+          options.authorizeOrigin(target, record).status !== "withheld") {
+        await update(sessionKey, record.id, (entry) => {
+          if (entry.status !== "withheld") return;
+          entry.status = "pending";
+          delete entry.withheldSince;
+          delete entry.error;
+        });
+        return "rescan";
+      }
       warn(`${options.label} scheduled delivery withheld for ${record.id}: no durable origin admission evidence.`);
-      return;
+      return "done";
     }
     if (authorization.status === "unauthorized") {
       await update(sessionKey, record.id, (entry) => {
@@ -218,14 +241,15 @@ export function createOutboxDrainer<Target>(options: OutboxDrainerOptions<Target
         entry.settledAt = now();
         entry.error = "origin sender is no longer authorized";
       });
-      return;
+      return "done";
     }
-    if (await options.deliverRecord(sessionKey, target, record) !== "delivered") return;
+    if (await options.deliverRecord(sessionKey, target, record) !== "delivered") return "done";
     await update(sessionKey, record.id, (entry) => {
       entry.status = "delivered";
       entry.settledAt = now();
       delete entry.error;
     });
+    return "done";
   };
 
   const scanOnce = async (): Promise<void> => {
@@ -253,12 +277,18 @@ export function createOutboxDrainer<Target>(options: OutboxDrainerOptions<Target
         if (record.status !== "pending") continue;
         const key = JSON.stringify([sessionKey, record.id]);
         const scope = options.scopeOf?.(target);
+        if (activeKeys.size >= options.maxActive) return;
         if (activeKeys.has(key) || (scope !== undefined && activeScopes.has(scope))) continue;
         if (options.admitDispatch !== undefined && !(await options.admitDispatch(sessionKey, target, record))) continue;
-        if (activeKeys.size >= options.maxActive) return;
+        // Recheck liveness, capacity and reservations after awaiting `admitDispatch`.
+        if (!options.active() || activeKeys.size >= options.maxActive) return;
+        if (activeKeys.has(key) || (scope !== undefined && activeScopes.has(scope))) continue;
         activeKeys.add(key);
         if (scope !== undefined) activeScopes.add(scope);
-        const run = () => deliver(sessionKey, target, record);
+        let rescan = false;
+        const run = async (): Promise<void> => {
+          if (await deliver(sessionKey, target, record) === "rescan") rescan = true;
+        };
         let task!: Promise<void>;
         task = Promise.resolve()
           .then(() => options.observe === undefined ? run() : options.observe(sessionKey, target, record, run))
@@ -268,6 +298,7 @@ export function createOutboxDrainer<Target>(options: OutboxDrainerOptions<Target
           .finally(() => {
             activeKeys.delete(key);
             if (scope !== undefined) activeScopes.delete(scope);
+            if (rescan) requestScan();
             tasks.delete(task);
           });
         tasks.add(task);
@@ -275,9 +306,35 @@ export function createOutboxDrainer<Target>(options: OutboxDrainerOptions<Target
     }
   };
 
+  /** Single-flight scan coordinator: at most one scan runs, with at most one coalesced follow-up. */
+  const runScan = (): Promise<void> => {
+    if (!options.active()) return Promise.resolve();
+    if (scanning === undefined && pendingScan === undefined) {
+      let current!: Promise<void>;
+      current = scanOnce().finally(() => {
+        if (scanning === current) scanning = undefined;
+      });
+      scanning = current;
+      return current;
+    }
+    if (pendingScan === undefined) {
+      const waitFor = scanning!;
+      let queued!: Promise<void>;
+      queued = waitFor
+        .catch(() => undefined)
+        .then(() => {
+          if (pendingScan === queued) pendingScan = undefined;
+          if (!options.active()) return undefined;
+          return runScan();
+        });
+      pendingScan = queued;
+    }
+    return pendingScan;
+  };
+
   const requestScan = (): void => {
-    if (scanning !== undefined || !options.active()) return;
-    scanning = scanOnce().catch(() => undefined).finally(() => { scanning = undefined; });
+    if (!options.active()) return;
+    void runScan().catch(() => undefined);
   };
 
   return {
@@ -305,9 +362,10 @@ export function createOutboxDrainer<Target>(options: OutboxDrainerOptions<Target
         }
       }
     },
-    scan: scanOnce,
+    scan: runScan,
     requestScan,
     async releaseWithheld(sessionKey) {
+      releaseEpochs.set(sessionKey, (releaseEpochs.get(sessionKey) ?? 0) + 1);
       if (outbox === undefined || !options.active()) return;
       let records: readonly unknown[];
       try {
@@ -340,8 +398,12 @@ export function createOutboxDrainer<Target>(options: OutboxDrainerOptions<Target
     markFailed,
     reportFault,
     async idle() {
-      while (scanning !== undefined || tasks.size > 0) {
-        await Promise.allSettled([...(scanning === undefined ? [] : [scanning]), ...tasks]);
+      while (scanning !== undefined || pendingScan !== undefined || tasks.size > 0) {
+        await Promise.allSettled([
+          ...(scanning === undefined ? [] : [scanning]),
+          ...(pendingScan === undefined ? [] : [pendingScan]),
+          ...tasks,
+        ]);
       }
     },
   };

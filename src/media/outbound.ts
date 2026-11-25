@@ -274,8 +274,16 @@ export async function* boundedResponseBody(
   maxBytes: number,
   signal?: AbortSignal,
 ): AsyncIterable<Uint8Array> {
-  const advertised = Number(response.headers.get("content-length"));
-  if (Number.isSafeInteger(advertised) && advertised > maxBytes) throw new MediaRejected("too-large");
+  const header = response.headers.get("content-length");
+  const advertised = header === null || header.trim() === "" ? Number.NaN : Number(header);
+  if (Number.isSafeInteger(advertised) && advertised > maxBytes) {
+    try {
+      await response.body?.cancel();
+    } catch {
+      // Best-effort cancellation before rejecting an oversized advertised body.
+    }
+    throw new MediaRejected("too-large");
+  }
   if (response.body === null) throw new Error("media response has no body");
   const reader = response.body.getReader();
   let total = 0;

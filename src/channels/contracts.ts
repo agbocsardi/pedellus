@@ -14,6 +14,8 @@ import {
   UsageDoc,
   type Conversation,
   type ConversationId,
+  type DocumentReader,
+  type LiveState,
   type UsageState,
 } from "@earendil-works/pi-durable";
 import { copyJson } from "@earendil-works/chord";
@@ -42,6 +44,8 @@ export type ChannelScopeNoun = "chat" | "channel" | "thread";
  */
 export interface ChannelGateway {
   conversationFor(sessionKey: string, context: Context): Promise<Conversation>;
+  /** Read-only Durable document snapshot reader, when the host exposes its Harness. */
+  readonly harness?: StatusDocumentReader;
   /** Decides a prepared idle rollover just before an owner input is submitted; absent means none. */
   beforeOwnerInput?(
     sessionKey: string,
@@ -206,49 +210,99 @@ export const CONVERSATION_STATUS_LIMITS = Object.freeze({
   statusQueueScan: 2_000,
 });
 
+/** Read-only Durable snapshot surface used by {@link projectConversationStatus}. */
+export type StatusDocumentReader = Pick<DocumentReader, "snapshot">;
+
+function projectStatusFields(input: {
+  readonly model?: { readonly provider: string; readonly modelId: string };
+  readonly live?: LiveState;
+  readonly inbox?: { readonly items?: readonly { readonly mode?: string }[] };
+  readonly usage?: UsageState;
+}): ConversationStatus {
+  const limit = CONVERSATION_STATUS_LIMITS.statusQueueScan;
+  const queued = input.inbox?.items ?? [];
+  const modeCounts = { steer: 0, followUp: 0, write: 0 };
+  const scanned = Math.min(queued.length, limit);
+  for (let index = 0; index < scanned; index++) {
+    const mode = queued[index]!.mode;
+    if (mode === "steer" || mode === "followUp" || mode === "write") modeCounts[mode]++;
+  }
+  const tools = input.live?.tools ?? [];
+  const toolsScanned = Math.min(tools.length, limit);
+  let running = 0;
+  let pending = 0;
+  for (let index = 0; index < toolsScanned; index++) {
+    const status = tools[index]!.status;
+    if (status === "running") running++;
+    else if (status === "pending") pending++;
+  }
+  const model = input.model;
+  const run = input.live?.run;
+  const attempt = input.live?.generation?.attempt;
+  return {
+    ...(model === undefined ? {} : { model: { provider: model.provider, modelId: model.modelId } }),
+    ...(run === undefined
+      ? {}
+      : { run: { taskId: run.taskId, inputs: run.inputs.length, ...(attempt === undefined ? {} : { attempt }) } }),
+    inbox: { total: queued.length, scanned, ...modeCounts },
+    tools: { total: tools.length, scanned: toolsScanned, running, pending },
+    compactions: input.live?.compactions?.length ?? 0,
+    ...(input.usage === undefined ? {} : { usage: input.usage }),
+  };
+}
+
 /**
- * Project one conversation's status from a single read transaction over its native documents
- * (`pi.agent`, `pi.live`, `pi.inbox`, `pi.usage`). No watch is opened, no model is called and
- * nothing is written; the projection is copied out of the transaction, so no draft escapes.
+ * Project one conversation's status strictly read-only.
+ *
+ * When `reader` (`Harness.snapshot`) is supplied, reads `pi.agent`, `pi.live`, `pi.inbox` and
+ * `pi.usage` directly via `snapshot()` without opening a watch or creating absent documents.
+ * Without a `reader`, falls back to a minimal read-only watch (`{ min: 1, max: 1 }`) so a caller
+ * holding only a `Conversation` handle still never writes or recreates absent/retired documents
+ * (unlike `tx.doc()`). Absent `pi.usage` stays `undefined`, distinct from an empty ledger.
  */
 export async function projectConversationStatus(
-  conversation: Pick<Conversation, "id" | "commit">,
+  conversation: Pick<Conversation, "id">,
   context: Context,
+  reader: StatusDocumentReader,
+): Promise<ConversationStatus>;
+export async function projectConversationStatus(
+  conversation: Pick<Conversation, "id" | "agent" | "watch">,
+  context: Context,
+  reader?: StatusDocumentReader,
+): Promise<ConversationStatus>;
+export async function projectConversationStatus(
+  conversation: Pick<Conversation, "id"> & Partial<Pick<Conversation, "agent" | "watch">>,
+  context: Context,
+  reader?: StatusDocumentReader,
 ): Promise<ConversationStatus> {
-  return conversation.commit(async (tx) => {
-    const agent = await tx.doc(AgentDoc, conversation.id);
-    const live = await tx.doc(LiveDoc, conversation.id);
-    const inbox = await tx.doc(InboxDoc, conversation.id);
-    const usage = await tx.doc(UsageDoc, conversation.id);
-    const limit = CONVERSATION_STATUS_LIMITS.statusQueueScan;
-    const queued = inbox.items;
-    const modeCounts = { steer: 0, followUp: 0, write: 0 };
-    const scanned = Math.min(queued.length, limit);
-    for (let index = 0; index < scanned; index++) {
-      const mode = queued[index]!.mode;
-      if (mode === "steer" || mode === "followUp" || mode === "write") modeCounts[mode]++;
-    }
-    const tools = live.tools ?? [];
-    const toolsScanned = Math.min(tools.length, limit);
-    let running = 0;
-    let pending = 0;
-    for (let index = 0; index < toolsScanned; index++) {
-      const status = tools[index]!.status;
-      if (status === "running") running++;
-      else if (status === "pending") pending++;
-    }
-    const model = agent.model;
-    const run = live.run;
-    const attempt = live.generation?.attempt;
-    return {
-      ...(model === undefined ? {} : { model: { provider: model.provider, modelId: model.modelId } }),
-      ...(run === undefined
-        ? {}
-        : { run: { taskId: run.taskId, inputs: run.inputs.length, ...(attempt === undefined ? {} : { attempt }) } }),
-      inbox: { total: queued.length, scanned, ...modeCounts },
-      tools: { total: tools.length, scanned: toolsScanned, running, pending },
-      compactions: live.compactions?.length ?? 0,
-      usage: copyJson(usage) as unknown as UsageState,
-    };
-  }, context);
+  if (reader !== undefined) {
+    const [agent, live, inbox, usage] = await Promise.all([
+      reader.snapshot(AgentDoc, conversation.id, context),
+      reader.snapshot(LiveDoc, conversation.id, context),
+      reader.snapshot(InboxDoc, conversation.id, context),
+      reader.snapshot(UsageDoc, conversation.id, context),
+    ]);
+    return projectStatusFields({
+      ...(agent?.model === undefined ? {} : { model: agent.model }),
+      ...(live === undefined ? {} : { live }),
+      ...(inbox === undefined ? {} : { inbox }),
+      ...(usage === undefined ? {} : { usage: copyJson(usage) as unknown as UsageState }),
+    });
+  }
+  const agent = await conversation.agent!(context);
+  const watch = await conversation.watch!(context, { min: 1, max: 1 });
+  try {
+    const docs = watch.value.docs;
+    const live = docs["pi.live"] as unknown as LiveState | undefined;
+    const inbox = docs["pi.inbox"] as unknown as { readonly items?: readonly { readonly mode?: string }[] } | undefined;
+    const usage = docs["pi.usage"] as unknown as UsageState | undefined;
+    return projectStatusFields({
+      ...(agent.model === undefined ? {} : { model: agent.model }),
+      ...(live === undefined ? {} : { live }),
+      ...(inbox === undefined ? {} : { inbox }),
+      ...(usage === undefined ? {} : { usage: copyJson(usage) as unknown as UsageState }),
+    });
+  } finally {
+    await watch.stop();
+  }
 }
