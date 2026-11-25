@@ -269,9 +269,9 @@ function telegramMock(batches) {
 /** Run the real adapter over the real Gateway, optionally behind a narrow SDK host shape. */
 function start(store, transport, options = {}) {
   const scope = withCancel(context);
-  const host = options.narrow === true
+  const host = options.host ?? (options.narrow === true
     ? { conversationFor: (key, ctx) => store.gateway.conversationFor(key, ctx) }
-    : store.gateway;
+    : store.gateway);
   const adapter = runTelegram(host, {
     token: TOKEN,
     allowFrom: options.allowFrom ?? ['501'],
@@ -791,14 +791,15 @@ test('/model lists and selects one configured preset for this chat only', { time
     assert.match(listing, /\n- deep — fixture beta \[thinking: high\]/);
     assert.match(listing, /\*\*Configured default preset:\*\* fast/);
 
-    assert.equal(texts[1], 'Model: deep.');
+    assert.equal(rendered(texts[1]), 'Model set to preset deep: fixture/beta (thinking: high) for this chat.');
 
     assert.match(rendered(texts[2]), /\*\*Current model:\*\* fixture\/beta \(thinking: high\)/);
     assert.match(rendered(texts[2]), /\*\*Selected:\*\* deep — fixture beta \[thinking: high\]/);
 
     assert.match(texts[3], /Unknown model preset nope: nothing was changed/);
     assert.match(texts[4], /Usage: \/model \(list the configured presets\)/);
-    assert.equal(texts[5], 'Model: default.');
+    assert.equal(rendered(texts[5]),
+      'Model set to the configured default preset: fixture/alpha (thinking: off) for this chat.');
 
     // `/refresh` was retired in favour of `/new`; it is refused and never a control. This host has no
     // restart capability, so `/restart` is not offered either.
@@ -839,7 +840,7 @@ test('/model is refused atomically while this chat runs a turn', { timeout: 20_0
     harness = start(store, transport);
     await entered;
     assert.equal(store.captured.length, 1);
-    await until(() => transport.sent.some((entry) => /Model preset selection rejected: this chat is busy/.test(entry.text)),
+    await until(() => transport.sent.some((entry) => /Model selection refused: this chat is busy/.test(entry.text)),
       'busy refusal');
     // The refusal changed nothing and scheduled nothing: even before the turn ends, the selection
     // is still the configured default.
@@ -1269,5 +1270,151 @@ test('the restart helper replaces the real process image with the same argv and 
     assert.equal(process.env.NANOBOT_RESTART_SENTINEL, undefined, 'the child environment is its own');
   } finally {
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+/** Whether the adapter promise has settled (it never should while a test still drives it). */
+function settledFlag(harness) {
+  const flag = { settled: false };
+  harness.adapter.then(() => { flag.settled = true; }, () => { flag.settled = true; });
+  return flag;
+}
+
+test('a deferred /restart publishes its late outcome and still asks the host once', { timeout: 30_000 }, async () => {
+  const store = await syntheticStore('deferred-restart');
+  // The earlier input's delivery and the command's ordered flush both fail once, so the command is
+  // deferred to the next poll with its still-pending wording already published.
+  let failures = 2;
+  const host = Object.create(store.gateway, {
+    beforeOwnerInput: {
+      value: async (...args) => {
+        if (failures > 0) {
+          failures -= 1;
+          throw new Error('synthetic transient rollover failure');
+        }
+        return store.gateway.beforeOwnerInput(...args);
+      },
+    },
+  });
+  const requested = [];
+  const restart = { supported: true, async request() { requested.push(await stateDoc(store.gateway)); } };
+  let transport;
+  transport = telegramMock([
+    [textUpdate(1600, 1600, 'earlier input'), textUpdate(1601, 1601, '/restart')],
+    async () => {
+      await until(() => transport.sent.some((entry) => entry.text === 'Restart pending.'), 'still-pending wording');
+      return [];
+    },
+  ]);
+  let harness;
+  try {
+    harness = start(store, transport, { restart, host });
+    await until(() => requested.length === 1, 'host restart request after the deferred flush');
+    await until(() => transport.sent.some((entry) => /^Restart requested; checking active work\.$/.test(entry.text)),
+      'late completion notice');
+    const texts = transport.sent.map((entry) => entry.text);
+    assert.ok(texts.indexOf('Restart pending.') < texts.findIndex((text) => text.startsWith('Restart requested')),
+      'the completion follows the still-pending wording');
+    // The host was asked only once the applied record and the owed confirmation were durable.
+    assert.deepEqual(requested[0].controls.map((entry) => entry.status), ['applied']);
+    assert.deepEqual(requested[0].restart, [{ chatId: CHAT_ID, senderId: '501' }]);
+    // The earlier input was placed ahead of the command and answered exactly once.
+    await until(() => transport.sent.filter((entry) => entry.text === 'SYNTHETIC-REPLY').length === 1, 'earlier reply');
+    await flush();
+    assert.equal(store.captured.length, 1);
+    assert.equal(requested.length, 1, 'the host is asked once');
+  } finally {
+    await cleanup(store, harness);
+    transport.restore();
+  }
+});
+
+test('a control whose admission commit fails is polled again without locking its chat', { timeout: 30_000 }, async () => {
+  const store = await syntheticStore('admit-failure');
+  const stateKey = `telegram:${BOT_ID}:channel-state`;
+  let failAdmission = true;
+  // One synthetic storage failure of exactly the commit that admits update 1700; the transaction
+  // aborts, so neither the record, its acknowledgement nor the offset is durable.
+  const host = Object.create(store.gateway, {
+    conversationFor: {
+      value: async (key, ctx) => {
+        const conversation = await store.gateway.conversationFor(key, ctx);
+        if (key !== stateKey) return conversation;
+        return new Proxy(conversation, {
+          get(target, property) {
+            if (property === 'commit') {
+              return (change, commitContext) => target.commit(async (tx) => {
+                const result = await change(tx);
+                const doc = await tx.doc(TelegramState, target.id);
+                if (failAdmission && doc.controls.some((entry) => entry.updateId === 1700)) {
+                  failAdmission = false;
+                  throw new Error('synthetic storage failure');
+                }
+                return result;
+              }, commitContext);
+            }
+            const value = Reflect.get(target, property, target);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
+      },
+    },
+  });
+  let transport;
+  transport = telegramMock([
+    [textUpdate(1700, 1700, '/new')],
+    // Telegram serves the same update again because its offset was never committed.
+    [textUpdate(1700, 1700, '/new')],
+    async () => {
+      await until(() => transport.sent.some((entry) => entry.text === 'Context reset.'), 'retried reset');
+      return [textUpdate(1701, 1701, '/abort')];
+    },
+  ]);
+  let harness;
+  try {
+    harness = start(store, transport, { host });
+    const adapter = settledFlag(harness);
+    await until(() => transport.sent.some((entry) => entry.text === 'Idle. Queue cleared.'), 'later control in the chat');
+    assert.equal(failAdmission, false, 'the admission failure was exercised');
+    assert.ok(!transport.sent.some((entry) => /Previous command pending/.test(entry.text)),
+      'the failed admission left no gate behind');
+    assert.equal(transport.sent.filter((entry) => entry.text === 'Context reset.').length, 1);
+    const doc = await stateDoc(store.gateway);
+    assert.deepEqual(doc.controls.map((entry) => [entry.updateId, entry.status]), [[1700, 'applied'], [1701, 'applied']]);
+    assert.equal(doc.offset, 1702);
+    assert.equal(adapter.settled, false, 'the adapter keeps running');
+  } finally {
+    await cleanup(store, harness);
+    transport.restore();
+  }
+});
+
+test('a thrown ConversationBusy from the paired reset is a clean refusal, not an adapter failure', { timeout: 30_000 }, async () => {
+  const store = await syntheticStore('reset-busy-throw');
+  const host = Object.create(store.gateway, {
+    resetSession: {
+      value: async () => { throw Object.assign(new Error('conversation busy'), { name: 'ConversationBusy' }); },
+    },
+  });
+  let transport;
+  transport = telegramMock([
+    [textUpdate(1800, 1800, '/new')],
+    async () => {
+      await until(() => transport.sent.some((entry) => /^Reset refused: chat busy\./.test(entry.text)), 'busy refusal');
+      return [textUpdate(1801, 1801, 'still answered')];
+    },
+  ]);
+  let harness;
+  try {
+    harness = start(store, transport, { host });
+    const adapter = settledFlag(harness);
+    await until(() => transport.sent.some((entry) => entry.text === 'SYNTHETIC-REPLY'), 'later message answered');
+    assert.equal(rendered(transport.sent.find((entry) => /^Reset refused/.test(entry.text)).text),
+      'Reset refused: chat busy. /abort or retry /new when idle.');
+    assert.ok(!transport.sent.some((entry) => entry.text === 'Context reset.'), 'a refused reset never claims success');
+    assert.equal(adapter.settled, false, 'the adapter keeps running');
+  } finally {
+    await cleanup(store, harness);
+    transport.restore();
   }
 });

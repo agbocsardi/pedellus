@@ -28,6 +28,7 @@ import {
   type ConversationId,
   type Extension,
 } from "@earendil-works/pi-durable";
+import { createSingleHostRegistry, type SingleHostRegistry } from "./contracts.js";
 import {
   TELEGRAM_ACTION_LIMITS,
   TELEGRAM_FILE_KINDS,
@@ -78,28 +79,10 @@ export interface TelegramActionHost {
 }
 
 /** One host per process, attached by the running Telegram adapter and detached when it stops. */
-export interface TelegramActionRegistry {
-  attach(host: TelegramActionHost): () => void;
-  current(): TelegramActionHost | undefined;
-}
+export interface TelegramActionRegistry extends SingleHostRegistry<TelegramActionHost> {}
 
 export function createTelegramActionRegistry(): TelegramActionRegistry {
-  let host: TelegramActionHost | undefined;
-  return {
-    attach(next) {
-      const previous = host;
-      host = next;
-      let detached = false;
-      return () => {
-        if (detached) return;
-        detached = true;
-        if (host === next) host = previous;
-      };
-    },
-    current() {
-      return host;
-    },
-  };
+  return createSingleHostRegistry<TelegramActionHost>();
 }
 
 export interface TelegramToolOptions {

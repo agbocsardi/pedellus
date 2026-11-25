@@ -1,20 +1,15 @@
-import { defineDoc, AssistantEntry, ConversationBusy, LiveDoc } from "@earendil-works/pi-durable";
+import { defineDoc, AssistantEntry } from "@earendil-works/pi-durable";
 import type { Context, Draft } from "@earendil-works/chord";
 import { copyJson } from "@earendil-works/chord";
 import { withCancel, withoutAbortSignal, withTelemetry } from "@earendil-works/chord/context";
-import { Api, GrammyError, HttpError, InputFile } from "grammy";
 import type { TelemetryContext, TelemetrySpan } from "@earendil-works/pi-telemetry";
 import { journalEvent, journalTelemetry, observeOperation } from "../observability.js";
 import type { Message } from "grammy/types";
-import type { ApiClientOptions } from "grammy";
-import type { CallbackQuery, MessageReactionUpdated, ReactionType, ReactionTypeEmoji, Update } from "grammy/types";
-import type { Conversation, ConversationId, Submission, SubmissionId, SubmissionRecord } from "@earendil-works/pi-durable";
-import type { OwnerInputContent } from "../history/idle-rollover.js";
+import type { CallbackQuery, MessageReactionUpdated, Update } from "grammy/types";
+import type { Conversation, Submission, SubmissionId } from "@earendil-works/pi-durable";
 import type { AssistantMessage, ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { FollowUpMode } from "../config.js";
-import type { CronDeliveryOutbox, CronDeliveryRecord } from "../automation/cron-delivery.js";
-import { CronDeliveryOutboxError } from "../automation/cron-delivery.js";
-import { originOccurrencePending } from "../automation/cron.js";
+import type { CronDeliveryRecord } from "../automation/cron-delivery.js";
 import {
   conversationCommandNames,
   conversationCommandRefusal,
@@ -24,10 +19,6 @@ import {
   findConversationCommand,
   offeredConversationCommands,
 } from "../help/commands.js";
-import {
-  renderMemoryDigestStart,
-  renderMemoryDigestStatus,
-} from "../history/memory-digest.js";
 import { renderMcpListing } from "../mcp/admin.js";
 import {
   AskQuestionsDoc,
@@ -39,23 +30,55 @@ import {
   questionCallbackData,
   renderQuestionText,
   type AskQuestionView,
-  type AskSurfaceRegistry,
 } from "../questions/index.js";
 import { looksLikeOAuthCallback } from "../mcp/surface.js";
-import type {
-  GatewayMcpAdmin,
-  GatewayMemoryDigest,
-  GatewayModelList,
-  GatewayModelSelection,
-  GatewaySessionReset,
-} from "../runtime.js";
-import { inProcessTerminalConversation } from "../terminal/conversation.js";
-import { renderBackgroundStatus, type BackgroundStatus } from "../background-status.js";
-import { RESTART_BUSY_MESSAGE, RestartBusyError } from "../restart.js";
-import { isTurnInterruptionNotice } from "../recovery/interruption.js";
 import { CHANNEL_STATE_SESSION_SUFFIX } from "../history/scope.js";
 import { MEDIA_LIMITS, MediaRejected, createMediaStore, type MediaRejectionReason, type MediaStore, type StoredMedia } from "../media/attachments.js";
+import { WorkGate } from "../media/outbound.js";
 import { createTranscriber, TRANSCRIPTION_FAILURE_TEXT, type HexEngine, type Transcriber, type TranscriptionBackend, type WhisperCliEngine } from "../media/transcription.js";
+import {
+  detectHostCapabilities,
+  offeredChannelCommandNames,
+  type ChannelGateway,
+  type HostCapabilities,
+  type HostRestartController,
+} from "./contracts.js";
+import {
+  DIGEST_UNAVAILABLE_HOST,
+  MCP_UNAVAILABLE_HOST,
+  MODEL_LISTING_UNAVAILABLE,
+  MODEL_UNAVAILABLE_HOST,
+  RESTART_LIVE,
+  RESTART_UNAVAILABLE_HOST,
+  STATUS_UNAVAILABLE_HOST,
+  admitOwedRestartNotices,
+  createControlCoordinator,
+  createRestartRequester,
+  executeChannelControl,
+  handleOAuthCallback,
+  modelPresetRefusal,
+  parseModelArgument,
+  pruneControls,
+  readModelListing,
+  readStatusNotice,
+  recoverInterruptedControls,
+  renderDigestStatus,
+  renderModelListing,
+  type ChannelMutation,
+  type ControlLedger,
+  type ControlRecord,
+} from "./controls.js";
+import { createOutboxDrainer, type OriginAuthorization } from "./outbox-drainer.js";
+import {
+  SubmissionOrderQueue,
+  createPreviewWatcher,
+  isLiveGeneratingFor,
+  resolveOwnerBusyMode,
+  resolveSharedDeliveryGroup,
+  sharedDeliveryRole,
+  type LiveView,
+  type SubmissionSlot,
+} from "./turn-runtime.js";
 import {
   TELEGRAM_FILE_ORIGIN,
   TELEGRAM_MEDIA_LIMITS,
@@ -70,23 +93,14 @@ import {
   type TelegramPendingAttachment,
 } from "./telegram-media.js";
 import {
-  TELEGRAM_ACTION_LIMITS,
   TELEGRAM_COALESCE_LIMITS,
-  TELEGRAM_TARGET_LIMITS,
-  actionFor,
-  admitAction,
   coalescedInputText,
   findTarget,
   incomingContextText,
   observeTarget,
   reactionChangeSummary,
   retainReactionNote,
-  settleActionRecord,
   takeReactionContextText,
-  targetsForChat,
-  unresolvedActions,
-  validTelegramFilePath,
-  type TelegramActionAdmission,
   type TelegramActionRecord,
   type TelegramObservedTarget,
   type TelegramQuotedContext,
@@ -104,44 +118,42 @@ import {
   richMessagesEnabled,
   splitRichText,
 } from "./telegram-rich.js";
+import type { TelegramActionRegistry } from "./telegram-tool.js";
+import { createTelegramActions } from "./telegram-actions.js";
 import {
-  TELEGRAM_SEND_METHODS,
-  TelegramOutboundRejected,
-  outboundRejectionText,
-  readTelegramOutboundFile,
-} from "./telegram-outbound-media.js";
-import type {
-  TelegramActionHost,
-  TelegramActionOutcome,
-  TelegramActionRegistry,
-  TelegramActionRequest,
-  TelegramSendRequest,
-} from "./telegram-tool.js";
-import { isTelegramSendRequest } from "./telegram-tool.js";
+  NOTICES_UNAVAILABLE_HOST,
+  TelegramNoticeDismissals,
+  archiveUnknownNotice,
+  telegramNoticesCommand,
+  type PendingDismissal,
+} from "./telegram-notices.js";
+import {
+  POLL_TIMEOUT_MAX,
+  TelegramApiError,
+  type TelegramFloodGate,
+  backoff,
+  createTelegramTransport,
+  delay,
+  isMessageNotFound,
+  isNotModified,
+  isProvenRefusal,
+  type ApiCallOptions,
+  type ReadOutageHooks,
+  type TelegramSendTextOptions,
+} from "./telegram-transport.js";
 
-const API = "https://api.telegram.org";
+export { TelegramApiError, telegramFetch } from "./telegram-transport.js";
+export { TelegramNoticeDismissals } from "./telegram-notices.js";
+
 /** The `sendMessage` limit; a rich message uses `RICH_TEXT_LIMIT` and falls back to this. */
 const TELEGRAM_LIMIT = PLAIN_TEXT_LIMIT;
 const MAX_ADMITTED = 1000;
-const MAX_API_ATTEMPTS = 5;
-/** Safe reads (getMe/getUpdates) retry through a Telegram outage without a fixed attempt limit. */
-const READ_RETRY_BASE_MS = 1_000;
-const READ_RETRY_MAX_MS = 60_000;
-const POLL_TIMEOUT_MAX = 50;
-const MAX_TIMER_DELAY_MS = 2_147_483_647;
-const FLOOD_WAIT_BUDGET_MS = 5 * 60_000;
-/** How long a command acknowledgement waits for its native call before reporting that it is still pending. */
-const CONTROL_PENDING_NOTICE_MS = 30_000;
 /** Consecutive delivery failures after which a non-Telegram-rejected failure is held instead of retried forever. */
 const MAX_DELIVERY_FAILURES = 10;
-/** Bounded poll-cadence retries for a command whose earlier ordered inputs keep failing transiently. */
-const MAX_CONTROL_ATTEMPTS = 10;
-const FLOOD_WAIT_WITHOUT_HINT_MS = 1_000;
+/** Consecutive failed admissions of one control update before the failure is fatal; each re-polls it. */
+const MAX_CONTROL_ADMISSION_ATTEMPTS = 5;
 const COMMAND_NAME_MAX = 32;
 const BOT_MENTION_MAX = 64;
-const MAX_CONTROL_RECORDS = 64;
-/** Unresolved commands kept at most; further commands are refused so a hung or flooded chat cannot grow the log. */
-const MAX_UNRESOLVED_CONTROLS = 64;
 /** Chats that may be owed a restart confirmation, which is one message per requesting chat. */
 const MAX_RESTART_CONFIRMATIONS = 8;
 const MAX_NOTICE_CHARS = 1_500;
@@ -154,6 +166,8 @@ const MAX_ORIGINS = 1_000;
 const MAX_TRANSCRIPT_CHARS = 8_000;
 /** Telegram typing actions expire after about five seconds; refresh before that while a turn is active. */
 const TYPING_REFRESH_MS = 4_000;
+/** Coalescing delay between live preview edits. */
+const PREVIEW_DELAY_MS = 700;
 
 export type TelegramMediaTranscriptionOptions = {
   readonly enabled?: boolean;
@@ -184,18 +198,11 @@ export type TelegramMediaOptions = {
 };
 
 /**
- * Host-owned full-process restart for the authenticated-owner `/restart` control. The host performs
- * the replacement only after its own graceful teardown; the adapter confirms the request, never the
- * restart, and never retries it.
+ * Host-owned full-process restart for the authenticated-owner `/restart` control (the shared
+ * {@link HostRestartController}). The adapter confirms the request, never the restart, and never
+ * retries it.
  */
-export type TelegramRestartHost = {
-  /** Whether this host can actually replace its own process and configuration. */
-  readonly supported: boolean;
-  /** Fixed host-owned refusal used when `supported` is false; never user, model or provider input. */
-  readonly unavailable?: string;
-  /** Called at most once, only after this command's acknowledgement and offset are durable. */
-  request(): Promise<void>;
-};
+export type TelegramRestartHost = HostRestartController;
 
 export type TelegramOptions = {
   token: string;
@@ -280,17 +287,6 @@ export type TelegramControlRecord = {
   senderId: string;
 };
 
-/** One admitted command whose ordered flush is retried on the polling cadence. */
-type DeferredControl = {
-  readonly updateId: number;
-  readonly command: TelegramMutation;
-  readonly chatId: number;
-  /**
-   * The `/model` preset argument (already validated against the configured catalog, never a
-   * provider/model selector) or the `/mcp` request ID being decided.
-   */
-  readonly target?: string;
-};
 export type TelegramChannelState = {
   offset: number;
   pending: TelegramPendingDelivery[];
@@ -323,31 +319,6 @@ export type TelegramOriginBinding = {
   admittedAtMs: number;
 };
 type PendingReply = TelegramPendingDelivery;
-type SubmissionSlot = { readonly prior: Promise<void>; release(): void };
-/**
- * A committed answer that identifies the inputs one run consumed: every input that run consumed settles with
- * the same answer entry. Pending membership plus that durable settlement evidence is the whole shared-delivery
- * identity; no text, in-memory set or delivery tombstone is involved.
- *
- * A failed run has no such identity: Durable settles its inputs with a plain `unanswered` reason and exposes no
- * run reference afterwards, so failures are never grouped — each admitted message reports its own fixed notice.
- * Guessing from the reason text would let a held notice become the phantom owner of an unrelated failure.
- */
-type SharedAnswer = { readonly answer: number };
-/** `owner` sends the one shared reply, `sibling` stays silent behind it, `retired` is already gone. */
-type DeliveryRole = "owner" | "sibling" | "retired";
-
-/** The run's first input: it identifies the run across tool rounds, which only ever append inputs. */
-function firstInput(inputs: readonly SubmissionId[]): SubmissionId | undefined {
-  let first = inputs[0];
-  for (const id of inputs) if (first === undefined || id < first) first = id;
-  return first;
-}
-
-/** Whether this settled submission is one of the inputs the run with this committed answer consumed. */
-function answeredTogether(record: SubmissionRecord, settlement: SharedAnswer): boolean {
-  return record.type === "input" && record.status === "done" && record.answer === settlement.answer;
-}
 type TypingLoop = {
   /** Overlapping queued turns in one chat share this loop; the indicator stays until the last one settles. */
   turns: number;
@@ -362,18 +333,8 @@ type TypingLoop = {
  * another task, a parked run and an answered run are not generating, so they do not type. Typing is
  * therefore presence, never a promise of progress and never an endless keepalive for background work.
  */
-export function telegramTypingActive(
-  live: {
-    readonly run?: { readonly inputs?: readonly number[] };
-    readonly generation?: unknown;
-  } | undefined,
-  submissionId: number | undefined,
-): boolean {
-  if (submissionId === undefined || live?.run?.inputs === undefined) return false;
-  const generation = live.generation;
-  return live.run.inputs.includes(submissionId) && generation !== null && typeof generation === "object"
-    && (!('deferred' in generation) || generation.deferred === undefined)
-    && (!('retry' in generation) || generation.retry === undefined);
+export function telegramTypingActive(live: LiveView, submissionId: number | undefined): boolean {
+  return isLiveGeneratingFor(live, submissionId);
 }
 type ChannelState = TelegramChannelState;
 
@@ -457,72 +418,20 @@ export const TelegramState = defineDoc<ChannelState>({
   }),
 });
 
-export const TelegramNoticeDismissals = defineDoc<{
-  records: { id: string; sessionKey: string; text: string; unknownSince?: number; dismissedAt: number }[];
-}>({
-  kind: "nanobot.telegram-notice-dismissals", version: 1, scope: "conversation",
-  history: "latest", fork: "initial", initial: () => ({ records: [] }),
-  checkpointWhen: (_value, _ops, { deltasSinceBase }) => deltasSinceBase >= 64,
-});
-
-export interface TelegramGateway {
-  conversationFor(sessionKey: string, context: Context): Promise<Conversation>;
-  /** Decides a prepared idle rollover just before an owner input is submitted; absent means none. */
-  beforeOwnerInput?(sessionKey: string, conversationId: ConversationId, content: OwnerInputContent, context: Context): Promise<void>;
-  /**
-   * Host-authenticated durable outbox for completed background cron results. Optional so a host that
-   * only does inbound replies stays usable; absent means no scheduled delivery is attempted.
-   */
-  cronOutbox?: CronDeliveryOutbox;
-  /**
-   * Late-bound model-action host. The runtime creates it when `config.telegram` exists and offers the
-   * `telegram` tool only in mapped Telegram chat conversations; the running adapter attaches here.
-   */
+/**
+ * The host surface this adapter uses: the shared {@link ChannelGateway} plus the late-bound
+ * model-action registry. The runtime creates that registry when `config.telegram` exists and offers
+ * the `telegram` tool only in mapped Telegram chat conversations; the running adapter attaches here.
+ */
+export interface TelegramGateway extends ChannelGateway {
   telegramActions?: TelegramActionRegistry;
-  /**
-   * Optional host model catalog: the current selection, the configured direct choices and (in
-   * named-preset mode) the finite configured presets. Absent on a narrow SDK host, which then gets no
-   * `/status` or `/model` menu entry and a truthful refusal when the command is typed. It creates no
-   * conversation of its own and changes nothing.
-   */
-  listModels?(sessionKey: string, context: Context): Promise<GatewayModelList>;
-  /**
-   * Optional bounded background snapshot for this authenticated chat: its own live workers and
-   * scheduled jobs, plus whether the one shared workspace digestion run is live and whose it is.
-   * Absent, or a failed read, leaves `/status` with its core lines and makes no claim about work.
-   */
-  backgroundStatus?(sessionKey: string, context: Context): Promise<BackgroundStatus>;
-  /**
-   * Optional host preset selection: one configured preset name, or `default` for the configured one.
-   * It rejects atomically (including `ConversationBusy`) instead of queueing behind a running turn.
-   */
-  selectModelPreset?(sessionKey: string, name: string, context: Context): Promise<GatewayModelSelection>;
-  /**
-   * Optional paired reset for `new`: start a new context AND rebuild the host prompt snapshot from the
-   * current workspace files in one operation. Absent hosts keep the plain native reset; a host that has
-   * a prompt snapshot reports `busy` instead of resetting without rebuilding it.
-   */
-  resetSession?(sessionKey: string, context: Context): Promise<GatewaySessionReset>;
-  /**
-   * Optional host manual memory-digestion entry. Present means the authenticated owner may start one
-   * bounded batch with `/digest` and read bounded status with `/digest status`; absent means neither
-   * is advertised. It starts no schedule and calls no model from the command itself.
-   */
-  memoryDigest?: GatewayMemoryDigest;
-  /**
-   * Optional MCP host surface. Present only when the gateway loaded an on-disk configuration file.
-   * `/mcp` is read-only status; callback-shaped ingress is consumed before model admission and the
-   * initiating chat receives its own login link and fixed completion notice.
-   */
-  mcpAdmin?: GatewayMcpAdmin;
-  /** Live MCP login delivery and callback surfaces, attached by this adapter while it runs. */
-  mcpSurfaces?: import("../mcp/surface.js").McpSurfaceRegistry;
-  /**
-   * Live owner-question surfaces. The model's `ask_user` tool delivers here only for an exact mapped
-   * private chat; this adapter re-authenticates the chat and sender when a button is pressed.
-   */
-  askSurfaces?: AskSurfaceRegistry;
 }
+
+/** One admitted owner control of this adapter: keyed by update id, gated per chat. */
+type TelegramControlRequest = ControlRecord<number, number> & {
+  readonly senderId: string;
+  readonly sessionKey: string;
+};
 
 export async function runTelegram(
   gateway: TelegramGateway,
@@ -532,23 +441,14 @@ export async function runTelegram(
   validateOptions(options);
   // Attachment-disabled SDK callers keep the previous behavior: no store, no download, no transcription.
   const mediaIngress = createMediaIngress(options.media);
-  const mediaWork = new MediaWorkGate(MEDIA_LIMITS.maxConcurrentWork);
+  const mediaWork = new WorkGate(MEDIA_LIMITS.maxConcurrentWork);
   /**
    * Optional host operations this adapter may call, resolved once from the host surface. A narrow SDK
    * host keeps `/new`, `/abort` (and `/stop`), `/help` only; `/status`, `/model`, `/digest` and
    * `/restart` are then neither advertised nor applied, and typing one gets a truthful refusal
-   * instead of a half-working control. `/status` reports the selected model, so it needs the host
-   * catalog; `/model` needs the catalog and preset selection; `/digest` needs the manual digestion
-   * entry.
+   * instead of a half-working control.
    */
-  const hostCommands: TelegramCommandHost = {
-    model: typeof gateway.listModels === "function" && typeof gateway.selectModelPreset === "function",
-    status: typeof gateway.listModels === "function",
-    restart: options.restart !== undefined && options.restart.supported,
-    digest: typeof gateway.memoryDigest?.start === "function" && typeof gateway.memoryDigest?.status === "function",
-    mcp: typeof gateway.mcpAdmin?.list === "function" && typeof gateway.mcpAdmin?.submitCallback === "function",
-    notices: typeof gateway.cronOutbox?.list === "function" && typeof gateway.cronOutbox?.update === "function",
-  };
+  const hostCommands = detectHostCapabilities(gateway, options.restart);
   const scope = withCancel(context);
   const adapterContext = scope.context;
   const cleanupContext = withoutAbortSignal(adapterContext);
@@ -572,19 +472,13 @@ export async function runTelegram(
   // Outbound uploads resolve against the configured workspace only; the media opt-in is the
   // operator switch. Absent means every file send is refused before any external call.
   const outboundWorkspace = options.media?.workspace;
-  const outboundThrottle = new TelegramFloodGate();
-  const pollThrottle = new TelegramFloodGate();
-  const api = new Api(options.token, {
-    apiRoot: API,
-    timeoutSeconds: POLL_TIMEOUT_MAX + 10,
-    sensitiveLogs: false,
-    fetch: telegramFetch as unknown as NonNullable<ApiClientOptions["fetch"]>,
-  });
+  const transport = createTelegramTransport(options.token, signal);
+  const { api } = transport;
 
-  let me: Awaited<ReturnType<Api["getMe"]>> | undefined;
+  let me: Awaited<ReturnType<typeof api.getMe>> | undefined;
   try {
-    me = await apiCall(api, "getMe", signal, (callSignal) => api.getMe(toGrammySignal(callSignal)), {
-      throttle: pollThrottle,
+    me = await transport.call("getMe", (callSignal) => api.getMe(callSignal), {
+      throttle: transport.poll,
       retryOutage: readOutageHooks,
     });
   } catch (error) {
@@ -612,60 +506,24 @@ export async function runTelegram(
   let activeNotices = 0;
   const delivering = new Set<number>();
   const failedThisPoll = new Set<number>();
-  /** Chats whose control command is still being applied: nothing for them is submitted or delivered. */
-  const controlPending = new Set<number>();
-  /** Commands whose earlier ordered inputs hit a transient failure; retried on the poll cadence. */
-  const deferredControls = new Map<number, DeferredControl>();
-  const controlFailures = new Map<number, number>();
   /**
    * Submissions a control flush already placed for earlier inputs, so the normal delivery
    * path reuses that exact turn instead of submitting the same input a second time.
    */
   const earlySubmissions = new Map<number, Submission>();
-  const controlChains = new Map<number, Promise<void>>();
-  const submissionChains = new Map<number, Promise<void>>();
-  const pendingControls = new Set<Promise<void>>();
-  /** Set once this adapter asked the host to replace the process; a second `/restart` is refused. */
-  let restartHostRequested = false;
-  /** Set when that one host request was refused, so a later refusal does not claim a restart is in progress. */
-  let restartHostRequestFailed = false;
+  /**
+   * Each chat's submission order: a delivery reserves its place when it is dispatched, before any
+   * asynchronous preparation, so admission order never depends on how long a lookup takes.
+   */
+  const order = new SubmissionOrderQueue<number>();
   /** Consecutive delivery failures per pending record, so a permanent failure is held instead of retried forever. */
   const deliveryFailures = new Map<number, number>();
   let fatal: unknown;
   let stopping = false;
+  /** Consecutive failed admissions of the control update being polled again. */
+  let controlRetry: { readonly updateId: number; readonly attempts: number } | undefined;
 
-  /**
-   * Reserve one chat's next submission place when the delivery is dispatched, before any asynchronous preparation, so
-   * admission order never depends on how long `conversationFor`/`watch` take. Durable orders the inbox by submission.
-   */
-  const beginSubmission = (chatId: number): SubmissionSlot => {
-    const prior = submissionChains.get(chatId) ?? Promise.resolve();
-    let open!: () => void;
-    const held = new Promise<void>((resolve) => { open = resolve; });
-    const tail = prior.then(() => held);
-    submissionChains.set(chatId, tail);
-    let released = false;
-    return {
-      prior,
-      release: () => {
-        if (released) return;
-        released = true;
-        open();
-        if (submissionChains.get(chatId) === tail) submissionChains.delete(chatId);
-      },
-    };
-  };
-
-  /** Submit through a fresh place in a chat's order, for work that is not itself a dispatched delivery. */
-  const submitInOrder = async <T>(chatId: number, work: () => Promise<T>): Promise<T> => {
-    const slot = beginSubmission(chatId);
-    try {
-      await slot.prior;
-      return await work();
-    } finally {
-      slot.release();
-    }
-  };
+  const isActive = (): boolean => !stopping && !signal?.aborted;
 
   /**
    * Per-chat coalescing gate for the delivery that currently holds this chat's submission place.
@@ -710,47 +568,7 @@ export async function runTelegram(
   };
 
   const outbox = gateway.cronOutbox;
-  const scheduledActive = new Set<string>();
-  const scheduledChatActive = new Set<number>();
-  const scheduledTasks = new Set<Promise<void>>();
-  let scheduledScanning = false;
   let scheduledTimer: ReturnType<typeof setInterval> | undefined;
-
-  // Message sends/edits for one chat are ordered; chunks from separate messages may interleave.
-  // Disposable typing actions bypass this ordering but share the bot-token flood gate.
-  const chatSendTails = new Map<number, Promise<void>>();
-  const withChatSendOrder = <T>(chatId: number, work: () => Promise<T>): Promise<T> => {
-    const previous = chatSendTails.get(chatId) ?? Promise.resolve();
-    const next = previous.then(work);
-    const tail = next.then(() => undefined, () => undefined);
-    chatSendTails.set(chatId, tail);
-    void tail.finally(() => {
-      if (chatSendTails.get(chatId) === tail) chatSendTails.delete(chatId);
-    });
-    return next;
-  };
-
-  /**
-   * Durable bookkeeping a caller supplies so a text send stays truthful about its own record: the
-   * intent precedes the request, a proven refusal drops it, and an accepted message id is persisted.
-   */
-  type TelegramTextHooks = {
-    /** Persist the write-ahead intent for this exact attempt, before the request leaves. */
-    before(text: string): Promise<void>;
-    /** The request provably did not deliver anything; drop the intent. */
-    abandoned(): Promise<void>;
-    /** Record each accepted message without advancing the whole-chunk cursor. */
-    partAccepted?(messageId: number, text: string): Promise<void>;
-    /** All parts were accepted; advance the whole-chunk cursor. */
-    accepted(messageId: number, text: string): Promise<void>;
-  };
-
-  /** A send with no durable record of its own: nothing to write before, abandon or accept. */
-  const idleTextHooks: TelegramTextHooks = {
-    before: async () => undefined,
-    abandoned: async () => undefined,
-    accepted: async () => undefined,
-  };
 
   /** Chunk boundaries are independent of the process-local rich capability latch. */
   const splitOutboundText = (text: string, plan: "rich-v1" | "preview-v1" | "legacy" = "rich-v1"): string[] =>
@@ -771,14 +589,7 @@ export async function runTelegram(
   const sendOutboundText = async (
     chatId: number,
     text: string,
-    sendOptions: {
-      hooks: TelegramTextHooks;
-      replyTo?: number;
-      mode?: "markdown" | "literal";
-      richBody?: string;
-      throttle?: TelegramFloodGate;
-      replaceable?: boolean;
-    },
+    sendOptions: TelegramSendTextOptions,
   ): Promise<number | undefined> => {
     const body = sendOptions.richBody ?? (sendOptions.mode === "literal" ? escapeTelegramLiteral(text) : text);
     const reply: { reply_parameters?: { message_id: number; allow_sending_without_reply: boolean } } =
@@ -792,15 +603,15 @@ export async function runTelegram(
     if (richMessagesEnabled()) {
       let richAccepted = false;
       try {
-        const sent = await apiCall<Message.RichMessageMessage>(api, "sendRichMessage", signal, async (callSignal) => {
+        const sent = await transport.call<Message.RichMessageMessage>("sendRichMessage", async (callSignal) => {
           await sendOptions.hooks.before(text);
           if (signal?.aborted) {
             await sendOptions.hooks.abandoned();
             throw new TelegramApiError("sendRichMessage", 0, "not-sent");
           }
           try {
-            return await withChatSendOrder(chatId, () => api.sendRichMessage(
-              chatId, { markdown: body }, reply, toGrammySignal(callSignal),
+            return await transport.inChatOrder(chatId, () => api.sendRichMessage(
+              chatId, { markdown: body }, reply, callSignal,
             ));
           } catch (error) {
             if (isProvenRefusal(error)) await sendOptions.hooks.abandoned();
@@ -831,15 +642,15 @@ export async function runTelegram(
     for (let index = 0; index < parts.length; index += 1) {
       const part = parts[index]!;
       try {
-        const sent = await apiCall<Message.TextMessage>(api, "sendMessage", signal, async (callSignal) => {
+        const sent = await transport.call<Message.TextMessage>("sendMessage", async (callSignal) => {
           await sendOptions.hooks.before(part);
           if (signal?.aborted) {
             if (index === 0) await sendOptions.hooks.abandoned();
             throw new TelegramApiError("sendMessage", 0, "not-sent");
           }
           try {
-            return await withChatSendOrder(chatId, () => api.sendMessage(
-              chatId, part, index === 0 ? reply : {}, toGrammySignal(callSignal),
+            return await transport.inChatOrder(chatId, () => api.sendMessage(
+              chatId, part, index === 0 ? reply : {}, callSignal,
             ));
           } catch (error) {
             if (index === 0 && isProvenRefusal(error)) await sendOptions.hooks.abandoned();
@@ -889,8 +700,8 @@ export async function runTelegram(
     };
     if (richMessagesEnabled()) {
       try {
-        const edited = await apiCall(api, "editMessageText", signal, (callSignal) => withChatSendOrder(chatId, () =>
-          api.editMessageText(chatId, messageId, { markdown: body }, {}, toGrammySignal(callSignal))),
+        const edited = await transport.call("editMessageText", (callSignal) => transport.inChatOrder(chatId, () =>
+          api.editMessageText(chatId, messageId, { markdown: body }, {}, callSignal)),
         callOptions);
         return edited !== undefined;
       } catch (error) {
@@ -903,8 +714,8 @@ export async function runTelegram(
         }
       }
     }
-    const edited = await apiCall(api, "editMessageText", signal, (callSignal) => withChatSendOrder(chatId, () =>
-      api.editMessageText(chatId, messageId, text, {}, toGrammySignal(callSignal))),
+    const edited = await transport.call("editMessageText", (callSignal) => transport.inChatOrder(chatId, () =>
+      api.editMessageText(chatId, messageId, text, {}, callSignal)),
     callOptions);
     return edited !== undefined;
   };
@@ -918,12 +729,12 @@ export async function runTelegram(
   const refreshTyping = async (chatId: number, loop: TypingLoop): Promise<void> => {
     if (loop.stopped || stopping || signal?.aborted) return;
     try {
-      const sent = await apiCall(api, "sendChatAction", signal,
-        (callSignal) => api.sendChatAction(chatId, "typing", {}, toGrammySignal(callSignal)),
-        { throttle: outboundThrottle, replaceable: true });
+      const sent = await transport.call("sendChatAction",
+        (callSignal) => api.sendChatAction(chatId, "typing", {}, callSignal),
+        { throttle: transport.outbound, replaceable: true });
       if (!loop.stopped && !signal?.aborted) {
         if (sent === undefined && !loop.unavailable) {
-          journalEvent("telegram.typing.skipped", { "chat.id": chatId, "cooldown.ms": outboundThrottle.remainingMs() });
+          journalEvent("telegram.typing.skipped", { "chat.id": chatId, "cooldown.ms": transport.outbound.remainingMs() });
         } else if (sent !== undefined && loop.unavailable) {
           journalEvent("telegram.typing.recovered", { "chat.id": chatId });
         }
@@ -1062,362 +873,18 @@ export async function runTelegram(
     return chatId;
   };
 
-  const settleAction = async (
-    callId: string,
-    status: "sent" | "unknown" | "failed" | "denied",
-    error?: string,
-  ): Promise<void> => {
-    await mutateState((doc) => {
-      settleActionRecord(doc.actions, callId, status, error === undefined ? {} : { error });
-    });
-  };
-
-  const actionOutcome = (record: TelegramActionRecord): TelegramActionOutcome => {
-    if (record.status === "sent") {
-      const ids = record.resultMessageIds ?? [];
-      return {
-        ok: true,
-        text: ids.length === 0
-          ? "This Telegram action was already applied."
-          : `This Telegram action was already applied (message id ${ids.join(", ")}).`,
-        ...(ids.length === 0 ? {} : { messageIds: ids }),
-      };
-    }
-    if (record.status === "unknown" || record.status === "sending") {
-      return { ok: false, text: "The outcome of this Telegram action is unknown; it will not be retried automatically." };
-    }
-    if (record.status === "failed") {
-      return { ok: false, text: "This Telegram action previously failed and will not be retried automatically." };
-    }
-    if (record.status === "denied") {
-      return { ok: false, text: "This Telegram action was previously denied and will not be retried automatically." };
-    }
-    return { ok: false, text: "This Telegram action was interrupted before sending and will not be retried automatically." };
-  };
-
-  const priorActionOutcome = (
-    record: TelegramActionRecord,
-    chatId: number,
-    request: TelegramActionRequest,
-  ): TelegramActionOutcome => {
-    const targetMessageId = isTelegramSendRequest(request)
-      ? request.messageId ?? 0
-      : request.messageId;
-    const samePayload = isTelegramSendRequest(request)
-      ? record.path === request.path && (record.caption ?? "") === (request.caption ?? "")
-      : request.kind === "reply"
-        ? record.text === request.text
-        : record.emoji === request.emoji;
-    if (record.chatId !== chatId || record.targetMessageId !== targetMessageId ||
-        record.kind !== request.kind || !samePayload) {
-      return { ok: false, text: "This action identity belongs to a different request; no action was taken." };
-    }
-    return actionOutcome(record);
-  };
-
-  /**
-   * Fixed refusal for a fresh call that would repeat an effect whose earlier attempt in this chat has
-   * no definite outcome. It states the uncertainty, that nothing new left the host, and what not to do:
-   * a reworded or re-identified retry would duplicate the effect rather than resolve it.
-   */
-  const repeatedEffectOutcome = (): TelegramActionOutcome => ({
-    ok: false,
-    text: "No new Telegram message was sent. An earlier action in this chat with the same kind, target and " +
-      "content has no definite outcome yet, so it may already have been applied, possibly in part. Do not " +
-      "work around this by rewording the text, changing the target or using a new call id: if the earlier " +
-      "attempt was delivered, that would deliver the effect twice. Tell the owner the earlier delivery's " +
-      "outcome is unknown.",
+  const telegramActions = createTelegramActions({
+    transport,
+    outboundWorkspace,
+    state: () => state,
+    mutate: async (change) => { await mutateState(change); },
+    authorizedChat: authorizedActionChat,
+    active: isActive,
+    sendText: (chatId, text, sendOptions) => sendOutboundText(chatId, text, sendOptions),
+    splitText: (text) => splitOutboundText(text),
+    rememberOutgoing: rememberOutgoingTarget,
   });
 
-  /**
-   * One native media upload. The workspace file is read into bounded memory before the API call so
-   * the bytes cannot change mid-upload, and every refusal happens before any external request. The
-   * `sending` record was already written by `act`, so an abort or transport ambiguity here stays
-   * `unknown` and is never resent.
-   */
-  const performFileSend = async (
-    chatId: number,
-    callId: string,
-    request: TelegramSendRequest,
-  ): Promise<TelegramActionOutcome> => {
-    const kind = request.kind;
-    const caption = request.caption === undefined || request.caption === "" ? undefined : request.caption;
-    const targetMessageId = request.messageId ?? 0;
-    if (outboundWorkspace === undefined) {
-      await settleAction(callId, "failed", "outbound files are not configured");
-      return { ok: false, text: "Outbound files are not enabled in this host." };
-    }
-    let file;
-    try {
-      file = await readTelegramOutboundFile({
-        workspace: outboundWorkspace,
-        path: request.path,
-        kind,
-      });
-    } catch (error) {
-      const reason = error instanceof TelegramOutboundRejected ? error.reason : "unreadable";
-      // Nothing left the host, so this is a known non-send rather than an ambiguous outcome.
-      await settleAction(callId, "failed", `outbound file refused: ${reason}`);
-      return { ok: false, text: `The file was not sent: ${outboundRejectionText(kind, reason)}.` };
-    }
-    const method = TELEGRAM_SEND_METHODS[kind];
-    try {
-      const sent = await apiCall<Message>(api, method, signal, (callSignal) => withChatSendOrder<Message>(chatId, () => {
-        const outbound = new InputFile(file!.bytes, file!.filename);
-        const other = {
-          ...(caption === undefined ? {} : { caption }),
-          ...(targetMessageId > 0
-            ? { reply_parameters: { message_id: targetMessageId, allow_sending_without_reply: false } }
-            : {}),
-        };
-        const callSignalOrUndefined = toGrammySignal(callSignal);
-        switch (kind) {
-          case "document": return api.sendDocument(chatId, outbound, other, callSignalOrUndefined);
-          case "photo": return api.sendPhoto(chatId, outbound, other, callSignalOrUndefined);
-          case "audio": return api.sendAudio(chatId, outbound, other, callSignalOrUndefined);
-          case "video":
-            return api.sendVideo(chatId, outbound, { ...other, supports_streaming: true }, callSignalOrUndefined);
-          case "voice": return api.sendVoice(chatId, outbound, other, callSignalOrUndefined);
-        }
-      }), { throttle: outboundThrottle });
-      if (sent === undefined) throw new Error(`Telegram ${method} returned no result`);
-      const messageIds = [sent.message_id];
-      await mutateState((doc) => {
-        const entry = doc.actions.find((candidate) => candidate.callId === callId);
-        if (entry === undefined) return;
-        entry.resultMessageIds = [...(entry.resultMessageIds ?? []), sent.message_id];
-      });
-      await rememberOutgoingTarget(
-        chatId,
-        sent.message_id,
-        caption ?? `[${kind}: ${file.filename}]`,
-      );
-      await settleAction(callId, "sent");
-      return {
-        ok: true,
-        text: `Sent one ${kind} (${file.filename})` +
-          `${targetMessageId > 0 ? ` as a native reply to message ${targetMessageId}` : ""} ` +
-          `(message id ${sent.message_id}).`,
-        messageIds,
-      };
-    } catch (error) {
-      const knownNotSent = error instanceof TelegramApiError &&
-        (error.outcome === "not-sent" ||
-          (error.outcome === "rejected" && error.status > 0 && error.status < 500));
-      if (knownNotSent) {
-        await settleAction(callId, "failed", "Telegram rejected the upload");
-        return {
-          ok: false,
-          text: "Telegram rejected the file; it was not accepted and will not be retried automatically.",
-        };
-      }
-      await settleAction(callId, "unknown");
-      console.warn(`Telegram ${kind} upload outcome unknown; it will not be retried automatically.`);
-      return {
-        ok: false,
-        text: "The file may or may not have been delivered; it will not be retried automatically.",
-      };
-    }
-  };
-
-  /**
-   * Perform one already-admitted action. A `sending` record precedes the API call; a success records
-   * the returned ids, a known rejection fails closed, and any other outcome is quarantined as
-   * `unknown` so a later replay or reopen never resends it blindly.
-   */
-  const performAction = async (
-    chatId: number,
-    callId: string,
-    request: TelegramActionRequest,
-  ): Promise<TelegramActionOutcome> => {
-    if (isTelegramSendRequest(request)) return performFileSend(chatId, callId, request);
-    try {
-      if (request.kind === "react") {
-        const reaction: ReactionType[] = [{
-          type: "emoji",
-          // The adapter does not hardcode Telegram's reaction allowlist; an unsupported emoji is a
-          // known rejection and fails closed without retry.
-          emoji: request.emoji as ReactionTypeEmoji["emoji"],
-        }];
-        await apiCall(api, "setMessageReaction", signal, (callSignal) => withChatSendOrder(chatId, () =>
-          api.setMessageReaction(chatId, request.messageId, reaction, {}, toGrammySignal(callSignal))),
-        { throttle: outboundThrottle });
-        await settleAction(callId, "sent");
-        return { ok: true, text: `Set the ${request.emoji} reaction on message ${request.messageId}.` };
-      }
-      const chunks = splitOutboundText(request.text);
-      const ids: number[] = [];
-      for (let index = actionFor(state.actions, callId)?.nextChunkIndex ?? 0; index < chunks.length; index++) {
-        const chunk = chunks[index]!;
-        const sent = await sendOutboundText(chatId, chunk, {
-          ...(index === 0 ? { replyTo: request.messageId } : {}),
-          throttle: outboundThrottle,
-          hooks: {
-            ...idleTextHooks,
-            partAccepted: async (sentId) => {
-              ids.push(sentId);
-              await mutateState((doc) => {
-                const entry = doc.actions.find((candidate) => candidate.callId === callId);
-                if (entry !== undefined) entry.resultMessageIds = [...(entry.resultMessageIds ?? []), sentId];
-              });
-            },
-            accepted: async () => {
-              await mutateState((doc) => {
-                const entry = doc.actions.find((candidate) => candidate.callId === callId);
-                if (entry !== undefined) entry.nextChunkIndex = Math.max(entry.nextChunkIndex, index + 1);
-              });
-            },
-          },
-        });
-        if (sent === undefined) throw new Error("Telegram send returned no result");
-      }
-      await settleAction(callId, "sent");
-      return {
-        ok: true,
-        text: `Sent as a native reply to message ${request.messageId}` +
-          `${ids.length > 1 ? ` in ${ids.length} parts` : ""} (message id ${ids.join(", ")}).`,
-        messageIds: ids,
-      };
-    } catch (error) {
-      // `sendMessage` 5xx is already `unknown`. A reaction 5xx is likewise ambiguous, so only a
-      // proven pre-connect failure or a non-5xx rejection may be called a known non-send.
-      const knownNotSent = error instanceof TelegramApiError &&
-        (error.outcome === "not-sent" ||
-          (error.outcome === "rejected" && error.status > 0 && error.status < 500));
-      if (knownNotSent) {
-        await settleAction(callId, "failed", "Telegram rejected the action");
-        return {
-          ok: false,
-          text: "Telegram rejected the action; it was not applied and will not be retried automatically.",
-        };
-      }
-      await settleAction(callId, "unknown");
-      console.warn(`Telegram ${request.kind} action outcome unknown; it will not be retried automatically.`);
-      return {
-        ok: false,
-        text: "The Telegram action may or may not have been applied; it will not be retried automatically.",
-      };
-    }
-  };
-
-  const actionHost: TelegramActionHost = {
-    targets(sessionKey) {
-      if (stopping || signal?.aborted) return undefined;
-      const chatId = authorizedActionChat(sessionKey);
-      if (chatId === undefined) return undefined;
-      return targetsForChat(state.targets, chatId, TELEGRAM_TARGET_LIMITS.listing);
-    },
-    async act(sessionKey, callId, request, ctx) {
-      if (stopping || signal?.aborted || ctx.abortSignal?.aborted) {
-        return { ok: false, text: "The Telegram adapter is stopping, so no action was taken." };
-      }
-      if (typeof callId !== "string" || callId === "" || callId.length > TELEGRAM_ACTION_LIMITS.callIdChars) {
-        return { ok: false, text: "This Telegram action has no usable call identity and was not taken." };
-      }
-      const chatId = authorizedActionChat(sessionKey);
-      if (chatId === undefined) {
-        return { ok: false, text: "This chat is not currently authorized for Telegram actions." };
-      }
-      let targetMessageId: number;
-      if (isTelegramSendRequest(request)) {
-        // A host caller may bypass the model schema; an unknown kind is refused before admission.
-        if (!Object.hasOwn(TELEGRAM_SEND_METHODS, request.kind)) {
-          return { ok: false, text: "Unknown Telegram file kind; no file was sent." };
-        }
-        // Outbound files need the configured workspace media opt-in. The tool is also withheld
-        // unless the same conversation holds the configured `read` tool, so this adds no read grant.
-        if (options.media === undefined) {
-          return { ok: false, text: "Outbound files are not enabled in this host." };
-        }
-        if (!validTelegramFilePath(request.path)) {
-          return { ok: false, text: "The file path must be workspace-relative and inside the configured workspace." };
-        }
-        if (request.caption !== undefined &&
-            (typeof request.caption !== "string" || request.caption.length > TELEGRAM_ACTION_LIMITS.captionChars)) {
-          return { ok: false, text: `A caption is limited to ${TELEGRAM_ACTION_LIMITS.captionChars} characters.` };
-        }
-        if (request.messageId !== undefined &&
-            (!Number.isSafeInteger(request.messageId) || request.messageId < 1)) {
-          return { ok: false, text: "messageId, when given for a file send, must be a positive observed message id." };
-        }
-        targetMessageId = request.messageId ?? 0;
-        // A file send without a reply target is ordinary; a named target must be observed here.
-        if (targetMessageId > 0 && findTarget(state.targets, chatId, targetMessageId) === undefined) {
-          return {
-            ok: false,
-            text: `Message id ${targetMessageId} is not an observed message in this chat, so it cannot be ` +
-              "targeted. Use action=targets to see the ids this chat may target.",
-          };
-        }
-      } else {
-        if (!Number.isSafeInteger(request.messageId) || request.messageId < 1) {
-          return { ok: false, text: "messageId must be a positive observed message id from this chat." };
-        }
-        if (findTarget(state.targets, chatId, request.messageId) === undefined) {
-          return {
-            ok: false,
-            text: `Message id ${request.messageId} is not an observed message in this chat, so it cannot be ` +
-              "targeted. Use action=targets to see the ids this chat may target.",
-          };
-        }
-        targetMessageId = request.messageId;
-      }
-      const existing = actionFor(state.actions, callId);
-      if (existing !== undefined) return priorActionOutcome(existing, chatId, request);
-
-      const record: TelegramActionRecord = {
-        callId,
-        kind: request.kind,
-        chatId,
-        targetMessageId,
-        ...(isTelegramSendRequest(request)
-          ? {
-              path: request.path,
-              ...(request.caption === undefined ? {} : { caption: request.caption }),
-            }
-          : request.kind === "reply"
-            ? { text: request.text }
-            : { emoji: request.emoji }),
-        status: "intent",
-        nextChunkIndex: 0,
-        startedAtMs: Date.now(),
-      };
-      let admission: TelegramActionAdmission = "full";
-      await mutateState((doc) => {
-        admission = admitAction(doc.actions, record);
-      });
-      if (admission === "full") {
-        return { ok: false, text: "Too many Telegram actions are awaiting outcome; this action was not taken." };
-      }
-      if (admission === "conflict") {
-        // The fence refused inside the intent transaction: no record, no preflight and no API call
-        // was made for this call id, and the earlier record is left exactly as it was.
-        return repeatedEffectOutcome();
-      }
-      if (admission === "duplicate") {
-        const duplicate = actionFor(state.actions, callId);
-        return duplicate === undefined
-          ? { ok: false, text: "This Telegram action is already recorded and will not be resent." }
-          : priorActionOutcome(duplicate, chatId, request);
-      }
-      // Preflight recheck after the durable intent: never send if the adapter stopped, the admission
-      // evidence changed, or the target was evicted between validation and the effect.
-      if (stopping || signal?.aborted || ctx.abortSignal?.aborted) {
-        await settleAction(callId, "denied", "adapter stopped before sending");
-        return { ok: false, text: "The adapter stopped before sending; no action was taken." };
-      }
-      if (authorizedActionChat(sessionKey) === undefined ||
-          (targetMessageId > 0 && findTarget(state.targets, chatId, targetMessageId) === undefined)) {
-        await settleAction(callId, "denied", "scope or target recheck failed");
-        return { ok: false, text: "The chat or target is no longer authorized; no action was taken." };
-      }
-      await mutateState((doc) => {
-        const entry = doc.actions.find((candidate) => candidate.callId === callId);
-        if (entry !== undefined) entry.status = "sending";
-      });
-      return performAction(chatId, callId, request);
-    },
-  };
   /** The exact private chat and durable sender binding for one Telegram session key. */
   function ownerChatFor(sessionKey: string): { readonly chatId: number; readonly senderId: string } | undefined {
     const prefix = `telegram:${identity}:chat:`;
@@ -1435,8 +902,8 @@ export async function runTelegram(
   async function sendOwnerPlainText(chatId: number, senderId: string, text: string): Promise<void> {
     if (!options.allowFrom.includes(senderId)) throw new Error("the owner sender is no longer authorized");
     if (text.length > PLAIN_TEXT_LIMIT) throw new Error("owner message is too long for one message");
-    await apiCall(api, "sendMessage", signal, (callSignal) => withChatSendOrder(chatId, () =>
-      api.sendMessage(chatId, text, {}, toGrammySignal(callSignal))), { throttle: outboundThrottle });
+    await transport.call("sendMessage", (callSignal) => transport.inChatOrder(chatId, () =>
+      api.sendMessage(chatId, text, {}, callSignal)), { throttle: transport.outbound });
   }
 
   let detachTelegramActions: (() => void) | undefined;
@@ -1444,81 +911,39 @@ export async function runTelegram(
   let detachAskSurface: (() => void) | undefined;
 
   // A completed background result is sent as stored text: no submission, no preview, no model turn.
-  const scheduledSessions = async (): Promise<{ sessionKey: string; chatId: number }[]> => {
-    if (outbox === undefined) return [];
-    const prefix = `telegram:${identity}:chat:`;
-    const sessions: { sessionKey: string; chatId: number }[] = [];
-    for (const { sessionKey } of await outbox.sessions(adapterContext)) {
-      if (!sessionKey.startsWith(prefix)) continue;
-      const raw = sessionKey.slice(prefix.length);
-      if (!/^[1-9][0-9]*$/.test(raw)) continue;
-      const chatId = Number(raw);
-      if (!Number.isSafeInteger(chatId)) continue;
-      sessions.push({ sessionKey, chatId });
-    }
-    return sessions;
-  };
-
-  const updateScheduled = async (
-    sessionKey: string,
-    id: string,
-    change: (entry: Draft<CronDeliveryRecord>) => void,
-    commitContext: Context = adapterContext,
-  ): Promise<CronDeliveryRecord | undefined> => {
-    if (outbox === undefined) return undefined;
-    return outbox.update(sessionKey, id, change, commitContext);
-  };
-
-  const reportOutboxFault = async (sessionKey: string, message: string): Promise<void> => {
-    if (outbox === undefined) return;
-    await outbox.recordFault(sessionKey, message, cleanupContext).catch(() => undefined);
-  };
-
-  // A write-ahead intent may have reached Telegram before a crash. Quarantine it on open: an
-  // ambiguous external send is never auto-resent.
-  const recoverScheduled = async (): Promise<void> => {
-    if (outbox === undefined) return;
-    for (const { sessionKey } of await scheduledSessions()) {
-      let records: readonly unknown[];
-      try {
-        records = await outbox.list(sessionKey, cleanupContext);
-      } catch (error) {
-        await reportOutboxFault(sessionKey, outboxFaultMessage(error));
-        continue;
-      }
-      for (const value of records) {
-        const record = value as { id?: unknown; status?: unknown; sendIntent?: unknown };
-        if (record === null || typeof record !== "object") {
-          await reportOutboxFault(sessionKey, "delivery outbox contains an unusable record");
-          continue;
-        }
-        if (record.status !== "sending" && record.sendIntent === undefined) continue;
-        if (typeof record.id !== "string" || record.id === "") {
-          await reportOutboxFault(sessionKey, "delivery outbox contains an unusable record");
-          continue;
-        }
-        try {
-          await updateScheduled(sessionKey, record.id, (entry) => {
-            entry.status = "unknown";
-            entry.unknownSince = Date.now();
-            delete entry.sendIntent;
-          }, cleanupContext);
-        } catch (error) {
-          await reportOutboxFault(sessionKey, outboxFaultMessage(error));
-          continue;
-        }
-        console.warn(`Telegram scheduled delivery outcome unknown for ${record.id}; inspect the Durable cron outbox record.`);
-      }
-    }
-  };
+  // The shared drainer owns quarantine, validation, the origin hold and revocation; this adapter
+  // owns the chunked write-ahead send of each record.
+  const drainer = createOutboxDrainer<number>({
+    outbox,
+    context: adapterContext,
+    cleanupContext,
+    decodeSession: (sessionKey) => chatIdForSession(sessionKey, identity),
+    scopeOf: (chatId) => chatId,
+    // The session key is only a candidate locator. Authorization comes from durable admission
+    // evidence for this bot and private chat, rechecked against the live allowlist for every send.
+    authorizeOrigin: (chatId): OriginAuthorization => {
+      const binding = originBindingOf(state.origins, chatId, identity);
+      if (binding === undefined) return { status: "withheld", reason: "origin chat has no durable admission evidence" };
+      if (!options.allowFrom.includes(binding.senderId)) return { status: "unauthorized" };
+      return { status: "deliver" };
+    },
+    deliverRecord: (sessionKey, chatId, record) => deliverScheduled(sessionKey, chatId, record),
+    validateRecord: scheduledRecordProblem,
+    observe: (_sessionKey, chatId, record, run) => observeOperation("gateway.telegram.scheduled_delivery", {
+      "chat.id": chatId, "delivery.id": record.id,
+    }, () => run()),
+    maxActive: MAX_SCHEDULED_ACTIVE,
+    active: isActive,
+    label: "Telegram",
+  });
 
   const clearScheduledIntent = (sessionKey: string, id: string) =>
-    updateScheduled(sessionKey, id, (entry) => {
+    drainer.update(sessionKey, id, (entry) => {
       if (entry.status === "sending" || entry.sendIntent !== undefined) {
         entry.status = "pending";
         delete entry.sendIntent;
       }
-    }, cleanupContext);
+    });
 
   const sendScheduledChunk = async (
     sessionKey: string,
@@ -1529,21 +954,21 @@ export async function runTelegram(
   ): Promise<"sent" | "retry" | "stop"> => {
     try {
       const sent = await sendOutboundText(chatId, chunk, {
-        throttle: outboundThrottle,
+        throttle: transport.outbound,
         hooks: {
-          before: async (text) => { await updateScheduled(sessionKey, recordId, (entry) => {
+          before: async (text) => { await drainer.update(sessionKey, recordId, (entry) => {
             entry.status = "sending";
             entry.sendIntent = { text, chunkIndex: index, startedAt: Date.now() };
-          }); },
+          }, adapterContext); },
           abandoned: async () => { await clearScheduledIntent(sessionKey, recordId); },
-          accepted: async (messageId, shown) => {
-            await updateScheduled(sessionKey, recordId, (entry) => {
+          accepted: async (messageId) => {
+            await drainer.update(sessionKey, recordId, (entry) => {
               entry.status = "pending";
               delete entry.sendIntent;
               delete entry.unknownSince;
               entry.nextChunkIndex = Math.max(entry.nextChunkIndex, index + 1);
               if (index === 0) entry.messageId = messageId;
-            }, cleanupContext);
+            });
           },
         },
       });
@@ -1551,12 +976,7 @@ export async function runTelegram(
     } catch (error) {
       if (error instanceof TelegramApiError) {
         if (error.outcome === "unknown") {
-          await updateScheduled(sessionKey, recordId, (entry) => {
-            entry.status = "unknown";
-            entry.unknownSince = Date.now();
-            delete entry.sendIntent;
-          }, cleanupContext);
-          console.warn(`Telegram scheduled delivery outcome unknown for ${recordId}; inspect the Durable cron outbox record.`);
+          await drainer.markUnknown(sessionKey, recordId);
           return "stop";
         }
         if (error.outcome === "not-sent") {
@@ -1567,186 +987,208 @@ export async function runTelegram(
           await clearScheduledIntent(sessionKey, recordId);
           return "retry";
         }
-        await updateScheduled(sessionKey, recordId, (entry) => {
-          entry.status = "failed";
-          entry.settledAt = Date.now();
-          delete entry.sendIntent;
-          entry.error = error.message;
-        }, cleanupContext);
+        await drainer.markFailed(sessionKey, recordId, error.message);
         return "stop";
       }
       if (signal?.aborted) {
         // An in-flight request was abandoned; the write-ahead intent stays ambiguous.
-        await updateScheduled(sessionKey, recordId, (entry) => {
-          entry.status = "unknown";
-          entry.unknownSince = Date.now();
-          delete entry.sendIntent;
-        }, cleanupContext);
-        console.warn(`Telegram scheduled delivery outcome unknown for ${recordId}; inspect the Durable cron outbox record.`);
+        await drainer.markUnknown(sessionKey, recordId);
         return "stop";
       }
-      await updateScheduled(sessionKey, recordId, (entry) => {
-        entry.status = "failed";
-        entry.settledAt = Date.now();
-        delete entry.sendIntent;
-        entry.error = "Telegram delivery failed";
-      }, cleanupContext);
+      await drainer.markFailed(sessionKey, recordId, "Telegram delivery failed");
       return "stop";
     }
   };
 
-  const deliverScheduled = async (sessionKey: string, chatId: number, record: CronDeliveryRecord) => {
-    if (outbox === undefined) return;
-    if (record.sessionKey !== sessionKey) {
-      await updateScheduled(sessionKey, record.id, (entry) => {
-        entry.status = "failed";
-        entry.settledAt = Date.now();
-        entry.error = "outbox session does not match its origin";
-      }, cleanupContext);
-      return;
-    }
-    if (record.text.trim() === "") {
-      await updateScheduled(sessionKey, record.id, (entry) => {
-        entry.status = "failed";
-        entry.settledAt = Date.now();
-        entry.error = "delivery text is empty";
-      }, cleanupContext);
-      return;
-    }
-    // The session key is only a candidate locator. Authorization comes from durable admission
-    // evidence for this bot and private chat, not from parsing the key or equating chat with sender.
-    const binding = originBindingOf(state.origins, chatId, identity);
-    if (binding === undefined) {
-      // Missing evidence is a reversible hold, not a failed delivery: a later authenticated
-      // admission for this private chat restores the binding and releases this record.
-      await updateScheduled(sessionKey, record.id, (entry) => {
-        entry.status = "withheld";
-        entry.withheldSince = Date.now();
-        entry.error = "origin chat has no durable admission evidence";
-      }, cleanupContext);
-      console.warn(`Telegram scheduled delivery withheld for ${record.id}: no durable origin admission evidence.`);
-      return;
-    }
-    // The original admitted sender is rechecked against the live allowlist for every send.
-    if (!options.allowFrom.includes(binding.senderId)) {
-      await updateScheduled(sessionKey, record.id, (entry) => {
-        entry.status = "unauthorized";
-        entry.settledAt = Date.now();
-        entry.error = "origin sender is no longer authorized";
-      }, cleanupContext);
-      return;
-    }
+  /** Send one validated, authorized record chunk by chunk; every chunk has its own write-ahead intent. */
+  const deliverScheduled = async (
+    sessionKey: string,
+    chatId: number,
+    record: CronDeliveryRecord,
+  ): Promise<"delivered" | "kept"> => {
     const plan = record.telegramChunkPlan ?? (record.nextChunkIndex > 0 ? "legacy" : "rich-v1");
     if (record.telegramChunkPlan === undefined) {
-      await updateScheduled(sessionKey, record.id, (entry) => { entry.telegramChunkPlan = plan; });
+      await drainer.update(sessionKey, record.id, (entry) => { entry.telegramChunkPlan = plan; }, adapterContext);
     }
     const chunks = splitOutboundText(record.text, plan);
-    let current = record;
-    for (let index = current.nextChunkIndex; index < chunks.length; index++) {
+    for (let index = record.nextChunkIndex; index < chunks.length; index++) {
       const result = await sendScheduledChunk(sessionKey, record.id, chatId, chunks[index]!, index);
-      if (result !== "sent") return;
-      const next = (await outbox.list(sessionKey, adapterContext))
-        .find((entry) => entry.id === record.id);
-      if (next === undefined) return;
-      current = next;
+      if (result !== "sent") return "kept";
+      const next = (await outbox!.list(sessionKey, adapterContext)).find((entry) => entry.id === record.id);
+      if (next === undefined) return "kept";
     }
-    await updateScheduled(sessionKey, record.id, (entry) => {
-      entry.status = "delivered";
-      entry.settledAt = Date.now();
-      delete entry.error;
-    }, cleanupContext);
+    return "delivered";
   };
 
-  const scanScheduled = async (): Promise<void> => {
-    if (outbox === undefined || stopping || signal?.aborted) return;
-    for (const { sessionKey, chatId } of await scheduledSessions()) {
-      if (stopping || signal?.aborted) return;
-      let records: readonly unknown[];
-      try {
-        records = await outbox.list(sessionKey, adapterContext);
-      } catch (error) {
-        await reportOutboxFault(sessionKey, outboxFaultMessage(error));
-        continue;
+  // ── Owner controls ────────────────────────────────────────────────────────
+  // The shared coordinator owns ordering, the per-chat gate, deferred retries and outcome
+  // wording; this adapter's ledger commits each step against its own channel state.
+
+  const sessionKeyFor = (chatId: number): string => `telegram:${identity}:chat:${chatId}`;
+
+  const controlNotice = (record: TelegramControlRequest, text: string): PendingReply => ({
+    updateId: record.key,
+    nextChunkIndex: 0,
+    chatId: record.scope,
+    sessionKey: record.sessionKey,
+    senderId: record.senderId,
+    text,
+    notice: true,
+  });
+
+  /** Publish the held acknowledgement, optionally rewritten; `lateNotice` is queued when it is gone. */
+  const releaseControlNotice = (key: number, text: string | undefined, lateNotice?: PendingReply) =>
+    mutateState((doc) => {
+      const notice = doc.pending.find((item) => item.notice === true && item.updateId === key);
+      if (notice !== undefined) {
+        if (text !== undefined) notice.text = text;
+        delete notice.hold;
+      } else if (lateNotice !== undefined && doc.pending.length < MAX_ADMITTED) {
+        doc.pending.push(lateNotice);
       }
-      for (const value of records) {
-        if (stopping || signal?.aborted) return;
-        const problem = pendingRecordProblem(value);
-        if (problem !== undefined) {
-          // A record with a usable ID is quarantined durably; one without an ID can only be
-          // surfaced through the separate fault document.
-          const candidate = value as { id?: unknown };
-          if (typeof candidate.id === "string" && candidate.id !== "") {
-            try {
-              await updateScheduled(sessionKey, candidate.id, (entry) => {
-                entry.status = "failed";
-                entry.settledAt = Date.now();
-                entry.error = problem;
-              }, cleanupContext);
-            } catch (error) {
-              await reportOutboxFault(sessionKey, outboxFaultMessage(error));
-            }
-          } else {
-            await reportOutboxFault(sessionKey, problem);
-          }
-          continue;
+    });
+
+  const controlLedger: ControlLedger<number, number, TelegramControlRequest> = {
+    status: (key) => state.controls.find((entry) => entry.updateId === key)?.status,
+    unresolved: () => state.controls.filter((entry) => entry.status === "admitted" || entry.status === "unconfirmed").length,
+    async admit(record, ackText) {
+      await mutateState((doc) => {
+        if (!doc.controls.some((entry) => entry.updateId === record.key)) {
+          doc.controls = pruneTelegramControls([
+            ...doc.controls,
+            { updateId: record.key, command: record.command, status: "admitted", chatId: record.scope, senderId: record.senderId },
+          ], doc.pending);
         }
-        const record = value as CronDeliveryRecord;
-        if (record.status !== "pending" || scheduledActive.has(record.id)) continue;
-        if (scheduledChatActive.has(chatId)) continue;
-        if (scheduledActive.size >= MAX_SCHEDULED_ACTIVE) return;
-        scheduledActive.add(record.id);
-        scheduledChatActive.add(chatId);
-        const task = Promise.resolve()
-          .then(() => observeOperation("gateway.telegram.scheduled_delivery", {
-            "chat.id": chatId, "delivery.id": record.id,
-          }, () => deliverScheduled(sessionKey, chatId, record)))
-          .catch(() => {
-            // Keep the durable record pending; the next scan retries or quarantines it.
-          })
-          .finally(() => {
-            scheduledActive.delete(record.id);
-            scheduledChatActive.delete(chatId);
-            scheduledTasks.delete(task);
-          });
-        scheduledTasks.add(task);
-      }
-    }
+        if (!doc.pending.some((entry) => entry.updateId === record.key)) {
+          if (doc.pending.length >= MAX_ADMITTED) throw new Error("Telegram durable output queue is full");
+          doc.pending.push({ ...controlNotice(record, ackText), hold: true });
+        }
+        doc.offset = Math.max(doc.offset, record.key + 1);
+      }, adapterContext);
+    },
+    async markApplied(record) {
+      await mutateState((doc) => {
+        const entry = doc.controls.find((item) => item.updateId === record.key);
+        if (entry !== undefined) entry.status = "applied";
+        // The host replaces the process only after this commit, so the record of who is owed a live
+        // confirmation is durable first. Every requesting chat is recorded, not just one: chats admitted
+        // in the same poll batch each keep the answer their acknowledgement promised.
+        if (record.command === "restart" && entry !== undefined) {
+          const owed = doc.restart ?? [];
+          if (!owed.some((item) => item.chatId === record.scope)) {
+            doc.restart = [...owed, { chatId: record.scope, senderId: entry.senderId }].slice(-MAX_RESTART_CONFIRMATIONS);
+          }
+        }
+        // Bound the log here too: only applied, refused and already-reported records are pruned.
+        doc.controls = pruneTelegramControls(doc.controls, doc.pending);
+      }, adapterContext);
+    },
+    async release(key, text) {
+      await releaseControlNotice(key, text);
+    },
+    async markRefused(record, text, late) {
+      const bounded = text.slice(0, MAX_NOTICE_CHARS);
+      await mutateState((doc) => {
+        const entry = doc.controls.find((item) => item.updateId === record.key);
+        if (entry !== undefined) entry.status = "refused";
+        const notice = doc.pending.find((item) => item.notice === true && item.updateId === record.key);
+        if (notice !== undefined) {
+          notice.text = bounded;
+          delete notice.hold;
+        } else if (late === true && doc.pending.length < MAX_ADMITTED) {
+          doc.pending.push(controlNotice(record, bounded));
+        }
+        doc.controls = pruneTelegramControls(doc.controls, doc.pending);
+      });
+    },
+    async markUnconfirmed(key, text, lateRecord) {
+      await mutateState((doc) => {
+        const entry = doc.controls.find((item) => item.updateId === key);
+        if (entry !== undefined) entry.status = "unconfirmed";
+        const notice = doc.pending.find((item) => item.notice === true && item.updateId === key);
+        if (notice !== undefined) {
+          notice.text = text;
+          delete notice.hold;
+        } else if (lateRecord !== undefined && doc.pending.length < MAX_ADMITTED) {
+          doc.pending.push(controlNotice(lateRecord, text));
+        }
+      });
+    },
+    async publishLate(record, text) {
+      const body = text.slice(0, MAX_LATE_CONTROL_CHARS);
+      await releaseControlNotice(record.key, body, controlNotice(record, body));
+    },
+    async refuse(record, text) {
+      await admitNotice(record.key, record.scope, record.senderId, record.sessionKey, text);
+    },
   };
 
-  const requestScheduledScan = () => {
-    if (scheduledScanning || stopping || signal?.aborted) return;
-    scheduledScanning = true;
-    void scanScheduled().catch(() => {}).finally(() => { scheduledScanning = false; });
-  };
+  /**
+   * Ask the host to replace this process at most once per adapter lifetime. A refusal is a known
+   * no-effect, so it is reported to the chats that asked and never retried or upgraded into a success.
+   */
+  const restartRequester = createRestartRequester(options.restart, {
+    label: "Telegram",
+    onRefused(text) {
+      // The acknowledgement promised a follow-up, so the refusal is reported now instead of leaving
+      // that promise open until some later process starts.
+      void stateConversation.commit(async (tx) => {
+        const doc = await tx.doc(TelegramState, stateConversation.id);
+        admitRestartNotices(doc, text);
+        delete doc.restart;
+        return copyJson(doc) as unknown as ChannelState;
+      }, adapterContext).then((next) => {
+        state = next;
+        if (isActive()) drain();
+      }).catch(() => undefined);
+    },
+  });
 
-  // A fresh authenticated admission restores a missing/evicted binding, then releases that chat's
-  // nonterminal withheld results. It does not release anything before the binding exists.
-  const releaseWithheld = async (sessionKey: string): Promise<void> => {
-    if (outbox === undefined || stopping || signal?.aborted) return;
-    let records: readonly unknown[];
-    try {
-      records = await outbox.list(sessionKey, adapterContext);
-    } catch {
-      return;
-    }
-    let released = false;
-    for (const value of records) {
-      if (value === null || typeof value !== "object" || Array.isArray(value)) continue;
-      const record = value as { id?: unknown; status?: unknown };
-      if (record.status !== "withheld" || typeof record.id !== "string" || record.id === "") continue;
-      try {
-        await updateScheduled(sessionKey, record.id, (entry) => {
-          entry.status = "pending";
-          delete entry.withheldSince;
-          delete entry.error;
+  const controls = createControlCoordinator<number, number, TelegramControlRequest, PendingReply>({
+    ledger: controlLedger,
+    order,
+    flush: {
+      // Every input admitted before this command in its chat, from current committed state.
+      inputs: (record) => state.pending.filter((item) =>
+        item.notice !== true && item.chatId === record.scope && item.updateId < record.key &&
+        options.allowFrom.includes(item.senderId)),
+      // Attachment content is prepared in the same chat order as a normal delivery, so a media
+      // message forced ahead of a control is never submitted as text only. An input delivered,
+      // merged or already placed meanwhile is skipped.
+      async prepareInput(input) {
+        const current = state.pending.find((entry) => entry.updateId === input.updateId);
+        if (current === undefined || earlySubmissions.has(input.updateId)) return undefined;
+        return prepareInputContent(current);
+      },
+      async submit(input, content) {
+        const conversation = await gateway.conversationFor(input.sessionKey, adapterContext);
+        await gateway.beforeOwnerInput?.(input.sessionKey, conversation.id, content, adapterContext);
+        const submission = await conversation.submit({
+          type: "input",
+          content: content as string | (TextContent | ImageContent)[],
+          requestId: requestIdFor(identity, input.updateId),
+          // The mode its own admission recorded, exactly as the normal delivery path submits it.
+          whenBusy: await submissionMode(conversation, input),
         }, adapterContext);
-        released = true;
-      } catch {
-        // The scan will retry or quarantine it; admission itself must still succeed.
-      }
-    }
-    if (released) requestScheduledScan();
-  };
+        // The normal delivery path reuses this turn, so a control-forced input is answered exactly
+        // once even when it settles before the chat's gate is released.
+        earlySubmissions.set(input.updateId, submission);
+      },
+    },
+    execute: (record) => executeChannelControl(gateway, {
+      command: record.command,
+      sessionKey: record.sessionKey,
+      ...(record.option === undefined ? {} : { option: record.option }),
+    }, adapterContext, { scope: "chat" }),
+    requestRestart: () => restartRequester.request(),
+    onFatal(error) {
+      // The record stays admitted and the acknowledgement held: a reopen reports it as unconfirmed.
+      fatal ??= error;
+      scope.cancel(error instanceof Error ? error : new Error("Telegram control command failed"));
+    },
+    drain: () => drain(),
+    active: isActive,
+  });
 
   /**
    * An ordinary owner input a short idle window may hold open for the next one. Notices, steers,
@@ -1844,13 +1286,13 @@ export async function runTelegram(
       if (notice && heldChats.has(item.chatId)) continue;
       if (notice ? activeNotices >= 8 : activeReplies >= 8) continue;
       // A gated chat holds its inputs; an acknowledgement is never a model submission, so it can still be delivered.
-      if (!notice && controlPending.has(item.chatId)) continue;
+      if (!notice && controls.gated(item.chatId)) continue;
       if (item.deliveryStatus !== undefined && options.allowFrom.includes(item.senderId)) continue;
       if (delivering.has(item.updateId) || failedThisPoll.has(item.updateId)) continue;
       delivering.add(item.updateId);
       if (notice) activeNotices += 1;
       else activeReplies += 1;
-      const slot = beginSubmission(item.chatId);
+      const slot = order.beginSubmission(item.chatId);
       const task = observeOperation("gateway.telegram.delivery", {
         "update.id": item.updateId, "chat.id": item.chatId, notice,
         "queue.depth": state.pending.length, attempt: (deliveryFailures.get(item.updateId) ?? 0) + 1,
@@ -1873,7 +1315,7 @@ export async function runTelegram(
   const deliver = async (item: PendingReply, slot: SubmissionSlot, trace: TelemetrySpan) => {
     if (!options.allowFrom.includes(item.senderId)) {
       if (item.messageId !== undefined) {
-        await apiCall(api, "deleteMessage", signal, (callSignal) => withChatSendOrder(item.chatId, () => api.deleteMessage(item.chatId, item.messageId!, toGrammySignal(callSignal))), { throttle: outboundThrottle }).catch(() => undefined);
+        await transport.call("deleteMessage", (callSignal) => transport.inChatOrder(item.chatId, () => api.deleteMessage(item.chatId, item.messageId!, callSignal)), { throttle: transport.outbound }).catch(() => undefined);
       }
       await forget(item.updateId);
       return;
@@ -1898,40 +1340,13 @@ export async function runTelegram(
       () => gateway.conversationFor(item.sessionKey, adapterContext), trace);
     trace.setAttributes({ "conversation.id": conversation.id });
     const requestId = requestIdFor(identity, item.updateId);
-    const watch = await conversation.watch(adapterContext);
-    let previewTimer: ReturnType<typeof setTimeout> | undefined;
-    let previewWork: Promise<void> | undefined;
-    let previewDirty = false;
-    let previewFailure: unknown;
-    let latestPreview = "";
     let submissionId: SubmissionId | undefined;
-    let watchStopped = false;
-    const schedulePreview = () => {
-      if (previewTimer !== undefined || watchStopped || signal?.aborted) return;
-      previewTimer = setTimeout(() => {
-        previewTimer = undefined;
-        if (previewWork) return;
-        previewDirty = false;
-        previewWork = publishPreview(latestPreview).catch((error: unknown) => {
-          previewFailure = error;
-        }).finally(() => {
-          previewWork = undefined;
-          if (previewDirty && !watchStopped && !signal?.aborted) schedulePreview();
-        });
-      }, 700);
-    };
-    const queuePreview = (text: string) => {
-      if (watchStopped) return;
-      latestPreview = text;
-      previewDirty = true;
-      schedulePreview();
-    };
     let stopTyping: (() => void) | undefined;
     // Typing follows the committed live state, not submission: it starts when this input's run has
     // an active generation attempt, and stops at every other boundary (queued, tool round, waiting
     // for another task, parked, answered). A run waiting on background work therefore never keeps it
     // alive, and a tool round never pretends the model is typing.
-    const syncTyping = (live: Parameters<typeof telegramTypingActive>[0]) => {
+    const syncTyping = (live: LiveView) => {
       if (telegramTypingActive(live, submissionId)) {
         if (stopTyping !== undefined) return;
         // One shared loop per chat: only a new loop is a request worth recording.
@@ -1944,25 +1359,18 @@ export async function runTelegram(
       stopTyping?.();
       stopTyping = undefined;
     };
+    // One preview per run: only the run's first input publishes, so a steered sibling keeps the
+    // chat's typing indicator but never publishes a second preview message.
+    const watcher = await createPreviewWatcher({
+      conversation,
+      context: adapterContext,
+      delayMs: PREVIEW_DELAY_MS,
+      publish: publishPreview,
+      onFrame: (_view, frame) => syncTyping(frame.live),
+      publishFailure: "rethrow",
+      ...(signal === undefined ? {} : { signal }),
+    });
     try {
-      watch.start(async (call) => {
-        // Durable's watches never send Chord's recoverable `failed` call; it ends instead.
-        if (call.kind !== "value") return;
-        const view = call.value;
-        const live = view.docs["pi.live"] as {
-          run?: { inputs?: SubmissionId[] };
-          generation?: { message?: { content?: { type: string; text?: string }[] } };
-        } | undefined;
-        syncTyping(live);
-        const inputs = live?.run?.inputs;
-        if (submissionId === undefined || inputs === undefined || !inputs.includes(submissionId)) return;
-        // One preview per run: the run's first input owns the single live preview message, so a steered
-        // sibling keeps the chat's typing indicator but never publishes a second one.
-        if (submissionId !== firstInput(inputs)) return;
-        const text = live?.generation?.message?.content
-          ?.flatMap((part) => part.type === "text" && part.text ? [part.text] : []).join("");
-        if (text) queuePreview(text);
-      });
       const early = earlySubmissions.get(item.updateId);
       earlySubmissions.delete(item.updateId);
       if (early === undefined) await gateway.beforeOwnerInput?.(item.sessionKey, conversation.id, content, adapterContext);
@@ -1976,9 +1384,10 @@ export async function runTelegram(
       // Ordering is established; free the chat's next submission place while this turn runs.
       slot.release();
       submissionId = submission.id;
+      watcher.setSubmission(submission.id);
       // The acquisition/current watch value may already hold this run's generation; the next frame
       // covers the case where it starts later.
-      syncTyping(watch.value.docs["pi.live"] as Parameters<typeof telegramTypingActive>[0]);
+      syncTyping(watcher.value.docs["pi.live"] as LiveView);
       trace.setAttributes({ "submission.id": submission.id });
       const settled = await observeOperation("gateway.telegram.settlement", { "submission.id": submission.id },
         () => submission.wait(adapterContext), trace);
@@ -1989,7 +1398,7 @@ export async function runTelegram(
           (settled.reason === "aborted" || settled.reason === "reset");
         trace.setAttributes({ intentional });
         if (!intentional) trace.setStatus({ status: "error" });
-        await stopPreviewWatch();
+        await watcher.stop();
         // A failed run has no committed answer and Durable exposes no run identity at settlement, so each
         // admitted message reports its own fixed notice. Grouping by the identical reason text would let a
         // held notice silently own an unrelated later failure.
@@ -2001,21 +1410,19 @@ export async function runTelegram(
       const message = answer?.model?.[0] as AssistantMessage | undefined;
       const answerText = message?.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("") ?? "";
       // Inputs the run consumed settle with this same committed answer, so one of them owns its single reply.
-      const settlement = { answer: settled.answer } as const;
-      const group = await sharedDeliveryGroup(conversation.id, item, settlement);
-      const role: DeliveryRole = !group.present ? "retired" :
-        group.owner === undefined || group.owner === item.updateId ? "owner" : "sibling";
+      const group = await sharedDeliveryGroup(conversation.id, item, settled.answer);
+      const role = sharedDeliveryRole(group, item.updateId, group.present);
       trace.setAttributes({ outcome: role });
-      await stopPreviewWatch();
+      await watcher.stop();
       if (role === "owner") {
         await observeOperation("gateway.telegram.reply", {}, () => flushFinal(answerText), trace);
-        await retireSharedDelivery(conversation, item, settlement);
+        await retireSharedDelivery(conversation, item, settled.answer);
       } else if (role === "sibling") {
         await forget(item.updateId);
       }
     } finally {
       stopTyping?.();
-      await stopPreviewWatch();
+      await watcher.stop();
     }
 
     async function deliverNotice(current: PendingReply) {
@@ -2029,19 +1436,6 @@ export async function runTelegram(
           ? formatReadOnlyNotice(current.text, current.noticeFormat) : undefined);
       if (sent === undefined) throw new Error("Telegram send returned no result");
       await forget(current.updateId);
-    }
-
-    async function stopPreviewWatch() {
-      if (watchStopped) return;
-      if (previewTimer !== undefined) {
-        clearTimeout(previewTimer);
-        previewTimer = undefined;
-      }
-      watchStopped = true;
-      previewDirty = false;
-      await watch.stop();
-      await previewWork;
-      if (previewFailure !== undefined) throw previewFailure;
     }
 
     async function flushFinal(text: string) {
@@ -2064,8 +1458,8 @@ export async function runTelegram(
         // An empty final must remove a streamed preview. Keep its durable id until deletion is
         // confirmed: on an ambiguous result recovery retries deletion, where not-found is success.
         try {
-          await apiCall(api, "deleteMessage", signal, (callSignal) => withChatSendOrder(item.chatId, () =>
-            api.deleteMessage(item.chatId, current.messageId!, toGrammySignal(callSignal))), { throttle: outboundThrottle });
+          await transport.call("deleteMessage", (callSignal) => transport.inChatOrder(item.chatId, () =>
+            api.deleteMessage(item.chatId, current.messageId!, callSignal)), { throttle: transport.outbound });
         } catch (error) {
           if (error instanceof TelegramApiError && error.method === "deleteMessage" && error.status === 400 &&
               error.description === "Bad Request: message to delete not found") {
@@ -2088,7 +1482,7 @@ export async function runTelegram(
         if (index === 0 && current.messageId !== undefined) {
           if (current.lastText !== chunk) {
             try {
-              await editOutboundText(item.chatId, current.messageId!, chunk, { throttle: outboundThrottle });
+              await editOutboundText(item.chatId, current.messageId!, chunk, { throttle: transport.outbound });
             } catch (error) {
               if (isNotModified(error)) {
                 // The remote edit may have succeeded before its response was lost.
@@ -2127,7 +1521,7 @@ export async function runTelegram(
           mode,
           ...(richBody === undefined ? {} : { richBody }),
           replaceable,
-          throttle: outboundThrottle,
+          throttle: transport.outbound,
           hooks: {
             before: (attempt) => mutatePending(item.updateId, (entry) => {
               entry.deliveryStatus = "sending";
@@ -2175,7 +1569,7 @@ export async function runTelegram(
       } else {
         try {
           const edited = await editOutboundText(item.chatId, current.messageId!, preview, {
-            throttle: outboundThrottle,
+            throttle: transport.outbound,
             replaceable: true,
           });
           if (edited) await rememberText(item.updateId, preview);
@@ -2246,83 +1640,45 @@ export async function runTelegram(
   };
 
   /**
-   * Whether this conversation's current run may take a steer from this chat. Only an owner surface steers,
-   * so a run whose first input is one of these submissions was started by an owner message; a scheduled
-   * origin-mode run, a digest result or a worker result starts its own run, and joining it would let the
-   * scheduled outbox and this chat deliver the same answer. An idle conversation and one with a live
-   * origin-mode occurrence both queue instead: an idle one places a follow-up identically, and a queued
-   * occurrence must never be placed into the same boundary as an owner steer.
-   */
-  const ownerRun = async (conversation: Conversation, sessionKey: string): Promise<boolean> =>
-    conversation.commit(async (tx) => {
-      const live = await tx.doc(LiveDoc, conversation.id);
-      const inputs = live.run?.inputs;
-      if (inputs === undefined || inputs.length === 0) return false;
-      if (await originOccurrencePending(tx, conversation.id)) return false;
-      const first = firstInput(inputs);
-      for (const candidate of state.pending) {
-        if (candidate.sessionKey !== sessionKey) continue;
-        const record = await tx.submissionByRequest(conversation.id, requestIdFor(identity, candidate.updateId));
-        if (record?.id === first) return true;
-      }
-      return false;
-    }, adapterContext);
-
-  /**
    * The native busy-mode to submit one admitted message with. Its own durable admission decided whether the
    * owner asked to steer; a run that another path owns always takes the conservative follow-up queueing, so no
-   * owner answer is dropped and no scheduled answer is delivered twice. Native `submit` has no conditional
-   * steering, so this state is read immediately before admission.
+   * owner answer is dropped and no scheduled answer is delivered twice. This chat's own admitted request IDs
+   * are read lazily inside the read, immediately before admission.
    */
-  const submissionMode = async (conversation: Conversation, current: PendingReply): Promise<"steer" | "followUp"> => {
-    if (current.whenBusy !== "steer") return "followUp";
-    return (await ownerRun(conversation, current.sessionKey)) ? "steer" : "followUp";
+  const submissionMode = (conversation: Conversation, current: PendingReply): Promise<"steer" | "followUp"> => {
+    function* ownerRequestIds(): Iterable<string> {
+      for (const candidate of state.pending) {
+        if (candidate.sessionKey === current.sessionKey) yield requestIdFor(identity, candidate.updateId);
+      }
+    }
+    return resolveOwnerBusyMode(conversation, current.whenBusy, ownerRequestIds(), adapterContext);
   };
 
   /**
-   * The admitted messages of this chat whose native submission settled with `settlement`'s committed answer,
-   * with the earliest native submission as the one that delivers their single shared reply. Durable settlement
-   * evidence plus committed pending membership decide it, so every observer computes the same owner without a
-   * lock and a reopened process reaches the same answer.
+   * The admitted messages of this chat whose native submission settled with `answer`, with the earliest
+   * native submission as the one that delivers their single shared reply. Durable settlement evidence plus
+   * committed pending membership decide it, so every observer computes the same owner without a lock and a
+   * reopened process reaches the same answer. A failed run has no committed answer and is never grouped.
    */
-  const sharedDeliveryGroup = async (
-    conversationId: Conversation["id"],
-    current: PendingReply,
-    settlement: SharedAnswer,
-  ): Promise<{ readonly updateIds: number[]; readonly owner: number | undefined; readonly present: boolean }> => {
-    const members: { updateId: number; submissionId: number }[] = [];
-    let present = false;
+  const sharedDeliveryGroup = (conversationId: Conversation["id"], current: PendingReply, answer: number) =>
     // A read-only commit: committed pending membership and submissions are the whole identity.
-    await stateConversation.commit(async (tx) => {
+    stateConversation.commit(async (tx) => {
       const doc = await tx.doc(TelegramState, stateConversation.id);
-      members.length = 0;
-      present = false;
-      for (const candidate of doc.pending) {
-        if (candidate.updateId === current.updateId) present = true;
-        if (candidate.sessionKey !== current.sessionKey) continue;
-        const record = await tx.submissionByRequest(conversationId, requestIdFor(identity, candidate.updateId));
-        if (record !== undefined && answeredTogether(record, settlement)) {
-          members.push({ updateId: candidate.updateId, submissionId: record.id });
-        }
-      }
-      return undefined;
+      const candidates = doc.pending
+        .filter((candidate) => candidate.sessionKey === current.sessionKey)
+        .map((candidate) => ({ key: candidate.updateId, requestId: requestIdFor(identity, candidate.updateId) }));
+      const group = await resolveSharedDeliveryGroup(tx, conversationId, candidates, answer);
+      return { ...group, present: doc.pending.some((candidate) => candidate.updateId === current.updateId) };
     }, adapterContext);
-    members.sort((left, right) => left.submissionId - right.submissionId || left.updateId - right.updateId);
-    return { updateIds: members.map((member) => member.updateId), owner: members[0]?.updateId, present };
-  };
 
   /**
    * One commit that retires this delivery owner and every still-pending sibling of the same answer, so a
    * delivered shared answer can never be sent again by a record left behind by a crash or a slow observer.
    * An unknown or held sibling keeps its own evidence: only pending membership is retired here.
    */
-  const retireSharedDelivery = async (
-    conversation: Conversation,
-    current: PendingReply,
-    settlement: SharedAnswer,
-  ) => {
-    const group = await sharedDeliveryGroup(conversation.id, current, settlement);
-    const retired = new Set(group.updateIds);
+  const retireSharedDelivery = async (conversation: Conversation, current: PendingReply, answer: number) => {
+    const group = await sharedDeliveryGroup(conversation.id, current, answer);
+    const retired = new Set(group.keys);
     retired.add(current.updateId);
     for (const updateId of retired) {
       deliveryFailures.delete(updateId);
@@ -2370,8 +1726,8 @@ export async function runTelegram(
     }
     let file;
     try {
-      file = await observeOperation("gateway.telegram.file.lookup", {}, () => apiCall(api, "getFile", signal,
-        (callSignal) => api.getFile(current.fileId, toGrammySignal(callSignal)), { throttle: pollThrottle }), telemetry);
+      file = await observeOperation("gateway.telegram.file.lookup", {}, () => transport.call("getFile",
+        (callSignal) => api.getFile(current.fileId, callSignal), { throttle: transport.poll }), telemetry);
     } catch (error) {
       if (signal?.aborted) throw signal.reason ?? error;
       // A definitive request rejection (unknown id, expired file, Bot API size limit)
@@ -2561,51 +1917,31 @@ export async function runTelegram(
     console.warn(`Telegram delivery for update ${updateId} is held after ${attempts} failure(s); inspect the Durable channel-state record.`);
   }
 
-  // A control recorded but never confirmed may or may not have taken effect: report it once, never replay it.
-  const unresolved = state.controls.filter((entry) => entry.status === "admitted");
-  const heldNotices = state.pending.some((item) => item.hold === true);
-  if (unresolved.length > 0 || heldNotices) {
-    state = await stateConversation.commit(async (tx) => {
-      const doc = await tx.doc(TelegramState, stateConversation.id);
-      for (const entry of doc.controls) {
-        if (entry.status !== "admitted") continue;
-        const notice = doc.pending.find((item) => item.notice === true && item.updateId === entry.updateId);
-        // A restart is never re-requested by recovery: only its interrupted outcome is reported.
-        const interrupted = entry.command === "restart" ? UNCONFIRMED_RESTART : UNCONFIRMED_CONTROL;
-        if (notice !== undefined) {
-          // In flight at a crash: correct the held acknowledgement (one message) and release it.
-          if (notice.hold === true) notice.text = interrupted;
-          delete notice.hold;
-          entry.status = "unconfirmed";
-          continue;
-        }
-        // Nothing left to correct: report the unconfirmed effect for the recorded chat, once.
-        if (doc.pending.length >= MAX_ADMITTED) continue;
-        doc.pending.push({
-          updateId: entry.updateId,
-          nextChunkIndex: 0,
-          chatId: entry.chatId,
-          sessionKey: `telegram:${identity}:chat:${entry.chatId}`,
-          senderId: entry.senderId,
-          text: interrupted,
-          notice: true,
-        });
-        entry.status = "unconfirmed";
-      }
-      for (const notice of doc.pending) {
-        if (notice.hold !== true) continue;
-        const record = doc.controls.find((entry) => entry.updateId === notice.updateId);
-        if (record === undefined) {
-          notice.text = UNCONFIRMED_CONTROL;
-          delete notice.hold;
-        } else if (record.status === "applied") {
-          delete notice.hold;
-        }
-      }
-      return copyJson(doc) as unknown as ChannelState;
+  // A control recorded but never confirmed may or may not have taken effect: report it once, never
+  // replay it. A restart is never re-requested by recovery: only its interrupted outcome is reported.
+  if (state.controls.some((entry) => entry.status === "admitted") || state.pending.some((item) => item.hold === true)) {
+    let interrupted = 0;
+    await mutateState((doc) => {
+      interrupted = recoverInterruptedControls(doc.controls, doc.pending, {
+        controlKey: (entry) => entry.updateId,
+        noticeKey: (item) => item.updateId,
+        report(entry, text) {
+          if (doc.pending.length >= MAX_ADMITTED) return false;
+          doc.pending.push({
+            updateId: entry.updateId,
+            nextChunkIndex: 0,
+            chatId: entry.chatId,
+            sessionKey: sessionKeyFor(entry.chatId),
+            senderId: entry.senderId,
+            text,
+            notice: true,
+          });
+          return true;
+        },
+      });
     }, adapterContext);
-    if (unresolved.length > 0) {
-      console.warn(`Telegram ${unresolved.length} control command(s) were interrupted; their effect is unconfirmed.`);
+    if (interrupted > 0) {
+      console.warn(`Telegram ${interrupted} control command(s) were interrupted; their effect is unconfirmed.`);
     }
   }
   /**
@@ -2614,30 +1950,25 @@ export async function runTelegram(
    * admits is dropped like any other notice; records that do not fit the admitted bound are returned as still
    * owed instead of being claimed as delivered.
    */
-  const admitRestartNotices = (doc: ChannelState, text: string): TelegramRestartRecord[] => {
-    const remaining: TelegramRestartRecord[] = [];
+  function admitRestartNotices(doc: Draft<ChannelState>, text: string): Draft<TelegramRestartRecord>[] {
     const used = new Set(doc.pending.map((item) => item.updateId));
     let next = RESTART_LIVE_UPDATE_ID;
-    for (const record of doc.restart ?? []) {
-      if (!options.allowFrom.includes(record.senderId)) continue;
-      if (doc.pending.length >= MAX_ADMITTED) {
-        remaining.push(record);
-        continue;
-      }
+    return admitOwedRestartNotices(doc.restart ?? [], (record) => {
+      if (doc.pending.length >= MAX_ADMITTED) return false;
       while (used.has(next)) next -= 1;
       used.add(next);
       doc.pending.push({
         updateId: next,
         nextChunkIndex: 0,
         chatId: record.chatId,
-        sessionKey: `telegram:${identity}:chat:${record.chatId}`,
+        sessionKey: sessionKeyFor(record.chatId),
         senderId: record.senderId,
         text,
         notice: true,
       });
-    }
-    return remaining;
-  };
+      return true;
+    }, (record) => options.allowFrom.includes(record.senderId));
+  }
 
   // A restart this store recorded was requested by the process this one replaced: confirm it is live in every
   // chat that asked, through the same durable notice queue every other host notice uses, then forget them. A
@@ -2657,20 +1988,15 @@ export async function runTelegram(
     await markUnknown(item.updateId, item.sendIntent?.stage ?? "final", item.sendIntent?.chunkIndex);
     console.warn(`Telegram delivery outcome unknown for update ${item.updateId}; inspect the Durable channel-state record.`);
   }
-  // A model-requested external action may have reached Telegram before a crash. Quarantine every
-  // unresolved intent/sending record as unknown: a replay or reopen must never resend it blindly.
-  for (const action of unresolvedActions(state.actions)) {
-    await settleAction(action.callId, "unknown");
-    console.warn(`Telegram ${action.kind} action was interrupted before its outcome was recorded; ` +
-      "it will not be retried automatically.");
-  }
+  // A model-requested external action may have reached Telegram before a crash: quarantine it.
+  await telegramActions.recover();
   // Recover admitted work before polling. Each requestId safely reacquires its existing submission.
-  await recoverScheduled();
+  await drainer.recover();
   // Cosmetic and best effort: a slow or flooded menu registration must not delay polling.
   void registerCommandMenu();
-  requestScheduledScan();
-  scheduledTimer = setInterval(requestScheduledScan, SCHEDULED_SCAN_INTERVAL_MS);
-  detachTelegramActions = gateway.telegramActions?.attach(actionHost);
+  drainer.requestScan();
+  scheduledTimer = setInterval(() => drainer.requestScan(), SCHEDULED_SCAN_INTERVAL_MS);
+  detachTelegramActions = gateway.telegramActions?.attach(telegramActions.host);
   detachMcpSurface = gateway.mcpSurfaces?.attach({
     owns: (sessionKey) => sessionKey.startsWith(`telegram:${identity}:chat:`),
     async deliverAuthorization(sessionKey, authorization) {
@@ -2711,13 +2037,13 @@ export async function runTelegram(
     while (!signal?.aborted) {
       failedThisPoll.clear();
       drain();
-      resumeDeferredControls();
-      requestScheduledScan();
-      const updates = await apiCall(api, "getUpdates", signal, (callSignal) => api.getUpdates({
+      controls.resumeDeferred();
+      drainer.requestScan();
+      const updates = await transport.call("getUpdates", (callSignal) => api.getUpdates({
         offset: state.offset,
         timeout: Math.min(options.pollTimeoutSeconds ?? 30, POLL_TIMEOUT_MAX),
         allowed_updates: ["message", "message_reaction", "callback_query"],
-      }, toGrammySignal(callSignal)), { throttle: pollThrottle, retryOutage: readOutageHooks });
+      }, callSignal), { throttle: transport.poll, retryOutage: readOutageHooks });
       if (!updates) throw new Error("Telegram getUpdates returned no result");
       for (const update of updates) {
         if (signal?.aborted) break;
@@ -2734,40 +2060,34 @@ export async function runTelegram(
           // Persist authenticated admission evidence before any control or conversation action.
           const origin = await rememberOrigin(message.chat.id, String(message.from!.id));
           if (origin.evictedChatId !== null) {
-            await reportOutboxFault(
+            await drainer.reportFault(
               `telegram:${identity}:chat:${origin.evictedChatId}`,
               "origin admission binding evicted at capacity; a fresh admission restores it",
             );
             console.warn("Telegram origin admission binding evicted at capacity; a fresh admission restores it.");
           }
-          if (origin.trusted) await releaseWithheld(sessionKey);
+          if (origin.trusted) await drainer.releaseWithheld(sessionKey);
           // An OAuth callback is consumed before any transcript or model admission. Only the exact
           // authenticated sender bound to this chat may submit it; the text itself is never stored.
           if (message.text !== undefined && looksLikeOAuthCallback(message.text)) {
             const senderId = String(message.from!.id);
             const binding = originBindingOf(state.origins, message.chat.id, identity);
-            if (binding === undefined || binding.senderId !== senderId) {
-              await admitNotice(update, message, sessionKey,
-                "This OAuth callback did not come from the authenticated sender that owns this chat. It was not sent " +
-                "to the assistant and was not stored.");
-            } else if (gateway.mcpAdmin === undefined) {
-              await admitNotice(update, message, sessionKey,
-                "No MCP login is available in this host; the callback was not stored or sent to the assistant.");
-            } else {
-              const result = await gateway.mcpAdmin.submitCallback(sessionKey, message.text, adapterContext);
-              await admitNotice(update, message, sessionKey,
-                result.handled
-                  ? result.text
-                  : "This OAuth callback was not accepted. It was not sent to the assistant and was not stored.");
-            }
+            const admin = gateway.mcpAdmin;
+            const result = await handleOAuthCallback(
+              admin === undefined ? undefined : (text) => admin.submitCallback(sessionKey, text, adapterContext),
+              message.text,
+              { authenticated: binding !== undefined && binding.senderId === senderId, scope: "chat" },
+            );
+            await admitMessageNotice(update, message, sessionKey, result.text);
             drain();
             continue;
           }
           // Control parsing happens only after allowlist authentication and never for attachments.
           const parsed = parseTelegramInput(message.text ?? "", me.username);
           if (parsed.kind !== "input") {
-            await handleControl(update, message, parsed);
-            continue;
+            // A failed admission committed nothing (not even the offset): re-poll the same update.
+            if (await admitControlUpdate(update, message, parsed)) continue;
+            break;
           }
           const caption = message.text !== undefined ? parsed.text : message.caption;
           // A shared location or venue is readable message content, not an attachment: it is
@@ -2889,7 +2209,7 @@ export async function runTelegram(
     // Release any delivery waiting on a coalescing window, so shutdown never waits for an idle timer.
     for (const chatId of [...coalesceWaiters.keys()]) finishCoalesceWindow(chatId);
     scope.cancel(new DOMException("Telegram adapter stopped", "AbortError"));
-    await Promise.allSettled([...active, ...pendingControls, ...scheduledTasks]);
+    await Promise.allSettled([...active, controls.idle(), drainer.idle()]);
   }
   if (fatal !== undefined) throw fatal;
 
@@ -2899,11 +2219,11 @@ export async function runTelegram(
    */
   async function registerCommandMenu(): Promise<void> {
     try {
-      await apiCall(api, "setMyCommands", signal, (callSignal) => api.setMyCommands(
+      await transport.call("setMyCommands", (callSignal) => api.setMyCommands(
         telegramCommands(hostCommands),
         { scope: { type: "all_private_chats" } },
-        toGrammySignal(callSignal),
-      ), { throttle: outboundThrottle, replaceable: true });
+        callSignal,
+      ), { throttle: transport.outbound, replaceable: true });
     } catch {
       if (!signal?.aborted) {
         console.warn("Telegram command menu registration failed; the implemented commands still work when typed.");
@@ -2921,9 +2241,9 @@ export async function runTelegram(
       text: option.label,
       callback_data: questionCallbackData(question.id, option.id),
     }]);
-    const sent = await apiCall<Message.TextMessage>(api, "sendMessage", signal, (callSignal) => withChatSendOrder(chatId, () =>
-      api.sendMessage(chatId, text, { reply_markup: { inline_keyboard } }, toGrammySignal(callSignal))),
-    { throttle: outboundThrottle });
+    const sent = await transport.call<Message.TextMessage>("sendMessage", (callSignal) => transport.inChatOrder(chatId, () =>
+      api.sendMessage(chatId, text, { reply_markup: { inline_keyboard } }, callSignal)),
+    { throttle: transport.outbound });
     // A throttled or otherwise skipped call would leave an admitted question undelivered while the
     // tool reported success; any non-result is a delivery failure here.
     if (sent === undefined) throw new Error("the question message was not sent");
@@ -2932,8 +2252,8 @@ export async function runTelegram(
   /** Cosmetic acknowledgement; an expired query id or a flood wait changes no durable answer state. */
   async function acknowledgeCallback(query: CallbackQuery, text: string): Promise<void> {
     try {
-      await apiCall(api, "answerCallbackQuery", signal, (callSignal) =>
-        api.answerCallbackQuery(query.id, { text }, toGrammySignal(callSignal)), { throttle: outboundThrottle });
+      await transport.call("answerCallbackQuery", (callSignal) =>
+        api.answerCallbackQuery(query.id, { text }, callSignal), { throttle: transport.outbound });
     } catch {
       // The popup is best effort; an unacknowledged press still has its durable outcome.
     }
@@ -2942,9 +2262,9 @@ export async function runTelegram(
   /** Best effort: the durable record already refuses a later tap with fixed text. */
   async function removeQuestionKeyboard(chatId: number, messageId: number): Promise<void> {
     try {
-      await apiCall(api, "editMessageReplyMarkup", signal, (callSignal) => withChatSendOrder(chatId, () =>
+      await transport.call("editMessageReplyMarkup", (callSignal) => transport.inChatOrder(chatId, () =>
         api.editMessageReplyMarkup(chatId, messageId, { reply_markup: { inline_keyboard: [] } },
-          toGrammySignal(callSignal))), { throttle: outboundThrottle });
+          callSignal)), { throttle: transport.outbound });
     } catch {
       // A keyboard that stays visible is harmless: the next tap is answered by the durable record.
     }
@@ -3070,14 +2390,16 @@ export async function runTelegram(
     finishCoalesceWindow(chatId);
     const recorded = state.controls.find((entry) => entry.updateId === update.update_id);
     if (recorded !== undefined) {
-      // The command was durably admitted before its effect, so a replay reports it instead of running it twice.
-      if (recorded.status === "admitted") await markControlUnconfirmed(recorded.updateId);
-      await admitNotice(update, message, sessionKey, replayControlText(recorded));
+      // The command was durably admitted before its effect, so a replay reports it instead of running
+      // it twice; one still applying here is answered by its own acknowledgement.
+      const replay = await controls.replay({ key: recorded.updateId, command: recorded.command, status: recorded.status });
+      if (replay === undefined) await persistOffset(update.update_id + 1);
+      else await admitMessageNotice(update, message, sessionKey, replay);
       drain();
       return;
     }
     if (parsed.kind === "foreign") {
-      await admitNotice(update, message, sessionKey,
+      await admitMessageNotice(update, message, sessionKey,
         `/${parsed.command}@${parsed.mention} did not run here and was not sent to the assistant: this bot only ` +
         `accepts an exact mention of its own username. Use /${parsed.command} without a mention.`);
       drain();
@@ -3085,7 +2407,7 @@ export async function runTelegram(
     }
     if (parsed.kind === "unsupported") {
       // The same catalogue reason `/help <name>` gives, so the two refusals cannot drift.
-      await admitNotice(update, message, sessionKey,
+      await admitMessageNotice(update, message, sessionKey,
         `${conversationCommandRefusal("telegram", parsed.command, availableCommandNames())} ` +
         "Any other message is sent to the assistant; prefix // to send a leading slash literally.");
       drain();
@@ -3094,13 +2416,13 @@ export async function runTelegram(
     if (parsed.command === "help") {
       const requested = parsed.args.trim().toLowerCase();
       if (!requested) {
-        await admitNotice(update, message, sessionKey, controlHelpText());
+        await admitMessageNotice(update, message, sessionKey, controlHelpText());
         drain();
         return;
       }
       const offered = availableCommandNames();
       const command = offered.includes(requested) ? findConversationCommand(requested) : undefined;
-      await admitNotice(update, message, sessionKey, command === undefined
+      await admitMessageNotice(update, message, sessionKey, command === undefined
         ? `${conversationCommandRefusal("telegram", requested, offered)} Nothing was sent to the assistant.`
         : conversationDetailBlock(command, "telegram"));
       drain();
@@ -3108,77 +2430,56 @@ export async function runTelegram(
     }
     if (parsed.command === "status") {
       if (!hostCommands.status) {
-        await admitNotice(update, message, sessionKey, STATUS_UNAVAILABLE_HOST);
+        await admitMessageNotice(update, message, sessionKey, STATUS_UNAVAILABLE_HOST);
         drain();
         return;
       }
       if (parsed.args) {
-        await admitNotice(update, message, sessionKey, usageNotice("status"));
+        await admitMessageNotice(update, message, sessionKey, usageNotice("status"));
         drain();
         return;
       }
       // Read-only: one bounded notice from the native conversation projection, no effect intent, no model call.
-      await admitNotice(update, message, sessionKey, await statusNotice(sessionKey), MAX_NOTICE_CHARS, "status");
+      await admitMessageNotice(update, message, sessionKey,
+        await readStatusNotice(gateway, sessionKey, "chat", adapterContext), MAX_NOTICE_CHARS, "status");
       drain();
       return;
     }
     if (parsed.command === "notices") {
       if (!hostCommands.notices) {
-        await admitNotice(update, message, sessionKey, NOTICES_UNAVAILABLE_HOST);
+        await admitMessageNotice(update, message, sessionKey, NOTICES_UNAVAILABLE_HOST);
         drain();
         return;
       }
-      const argument = parsed.args.trim();
-      if (argument === "") {
-        await admitNotice(update, message, sessionKey, await staleHostNoticesNotice(sessionKey));
-        drain();
-        return;
-      }
-      const dismiss = /^dismiss\s+(\S+)$/u.exec(argument);
-      if (dismiss === null || dismiss[1]!.length > 200) {
-        await admitNotice(update, message, sessionKey, usageNotice("notices"));
-        drain();
-        return;
-      }
-      await admitNotice(update, message, sessionKey, await dismissStaleHostNotice(sessionKey, dismiss[1]!));
+      await admitMessageNotice(update, message, sessionKey, await noticesCommand(sessionKey, parsed.args));
       drain();
       return;
     }
     if (parsed.command === "model") {
       if (!hostCommands.model) {
-        await admitNotice(update, message, sessionKey, MODEL_UNAVAILABLE_HOST);
+        await admitMessageNotice(update, message, sessionKey, MODEL_UNAVAILABLE_HOST);
         drain();
         return;
       }
       const argument = parseModelArgument(parsed.args);
       if (argument.kind === "usage") {
-        await admitNotice(update, message, sessionKey, usageNotice("model"));
+        await admitMessageNotice(update, message, sessionKey, usageNotice("model"));
         drain();
         return;
       }
-      const listing = await readModelListing(sessionKey);
+      const listing = await readModelListing(gateway, sessionKey, adapterContext);
       if (argument.kind === "list") {
-        await admitNotice(update, message, sessionKey,
-          listing === undefined ? MODEL_LISTING_UNAVAILABLE : modelListingText(listing), MAX_NOTICE_CHARS, "model");
+        await admitMessageNotice(update, message, sessionKey,
+          listing === undefined ? MODEL_LISTING_UNAVAILABLE : renderModelListing(listing, { scope: "chat" }),
+          MAX_NOTICE_CHARS, "model");
         drain();
         return;
       }
       // Only the finite configured catalog may be selected; this chat command never rewrites configuration and
       // never accepts an arbitrary provider/model/thinking triple.
-      if (listing === undefined) {
-        await admitNotice(update, message, sessionKey, MODEL_LISTING_UNAVAILABLE);
-        drain();
-        return;
-      }
-      if (listing.presets === undefined) {
-        await admitNotice(update, message, sessionKey, MODEL_PRESETS_UNAVAILABLE);
-        drain();
-        return;
-      }
-      if (argument.name !== "default" && !listing.presets.some((preset) => preset.name === argument.name)) {
-        await admitNotice(update, message, sessionKey,
-          `Unknown model preset ${boundedLabel(argument.name, 80)}: nothing was changed. ` +
-          "Use /model to list the configured presets.");
+      const refusal = modelPresetRefusal(listing, argument.name);
+      if (refusal !== undefined) {
+        await admitMessageNotice(update, message, sessionKey, refusal);
         drain();
         return;
       }
@@ -3188,7 +2489,7 @@ export async function runTelegram(
     if (parsed.command === "restart") {
       if (!hostCommands.restart) {
         const unavailable = options.restart?.unavailable;
-        await admitNotice(update, message, sessionKey,
+        await admitMessageNotice(update, message, sessionKey,
           typeof unavailable === "string" && unavailable.trim() !== ""
             ? unavailable.slice(0, MAX_NOTICE_CHARS)
             : RESTART_UNAVAILABLE_HOST);
@@ -3196,13 +2497,13 @@ export async function runTelegram(
         return;
       }
       if (parsed.args) {
-        await admitNotice(update, message, sessionKey, usageNotice("restart"));
+        await admitMessageNotice(update, message, sessionKey, usageNotice("restart"));
         drain();
         return;
       }
-      if (restartHostRequested) {
-        await admitNotice(update, message, sessionKey,
-          restartHostRequestFailed ? RESTART_REQUEST_FAILED : RESTART_ALREADY_REQUESTED);
+      const already = restartRequester.admissionRefusal();
+      if (already !== undefined) {
+        await admitMessageNotice(update, message, sessionKey, already);
         drain();
         return;
       }
@@ -3211,19 +2512,19 @@ export async function runTelegram(
     }
     if (parsed.command === "digest") {
       if (!hostCommands.digest) {
-        await admitNotice(update, message, sessionKey, DIGEST_UNAVAILABLE_HOST);
+        await admitMessageNotice(update, message, sessionKey, DIGEST_UNAVAILABLE_HOST);
         drain();
         return;
       }
       const argument = parsed.args.trim().toLowerCase();
       if (argument === "status") {
         // Read-only bounded status: no scan, no model call and no cursor change.
-        await admitNotice(update, message, sessionKey, await digestStatusNotice(sessionKey));
+        await admitMessageNotice(update, message, sessionKey, await renderDigestStatus(gateway, sessionKey, adapterContext));
         drain();
         return;
       }
       if (argument !== "") {
-        await admitNotice(update, message, sessionKey, usageNotice("digest"));
+        await admitMessageNotice(update, message, sessionKey, usageNotice("digest"));
         drain();
         return;
       }
@@ -3235,17 +2536,17 @@ export async function runTelegram(
     if (parsed.command === "mcp") {
       const admin = gateway.mcpAdmin;
       if (!hostCommands.mcp || admin === undefined) {
-        await admitNotice(update, message, sessionKey, MCP_UNAVAILABLE_HOST);
+        await admitMessageNotice(update, message, sessionKey, MCP_UNAVAILABLE_HOST);
         drain();
         return;
       }
       if (parsed.args.trim() !== "") {
-        await admitNotice(update, message, sessionKey, usageNotice("mcp"));
+        await admitMessageNotice(update, message, sessionKey, usageNotice("mcp"));
         drain();
         return;
       }
       // Read-only status; management itself is the model tool acting for this authenticated chat.
-      await admitNotice(update, message, sessionKey,
+      await admitMessageNotice(update, message, sessionKey,
         renderMcpListing(await admin.list(adapterContext), MAX_NOTICE_CHARS));
       drain();
       return;
@@ -3254,702 +2555,91 @@ export async function runTelegram(
     // it normalizes to the same control kind before admission, so the durable record, gating and
     // recovery path are shared and there is no second cancellation semantics.
     if (parsed.args) {
-      await admitNotice(update, message, sessionKey, usageNotice(parsed.command));
+      await admitMessageNotice(update, message, sessionKey, usageNotice(parsed.command));
       drain();
       return;
     }
-    const mutation: TelegramMutation = parsed.command === "stop" ? "abort" : parsed.command;
+    const mutation: ChannelMutation = parsed.command === "stop" ? "abort" : parsed.command;
     await admitControl(update, message, sessionKey, mutation);
   }
 
   /**
-   * Admit one native mutation: durable record, held acknowledgement and offset commit before the
-   * effect. The chat stays gated so its later inputs cannot overtake this command, and a refused
-   * effect is reported instead of being recorded as applied.
+   * Admit one native mutation through the shared coordinator: durable record, held acknowledgement
+   * and offset commit before the effect. The chat stays gated so its later inputs cannot overtake
+   * this command; a busy chat or the unresolved bound gets a fixed refusal notice instead.
    */
   async function admitControl(
     update: Update,
     message: TelegramMessage,
     sessionKey: string,
-    command: TelegramMutation,
-    target?: string,
+    command: ChannelMutation,
+    option?: string,
   ): Promise<void> {
-    const chatId = message.chat.id;
-    // An earlier command still owns this chat's order while it is applying or deferred. Refuse a
-    // newer one instead of letting it apply first; there is no queue for it.
-    if (controlPending.has(chatId) ||
-        [...deferredControls.values()].some((entry) => entry.chatId === chatId)) {
-      await admitNotice(update, message, sessionKey,
-        "Previous command pending. This command wasn't started; retry later.");
-      drain();
-      return;
-    }
-    // Refuse, never evict: a hung provider plus repeated commands must not grow the log without bound.
-    if (state.controls.filter((entry) => entry.status === "admitted" || entry.status === "unconfirmed").length >=
-        MAX_UNRESOLVED_CONTROLS) {
-      await admitNotice(update, message, sessionKey,
-        `Too many control commands are still unconfirmed (limit ${MAX_UNRESOLVED_CONTROLS}); this /${command} was not ` +
-        "started and was not sent to the assistant. Wait for them to finish or restart the adapter.");
-      drain();
-      return;
-    }
-    controlPending.add(chatId);
-    state = await stateConversation.commit(async (tx) => {
-      const doc = await tx.doc(TelegramState, stateConversation.id);
-      if (!doc.controls.some((entry) => entry.updateId === update.update_id)) {
-        doc.controls = pruneControls([
-          ...doc.controls,
-          {
-            updateId: update.update_id,
-            command,
-            status: "admitted" as const,
-            chatId,
-            senderId: String(message.from!.id),
-          },
-        ], doc.pending);
-      }
-      if (!doc.pending.some((entry) => entry.updateId === update.update_id)) {
-        if (doc.pending.length >= MAX_ADMITTED) throw new Error("Telegram durable output queue is full");
-        doc.pending.push({
-          updateId: update.update_id,
-          nextChunkIndex: 0,
-          chatId,
-          sessionKey,
-          senderId: String(message.from!.id),
-          text: CONTROL_ACK[command],
-          notice: true,
-          hold: true,
-        });
-      }
-      doc.offset = Math.max(doc.offset, update.update_id + 1);
-      return copyJson(doc) as unknown as ChannelState;
-    }, adapterContext);
-    // Apply it off the polling loop, serialized per chat: other chats keep polling, and this chat's later inputs and
-    // deliveries wait here so the command cannot land before a message admitted earlier.
-    const record: DeferredControl = {
-      updateId: update.update_id,
+    await controls.admit({
+      key: update.update_id,
+      scope: message.chat.id,
       command,
-      chatId,
-      ...(target === undefined ? {} : { target }),
-    };
-    const prior = controlChains.get(chatId) ?? Promise.resolve();
-    const run = prior.then(() => applyControl(record));
-    // The acknowledgement is published once: as the applied or refused wording when the native call returns, or as the
-    // explicit still-pending wording when it does not. A provider that ignores cancellation keeps the chat gated, so no
-    // later message can be withdrawn, and it is told plainly instead of being left silent.
-    let ack: "waiting" | "pending" | "applied" | "refused" = "waiting";
-    const pendingTimer = setTimeout(() => {
-      if (ack !== "waiting") return;
-      ack = "pending";
-      void releaseControlNotice(update.update_id, CONTROL_PENDING[command]).catch(() => undefined);
-    }, CONTROL_PENDING_NOTICE_MS);
-    const chain = run.then(() => undefined, () => undefined);
-    controlChains.set(chatId, chain);
-    const task = run.then(async (outcome) => {
-      if (outcome.kind === "refused") {
-        // A known no-effect is recorded and reported as refused, never as applied: a later replay of this update
-        // must not claim a change that did not happen.
-        const wasWaiting = ack === "waiting";
-        ack = "refused";
-        await markControlRefused(update.update_id, outcome.text).catch(() => undefined);
-        if (!wasWaiting) {
-          // The still-pending wording was already published. Publish the final refusal as a
-          // follow-up instead of losing it, still without any authorization URL (refusals never carry one).
-          await publishLateControlNotice(
-            update.update_id, chatId, sessionKey, String(message.from!.id), outcome.text,
-          ).catch(() => undefined);
-        }
-        return;
-      }
-      if (outcome.kind !== "applied") {
-        // Deferred: say plainly that the command is still pending; the chat keeps waiting and
-        // the poll cadence retries the same ordered flush. Abandoned: the unconfirmed wording
-        // was already released by the terminal report.
-        if (ack !== "waiting") return;
-        ack = "pending";
-        if (outcome.kind === "deferred") {
-          await releaseControlNotice(update.update_id, CONTROL_PENDING[command]).catch(() => undefined);
-        }
-        return;
-      }
-      if (ack !== "waiting") {
-        // The acknowledgement was already published with the still-pending wording. The final outcome
-        // still belongs to this command: deliver it as a follow-up, so a slow command cannot lose its
-        // only answer.
-        if (outcome.text !== undefined) {
-          await publishLateControlNotice(
-            update.update_id, chatId, sessionKey, String(message.from!.id), outcome.text,
-          ).catch(() => undefined);
-        }
-        if (outcome.requestRestart === true) requestRestart();
-        return;
-      }
-      ack = "applied";
-      try {
-        await releaseControlNotice(update.update_id, outcome.text);
-      } finally {
-        // The record, offset and acknowledgement are durable; the host owns the process replacement and is
-        // still asked when the acknowledgement commit itself failed (its notice is then reported after the
-        // restart by the recovery pass).
-        if (outcome.requestRestart === true) requestRestart();
-      }
-    }, (error: unknown) => {
-      // The record stays `admitted` and the acknowledgement stays held: a reopen reports it as unconfirmed.
-      if (signal?.aborted) return;
-      fatal ??= error;
-      scope.cancel(error instanceof Error ? error : new Error("Telegram control command failed"));
-    }).catch(() => {
-      // A failed acknowledgement release leaves the held notice for the next open to report; the command itself is done.
-    }).finally(() => {
-      clearTimeout(pendingTimer);
-      pendingControls.delete(task);
-      if (controlChains.get(chatId) === chain) {
-        controlChains.delete(chatId);
-        if (!stopping && !signal?.aborted) {
-          // A deferred command keeps the chat gated, but notices (including its honest
-          // still-pending acknowledgement) and other chats must still be dispatched.
-          if (!deferredControls.has(update.update_id)) controlPending.delete(chatId);
-          drain();
-        }
-      }
+      senderId: String(message.from!.id),
+      sessionKey,
+      ...(option === undefined ? {} : { option }),
     });
-    pendingControls.add(task);
     drain();
   }
 
   /**
-   * Ask the host to replace this process, at most once per adapter lifetime. The host performs it after its
-   * own graceful teardown; a refusal is a known no-effect, so it is reported to the chats that asked and
-   * never retried or upgraded into a success claim.
+   * Handle one control update. Handling commits nothing before its final admission (record,
+   * notice and offset in one commit), so a failure leaves the update to be polled again; repeated
+   * failures of the same update are fatal as before.
    */
-  function requestRestart(): void {
-    if (restartHostRequested) return;
-    const host = options.restart;
-    if (host === undefined || !host.supported) return;
-    restartHostRequested = true;
-    void host.request().catch((error: unknown) => {
-      // A busy refusal is a known no-effect before any acknowledgement or teardown: the owner may finish
-      // or abort the live work and ask again, so this adapter does not latch the refusal as final.
-      const busy = error instanceof RestartBusyError;
-      restartHostRequestFailed = !busy;
-      if (busy) restartHostRequested = false;
-      console.warn(busy
-        ? "Telegram /restart was refused while live work is active; the gateway keeps running."
-        : "Telegram /restart request was refused by the host; the gateway keeps running.");
-      // The acknowledgement promised a follow-up, so the refusal is reported now instead of leaving that
-      // promise open until some later process starts.
-      void stateConversation.commit(async (tx) => {
-        const doc = await tx.doc(TelegramState, stateConversation.id);
-        admitRestartNotices(doc, busy ? RESTART_BUSY_MESSAGE : RESTART_FAILED);
-        delete doc.restart;
-        return copyJson(doc) as unknown as ChannelState;
-      }, adapterContext).then((next) => {
-        state = next;
-        if (!stopping && !signal?.aborted) drain();
-      }).catch(() => undefined);
-    });
-  }
-
-  /**
-   * `/digest`: start one bounded digestion batch for this chat's own conversation. The host returns
-   * as soon as one native task is admitted; the digest turn runs in the background and reports to
-   * this conversation's agent internally. Nothing waits for it and nothing is sent to a user.
-   */
-  async function applyDigest(sessionKey: string): Promise<ControlOutcome> {
-    const host = gateway.memoryDigest;
-    if (host === undefined) return { kind: "refused", text: DIGEST_UNAVAILABLE_HOST };
-    const conversation = await gateway.conversationFor(sessionKey, adapterContext);
-    const result = await host.start({
-      id: conversation.id,
-      commit: (change, context) => conversation.commit(change, context),
-    }, adapterContext);
-    return result.status === "refused"
-      ? { kind: "refused", text: renderMemoryDigestStart(result) }
-      : { kind: "applied", text: renderMemoryDigestStart(result) };
-  }
-
-  /** Bounded read-only `/digest status`; it creates no task and reads no chat transcript. */
-  async function digestStatusNotice(sessionKey: string): Promise<string> {
-    const host = gateway.memoryDigest;
-    if (host === undefined) return DIGEST_UNAVAILABLE_HOST;
-    const conversation = await gateway.conversationFor(sessionKey, adapterContext);
-    return renderMemoryDigestStatus(await host.status({
-      id: conversation.id,
-      commit: (change, context) => conversation.commit(change, context),
-    }, adapterContext));
-  }
-
-  /**
-   * Submit every input admitted before this command, then apply the native call and record
-   * it. A transient failure while flushing earlier inputs is not fatal: the command stays
-   * admitted, the chat stays gated, and the poll cadence retries the same ordered flush.
-   * Repeated failures end in an explicit unconfirmed report rather than a silent takeover.
-   */
-  async function applyControl(record: DeferredControl): Promise<ControlOutcome> {
+  async function admitControlUpdate(
+    update: Update,
+    message: TelegramMessage,
+    parsed: Exclude<ParsedTelegramInput, { kind: "input" }>,
+  ): Promise<boolean> {
     try {
-      for (const earlier of state.pending.filter((item) =>
-        item.notice !== true && item.chatId === record.chatId && item.updateId < record.updateId &&
-        options.allowFrom.includes(item.senderId))) {
-        const earlierConversation = await gateway.conversationFor(earlier.sessionKey, adapterContext);
-        // Prepare attachment content in the same chat order as a normal delivery: a media
-        // message forced ahead of a control must not be submitted as text only.
-        await submitInOrder(record.chatId, async () => {
-          const content = await prepareInputContent(earlier);
-          await gateway.beforeOwnerInput?.(earlier.sessionKey, earlierConversation.id, content, adapterContext);
-          const submission = await earlierConversation.submit({
-            type: "input",
-            content,
-            requestId: requestIdFor(identity, earlier.updateId),
-            // The mode its own admission recorded, exactly as the normal delivery path submits it. A run that
-            // a scheduled, digest or worker path owns always queues instead of joining.
-            whenBusy: await submissionMode(earlierConversation, earlier),
-          }, adapterContext);
-          // The normal delivery path reuses this turn, so a control-forced input is answered
-          // exactly once even when it settles before the chat's gate is released.
-          earlySubmissions.set(earlier.updateId, submission);
-          return submission;
-        });
-      }
+      await handleControl(update, message, parsed);
+      controlRetry = undefined;
+      return true;
     } catch (error) {
       if (signal?.aborted) throw error;
-      const attempts = (controlFailures.get(record.updateId) ?? 0) + 1;
-      if (attempts < MAX_CONTROL_ATTEMPTS) {
-        controlFailures.set(record.updateId, attempts);
-        deferredControls.set(record.updateId, record);
-        return { kind: "deferred" };
-      }
-      // A permanently failing earlier input cannot be overtaken. Report the command
-      // honestly and release the gate instead of leaving the chat unusable forever.
-      controlFailures.delete(record.updateId);
-      deferredControls.delete(record.updateId);
-      await markControlUnconfirmed(record.updateId);
-      return { kind: "abandoned" };
-    }
-    const sessionKey = `telegram:${identity}:chat:${record.chatId}`;
-    let outcome: ControlOutcome;
-    if (record.command === "new") {
-      outcome = await applyNewSession(sessionKey);
-    } else if (record.command === "abort") {
-      const conversation = await gateway.conversationFor(sessionKey, adapterContext);
-      await conversation.abort(adapterContext);
-      outcome = { kind: "applied" };
-    } else if (record.command === "digest") {
-      outcome = await applyDigest(sessionKey);
-    } else if (record.command === "restart") {
-      // No conversation effect: the record and its acknowledgement are durable first, and the host
-      // replacement is requested by the caller only after that acknowledgement was released.
-      outcome = { kind: "applied", text: CONTROL_ACK.restart, requestRestart: true };
-    } else {
-      outcome = await applyModelPreset(record, sessionKey);
-    }
-    if (outcome.kind !== "applied") return outcome;
-    state = await stateConversation.commit(async (tx) => {
-      const doc = await tx.doc(TelegramState, stateConversation.id);
-      const entry = doc.controls.find((item) => item.updateId === record.updateId);
-      if (entry !== undefined) entry.status = "applied";
-      // The host replaces the process only after this commit, so the record of who is owed a live
-      // confirmation is durable first. Every requesting chat is recorded, not just one: chats admitted in
-      // the same poll batch each keep the answer their acknowledgement promised.
-      if (record.command === "restart" && entry !== undefined) {
-        const owed = doc.restart ?? [];
-        if (!owed.some((item) => item.chatId === record.chatId)) {
-          doc.restart = [...owed, { chatId: record.chatId, senderId: entry.senderId }]
-            .slice(-MAX_RESTART_CONFIRMATIONS);
-        }
-      }
-      // Bound the log here too: only applied, refused and already-reported records are pruned.
-      doc.controls = pruneControls(doc.controls, doc.pending);
-      return copyJson(doc) as unknown as ChannelState;
-    }, adapterContext);
-    controlFailures.delete(record.updateId);
-    deferredControls.delete(record.updateId);
-    return outcome;
-  }
-
-  /**
-   * `/new`: a native reset plus, when the host offers it, a rebuild of this session's assembled
-   * workspace prompt from the current on-disk files. The host refuses while a run is live, so a
-   * half-effect (reset without rebuild, or a new snapshot leaking into a running turn) is never
-   * reported as applied.
-   */
-  async function applyNewSession(sessionKey: string): Promise<ControlOutcome> {
-    const resetSession = gateway.resetSession;
-    if (resetSession === undefined) {
-      const conversation = await gateway.conversationFor(sessionKey, adapterContext);
-      await conversation.reset(undefined, adapterContext);
-      return { kind: "applied" };
-    }
-    const result: GatewaySessionReset = await resetSession.call(gateway, sessionKey, adapterContext);
-    if (result.status === "busy") return { kind: "refused", text: RESET_BUSY };
-    return { kind: "applied" };
-  }
-
-  /**
-   * The only model effect a chat command may have: select one configured preset, or `default` for the
-   * configured default. The host selection rejects atomically (including a busy conversation), so a
-   * refusal is a known no-effect on this chat's selection and is never retried or reported as applied.
-   */
-  async function applyModelPreset(record: DeferredControl, sessionKey: string): Promise<ControlOutcome> {
-    const selectPreset = gateway.selectModelPreset;
-    if (selectPreset === undefined || record.target === undefined) {
-      return { kind: "refused", text: MODEL_UNAVAILABLE_HOST };
-    }
-    try {
-      await selectPreset.call(gateway, sessionKey, record.target, adapterContext);
-      return { kind: "applied", text: `Model: ${boundedLabel(record.target, 80)}.` };
-    } catch (error) {
-      if (isConversationBusy(error)) {
-        return {
-          kind: "refused",
-          text: "Model preset selection rejected: this chat is busy, so nothing changed. " +
-            "Retry /model when this chat is idle. It was not queued and no other chat was affected.",
-        };
-      }
-      return {
-        kind: "refused",
-        text: "Model preset selection was refused, so this chat's selection is unchanged. " +
-          "Use /model to list the configured presets.",
-      };
+      const attempts = controlRetry?.updateId === update.update_id ? controlRetry.attempts + 1 : 1;
+      if (attempts >= MAX_CONTROL_ADMISSION_ATTEMPTS) throw error;
+      controlRetry = { updateId: update.update_id, attempts };
+      console.warn("Telegram control command could not be admitted; it is polled again.");
+      await delay(backoff(attempts - 1), signal);
+      return false;
     }
   }
 
-  /**
-   * Retry deferred commands once per poll response. The chat stays gated meanwhile, so no
-   * input admitted after the command can overtake the earlier durable inputs. This reuses
-   * the durable control record and the existing poll cadence; there is no separate queue.
-   */
-  function resumeDeferredControls(): void {
-    if (stopping || signal?.aborted) return;
-    for (const record of [...deferredControls.values()]) {
-      if (controlChains.has(record.chatId)) continue;
-      const prior = controlChains.get(record.chatId) ?? Promise.resolve();
-      const run = prior.then(() => applyControl(record));
-      const chain = run.then(() => undefined, () => undefined);
-      controlChains.set(record.chatId, chain);
-      const task = run.then(() => undefined, (error: unknown) => {
-        // A native reset/abort or storage failure is still a real adapter failure.
-        if (signal?.aborted) return;
-        fatal ??= error;
-        scope.cancel(error instanceof Error ? error : new Error("Telegram control command failed"));
-      }).catch(() => undefined).finally(() => {
-        pendingControls.delete(task);
-        if (controlChains.get(record.chatId) === chain) {
-          controlChains.delete(record.chatId);
-          if (!stopping && !signal?.aborted) {
-            if (!deferredControls.has(record.updateId)) controlPending.delete(record.chatId);
-            drain();
+  /** This chat's `/notices`, against the outbox and this adapter's own pending notices. */
+  function noticesCommand(sessionKey: string, args: string): Promise<string> {
+    return telegramNoticesCommand({
+      outbox,
+      context: adapterContext,
+      pending: () => state.pending,
+      usage: usageNotice("notices"),
+      maxChars: MAX_NOTICE_CHARS,
+      async dismissPending(dismissKey, updateId, id) {
+        const committed = await stateConversation.commit(async (tx) => {
+          const doc = await tx.doc(TelegramState, stateConversation.id);
+          const archive = await tx.doc(TelegramNoticeDismissals, stateConversation.id);
+          const outcome: PendingDismissal =
+            archiveUnknownNotice(doc.pending, archive, { sessionKey: dismissKey, updateId, id, now: Date.now() });
+          // Dismissal frees only the delivery queue slot and never claims external delivery.
+          if (outcome === "dismissed") {
+            doc.pending = doc.pending.filter((entry) => !(entry.updateId === updateId && entry.sessionKey === dismissKey));
           }
-        }
-      });
-      pendingControls.add(task);
-    }
-  }
-
-  /**
-   * Publish a final control outcome whose "still pending" notice was already sent. When that notice is
-   * still queued it is replaced; once it was delivered (and forgotten) a fresh notice is admitted under
-   * the same update ID, which no longer collides with any pending record.
-   */
-  async function publishLateControlNotice(
-    updateId: number,
-    chatId: number,
-    sessionKey: string,
-    senderId: string,
-    text: string,
-  ): Promise<void> {
-    const body = text.slice(0, MAX_LATE_CONTROL_CHARS);
-    state = await stateConversation.commit(async (tx) => {
-      const doc = await tx.doc(TelegramState, stateConversation.id);
-      const notice = doc.pending.find((item) => item.notice === true && item.updateId === updateId);
-      if (notice !== undefined) {
-        notice.text = body;
-        delete notice.hold;
-        return copyJson(doc) as unknown as ChannelState;
-      }
-      if (doc.pending.length >= MAX_ADMITTED) return copyJson(doc) as unknown as ChannelState;
-      doc.pending.push({
-        updateId,
-        nextChunkIndex: 0,
-        chatId,
-        sessionKey,
-        senderId,
-        text: body,
-        notice: true,
-      });
-      return copyJson(doc) as unknown as ChannelState;
-    }, cleanupContext);
-    drain();
-  }
-
-  /** Publish the held acknowledgement, optionally as the still-pending wording. */
-  async function releaseControlNotice(updateId: number, text?: string): Promise<void> {
-    state = await stateConversation.commit(async (tx) => {
-      const doc = await tx.doc(TelegramState, stateConversation.id);
-      const notice = doc.pending.find((item) => item.notice === true && item.updateId === updateId);
-      if (notice === undefined) return copyJson(doc) as unknown as ChannelState;
-      if (text !== undefined) notice.text = text;
-      delete notice.hold;
-      return copyJson(doc) as unknown as ChannelState;
-    }, cleanupContext);
-  }
-
-  /** Report that an admitted command never confirmed its effect, and release its held acknowledgement. */
-  async function markControlUnconfirmed(updateId: number): Promise<void> {
-    state = await stateConversation.commit(async (tx) => {
-      const doc = await tx.doc(TelegramState, stateConversation.id);
-      const entry = doc.controls.find((item) => item.updateId === updateId);
-      if (entry !== undefined) entry.status = "unconfirmed";
-      const notice = doc.pending.find((item) => item.notice === true && item.updateId === updateId);
-      if (notice !== undefined) {
-        notice.text = entry?.command === "restart" ? UNCONFIRMED_RESTART : UNCONFIRMED_CONTROL;
-        delete notice.hold;
-      }
-      return copyJson(doc) as unknown as ChannelState;
-    }, adapterContext);
-  }
-
-  /**
-   * Record a proven no-effect outcome and publish its refusal wording instead of an applied
-   * acknowledgement. A later replay of the same update reports the refusal; the command is never retried.
-   */
-  async function markControlRefused(updateId: number, text: string): Promise<void> {
-    const bounded = text.slice(0, MAX_NOTICE_CHARS);
-    state = await stateConversation.commit(async (tx) => {
-      const doc = await tx.doc(TelegramState, stateConversation.id);
-      const entry = doc.controls.find((item) => item.updateId === updateId);
-      if (entry !== undefined) entry.status = "refused";
-      const notice = doc.pending.find((item) => item.notice === true && item.updateId === updateId);
-      if (notice !== undefined) {
-        notice.text = bounded;
-        delete notice.hold;
-      }
-      doc.controls = pruneControls(doc.controls, doc.pending);
-      return copyJson(doc) as unknown as ChannelState;
-    }, cleanupContext);
-  }
-
-  /**
-   * The host model catalog is per-session, so this chat's mapped conversation must exist first. That
-   * mapping is the adapter's own bound for the CURRENT authenticated chat: it creates no other
-   * conversation, grants no root authority, and holds no model call.
-   */
-  async function readModelListing(sessionKey: string): Promise<GatewayModelList | undefined> {
-    if (gateway.listModels === undefined) return undefined;
-    try {
-      await gateway.conversationFor(sessionKey, adapterContext);
-      return await gateway.listModels(sessionKey, adapterContext);
-    } catch {
-      return undefined;
-    }
-  }
-
-  /**
-   * Bounded point-in-time metadata of this authenticated chat through the same native conversation
-   * projection the terminal uses. Read only: no model call, no watch, no transcript, prompt, tool
-   * argument or other chat, and no configuration change.
-   */
-  async function statusNotice(sessionKey: string): Promise<string> {
-    try {
-      const listing = await readModelListing(sessionKey);
-      const conversation = await gateway.conversationFor(sessionKey, adapterContext);
-      const status = await inProcessTerminalConversation(conversation).status(adapterContext);
-      const selection = listing?.selected;
-      const model = selection === undefined
-        ? (status.model === undefined ? "unknown" : `${status.model.provider}/${status.model.modelId}`)
-        : `${selection.provider}/${selection.modelId} (thinking: ${selection.thinkingLevel})`;
-      const preset = listing === undefined ? undefined : matchingPresetName(listing);
-      // Additive, bounded and read-only: this chat's own workers and cron jobs, plus whether the one
-      // shared workspace digestion run is live. A read failure adds nothing; the core status stands.
-      let background: string[] = [];
-      try {
-        if (typeof gateway.backgroundStatus === "function") {
-          background = renderBackgroundStatus(await gateway.backgroundStatus(sessionKey, adapterContext));
-        }
-      } catch {
-        background = [];
-      }
-      return [
-        "Status for this chat (no model call, no configuration change):",
-        `Model: ${boundedLabel(model, 240)}${preset === undefined ? "" : ` — preset ${boundedLabel(preset, 80)}`}`,
-        status.run === undefined
-          ? "Run: idle"
-          : `Run: running (turn ${status.run.taskId}, ${status.run.inputs} input(s)` +
-            `${status.run.attempt === undefined ? "" : `, generation attempt ${status.run.attempt}`})`,
-        `Queued native inputs: ${status.inbox.total}`,
-        ...background,
-        "Only this chat's own records were read; no other chat's transcript, prompt or tool argument is included.",
-      ].join("\n");
-    } catch {
-      return "Status is unavailable right now: this chat's conversation metadata could not be read. " +
-        "No model call was made and nothing changed.";
-    }
-  }
-
-  /**
-   * This chat's own non-answer host notices whose delivery outcome is unknown. Only exact host
-   * notice ids are projected: a model answer or a scheduled result is never listed here, and its
-   * text is never copied. Read only; nothing is retried or changed.
-   */
-  async function staleHostNoticesNotice(sessionKey: string): Promise<string> {
-    if (outbox === undefined) return NOTICES_UNAVAILABLE_HOST;
-    let records: readonly CronDeliveryRecord[];
-    try {
-      records = await outbox.list(sessionKey, adapterContext);
-    } catch {
-      return "Stale host notices are unavailable right now: this chat's delivery outbox could not be read. " +
-        "Nothing was changed and nothing was resent.";
-    }
-    const stale = records
-      .filter((record) => record.status === "unknown" && isTurnInterruptionNotice(record))
-      .sort((left, right) => unknownSinceMs(left) - unknownSinceMs(right));
-    const pending = state.pending.filter((entry) => entry.sessionKey === sessionKey
-      && entry.notice === true && entry.deliveryStatus === "unknown");
-    const all = [
-      ...stale.map((record) => ({ id: record.id, since: unknownSinceText(record) })),
-      ...pending.map((entry) => ({ id: `telegram:${entry.updateId}`,
-        since: entry.unknownSince === undefined ? "unrecorded time" : new Date(entry.unknownSince).toISOString() })),
-    ];
-    if (all.length === 0) {
-      return "No stale host notices in this chat. Model answers and scheduled results are never listed here.";
-    }
-    all.sort((left, right) => (Date.parse(left.since) || 0) - (Date.parse(right.since) || 0));
-    const rows = all.slice(0, STALE_HOST_NOTICE_ROWS).map((record) =>
-      `  ${boundedLabel(record.id, 80)} — outcome unknown since ${record.since}`);
-    return [
-      `Stale host notices in this chat: ${all.length}. Their delivery outcome is unknown, so none was resent.`,
-      ...rows,
-      ...(all.length > rows.length ? [`  … ${all.length - rows.length} more not shown`] : []),
-      "Use /notices dismiss <id> for exactly one whose unknown outcome you accept.",
-    ].join("\n").slice(0, MAX_NOTICE_CHARS);
-  }
-
-  /**
-   * Retire exactly one stale host notice of this chat. The record keeps its text and unknown
-   * provenance; only its status settles as a fixed, owner-initiated dismissal. An ambiguous send
-   * is never retried and a model answer or scheduled result is never touched.
-   */
-  async function dismissStaleHostNotice(sessionKey: string, id: string): Promise<string> {
-    if (outbox === undefined) return NOTICES_UNAVAILABLE_HOST;
-    if (/^telegram:-?\d+$/.test(id)) {
-      const updateId = Number(id.slice("telegram:".length));
-      if (!Number.isSafeInteger(updateId) || id !== `telegram:${updateId}`) {
-        return "No stale host notice with that exact id exists in this chat. Nothing was changed and nothing was resent.";
-      }
-      let outcome = "missing";
-      state = await stateConversation.commit(async (tx) => {
-        const doc = await tx.doc(TelegramState, stateConversation.id);
-        const notice = doc.pending.find((entry) => entry.updateId === updateId && entry.sessionKey === sessionKey);
-        if (notice?.notice !== true || notice.deliveryStatus !== "unknown") {
-          return copyJson(doc) as unknown as ChannelState;
-        }
-        const archive = await tx.doc(TelegramNoticeDismissals, stateConversation.id);
-        // Refuse rather than silently evict provenance. Archival records retain the original unknown
-        // outcome; dismissal frees only the delivery queue slot and never claims external delivery.
-        if (archive.records.length >= 100) { outcome = "full"; return copyJson(doc) as unknown as ChannelState; }
-        archive.records.push({ id, sessionKey, text: notice.text,
-          ...(notice.unknownSince === undefined ? {} : { unknownSince: notice.unknownSince }), dismissedAt: Date.now() });
-        doc.pending = doc.pending.filter((entry) => entry !== notice);
-        outcome = "dismissed";
-        return copyJson(doc) as unknown as ChannelState;
-      }, adapterContext);
-      if (outcome === "dismissed") return `Dismissed stale host notice ${id}. Its original outcome stays unknown; it was not resent.`;
-      if (outcome === "full") return "Notice dismissal archive is full. Nothing was changed or resent.";
-      return "No stale host notice with that exact id exists in this chat. Nothing was changed and nothing was resent.";
-    }
-    if (!isTurnInterruptionNotice({ id })) {
-      return "Only host notices can be dismissed here. Model answers and scheduled results are never " +
-        "dismissed or resent.";
-    }
-    let records: readonly CronDeliveryRecord[];
-    try {
-      records = await outbox.list(sessionKey, adapterContext);
-    } catch {
-      return "That stale notice could not be read right now. Nothing was changed and nothing was resent.";
-    }
-    const current = records.find((record) => record.id === id);
-    if (current === undefined) {
-      return "No stale host notice with that exact id exists in this chat. Nothing was changed and " +
-        "nothing was resent.";
-    }
-    if (!isTurnInterruptionNotice(current)) {
-      return "Only host notices can be dismissed here. Model answers and scheduled results are never " +
-        "dismissed or resent.";
-    }
-    if (current.status !== "unknown") {
-      return "That host notice is not in an unknown state, so it was not dismissed. Nothing was changed " +
-        "and nothing was resent.";
-    }
-    let dismissed = false;
-    try {
-      const updated = await outbox.update(sessionKey, id, (entry) => {
-        // Rechecked inside the commit: a concurrent scan or reopen may have settled it already.
-        if (!isTurnInterruptionNotice(entry) || entry.status !== "unknown") return;
-        dismissed = true;
-        entry.status = "failed";
-        entry.settledAt = Date.now();
-        entry.error = STALE_HOST_NOTICE_DISMISSED;
-      }, adapterContext);
-      if (updated === undefined) {
-        return "No stale host notice with that exact id exists in this chat. Nothing was changed and " +
-          "nothing was resent.";
-      }
-    } catch {
-      return "That stale notice could not be changed right now. Nothing was resent; try again later.";
-    }
-    if (!dismissed) {
-      return "That host notice is not in an unknown state, so it was not dismissed. Nothing was changed " +
-        "and nothing was resent.";
-    }
-    return `Dismissed stale host notice ${boundedLabel(id, 80)}. Its original outcome stays unknown; ` +
-      "it was not resent.";
-  }
-
-  /** One bounded listing of the current selection and the finite configured choices. */
-  function modelListingText(listing: GatewayModelList): string {
-    const maxChoices = 50;
-    const selectedLine = `Current model: ${boundedLabel(listing.selected.provider, 80)}/` +
-      `${boundedLabel(listing.selected.modelId, 160)} (thinking: ${boundedLabel(listing.selected.thinkingLevel, 32)}).`;
-    const presets = listing.presets ?? [];
-    if (presets.length === 0) {
-      // Legacy direct-model configuration: the selection and its allowed choices are shown read only.
-      const rows = listing.models.slice(0, maxChoices).map((choice) => {
-        const current = choice.provider === listing.selected.provider && choice.modelId === listing.selected.modelId;
-        const levels = choice.thinkingLevels.map((level) => boundedLabel(level, 32)).join(", ");
-        return `  ${current ? "* " : "  "}${boundedLabel(choice.provider, 80)} ${boundedLabel(choice.modelId, 160)} ` +
-          `— ${boundedLabel(choice.name, 160)} [thinking: ${levels === "" ? "off" : levels}]`;
-      });
-      if (listing.models.length > maxChoices) {
-        rows.push(`  … ${listing.models.length - maxChoices} more allowed models omitted`);
-      }
-      return [
-        selectedLine,
-        "Named model presets are not configured in this deployment, so /model <name> and /model default are " +
-          "unavailable here; this chat command never rewrites the configuration.",
-        "Configured direct choices (read only; the direct selection belongs to the local CLI):",
-        ...rows,
-      ].join("\n");
-    }
-    const selectedPreset = matchingPresetName(listing);
-    const rows = presets.slice(0, maxChoices).map((preset) => {
-      const isDefault = preset.name === listing.defaultPreset;
-      return `  ${preset.name === selectedPreset ? "* " : "  "}${boundedLabel(preset.name, 80)} — ` +
-        `${boundedLabel(preset.provider, 80)} ${boundedLabel(preset.modelId, 160)} ` +
-        `[thinking: ${boundedLabel(preset.thinkingLevel ?? "off", 32)}]${isDefault ? " (default)" : ""}`;
-    });
-    if (presets.length > maxChoices) rows.push(`  … ${presets.length - maxChoices} more named presets omitted`);
-    return [
-      selectedLine,
-      ...(listing.defaultPreset === undefined ? [] : [`Configured default preset: ${boundedLabel(listing.defaultPreset, 80)}.`]),
-      "Named model presets (see /help model to select one):",
-      ...rows,
-      "A selection applies to this chat only and lasts while the gateway stays open; a restart restores the " +
-        "configured default and prepared requests keep their model.",
-    ].join("\n");
+          return { outcome, state: copyJson(doc) as unknown as ChannelState };
+        }, adapterContext);
+        state = committed.state;
+        return committed.outcome;
+      },
+    }, sessionKey, args);
   }
 
   /** The catalogued Telegram commands this host actually supports, in menu order. */
   function availableCommandNames(): readonly string[] {
-    return offeredTelegramCommandNames(hostCommands);
+    return offeredChannelCommandNames("telegram", hostCommands);
   }
 
   /** Help lists exactly the controls this host implements, one line each; detail stays in `/help <command>`. */
@@ -3967,32 +2657,43 @@ export async function runTelegram(
     ].join("\n\n");
   }
 
+  /** Admit one fixed notice for an update and advance the offset past it, in one commit. */
   async function admitNotice(
-    update: Update,
-    message: TelegramMessage,
+    updateId: number,
+    chatId: number,
+    senderId: string,
     sessionKey: string,
     text: string,
     limit: number = MAX_NOTICE_CHARS,
     noticeFormat?: "status" | "model",
   ): Promise<void> {
-    state = await stateConversation.commit(async (tx) => {
-      const doc = await tx.doc(TelegramState, stateConversation.id);
-      if (!doc.pending.some((entry) => entry.updateId === update.update_id)) {
+    await mutateState((doc) => {
+      if (!doc.pending.some((entry) => entry.updateId === updateId)) {
         if (doc.pending.length >= MAX_ADMITTED) throw new Error("Telegram durable output queue is full");
         doc.pending.push({
-          updateId: update.update_id,
+          updateId,
           nextChunkIndex: 0,
-          chatId: message.chat.id,
+          chatId,
           sessionKey,
-          senderId: String(message.from!.id),
+          senderId,
           text: text.slice(0, limit),
           notice: true,
           ...(noticeFormat === undefined ? {} : { noticeFormat }),
         });
       }
-      doc.offset = Math.max(doc.offset, update.update_id + 1);
-      return copyJson(doc) as unknown as ChannelState;
+      doc.offset = Math.max(doc.offset, updateId + 1);
     }, adapterContext);
+  }
+
+  function admitMessageNotice(
+    update: Update,
+    message: TelegramMessage,
+    sessionKey: string,
+    text: string,
+    limit?: number,
+    noticeFormat?: "status" | "model",
+  ): Promise<void> {
+    return admitNotice(update.update_id, message.chat.id, String(message.from!.id), sessionKey, text, limit, noticeFormat);
   }
 
   async function persistOffset(offset: number) {
@@ -4004,40 +2705,14 @@ export async function runTelegram(
   }
 }
 
-const DELIVERY_STATUSES: ReadonlySet<string> = new Set([
-  "pending", "sending", "unknown", "withheld", "delivered", "failed", "unauthorized",
-]);
-
-function pendingRecordProblem(value: unknown): string | undefined {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    return "delivery outbox contains an unusable record";
-  }
-  const record = value as Record<string, unknown>;
-  if (typeof record.id !== "string" || record.id === "") {
-    return "delivery outbox contains an unusable record";
-  }
-  if (typeof record.status !== "string" || !DELIVERY_STATUSES.has(record.status)) {
-    return "delivery record has an invalid status";
-  }
-  if (record.status !== "pending") return undefined;
-  if (typeof record.sessionKey !== "string" || record.sessionKey === "") {
-    return "delivery record has no origin session";
-  }
-  if (typeof record.text !== "string" || record.text.trim() === "") {
-    return "delivery record has no text";
-  }
+/** Telegram's own checks of a pending outbox record: a present chunk cursor and a known chunk plan. */
+function scheduledRecordProblem(record: Readonly<Record<string, unknown>>): string | undefined {
   if (!Number.isSafeInteger(record.nextChunkIndex) || (record.nextChunkIndex as number) < 0) {
     return "delivery record has an invalid chunk cursor";
   }
   if (record.telegramChunkPlan !== undefined && record.telegramChunkPlan !== "legacy" &&
       record.telegramChunkPlan !== "rich-v1") return "delivery record has an invalid chunk plan";
   return undefined;
-}
-
-function outboxFaultMessage(error: unknown): string {
-  return error instanceof CronDeliveryOutboxError
-    ? "delivery outbox is malformed"
-    : "delivery outbox could not be read";
 }
 
 function originBindingOf(
@@ -4143,65 +2818,6 @@ const MEDIA_REJECTION_TEXT: Record<MediaRejectionReason, string> = {
   unavailable: "Telegram did not provide the file",
 };
 
-/**
- * Bound concurrent attachment work across chats so downloads and local
- * transcription never starve polling. Waiters release immediately on abort.
- */
-class MediaWorkGate {
-  readonly #max: number;
-  #active = 0;
-  readonly #waiters: {
-    resolve(): void;
-    reject(error: unknown): void;
-    readonly signal: AbortSignal | undefined;
-    onAbort: (() => void) | undefined;
-  }[] = [];
-
-  constructor(max: number) {
-    this.#max = Math.max(1, Math.trunc(max));
-  }
-
-  async run<T>(work: () => Promise<T>, signal?: AbortSignal): Promise<T> {
-    await this.#acquire(signal);
-    try {
-      return await work();
-    } finally {
-      this.#release();
-    }
-  }
-
-  #acquire(signal?: AbortSignal): Promise<void> {
-    if (signal?.aborted) return Promise.reject(signal.reason);
-    if (this.#active < this.#max) {
-      this.#active += 1;
-      return Promise.resolve();
-    }
-    return new Promise<void>((resolve, reject) => {
-      const waiter = { resolve, reject, signal, onAbort: undefined as (() => void) | undefined };
-      waiter.onAbort = () => {
-        const index = this.#waiters.indexOf(waiter);
-        if (index >= 0) this.#waiters.splice(index, 1);
-        reject(signal?.reason);
-      };
-      signal?.addEventListener("abort", waiter.onAbort, { once: true });
-      this.#waiters.push(waiter);
-    });
-  }
-
-  #release(): void {
-    const waiter = this.#waiters.shift();
-    if (waiter === undefined) {
-      this.#active -= 1;
-      return;
-    }
-    if (waiter.signal !== undefined && waiter.onAbort !== undefined) {
-      waiter.signal.removeEventListener("abort", waiter.onAbort);
-    }
-    // The released slot passes straight to the next waiter.
-    waiter.resolve();
-  }
-}
-
 function isAllowedPrivateMessage(
   message: Update["message"],
   allowFrom: readonly string[],
@@ -4283,40 +2899,13 @@ const TELEGRAM_MENU_DESCRIPTION_MAX = 256;
  * its names and one-line descriptions cannot drift from `/help`.
  */
 function telegramCommands(
-  host: TelegramCommandHost,
+  host: HostCapabilities,
 ): readonly { readonly command: string; readonly description: string }[] {
-  return offeredConversationCommands("telegram", offeredTelegramCommandNames(host)).map((command) => ({
+  return offeredConversationCommands("telegram", offeredChannelCommandNames("telegram", host)).map((command) => ({
     command: command.name,
     description: command.summary.slice(0, TELEGRAM_MENU_DESCRIPTION_MAX),
   }));
 }
-
-/** The catalogued Telegram controls this host really implements, in catalogue order. */
-function offeredTelegramCommandNames(host: TelegramCommandHost): readonly string[] {
-  const offered: Record<string, boolean> = {
-    new: true,
-    abort: true,
-    stop: true,
-    help: true,
-    status: host.status,
-    model: host.model,
-    restart: host.restart,
-    digest: host.digest,
-    mcp: host.mcp,
-    notices: host.notices,
-  };
-  return conversationCommandNames("telegram").filter((name) => offered[name] === true);
-}
-
-/** Which optional host operations this adapter may advertise and apply. */
-type TelegramCommandHost = {
-  readonly status: boolean;
-  readonly model: boolean;
-  readonly restart: boolean;
-  readonly digest: boolean;
-  readonly mcp: boolean;
-  readonly notices: boolean;
-};
 
 type ParsedTelegramInput =
   | { readonly kind: "input"; readonly text: string }
@@ -4325,22 +2914,6 @@ type ParsedTelegramInput =
   | { readonly kind: "foreign"; readonly command: string; readonly mention: string };
 
 type TelegramControl = "new" | "abort" | "stop" | "help" | "status" | "model" | "restart" | "digest" | "mcp" | "notices";
-
-/**
- * A command with a native effect on this chat or this process; a refusal is terminal, never retried.
- * `/stop` normalizes to `abort` here, so one control kind covers both spellings.
- */
-type TelegramMutation = "new" | "abort" | "model" | "restart" | "digest";
-
-type ControlOutcome =
-  | {
-      readonly kind: "applied";
-      readonly text?: string;
-      readonly requestRestart?: true;
-    }
-  | { readonly kind: "refused"; readonly text: string }
-  | { readonly kind: "deferred" }
-  | { readonly kind: "abandoned" };
 
 /** Escape all data first; only these host-owned labels and list markers become rich formatting. */
 function formatReadOnlyNotice(text: string, kind: "status" | "model"): string {
@@ -4362,153 +2935,17 @@ function formatReadOnlyNotice(text: string, kind: "status" | "model"): string {
   }).join("\n");
 }
 
-const CONTROL_ACK: Record<TelegramMutation, string> = {
-  new: "Context reset.",
-  abort: "Idle. Queue cleared.",
-  model: "Model selected.",
-  restart: "Restart requested; checking active work.",
-  digest: "Digest requested.",
-};
-
-const CONTROL_PENDING: Record<TelegramMutation, string> = {
-  new: "Reset pending.",
-  abort: "Still stopping. New messages are held.",
-  model: "Model change pending.",
-  restart: "Restart pending.",
-  digest: "Digest pending; not started yet.",
-};
-
-const UNCONFIRMED_CONTROL =
-  "Command interrupted; outcome unknown. Send it again if needed.";
-
-/** An interrupted restart is never repeated automatically, and resending it is the caller's decision. */
-const UNCONFIRMED_RESTART =
-  "Restart interrupted; outcome unknown. Not retried.";
-
-/**
- * The confirmation the replacement process owes the chat that asked for `/restart`. It is reserved here because it
- * proves only that this process opened and loaded its configuration; it says nothing about later model calls.
- */
-const RESTART_LIVE = "Restarted.";
-/** The other half of that promise: the host refused the replacement, so this process is still the one serving. */
-const RESTART_FAILED = "Restart refused. Gateway still running.";
 /**
  * Starting point for the durable queue id of that confirmation. Telegram update ids are never negative, so these
  * ids cannot collide with an admitted update, an acknowledgement or a control record.
  */
 const RESTART_LIVE_UPDATE_ID = -1;
 
-/** Fixed, sanitized refusals: a narrow host advertises nothing it cannot do. */
-const STATUS_UNAVAILABLE_HOST =
-  "Status is unavailable in this host: it exposes no model/status metadata for this chat. Nothing was sent to the assistant.";
-const MODEL_UNAVAILABLE_HOST =
-  "Model commands are unavailable in this host: it exposes no preset catalog or preset selection. Nothing was sent to the assistant.";
-const MODEL_LISTING_UNAVAILABLE =
-  "Model choices are unavailable right now: this chat's host model catalog could not be read. Nothing changed.";
-const MODEL_PRESETS_UNAVAILABLE =
-  "Named model presets are not configured in this deployment, so /model <name> and /model default are unavailable. " +
-  "Nothing was changed; /model lists the current selection read only, and this chat command never rewrites the configuration.";
 /** A fixed Telegram usage notice: the catalogue's line, a no-argument note, and the surface's tail. */
 function usageNotice(name: string): string {
   const argumentsNote = findConversationCommand(name)?.args === undefined ? " (no arguments)." : "";
   return `${conversationCommandUsage(name, "telegram")}${argumentsNote} Nothing was sent to the assistant.`;
 }
-
-const MCP_UNAVAILABLE_HOST =
-  "MCP management is unavailable in this host: the gateway was opened without an on-disk configuration file, " +
-  "so there is nothing to write. Nothing was sent to the assistant.";
-const NOTICES_UNAVAILABLE_HOST =
-  "Host notices are unavailable in this host: it exposes no delivery outbox. Nothing was changed and " +
-  "nothing was resent.";
-/** Bound of stale host notice rows in one listing; the count is still stated above the cut. */
-const STALE_HOST_NOTICE_ROWS = 4;
-const STALE_HOST_NOTICE_DISMISSED =
-  "stale host notice dismissed by the owner; the outcome stays unknown and it was not resent";
-
-/** Unknown-outcome provenance; a record without one falls back to its creation time. */
-function unknownSinceMs(record: CronDeliveryRecord): number {
-  const since = record.unknownSince;
-  return typeof since === "number" && Number.isSafeInteger(since) && since >= 0 ? since : record.createdAtMs;
-}
-
-function unknownSinceText(record: CronDeliveryRecord): string {
-  const at = unknownSinceMs(record);
-  return Number.isSafeInteger(at) && Math.abs(at) <= 8.64e15 ? new Date(at).toISOString() : "an unrecorded time";
-}
-
-/** One pending owner control command. Opaque, fixed-width and content-bound at creation. */
-const RESTART_UNAVAILABLE_HOST =
-  "Restart is unavailable in this host: it cannot replace its own process with the same program and configuration. " +
-  "Nothing was sent to the assistant.";
-const RESTART_ALREADY_REQUESTED =
-  "A restart was already requested in this gateway and is still stopping it; this /restart was not requested again.";
-const RESTART_REQUEST_FAILED =
-  "A restart was already requested in this gateway and the host refused it, so the gateway is still running. " +
-  "This /restart was not requested again; fix the host and start the gateway yourself.";
-const RESET_BUSY = "Reset refused: chat busy. /abort or retry /new when idle.";
-const DIGEST_UNAVAILABLE_HOST =
-  "Memory digestion is unavailable in this host: it exposes no manual digestion entry. Nothing was started and " +
-  "nothing was sent to the assistant.";
-
-/** Replay wording for a command this adapter recorded before a restart; it is never run twice. */
-function replayControlText(entry: TelegramControlRecord): string {
-  if (entry.command === "restart") {
-    return entry.status === "applied"
-      ? "That /restart was already requested before this process restarted, so it is not requested again."
-      : "That /restart was interrupted before it was confirmed: it may or may not have restarted the gateway, and it " +
-        "is not requested again.";
-  }
-  if (entry.status === "applied") return "That command was already applied before a restart, so it was not run again.";
-  if (entry.status === "refused") {
-    return "That command was refused before any effect and will not be retried; send it again if it is still needed.";
-  }
-  if (entry.status === "unconfirmed") {
-    return "That command was already reported as interrupted; send it again if you still need it.";
-  }
-  return UNCONFIRMED_CONTROL;
-}
-
-type ModelArgument =
-  | { readonly kind: "list" }
-  | { readonly kind: "preset"; readonly name: string }
-  | { readonly kind: "usage" };
-
-/** Bound a `/model` argument to the shape the config itself accepts: one name, never a selector triple. */
-function parseModelArgument(args: string): ModelArgument {
-  const trimmed = args.trim();
-  if (trimmed === "") return { kind: "list" };
-  const parts = trimmed.split(/\s+/u);
-  if (parts.length !== 1) return { kind: "usage" };
-  const name = parts[0]!;
-  // Config preset names carry no whitespace or control characters; bidi/format characters would reorder the notice.
-  if (name.length > 80 || !/^[^\s\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]+$/u.test(name)) return { kind: "usage" };
-  return { kind: "preset", name };
-}
-
-/** Plain-text notice labels: no parse mode is used, and control/bidi characters never reach the chat. */
-function boundedLabel(value: unknown, max: number): string {
-  const text = typeof value === "string" ? value : "";
-  const cleaned = text.replace(/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/gu, " ")
-    .replace(/\s+/gu, " ")
-    .trim();
-  if (cleaned === "") return "(empty)";
-  let bounded = cleaned.slice(0, max);
-  // Never cut a surrogate pair.
-  if (bounded.length > 0 && /[\uD800-\uDBFF]/u.test(bounded[bounded.length - 1]!)) bounded = bounded.slice(0, -1);
-  return bounded;
-}
-
-/** The configured preset this chat currently uses, matched by provider/model/thinking. */
-function matchingPresetName(listing: GatewayModelList): string | undefined {
-  const selected = listing.selected;
-  return listing.presets?.find((preset) => preset.provider === selected.provider &&
-    preset.modelId === selected.modelId && (preset.thinkingLevel ?? "off") === selected.thinkingLevel)?.name;
-}
-
-function isConversationBusy(error: unknown): boolean {
-  return error instanceof ConversationBusy || (error instanceof Error && error.name === "ConversationBusy");
-}
-
 
 const TELEGRAM_COMMAND = new RegExp(
   "^/([A-Za-z0-9_]{1," + COMMAND_NAME_MAX + "})(?:@([A-Za-z0-9_]{1," + BOT_MENTION_MAX + "}))?(?=\\s|$)",
@@ -4545,23 +2982,15 @@ function parseTelegramInput(raw: string, botUsername: string | undefined): Parse
 }
 
 /**
- * Keep every unresolved record, only the most recent applied ones, and a reported terminal record only while its
- * report is still queued. A hung provider plus repeated commands therefore cannot grow the log: unresolved records are
- * bounded by the admission limit and reported ones are pruned once delivered.
+ * The shared control-log bound: a reported terminal record is kept only while its notice is still
+ * queued, so a hung provider plus repeated commands cannot grow the log.
  */
-function pruneControls(
-  controls: readonly TelegramControlRecord[],
+function pruneTelegramControls<R extends TelegramControlRecord>(
+  controls: readonly R[],
   pending: readonly TelegramPendingDelivery[],
-): TelegramControlRecord[] {
-  const totalApplied = controls.filter((entry) => entry.status === "applied").length;
-  let drop = Math.max(0, totalApplied - MAX_CONTROL_RECORDS);
+): R[] {
   const reported = new Set(pending.filter((item) => item.notice === true).map((item) => item.updateId));
-  return controls.filter((entry) => {
-    if ((entry.status === "unconfirmed" || entry.status === "refused") && !reported.has(entry.updateId)) return false;
-    if (entry.status !== "applied" || drop === 0) return true;
-    drop -= 1;
-    return false;
-  });
+  return pruneControls(controls, (entry) => reported.has(entry.updateId));
 }
 
 function requestIdFor(botId: string, updateId: number): string {
@@ -4601,271 +3030,4 @@ function splitPlainTextLossless(text: string): string[] {
     offset = end;
   }
   return chunks;
-}
-
-type ReadOutageHooks = {
-  entered(method: string): void;
-  recovered(): void;
-};
-
-type ApiCallOptions = {
-  throttle?: TelegramFloodGate;
-  replaceable?: boolean;
-  /** Present only for idempotent reads that must survive a sustained Telegram outage. */
-  retryOutage?: ReadOutageHooks;
-};
-
-type GrammySignal = Parameters<Api["getMe"]>[0];
-
-function toGrammySignal(signal?: AbortSignal): GrammySignal {
-  return signal as unknown as GrammySignal;
-}
-
-/**
- * grammY's Node build creates its own `AbortController` per call, and native fetch rejects that foreign
- * `AbortSignal`. Re-express it with a native controller so grammY's timeout and chat cancellation still
- * abort the in-flight request. The listener lives on grammY's per-call signal, so nothing outlives the call.
- */
-export async function telegramFetch(
-  input: Parameters<typeof fetch>[0],
-  init?: Parameters<typeof fetch>[1],
-): Promise<Response> {
-  const signal: unknown = init?.signal;
-  let nativeSignal = init?.signal ?? null;
-  if (signal !== undefined && signal !== null && !(signal instanceof AbortSignal)) {
-    const controller = new AbortController();
-    if ((signal as AbortSignal).aborted) controller.abort();
-    else (signal as AbortSignal).addEventListener("abort", () => controller.abort(), { once: true });
-    nativeSignal = controller.signal;
-  }
-  const response = await globalThis.fetch(input, { ...init, signal: nativeSignal, redirect: "error" });
-  // grammY discards HTTP status before decoding JSON. Preserve safe-read 5xx even when a
-  // proxy returns HTML or JSON without Telegram's error_code; outbound decoding is unchanged.
-  const method = String(input).split("/").at(-1);
-  if ((method === "getMe" || method === "getUpdates") && response.status >= 500 && response.status < 600) {
-    await response.body?.cancel().catch(() => undefined);
-    throw new TelegramApiError(method, response.status, "rejected");
-  }
-  return response;
-}
-
-/** Bot API methods whose request may already have been accepted when 5xx/transport fails. */
-const AMBIGUOUS_SEND_METHODS: ReadonlySet<string> = new Set([
-  "sendMessage",
-  "sendRichMessage",
-  ...Object.values(TELEGRAM_SEND_METHODS),
-]);
-
-function isAmbiguousSendMethod(method: string): boolean {
-  return AMBIGUOUS_SEND_METHODS.has(method);
-}
-
-async function apiCall<T>(
-  api: Api,
-  method: string,
-  signal: AbortSignal | undefined,
-  request: (signal?: AbortSignal) => Promise<T>,
-  options: ApiCallOptions = {},
-): Promise<T | undefined> {
-  let waitedMs = 0;
-  for (let attempt = 0; ; attempt++) {
-    if (signal?.aborted) throw signal.reason;
-    if (options.throttle) {
-      for (;;) {
-        if (options.replaceable && options.throttle.remainingMs() > 0) return undefined;
-        waitedMs += await options.throttle.wait(signal, FLOOD_WAIT_BUDGET_MS - waitedMs);
-        if (options.throttle.remainingMs() === 0) break;
-      }
-    }
-    if (signal?.aborted) throw signal.reason;
-    try {
-      const result = await request(signal);
-      options.retryOutage?.recovered();
-      return result;
-    } catch (error) {
-      if (error instanceof GrammyError) {
-        if (method === "editMessageText" && error.error_code === 400 &&
-            (isNotModifiedDescription(error.description) || error.description === "Bad Request: message to edit not found")) {
-          throw new TelegramApiError(method, error.error_code, "rejected", error.description, { cause: error });
-        }
-        if (error.error_code === 429) {
-          const retryAfter = error.parameters.retry_after;
-          if (retryAfter !== undefined && (!Number.isFinite(retryAfter) || retryAfter <= 0)) {
-            throw new TelegramApiError(method, 429, "rejected", undefined, { cause: error });
-          }
-          const deadline = Date.now() + (retryAfter === undefined ? FLOOD_WAIT_WITHOUT_HINT_MS : retryAfter * 1000);
-          if (!Number.isFinite(deadline)) throw new TelegramApiError(method, 429, "rejected", undefined, { cause: error });
-          journalEvent("telegram.rate_limited", { type: method, "cooldown.ms": Math.max(0, deadline - Date.now()) });
-          options.throttle?.defer(deadline);
-          if (options.replaceable) return undefined;
-          if (attempt < MAX_API_ATTEMPTS - 1) continue;
-          throw new TelegramApiError(method, 429, "rejected", undefined, { cause: error });
-        }
-        if (options.retryOutage !== undefined && error.error_code >= 500) {
-          options.retryOutage.entered(method);
-          await delay(readRetryBackoff(attempt), signal);
-          continue;
-        }
-        throw new TelegramApiError(method, error.error_code,
-          isAmbiguousSendMethod(method) && error.error_code >= 500 ? "unknown" : "rejected", error.description, { cause: error });
-      }
-      if (error instanceof HttpError) {
-        if (isAmbiguousSendMethod(method)) {
-          if (isProvenPreConnectFailure(error.error)) {
-            if (attempt < MAX_API_ATTEMPTS - 1 && !signal?.aborted) {
-              await delay(backoff(attempt), signal);
-              continue;
-            }
-            throw new TelegramApiError(method, 0, "not-sent", undefined, { cause: error });
-          }
-          throw new TelegramApiError(method, 0, "unknown", undefined, { cause: error });
-        }
-        if (signal?.aborted) throw signal.reason;
-        if (options.retryOutage !== undefined && isTransientTransportError(error.error)) {
-          options.retryOutage.entered(method);
-          await delay(readRetryBackoff(attempt), signal);
-          continue;
-        }
-      }
-      if (signal?.aborted) throw signal.reason;
-      if (isAmbiguousSendMethod(method)) throw new TelegramApiError(method, 0, "unknown", undefined, { cause: error });
-      throw new Error(`Telegram ${method} transport failed`, { cause: error });
-    }
-  }
-}
-
-export class TelegramApiError extends Error {
-  readonly method: string;
-  readonly status: number;
-  readonly outcome: "unknown" | "rejected" | "not-sent";
-  readonly description: string | undefined;
-
-  constructor(method: string, status: number, outcome: "unknown" | "rejected" | "not-sent", description?: string, options?: ErrorOptions) {
-    super(`Telegram ${method} failed with status ${status}`, options);
-    this.method = method;
-    this.status = status;
-    this.outcome = outcome;
-    this.description = description;
-  }
-}
-
-function isNotModifiedDescription(description: string | undefined): boolean {
-  const prefix = "Bad Request: message is not modified";
-  return description === prefix || (description !== undefined && description.length <= 512 &&
-    description.startsWith(`${prefix}: `));
-}
-
-function isNotModified(error: unknown): boolean {
-  return error instanceof TelegramApiError && error.method === "editMessageText" && error.status === 400 &&
-    isNotModifiedDescription(error.description);
-}
-
-function isMessageNotFound(error: unknown): boolean {
-  return error instanceof TelegramApiError && error.method === "editMessageText" && error.status === 400 &&
-    error.description === "Bad Request: message to edit not found";
-}
-
-/** A response that provably never produced a message: a sub-5xx refusal or a pre-connect transport failure. */
-function isProvenRefusal(error: unknown): boolean {
-  return (error instanceof GrammyError && error.error_code < 500) ||
-    (error instanceof HttpError && isProvenPreConnectFailure(error.error));
-}
-
-const TRANSIENT_TRANSPORT_CODES: ReadonlySet<string> = new Set([
-  "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "ENETUNREACH", "ENETDOWN", "EHOSTUNREACH",
-  "EAI_AGAIN", "ENOTFOUND", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT",
-  "UND_ERR_SOCKET", "UND_ERR_CLOSED",
-]);
-
-function isProvenPreConnectFailure(error: unknown): boolean {
-  const pending: unknown[] = [error];
-  const visited = new Set<unknown>();
-  while (pending.length > 0) {
-    const current = pending.pop();
-    if (!current || typeof current !== "object" || visited.has(current)) continue;
-    visited.add(current);
-    const candidate = current as { code?: unknown; errno?: unknown; cause?: unknown };
-    const code = candidate.code ?? candidate.errno;
-    if (code === "ENETDOWN" || code === "EHOSTUNREACH") return true;
-    if (candidate.cause !== undefined) pending.push(candidate.cause);
-  }
-  return false;
-}
-
-function backoff(attempt: number): number {
-  return Math.min(10_000, 250 * 2 ** attempt);
-}
-
-/** Capped exponential outage delay with bounded jitter; a successful read starts the next episode at 1s. */
-function readRetryBackoff(attempt: number): number {
-  const exponential = Math.min(READ_RETRY_MAX_MS / 1.2, READ_RETRY_BASE_MS * 2 ** Math.min(attempt, 16));
-  return Math.round(exponential * (1 + Math.random() * 0.2));
-}
-
-/** Network failures, grammY timeouts and safe-read HTTP 5xx are transient; malformed/local failures are not. */
-function isTransientTransportError(error: unknown): boolean {
-  const pending: unknown[] = [error];
-  const visited = new Set<unknown>();
-  while (pending.length > 0) {
-    const current = pending.pop();
-    if (!current || typeof current !== "object" || visited.has(current)) continue;
-    visited.add(current);
-    if (current instanceof TelegramApiError && current.status >= 500 && current.status < 600) return true;
-    const candidate = current as { name?: unknown; code?: unknown; errno?: unknown; message?: unknown;
-      cause?: unknown; error?: unknown; errors?: unknown };
-    if (candidate.name === "TimeoutError" || candidate.name === "AbortError") return true;
-    const code = candidate.code ?? candidate.errno;
-    if (typeof code === "string" && TRANSIENT_TRANSPORT_CODES.has(code)) return true;
-    if (candidate.message === "fetch failed") return true;
-    if (typeof candidate.message === "string" && /^Request to '.+' timed out after .+ seconds$/.test(candidate.message)) {
-      return true;
-    }
-    if (candidate.cause !== undefined) pending.push(candidate.cause);
-    if (candidate.error instanceof Error) pending.push(candidate.error);
-    if (current instanceof AggregateError && Array.isArray(candidate.errors)) pending.push(...candidate.errors);
-  }
-  return false;
-}
-
-class TelegramFloodGate {
-  #retryAt = 0;
-
-  remainingMs(): number {
-    return Math.max(0, this.#retryAt - Date.now());
-  }
-
-  defer(deadline: number): void {
-    this.#retryAt = Math.max(this.#retryAt, deadline);
-  }
-
-  async wait(signal: AbortSignal | undefined, budgetMs: number): Promise<number> {
-    let waited = 0;
-    while (this.remainingMs() > 0) {
-      const remaining = this.remainingMs();
-      if (remaining > budgetMs - waited) throw new Error("Telegram flood wait exceeds delivery budget");
-      await delay(remaining, signal);
-      waited += remaining;
-    }
-    return waited;
-  }
-}
-
-async function delay(ms: number, signal?: AbortSignal): Promise<void> {
-  const deadline = Date.now() + ms;
-  if (!Number.isFinite(ms) || ms < 0 || !Number.isFinite(deadline)) throw new Error("Invalid delay");
-  while (Date.now() < deadline) {
-    if (signal?.aborted) throw signal.reason;
-    const chunk = Math.min(deadline - Date.now(), MAX_TIMER_DELAY_MS);
-    await new Promise<void>((resolve, reject) => {
-      const onAbort = () => {
-        clearTimeout(timer);
-        reject(signal?.reason);
-      };
-      const timer = setTimeout(() => {
-        signal?.removeEventListener("abort", onAbort);
-        resolve();
-      }, chunk);
-      signal?.addEventListener("abort", onAbort, { once: true });
-    });
-  }
 }

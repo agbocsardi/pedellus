@@ -11,6 +11,39 @@ that signal with a native one; cancellation and grammY's timeout still abort the
 in-flight request. The adapter calls typed `getMe` before polling and never
 writes the token or token-bearing URL into an error message.
 
+### Module layout and shared channel core
+
+`telegram.ts` keeps what is Telegram-specific: the durable `TelegramState`
+document and its migrations, private-chat `allowFrom` admission, the
+`update_id` offset, album coalescing, attachments, rich-markdown fallback and
+the chunked write-ahead `sendIntent` fencing. Around it:
+
+- `telegram-transport.ts` — the `TelegramTransport` seam: grammY's `Api` behind
+  the native-fetch bridge (`telegramFetch`), the bounded `apiCall` with the two
+  flood gates (outbound sends; polling and file reads) and the safe-read outage
+  retry, per-chat send ordering and the `TelegramApiError` outcome
+  classification (`rejected`, `not-sent`, `unknown`).
+- `telegram-actions.ts` — the live host of the model-callable `telegram` tool
+  (replies, reactions, file uploads, target listing) with its write-ahead
+  action fencing; `telegram-tool.ts` keeps the tool and the shared
+  single-host registry it attaches to.
+- `telegram-notices.ts` — `/notices` and the `TelegramNoticeDismissals` archive.
+- `telegram-outbound-media.ts`, `telegram-interactions.ts` and
+  `telegram-rich.ts` keep their exported names but delegate the workspace file
+  read, path syntax, refusal wording and rich-text splitting to
+  `src/media/outbound.ts` and `src/channels/markdown.ts`.
+
+The channel-neutral parts come from the shared core, identical across channels:
+host capability detection and the offered command list
+(`contracts.ts`), the mutating-control coordinator, startup control recovery,
+restart requests and confirmations, `/status`, `/model`, `/digest status` and
+OAuth-callback interception (`controls.ts`), submission order, owner busy-mode,
+shared-answer ownership, the live-generation predicate and the preview watcher
+(`turn-runtime.ts`), and the scheduled outbox recovery, scan, origin hold and
+fault reports (`outbox-drainer.ts`). `TelegramGateway` is the shared
+`ChannelGateway` plus `telegramActions`; `TelegramRestartHost` is the shared
+`HostRestartController`.
+
 ## Controls
 
 A bounded authenticated control dispatcher runs before any input admission. It
@@ -326,15 +359,18 @@ acknowledgement is committed **held** (`hold: true`) with the command intent, an
 published once:
 
 - the native call returns: "Context reset.", "Idle. Queue cleared.",
-  "Model: <preset>.", a short `/digest` admission, or "Restart requested;
-  checking active work.";
+  "Model set to preset <name>: <provider>/<model> (thinking: <level>) for this
+  chat." (or "…the configured default preset…"), a short `/digest` admission, or
+  "Restart requested; checking active work.";
 - the native call proved that nothing changed (`/new` or `/model` on a busy chat,
-  an unknown or unavailable preset, a legacy direct config): the acknowledgement
+  whether the host reports `busy` or throws `ConversationBusy`, an unknown or
+  unavailable preset, a legacy direct config): the acknowledgement
   is corrected to that fixed refusal; the record becomes `refused`, never
   `applied`, so a replay cannot claim a change that did not happen;
 - or the call has not returned after 30 seconds: a pending notice, e.g. "Still
-  stopping. New messages are held." No completion is claimed. `/model`, `/digest`
-  and `/restart` publish their result later; `/new` and `/abort` do not.
+  stopping. New messages are held." No completion is claimed. Every command's
+  final outcome (applied, refused or interrupted) is published later as one
+  follow-up notice, and a late-applied `/restart` asks the host only then.
 
 A held acknowledgement is never delivered early, and it is not tied to the input
 gate: notices are never model submissions, so a released notice can still reach
@@ -377,9 +413,19 @@ retried once per poll response. A control-forced input reuses its single model
 turn when it is later delivered, so it is answered exactly once. After a bounded
 number of failed attempts the command is reported as unconfirmed and the gate is
 released rather than leaving the chat unusable; a reopen reports any command
-still admitted the same honest way. A newer command in that chat is refused
-while an earlier one is still being applied or is deferred, so two commands
-cannot reorder; there is no queued-command guarantee.
+still admitted the same honest way. A deferred command that later applies or is
+refused publishes that final outcome as a follow-up to its still-pending
+notice, and a deferred `/restart` then asks the host exactly once. A newer
+command in that chat is refused while an earlier one is still being applied or
+is deferred, so two commands cannot reorder; there is no queued-command
+guarantee.
+
+Handling a control update commits nothing before its final admission (record,
+held acknowledgement and offset in one commit). If that commit fails, the chat's
+gate is released, nothing of the command is applied, and the adapter stops the
+current batch and polls again from the durable offset, so Telegram serves the
+same update once more (after a short backoff). Five consecutive failures of the
+same update are fatal, as any other storage failure is.
 
 Per-chat model submissions keep admission order, and each chat's place is
 reserved when a delivery is dispatched, before any asynchronous
