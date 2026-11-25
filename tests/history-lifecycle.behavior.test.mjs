@@ -723,3 +723,399 @@ test("an episode longer than the old 12-chunk cap is covered by one bounded requ
     if (gateway) await gateway.close(context);
   }
 });
+
+/** The derived history index file of one disposable data directory. */
+async function historyIndexFile(dataDir) {
+  const { readdir } = await import("node:fs/promises");
+  const names = await readdir(dataDir, { recursive: true });
+  const name = names.find((candidate) => candidate.endsWith("-history-index.sqlite"));
+  assert.ok(name, `no derived history index under ${dataDir}: ${names.join(",")}`);
+  return join(dataDir, name);
+}
+
+/** Drop one summary row from FTS5 only: logical drift that queries do not report as an error. */
+async function driftSummaryFts(indexFile) {
+  const { DatabaseSync } = await import("node:sqlite");
+  const db = new DatabaseSync(indexFile);
+  try {
+    const rows = db.prepare("SELECT summary_id, title, body FROM history_summaries").all();
+    assert.ok(rows.length > 0, "a summary row is indexed");
+    for (const row of rows) {
+      db.prepare("INSERT INTO history_summary_fts (history_summary_fts, rowid, title, body) VALUES ('delete', ?, ?, ?)")
+        .run(row.summary_id, row.title, row.body);
+    }
+  } finally {
+    db.close();
+  }
+}
+
+test("summary search verifies FTS5 integrity once per open and repairs a failing query in place", { timeout: 60_000 }, async (t) => {
+  const root = await mkdtemp(resolve(tmpdir(), "nanobot-summary-integrity-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = resolve(root, "workspace");
+  const dataDir = resolve(root, "state");
+  await writeWorkspace(workspace);
+  const config = lifecycleConfig(workspace, dataDir);
+  const built = buildProviders();
+  const open = () => openGateway(config, context, { models: built.models, ...workspaceContextGatewayOptions(config) });
+  let gateway = await open();
+  try {
+    const conversation = await gateway.conversationFor(SESSION, context);
+    built.state.script = [fauxAssistantMessage("Recorded the fact.")];
+    built.generation.setResponses([built.dispatcher]);
+    const submission = await conversation.submit({ type: "input", content: `Remember ${FACT}.`, requestId: "integrity-1" }, context);
+    assert.equal((await submission.wait(context)).status, "done");
+    await conversation.waitForIdle(context);
+
+    const entered = built.state.summaryGate.wait();
+    await conversation.reset(undefined, context);
+    await within(gateway.reconcileHistoryEpisodes(SESSION, context).then(() => entered), 10_000, "summary request");
+    const queue = await gateway.historySummaryQueue(SESSION, context);
+    const settled = gateway.harness.waitForTask(queue.currentTaskId, context);
+    built.state.summaryGate.release();
+    assert.equal((await within(settled, 10_000, "summary task")).state.outcome.status, "completed");
+
+    const search = () => gateway.historySummarySearch({ text: FACT }, context);
+    const first = await search();
+    assert.equal(first.hits.length, 1, JSON.stringify(first.coverage));
+    assert.equal(first.coverage.indexReady, true);
+    const indexFile = await historyIndexFile(dataDir);
+
+    // A normal page trusts this open's verification: silent FTS drift is not re-checked per query.
+    await driftSummaryFts(indexFile);
+    const drifted = await search();
+    assert.equal(drifted.hits.length, 0, "a normal summary page does not run the FTS5 integrity check");
+    assert.equal(drifted.coverage.indexReady, true);
+
+    // A query that fails on a broken summary layer re-verifies, repairs and retries in place.
+    const { DatabaseSync } = await import("node:sqlite");
+    const raw = new DatabaseSync(indexFile);
+    try { raw.exec("DROP TABLE history_summary_fts"); } finally { raw.close(); }
+    const repaired = await search();
+    assert.equal(repaired.hits.length, 1, JSON.stringify(repaired.coverage));
+    assert.equal(repaired.coverage.indexReady, true);
+    assert.equal(repaired.coverage.available, true);
+
+    // Drift after that repair is found by the next open's one-time integrity check.
+    await driftSummaryFts(indexFile);
+    assert.equal((await search()).hits.length, 0);
+    await gateway.close(context);
+    gateway = undefined;
+    gateway = await open();
+    const reopened = await search();
+    assert.equal(reopened.hits.length, 1, JSON.stringify(reopened.coverage));
+    assert.equal(reopened.coverage.indexReady, true);
+  } finally {
+    built.state.summaryGate.release();
+    if (gateway) await gateway.close(context);
+  }
+});
+
+test("memory_search reads message hits with one bounded entry read per conversation slice", { timeout: 30_000 }, async () => {
+  const { createHistorySearcher } = await import(pathToFileURL(`${pkg}/dist/memory/history-search.js`).href);
+  const { UserEntry } = await import(pathToFileURL(`${pkg}/node_modules/@earendil-works/pi-durable/dist/index.js`).href);
+  const entry = (id, text) => ({ id, kind: UserEntry.kind, model: [{ role: "user", content: text, timestamp: 1_700_000_000_000 + id }] });
+  const stored = new Map([
+    ["cli:a", [entry(3, "needle three"), entry(5, "needle five"), entry(6, "filler"), entry(7, "needle seven"), entry(40, "needle forty")]],
+    ["cli:b", [entry(1000, "needle thousand")]],
+  ]);
+  const hit = (sessionKey, entryId, conversationId) => ({
+    conversationId, sessionKey, entryId, entryKind: UserEntry.kind, role: "user", episodeStartEntryId: 1,
+    excerpt: `[needle] ${entryId}`, excerptTruncated: false, bodyLength: 12, partIndex: 0, chunkIndex: 0, charStart: 0,
+    bodyTruncated: false,
+  });
+  // Relevance order interleaves sessions; entry 9 is missing from the transcript.
+  const hits = [hit("cli:a", 7, 1), hit("cli:b", 1000, 2), hit("cli:a", 3, 1), hit("cli:a", 9, 1), hit("cli:a", 5, 1), hit("cli:a", 40, 1)];
+  const calls = [];
+  const host = {
+    async search() { return { hits, coverage: { complete: true, sessions: 2 } }; },
+    async searchSummaries() { throw new Error("not used"); },
+    async summary() { throw new Error("not used"); },
+    async scope() { throw new Error("not used"); },
+    async entries(session, query, limit, cursor) {
+      calls.push({ session, ...query, limit, cursor });
+      const items = (stored.get(session) ?? [])
+        .filter((item) => (query.minEntryId === undefined || item.id >= query.minEntryId)
+          && (query.maxEntryId === undefined || item.id <= query.maxEntryId))
+        .slice(0, limit);
+      return { items };
+    },
+  };
+  const scope = {
+    storeId: "synthetic-store",
+    workspaceRoot: "/nonexistent",
+    memoryFiles: [],
+    sessions: [
+      { sessionKey: "cli:a", conversationId: 1, channel: "cli" },
+      { sessionKey: "cli:b", conversationId: 2, channel: "cli" },
+    ],
+  };
+  const searcher = createHistorySearcher(host);
+  try {
+    const page = await searcher.search({ target: "messages", query: "needle" }, scope, context);
+    assert.deepEqual(page.hits.map((item) => [item.source.session, item.source.entryId]),
+      [["cli:a", 7], ["cli:b", 1000], ["cli:a", 3], ["cli:a", 5], ["cli:a", 40]],
+      "relevance order and filtering are unchanged");
+    assert.deepEqual(page.hits.map((item) => item.excerpt), ["[needle] 7", "[needle] 1000", "[needle] 3", "[needle] 5", "[needle] 40"]);
+    assert.equal(page.coverage.unreadable, 1, "the missing entry is still one unreadable hit");
+    assert.equal(page.complete, true);
+    assert.deepEqual(calls.map(({ session, minEntryId, maxEntryId, limit }) => [session, minEntryId, maxEntryId, limit]),
+      [["cli:a", 3, 9, 7], ["cli:b", 1000, 1000, 1], ["cli:a", 40, 40, 1]],
+      "dense hits coalesce into one bounded slice while a distant hit stays an exact read");
+  } finally {
+    searcher.close();
+  }
+});
+
+test("memory_search pre-filters excluded sessions, bounds sparse windows, and falls back on failed range reads", { timeout: 30_000 }, async () => {
+  const { createHistorySearcher } = await import(pathToFileURL(`${pkg}/dist/memory/history-search.js`).href);
+  const { UserEntry } = await import(pathToFileURL(`${pkg}/node_modules/@earendil-works/pi-durable/dist/index.js`).href);
+  const entry = (id, text) => ({ id, kind: UserEntry.kind, model: [{ role: "user", content: text, timestamp: 1_700_000_000_000 + id }] });
+  const hit = (sessionKey, entryId, conversationId) => ({
+    conversationId, sessionKey, entryId, entryKind: UserEntry.kind, role: "user", episodeStartEntryId: 1,
+    excerpt: `[needle] ${entryId}`, excerptTruncated: false, bodyLength: 12, partIndex: 0, chunkIndex: 0, charStart: 0,
+    bodyTruncated: false,
+  });
+
+  // Part A: 60 hits in an excluded session plus 15 sparse hits (50 entries apart, dense filler
+  // between every pair) in the requested session must complete in one call without reading the
+  // excluded session or coalescing across wide filler gaps.
+  const sparseTargetIds = Array.from({ length: 15 }, (_, index) => 10 + index * 50);
+  const sparseTargetSet = new Set(sparseTargetIds);
+  const sparseStored = new Map([
+    ["cli:excluded", Array.from({ length: 3000 }, (_, i) => entry(i + 1, "excluded filler"))],
+    ["cli:target", Array.from({ length: 800 }, (_, i) => entry(i + 1, sparseTargetSet.has(i + 1) ? `needle ${i + 1}` : "filler"))],
+  ]);
+  const allSparseHits = [
+    ...Array.from({ length: 60 }, (_, i) => hit("cli:excluded", 10 + i * 40, 1)),
+    ...sparseTargetIds.map((id) => hit("cli:target", id, 2)),
+  ];
+  const sparseCalls = [];
+  const sparseHost = {
+    async search(query) {
+      const offset = query.cursor ?? 0;
+      const slice = allSparseHits.slice(offset, offset + 20);
+      return {
+        hits: slice,
+        ...(offset + 20 < allSparseHits.length ? { next: offset + 20 } : {}),
+        coverage: { complete: true, sessions: 2 },
+      };
+    },
+    async searchSummaries() { throw new Error("not used"); },
+    async summary() { throw new Error("not used"); },
+    async scope() { throw new Error("not used"); },
+    async entries(session, query, limit) {
+      sparseCalls.push({ session, ...query, limit });
+      const items = (sparseStored.get(session) ?? [])
+        .filter((item) => (query.minEntryId === undefined || item.id >= query.minEntryId)
+          && (query.maxEntryId === undefined || item.id <= query.maxEntryId))
+        .slice(0, limit);
+      return { items };
+    },
+  };
+  const scope = {
+    storeId: "synthetic-store",
+    workspaceRoot: "/nonexistent",
+    memoryFiles: [],
+    sessions: [
+      { sessionKey: "cli:excluded", conversationId: 1, channel: "cli" },
+      { sessionKey: "cli:target", conversationId: 2, channel: "cli" },
+    ],
+  };
+  const sparseSearcher = createHistorySearcher(sparseHost);
+  try {
+    const page = await sparseSearcher.search(
+      { target: "messages", query: "needle", filter: { sessions: ["cli:target"] } },
+      scope,
+      context,
+    );
+    assert.deepEqual(page.hits.map((item) => item.source.entryId), sparseTargetIds);
+    assert.equal(page.complete, true, "sparse hits finish in one call without exhausting source budget");
+    assert.equal(sparseCalls.some((call) => call.session === "cli:excluded"), false, "excluded session is never read");
+    assert.equal(sparseCalls.every((call) => call.limit === 1 && call.minEntryId === call.maxEntryId), true, "sparse hits do not span wide filler gaps");
+  } finally {
+    sparseSearcher.close();
+  }
+
+  // Part B: a failed batched range read (e.g. corrupt filler entry 11) falls back to exact-ID reads
+  // so readable hits 10, 12, 16 still succeed and only genuinely unreadable hit 14 is dropped.
+  const fallbackStored = new Map([
+    ["cli:target", [entry(10, "needle 10"), entry(12, "needle 12"), entry(16, "needle 16")]],
+  ]);
+  const fallbackHits = [hit("cli:target", 10, 2), hit("cli:target", 12, 2), hit("cli:target", 14, 2), hit("cli:target", 16, 2)];
+  const fallbackCalls = [];
+  const fallbackHost = {
+    async search() { return { hits: fallbackHits, coverage: { complete: true, sessions: 1 } }; },
+    async searchSummaries() { throw new Error("not used"); },
+    async summary() { throw new Error("not used"); },
+    async scope() { throw new Error("not used"); },
+    async entries(session, query, limit) {
+      fallbackCalls.push({ session, ...query, limit });
+      if (query.minEntryId <= 11 && query.maxEntryId >= 11) throw new Error("corrupt filler entry 11");
+      if (query.minEntryId === 14 && query.maxEntryId === 14) throw new Error("corrupt hit entry 14");
+      const items = (fallbackStored.get(session) ?? [])
+        .filter((item) => (query.minEntryId === undefined || item.id >= query.minEntryId)
+          && (query.maxEntryId === undefined || item.id <= query.maxEntryId))
+        .slice(0, limit);
+      return { items };
+    },
+  };
+  const fallbackSearcher = createHistorySearcher(fallbackHost);
+  try {
+    const page = await fallbackSearcher.search({ target: "messages", query: "needle" }, scope, context);
+    assert.deepEqual(page.hits.map((item) => item.source.entryId), [10, 12, 16]);
+    assert.equal(page.coverage.unreadable, 1, "only genuinely unreadable hit 14 counts as unreadable");
+    assert.deepEqual(
+      fallbackCalls.map(({ minEntryId, maxEntryId, limit }) => [minEntryId, maxEntryId, limit]),
+      [[10, 16, 7], [10, 10, 1], [12, 12, 1], [14, 14, 1], [16, 16, 1]],
+      "failed range read falls back to exact-ID reads for the window",
+    );
+  } finally {
+    fallbackSearcher.close();
+  }
+});
+
+test("summary continuation recovers from schema corruption and retry shares the read budget", { timeout: 30_000 }, async (t) => {
+  const { createHistoryIndex, HISTORY_SUMMARY_LIMITS } = await import(pathToFileURL(`${pkg}/dist/history/index.js`).href);
+  const { UserEntry, ResetEntry } = await import(pathToFileURL(`${pkg}/node_modules/@earendil-works/pi-durable/dist/index.js`).href);
+  const { DatabaseSync } = await import("node:sqlite");
+  const root = await mkdtemp(resolve(tmpdir(), "nanobot-summary-recovery-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const indexPath = resolve(root, "derived-history-index.sqlite");
+
+  // 16 mapped sessions x 5 closed episodes = 80 closed episodes (> 64 read budget per pass).
+  const sessionCount = 16;
+  const episodesPerSession = 5;
+  const sessions = Array.from({ length: sessionCount }, (_, index) => ({
+    sessionKey: `cli:s${index + 1}`,
+    conversationId: index + 1,
+  }));
+  const entriesByConv = new Map();
+  const entryById = new Map();
+  let nextEntryId = 1;
+  for (const session of sessions) {
+    const entries = [];
+    for (let ep = 0; ep < episodesPerSession; ep++) {
+      const userId = nextEntryId++;
+      const resetId = nextEntryId++;
+      const userEntry = {
+        id: userId,
+        conversationId: session.conversationId,
+        kind: UserEntry.kind,
+        model: [{ role: "user", content: `session ${session.conversationId} episode ${ep}`, timestamp: 1_700_000_000_000 + userId }],
+      };
+      const resetEntry = { id: resetId, conversationId: session.conversationId, kind: ResetEntry.kind, model: [] };
+      entries.push(userEntry, resetEntry);
+      entryById.set(userId, userEntry);
+      entryById.set(resetId, resetEntry);
+    }
+    entriesByConv.set(session.conversationId, entries);
+  }
+
+  let readSummaryCalls = 0;
+  let summaryVersion = 1;
+  let summaryTag = "alpha";
+  const index = createHistoryIndex({
+    indexPath,
+    storeId: "summary-recovery-store",
+    sessions: async () => sessions,
+    scan: async (_ctx, read) => read({
+      async entry(entryId) { return entryById.get(entryId); },
+      async scanEntries(query, limit) {
+        let list = (entriesByConv.get(query.conversationId) ?? []).filter(
+          (entry) => (query.minEntryId === undefined || entry.id >= query.minEntryId)
+            && (query.maxEntryId === undefined || entry.id <= query.maxEntryId),
+        );
+        if (query.order === "descending") list = [...list].reverse();
+        const items = list.slice(0, limit);
+        return { items, ...(list.length > items.length ? { next: items[items.length - 1]?.id } : {}) };
+      },
+    }),
+    readSummary: async (_ctx, conversationId, startEntryId) => {
+      readSummaryCalls++;
+      const list = entriesByConv.get(conversationId) ?? [];
+      const startIndex = list.findIndex((entry) => entry.id === startEntryId);
+      if (startIndex < 0) return { state: "missing" };
+      const closingIndex = list.findIndex((entry, idx) => idx > startIndex && entry.kind === ResetEntry.kind);
+      if (closingIndex < 0) return { state: "not-ready" };
+      const end = list[closingIndex - 1];
+      const reset = list[closingIndex];
+      return {
+        state: "ready",
+        snapshot: {
+          startEntryId,
+          endEntryId: end.id,
+          resetEntryId: reset.id,
+          summarizerVersion: summaryVersion,
+          title: `Episode ${conversationId}-${startEntryId}`,
+          summary: `Digest ${summaryTag} for conversation ${conversationId} episode ${startEntryId}.`,
+          summaryTruncated: false,
+          completedAtMs: 1_700_000_000_000 + end.id,
+          sourceEntries: closingIndex - startIndex,
+          sourceMessages: 1,
+          sourceToolResults: 0,
+          sourceTruncatedEntries: 0,
+          coverageComplete: true,
+        },
+      };
+    },
+  });
+
+  try {
+    // Seed the summary index with one bounded pass (64 reads).
+    const initial = await index.searchSummaries({ text: "alpha", limit: 2 }, context);
+    assert.equal(initial.hits.length, 2);
+    assert.equal(readSummaryCalls, HISTORY_SUMMARY_LIMITS.maxSummaryReadsPerPass);
+
+    // 1) Post-sweep FTS failure: repair preserves history_summaries and retries the query without
+    // repeating the already-completed 64-read sweep.
+    readSummaryCalls = 0;
+    {
+      const raw = new DatabaseSync(indexPath);
+      try { raw.exec("DROP TABLE history_summary_fts"); } finally { raw.close(); }
+    }
+    const afterPostSweepRepair = await index.searchSummaries({ text: "alpha", limit: 2 }, context);
+    assert.equal(afterPostSweepRepair.hits.length, 2);
+    assert.equal(afterPostSweepRepair.coverage.indexReady, true);
+    assert.equal(readSummaryCalls, HISTORY_SUMMARY_LIMITS.maxSummaryReadsPerPass, "retry must not repeat the 64-read sweep");
+
+    // 2) Mid-sweep FTS failure: changing summary content forces writeSummary to hit the broken FTS
+    // trigger during the sweep; the retry must share the remaining 64-read budget.
+    readSummaryCalls = 0;
+    summaryVersion = 2;
+    summaryTag = "beta";
+    {
+      const raw = new DatabaseSync(indexPath);
+      try { raw.exec("DROP TABLE history_summary_fts"); } finally { raw.close(); }
+    }
+    const afterMidSweepRepair = await index.searchSummaries({ text: "beta", limit: 2 }, context);
+    assert.equal(afterMidSweepRepair.hits.length, 2);
+    assert.equal(afterMidSweepRepair.coverage.indexReady, true);
+    assert.ok(
+      readSummaryCalls <= HISTORY_SUMMARY_LIMITS.maxSummaryReadsPerPass,
+      `mid-sweep retry must share the 64-read budget (got ${readSummaryCalls})`,
+    );
+
+    // 3) Cursor-proof SQL corruption: corrupting a history_summaries column before a continuation
+    // triggers self-repair inside the recovery boundary, rejects the invalidated cursor with a
+    // contract error, and leaves the index healthy for a fresh search.
+    const page1 = await index.searchSummaries({ text: "beta", limit: 1 }, context);
+    assert.ok(page1.next, "page 1 returns a continuation cursor");
+    {
+      const raw = new DatabaseSync(indexPath);
+      try { raw.exec("ALTER TABLE history_summaries RENAME COLUMN fingerprint TO broken_fingerprint"); }
+      finally { raw.close(); }
+    }
+    await assert.rejects(
+      () => index.searchSummaries({ text: "beta", limit: 1, cursor: page1.next }, context),
+      /cursor no longer matches/i,
+      "schema corruption during cursor proof self-repairs and rejects the invalidated cursor",
+    );
+    const fresh = await index.searchSummaries({ text: "beta", limit: 1 }, context);
+    assert.equal(fresh.hits.length, 1, "fresh search succeeds immediately on the repaired schema");
+    assert.equal(fresh.coverage.indexReady, true);
+    assert.equal(fresh.coverage.available, true);
+  } finally {
+    await index.close();
+  }
+});

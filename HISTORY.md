@@ -11,7 +11,8 @@ Two derived layers sit over Durable's retained transcript:
 
 - `src/history/summary-task.ts` is a durable background summary pass, enabled by default.
 - `src/history/index.ts` is a rebuildable message/tool and episode-summary index bound to the
-  committed store identity.
+  committed store identity. It is the public facade over `index-db.ts` (the private SQLite file,
+  store identity, mapped-session validation), `message-index.ts` and `summary-index.ts`.
 
 The legacy agent-facing `history` tool searched raw messages/tools, browsed episodes and original
 entries, discovered ready derived summaries across mapped chats, and read summaries with
@@ -378,17 +379,20 @@ recomputed from stored rows when the summary schema is created or repaired, so a
 cannot make an empty content table look full. A rebuild starts from empty and can admit the same
 history again.
 
-**Integrity.** Before every summary page, the summary schema object types and columns (content
-table, FTS table, all three triggers, sweep table) are checked, and FTS5 `integrity-check` compares
-the index with the content table. A deleted FTS table/trigger, a wrong-shaped sweep table, or a
+**Integrity.** Once per index open, before its first summary page, the summary schema object types
+and columns (content table, FTS table, all three triggers, sweep table) are checked, and FTS5
+`integrity-check` compares the index with the content table. Later pages trust that check; a summary
+query that fails with a SQL error re-runs it, repairs, and retries the page once. Logical FTS drift
+that raises no SQL error is therefore found at the next open, not on every page. A deleted FTS table/trigger, a wrong-shaped sweep table, or a
 logical FTS mismatch triggers repair: the FTS/triggers are recreated, the index is rebuilt from
 stored content, and the byte counter is recomputed. A wrongly shaped content table is dropped and
-recreated empty so later bounded sweeps can repopulate it. If repair fails, or any summary SQL error
-escapes, the summary index is reported `indexReady: false` and `complete: false` and raw
-message/tool search continues normally. Repair keeps a valid content table, so stored summary rows
+recreated empty so later bounded sweeps can repopulate it. If repair fails, or the retried page fails
+again, the summary index is reported `indexReady: false` and `complete: false` for the rest of that
+open and raw message/tool search continues normally. Repair keeps a valid content table, so stored summary rows
 are preserved when only the FTS layer or sweep state is missing. The integrity check runs on demand,
 not on raw search, and is bounded by the 64 MiB summary-index budget. An offline synthetic
-review measured roughly 0.44–0.49 seconds per summary page at that cap. A view occupying a summary
+review measured roughly 0.44–0.49 seconds for that check at the cap, now paid once per open rather
+than per summary page. A view occupying a summary
 schema name can prevent repair across reopen; the summary index remains unavailable until the
 rebuildable index is deleted and rebuilt.
 
@@ -753,7 +757,8 @@ session key, and the summary text is model output over untrusted source.
 ## Digestion input and cursor
 
 `src/history/digestion.ts` is the one bounded, source-labeled evidence reader for conversation
-digestion (memory curation) and its one durable cursor. `openGateway` injects it into
+digestion (memory curation) and its one durable cursor; the historical completed-turn `read()` and
+legacy cursor mapping live in `digestion-legacy.ts`. `openGateway` injects it into
 `src/history/memory-digest.ts` below; a run still starts only on an explicit manual command or cron
 intent. The module calls no model, writes no memory, creates no task, schedules nothing and adds no
 tool surface. There is no second reader or second cursor.
@@ -852,7 +857,8 @@ boundaries, the two-entry minimum, the verification bound, and the no-evidence b
 ## Memory digestion execution
 
 `src/history/memory-digest.ts` is the reusable, bounded conversation-to-memory run over the input and
-cursor above. It adds no second agent loop, history archive, retry framework or service: one native
+cursor above (its curation scope, run verifier and prompt are `digest-scope.ts`, `digest-verifier.ts`
+and `digest-prompt.ts`). It adds no second agent loop, history archive, retry framework or service: one native
 Durable task (`nanobot.memory-digest`) consumes exactly one bounded O1 batch, in its own task-owned
 conversation, and acknowledges the cursor only after a settled, answered turn.
 
@@ -924,7 +930,9 @@ transcript and once in the run's own transcript, never in a permanent task input
 
 The agent-owned prompt is `<workspace>/DIGEST.md`, seeded with `DEFAULT_MEMORY_DIGEST_PROMPT` only when
 the file does not exist (exclusive create; an existing file is read as-is and never rewritten,
-shortened on disk or versioned). Ordinary configured tools edit it in a normal conversation. Editing it
+shortened on disk or versioned). It is opened without following a final symlink and must be a
+regular file; a symlinked or special `DIGEST.md` fails the run before any provider call. Ordinary
+configured tools edit it in a normal conversation. Editing it
 changes guidance only: the trust framing, scope and authority text is composed by the host, so the
 prompt cannot grant a tool, a path or an effect.
 
@@ -948,7 +956,10 @@ duplicate-free replay are not guaranteed. This partial-write/retry behavior is i
 and staged publication are [not planned](plan/2026-10-31_digest-rollback-design.md).
 No shell, network, MCP, Code Mode, history, channel, worker, cron or
 scheduling tool is installed in a digest target, and a run never writes to the origin chat, a channel
-outbox or a schedule. The same curation hook enforces the run's budgets at the native call: every
+outbox or a schedule. The same curation hook enforces the run's budgets at the native call, from the run's committed
+transcript: it keeps a per-conversation running tally and reads only the entries committed since the
+previous call (a reopen starts again from entry one; the post-turn check and the outcome accounting
+still re-read the whole bounded transcript). Every
 assistant tool-call part counts, including a call that is refused or fails, so `maxToolCalls` is a
 per-run ceiling over individual calls. For `write` and `edit` it also reserves changed files and
 changed text before execution. A create charges its whole content; an edit charges both `oldText` and
