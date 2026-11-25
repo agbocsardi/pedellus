@@ -78,12 +78,11 @@
   --bubble: #0e7a6a;
   --bubble-ink: #ffffff;
   --shadow: 0 1px 2px rgb(30 25 15 / 0.05), 0 8px 28px rgb(30 25 15 / 0.08);
-  /* doodle robot materials */
+  /* default robot avatar materials */
   --steel: #c3cfd4;
   --steel-shine: #eef4f6;
   --steel-shade: #9aafb9;
   --brass: #d3a54e;
-  --hat: #2c2d31;
   --gutter: max(16px, env(safe-area-inset-left), env(safe-area-inset-right));
 }
 @media (prefers-color-scheme: dark) {
@@ -94,7 +93,6 @@
     --steel-shine: #9fb3bb;
     --steel-shade: #43545e;
     --brass: #c7983f;
-    --hat: #454a52;
     --bubble-ink: #f1fbf8;
     --shadow: 0 1px 2px rgb(0 0 0 / 0.3), 0 10px 30px rgb(0 0 0 / 0.35);
   }
@@ -171,6 +169,7 @@ svg {
   margin-inline: auto;
 }
 .avatar {
+  position: relative;
   display: block;
   width: 100%;
   height: 100%;
@@ -179,9 +178,18 @@ svg {
 .avatar svg {
   width: 100%;
   height: 100%;
-  overflow: visible; /* Leave room for claws and wrench tips at the edge of a pose. */
+  overflow: visible;
 }
-.avatar :is(path, circle) {
+.avatar .sprite {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  pointer-events: none;
+  user-select: none;
+}
+.avatar :is(path, circle, rect) {
   fill: none;
   stroke: currentColor;
   stroke-width: 1.95;
@@ -191,83 +199,89 @@ svg {
 .avatar .shell {
   fill: var(--steel);
 }
+.avatar .ear {
+  fill: var(--steel-shade);
+  stroke-width: 1.65;
+}
 .avatar .shade {
   fill: var(--steel-shade);
   stroke: none;
+  opacity: 0.45;
 }
 .avatar .fine {
-  stroke-width: 1.35;
+  stroke-width: 1.5;
 }
 .avatar .shine {
   stroke: var(--steel-shine);
 }
-.avatar .rivets {
+.avatar .visor {
+  fill: #172024;
   stroke-width: 1.6;
 }
-.avatar .tube {
-  stroke-width: 4.7;
-}
-.avatar .tube-inset {
-  stroke: var(--steel);
-  stroke-width: 2.4;
-}
-.avatar .joint {
-  fill: var(--steel-shade);
-  stroke-width: 1.25;
-}
-.avatar .brass {
-  fill: var(--brass);
-}
-.avatar .glass {
+.avatar .lid {
   fill: #172024;
-  stroke-width: 1.25;
-}
-.avatar .shutter {
-  fill: var(--steel-shade);
-  stroke-width: 1;
+  stroke: none;
 }
 .avatar .iris {
   fill: var(--accent);
   stroke: none;
 }
-.avatar .alarm {
-  fill: #fa8474;
-  stroke: none;
+.avatar .eye-line {
+  stroke: var(--accent);
+  stroke-width: 2.1;
+}
+.avatar .eye-shut {
+  stroke: var(--steel-shine);
+  stroke-width: 1.9;
+  opacity: 0.7;
+}
+.avatar .eye-alarm {
+  stroke: #fa8474;
+  stroke-width: 2.2;
 }
 .avatar .glint {
   fill: #f4fbf9;
   stroke: none;
 }
-.avatar .hat {
-  fill: var(--hat);
+.avatar .beacon {
+  fill: var(--accent);
+  stroke-width: 1.6;
 }
-.avatar .band {
-  stroke: var(--brass);
-  stroke-width: 1.55;
+.avatar .beacon-bright {
+  fill: var(--brass);
+  stroke-width: 1.6;
 }
-.avatar .brim {
-  stroke-width: 2.65;
+.avatar .beacon-alert {
+  fill: #fa8474;
+  stroke-width: 1.6;
 }
-.avatar .paper {
-  fill: #f4ebd7;
+.avatar .beacon-off {
+  fill: var(--steel-shade);
+  stroke-width: 1.6;
+}
+.avatar .brass {
+  fill: var(--brass);
+  stroke-width: 1.5;
+}
+.avatar .pip {
+  fill: var(--accent);
+  stroke: none;
+  opacity: 0.85;
+}
+.avatar .sleep {
+  opacity: 0.7;
 }
 @media (prefers-color-scheme: dark) {
   .avatar {
     color: #b9c5c9;
   }
-  .avatar :is(.glass, .shutter) {
+  .avatar .visor {
     stroke: #27343b;
-  }
-  .avatar .paper {
-    fill: #756b59;
   }
 }
 .avatar[data-state="offline"] {
   --steel: color-mix(in oklab, var(--steel-shade), var(--muted) 45%);
   --brass: var(--steel-shade);
-}
-.avatar .wisp {
-  opacity: 0.54;
 }
 .avatar .avatar-accent {
   visibility: hidden;
@@ -284,19 +298,19 @@ svg {
     --hold: hidden;
     --accent-pose: visible;
   }
-  .avatar:is([data-state="idle"], [data-state="queued"]) svg > g {
+  .avatar[data-animated="true"]:is([data-state="idle"], [data-state="queued"]) :is(svg > g, img.sprite) {
     animation: avatar-glance 6.8s step-end infinite;
   }
-  .avatar[data-state="queued"] svg > g {
+  .avatar[data-animated="true"][data-state="queued"] :is(svg > g, img.sprite) {
     animation-duration: 4.4s;
   }
-  .avatar:is([data-state="thinking"], [data-state="tool"]) svg > g {
+  .avatar[data-animated="true"]:is([data-state="thinking"], [data-state="tool"]) :is(svg > g, img.sprite) {
     animation: avatar-effort 2.8s step-end infinite;
   }
-  .avatar[data-state="tool"] svg > g {
+  .avatar[data-animated="true"][data-state="tool"] :is(svg > g, img.sprite) {
     animation-duration: 1.45s;
   }
-  .avatar:is([data-state="error"], [data-state="offline"]) svg > g {
+  .avatar[data-animated="true"]:is([data-state="error"], [data-state="offline"]) :is(svg > g, img.sprite) {
     animation: avatar-settle 260ms step-end;
   }
   @keyframes avatar-glance {

@@ -7,7 +7,7 @@
 // tailnet, no live device, no paid inference. Every wait is event-driven; no test sleeps on a
 // schedule, and every handle is cleaned up by the test that created it.
 import assert from 'node:assert/strict';
-import { readdir, readFile, rm, stat } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
@@ -78,6 +78,10 @@ test('the app config block is opt-in, strict and loopback-only', { timeout: 10_0
   for (const agentName of ['', 'x'.repeat(41), 'bad\nname', 7]) {
     assert.throws(() => parseConfig({ ...WORKSPACE_BASE, app: { port: 43190, staticRoot: '/p', agentName } }, '/tmp'), /app\.agentName/u);
   }
+  assert.equal(parseConfig({ ...WORKSPACE_BASE, app: { port: 43190, staticRoot: '/p', avatarDir: '/srv//avatars/../avatars/' } }, '/tmp').app.avatarDir, '/srv/avatars');
+  for (const avatarDir of ['', '   ', 'avatars', 7]) {
+    assert.throws(() => parseConfig({ ...WORKSPACE_BASE, app: { port: 43190, staticRoot: '/p', avatarDir } }, '/tmp'), /app\.avatarDir/u);
+  }
   // Absent stays absent: nothing about the app channel is configured or loaded.
   assert.equal(parseConfig({ ...WORKSPACE_BASE }, '/tmp/synthetic').app, undefined);
 
@@ -90,9 +94,10 @@ test('the app config block is opt-in, strict and loopback-only', { timeout: 10_0
   assert.throws(() => parseConfig({ ...WORKSPACE_BASE, app: { port: 70000, staticRoot: '/p' } }, '/tmp'), /app\.port/u);
 
   // The adapter itself may take an ephemeral port (offline checks); the config never may.
-  assert.doesNotThrow(() => validateOptions({ port: 0, staticRoot: '/p' }));
+  assert.doesNotThrow(() => validateOptions({ port: 0, staticRoot: '/p', avatarDir: '/avatars' }));
   assert.throws(() => validateOptions({ port: 70000, staticRoot: '/p' }), /port/u);
   assert.throws(() => validateOptions({ port: 43190, staticRoot: 'pwa' }), /absolute/u);
+  assert.throws(() => validateOptions({ port: 43190, staticRoot: '/p', avatarDir: 'avatars' }), /avatarDir/u);
 });
 
 test('static files are served with safe paths, correct types and no-store for sw.js', { timeout: 15_000 }, async () => {
@@ -2860,6 +2865,69 @@ test('/status works on a host whose harness has no snapshot reader', { timeout: 
     assert.match(text, /^Model: fixture\/alpha/mu);
     assert.doesNotMatch(text, /unavailable/u);
     await device.close();
+  } finally {
+    await app.stop();
+    await store.close();
+  }
+});
+
+test('custom avatarDir serves allowlisted sprites, sandboxed SVGs, icon overrides and refuses escapes', { timeout: 20_000 }, async () => {
+  // Without avatarDir: manifest reports custom:false and sprite routes 404.
+  await withChannel('avatar-default', {}, async ({ base }) => {
+    const manifest = await fetch(`${base}/avatar/manifest.json`);
+    assert.equal(manifest.status, 200);
+    assert.equal(manifest.headers.get('cache-control'), 'no-store');
+    assert.deepEqual(await manifest.json(), { custom: false });
+    assert.equal((await fetch(`${base}/avatar/idle.svg`)).status, 404);
+  });
+
+  // With avatarDir: allowlisted sprites, precedence (.svg > .png), icon overrides, containment.
+  const store = await openAppStore('avatar-custom', {});
+  const avatarDir = join(store.directory, 'avatars');
+  const outsideFile = join(store.directory, 'outside.svg');
+  await mkdir(avatarDir, { recursive: true });
+  await writeFile(outsideFile, '<svg xmlns="http://www.w3.org/2000/svg"></svg>');
+  await writeFile(join(avatarDir, 'idle.svg'), '<svg xmlns="http://www.w3.org/2000/svg"><circle r="4"/></svg>');
+  await writeFile(join(avatarDir, 'idle.png'), Buffer.from('89504e470d0a1a0a', 'hex'));
+  await writeFile(join(avatarDir, 'idle-accent.svg'), '<svg xmlns="http://www.w3.org/2000/svg"><circle r="2"/></svg>');
+  await writeFile(join(avatarDir, 'thinking.png'), Buffer.from('89504e470d0a1a0a0000', 'hex'));
+  await writeFile(join(avatarDir, 'secret.txt'), 'not an avatar');
+  await symlink(outsideFile, join(avatarDir, 'error.svg'));
+  const customIcon = Buffer.from('89504e470d0a1a0a11223344', 'hex');
+  await writeFile(join(avatarDir, 'icon-192.png'), customIcon);
+
+  const app = startApp(store, { avatarDir });
+  try {
+    const base = `http://127.0.0.1:${await app.port}`;
+    const manifestRes = await fetch(`${base}/avatar/manifest.json`);
+    assert.equal(manifestRes.status, 200);
+    assert.equal(manifestRes.headers.get('cache-control'), 'no-store');
+    const manifest = await manifestRes.json();
+    assert.equal(manifest.custom, true);
+    assert.match(manifest.states.idle.hold, /^\/avatar\/idle\.svg\?v=/u, '.svg takes precedence over .png');
+    assert.match(manifest.states.idle.accent, /^\/avatar\/idle-accent\.svg\?v=/u);
+    assert.match(manifest.states.thinking.hold, /^\/avatar\/thinking\.png\?v=/u);
+    assert.equal(manifest.states.thinking.accent, undefined);
+    assert.equal(manifest.states.error, undefined, 'escaping symlink is excluded from manifest');
+
+    const svgRes = await fetch(`${base}${manifest.states.idle.hold}`);
+    assert.equal(svgRes.status, 200);
+    assert.equal(svgRes.headers.get('content-type'), 'image/svg+xml');
+    assert.equal(svgRes.headers.get('content-security-policy'), 'sandbox');
+    assert.equal(svgRes.headers.get('x-content-type-options'), 'nosniff');
+    assert.match(svgRes.headers.get('cache-control'), /immutable/u);
+    assert.match(await svgRes.text(), /<circle r="4"\/>/u);
+
+    // Non-allowlisted files and escaping symlinks are refused.
+    assert.equal((await fetch(`${base}/avatar/secret.txt`)).status, 404);
+    assert.equal((await fetch(`${base}/avatar/error.svg`)).status, 404);
+
+    // Custom icon overrides /icons/icon-192.png while non-overridden static icons keep working.
+    const iconRes = await fetch(`${base}/icons/icon-192.png`);
+    assert.equal(iconRes.status, 200);
+    assert.equal(iconRes.headers.get('content-type'), 'image/png');
+    assert.deepEqual(Buffer.from(await iconRes.arrayBuffer()), customIcon);
+    assert.equal((await fetch(`${base}/icons/icon.png`)).status, 200);
   } finally {
     await app.stop();
     await store.close();

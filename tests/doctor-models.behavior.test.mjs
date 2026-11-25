@@ -282,10 +282,14 @@ test("doctor catches missing memory files, symlinked memory dirs, unknown provid
   assert.match(credTypoRes.text, /never echoed/);
 
   // Missing app build index.html fails with build hint.
-  const { path: appCfg } = await setup((config, root) => ({ ...config, app: { port: 8787, staticRoot: join(root, "pwa") } }));
+  const { path: appCfg } = await setup((config, root) => ({
+    ...config,
+    app: { port: 8787, staticRoot: join(root, "pwa"), avatarDir: join(root, "missing-avatars") },
+  }));
   const appRes = await doctor(appCfg, { env: { OPENAI_API_KEY: "x" } });
   assert.equal(appRes.ok, false);
   assert.match(appRes.text, /^\[FAIL\] app: configured app\.staticRoot is missing index\.html$/m);
+  assert.match(appRes.text, /^\[FAIL\] app avatar: configured app\.avatarDir could not be resolved as a directory$/m);
   assert.match(appRes.text, /npm run install:pwa && npm run build:pwa/);
 });
 

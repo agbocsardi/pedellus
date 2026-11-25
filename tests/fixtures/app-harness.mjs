@@ -138,6 +138,9 @@ export function startApp(store, options = {}) {
     ...(options.followUpMode === undefined ? {} : { followUpMode: options.followUpMode }),
     autoArchiveDays: options.autoArchiveDays ?? store.config.app.autoArchiveDays,
     agentName: options.agentName ?? store.config.app.agentName,
+    ...((options.avatarDir ?? store.config.app.avatarDir) === undefined
+      ? {}
+      : { avatarDir: options.avatarDir ?? store.config.app.avatarDir }),
     ...(options.scanIntervalMs === undefined ? {} : { scanIntervalMs: options.scanIntervalMs }),
     ...(options.askWaitMs === undefined ? {} : { askWaitMs: options.askWaitMs }),
     ...(options.restart === undefined ? {} : { restart: options.restart }),

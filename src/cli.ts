@@ -685,6 +685,7 @@ async function runGateway(config: LoadedConfig): Promise<void> {
         staticRoot: config.app.staticRoot,
         autoArchiveDays: config.app.autoArchiveDays ?? 14,
         agentName: config.app.agentName ?? "Pedellus",
+        ...(config.app.avatarDir === undefined ? {} : { avatarDir: config.app.avatarDir }),
         ...(push === undefined ? {} : { push }),
         followUpMode: config.followUpMode ?? "followUp",
         ...(config.media === undefined

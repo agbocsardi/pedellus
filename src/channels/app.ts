@@ -321,6 +321,8 @@ export type AppOptions = {
   readonly autoArchiveDays?: number;
   /** Agent display name sent in every hello reply; 1–40 printable characters. */
   readonly agentName?: string;
+  /** Optional absolute directory holding custom avatar sprites and app icons. */
+  readonly avatarDir?: string;
   /** Resolved Web Push configuration; absent leaves every push op `unsupported` and sends nothing. */
   readonly push?: AppPushOptions;
   /** Configured owner busy-mode, written onto each admitted input. */
@@ -723,6 +725,10 @@ export function validateOptions(options: AppOptions): void {
   }
   if (options.agentName !== undefined && !validAppAgentName(options.agentName)) {
     throw new Error("App agentName must be 1 to 40 printable characters");
+  }
+  if (options.avatarDir !== undefined &&
+      (typeof options.avatarDir !== "string" || options.avatarDir.trim() === "" || !options.avatarDir.startsWith("/"))) {
+    throw new Error("App avatarDir must be an absolute path");
   }
   if (options.push !== undefined &&
       (!validVapidSubject(options.push.subject) || !validVapidPublicKey(options.push.publicKey) ||
@@ -2509,6 +2515,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   const listener = await startAppListener({
     port: options.port,
     staticRoot: options.staticRoot,
+    ...(options.avatarDir === undefined ? {} : { avatarDir: options.avatarDir }),
     host: {
       pairRedeem: (code, label) => devices.pairRedeem(code, label),
       authenticate: (token) => devices.authenticate(token),

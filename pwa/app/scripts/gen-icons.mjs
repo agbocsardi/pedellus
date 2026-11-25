@@ -1,12 +1,11 @@
 #!/usr/bin/env node
-// NOTE: the shipped icons in public/icons are now the robot avatar (src/Avatar.tsx, idle pose) rendered
-// on the dark background; running this script would replace them with the old speech-bubble mark.
-// Generates the app icons as PNGs with zero dependencies: a small PNG writer
-// (zlib is in the stdlib) plus a supersampled rasterizer for the "speech
-// bubble" mark. Deterministic, re-run any time with `npm run icons`.
+// Generates the default app icons as PNGs with zero dependencies: a small PNG
+// writer (zlib is in the stdlib) plus a supersampled rasterizer for the
+// default nondescript helper robot mark (matching src/Avatar.tsx).
+// Deterministic, re-run any time with `npm run icons`.
 //
-//   public/icons/icon-192.png          manifest, any
-//   public/icons/icon-512.png         manifest, any
+//   public/icons/icon-192.png              manifest, any
+//   public/icons/icon-512.png              manifest, any
 //   public/icons/apple-touch-icon-180.png  home-screen (opaque)
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -15,8 +14,13 @@ import { deflateSync } from "node:zlib";
 
 const outDir = resolve(dirname(fileURLToPath(import.meta.url)), "../public/icons");
 
-const BG = [14, 122, 106]; // calm teal, same as theme_color
-const GLYPH = [255, 255, 255];
+const BG = [23, 25, 23];          // dark app canvas (#171917)
+const STROKE = [185, 197, 201];   // #b9c5c9
+const SHELL = [91, 108, 116];     // #5b6c74
+const SHADE = [67, 84, 94];       // #43545e
+const VISOR = [23, 32, 36];       // #172024
+const ACCENT = [79, 191, 169];    // #4fbfa9
+const GLINT = [244, 251, 249];    // #f4fbf9
 
 // -- minimal PNG writer ----------------------------------------------------
 
@@ -69,47 +73,60 @@ function png(width, height, rgba) {
   ]);
 }
 
-// -- shapes (unit square coordinates) --------------------------------------
+// -- shapes (64x64 avatar coordinate space mapped into [0, 1]) -------------
 
-function inRoundRect(u, v, cx, cy, hw, hh, r) {
-  const dx = Math.abs(u - cx) - (hw - r);
-  const dy = Math.abs(v - cy) - (hh - r);
+function inRoundRect(x, y, rx, ry, w, h, r) {
+  const cx = rx + w / 2;
+  const cy = ry + h / 2;
+  const hw = w / 2;
+  const hh = h / 2;
+  const dx = Math.abs(x - cx) - (hw - r);
+  const dy = Math.abs(y - cy) - (hh - r);
   if (dx > r || dy > r) return false;
   if (dx <= 0 || dy <= 0) return true;
   return dx * dx + dy * dy <= r * r;
 }
 
-function inTriangle(u, v, [ax, ay], [bx, by], [cx, cy]) {
-  const d1 = (u - bx) * (ay - by) - (ax - bx) * (v - by);
-  const d2 = (u - cx) * (by - cy) - (bx - cx) * (v - cy);
-  const d3 = (u - ax) * (cy - ay) - (cx - ax) * (v - ay);
-  const neg = d1 < 0 || d2 < 0 || d3 < 0;
-  const pos = d1 > 0 || d2 > 0 || d3 > 0;
-  return !(neg && pos);
-}
-
-function inCircle(u, v, cx, cy, r) {
-  const dx = u - cx;
-  const dy = v - cy;
+function inCircle(x, y, cx, cy, r) {
+  const dx = x - cx;
+  const dy = y - cy;
   return dx * dx + dy * dy <= r * r;
 }
 
-const TAIL = [
-  [0.33, 0.56],
-  [0.41, 0.73],
-  [0.49, 0.555],
-];
-
 function sample(u, v, opaque) {
-  const inSquare = opaque || inRoundRect(u, v, 0.5, 0.5, 0.47, 0.47, 0.18);
-  if (!inSquare) return null;
-  const inBubble =
-    inRoundRect(u, v, 0.5, 0.43, 0.23, 0.16, 0.08) || inTriangle(u, v, ...TAIL);
-  if (!inBubble) return BG;
-  for (const x of [0.4, 0.5, 0.6]) {
-    if (inCircle(u, v, x, 0.43, 0.034)) return BG;
+  if (!opaque && !inRoundRect(u, v, 0.03, 0.03, 0.94, 0.94, 0.2)) return null;
+
+  // Map [0, 1] into a padded 64x64 viewBox (centered slightly lower for optical balance).
+  const x = u * 64;
+  const y = v * 64 - 2.5;
+
+  // Glints inside eyes
+  if (inCircle(x, y, 22.8, 32.7, 1.1) || inCircle(x, y, 38.8, 32.7, 1.1)) return GLINT;
+  // Eyes
+  if (inCircle(x, y, 24, 34, 3.3) || inCircle(x, y, 40, 34, 3.3)) return ACCENT;
+  // Visor interior + border
+  if (inRoundRect(x, y, 17.5, 26.5, 29, 15, 6.5)) return VISOR;
+  if (inRoundRect(x, y, 16, 25, 32, 18, 7.6)) return STROKE;
+
+  // Chin grille line
+  if (inRoundRect(x, y, 25.5, 44.1, 13, 1.8, 0.9)) return STROKE;
+
+  // Head shell (inner fill + subtle bottom bevel shade + outer stroke)
+  if (inRoundRect(x, y, 14.5, 20.5, 35, 27, 8.8)) {
+    return y > 42.5 ? SHADE : SHELL;
   }
-  return GLYPH;
+  if (inRoundRect(x, y, 12.2, 18.2, 39.6, 31.6, 10.6)) return STROKE;
+
+  // Side ear caps
+  if (inRoundRect(x, y, 9.2, 30, 3.6, 8, 1.4) || inRoundRect(x, y, 51.2, 30, 3.6, 8, 1.4)) return SHADE;
+  if (inRoundRect(x, y, 7.6, 28.4, 6.2, 11.2, 2.4) || inRoundRect(x, y, 50.2, 28.4, 6.2, 11.2, 2.4)) return STROKE;
+
+  // Antenna beacon + stalk
+  if (inCircle(x, y, 32, 10, 2.6)) return ACCENT;
+  if (inCircle(x, y, 32, 10, 4.3)) return STROKE;
+  if (inRoundRect(x, y, 30.8, 13.5, 2.4, 6, 1)) return STROKE;
+
+  return BG;
 }
 
 function render(size, opaque) {

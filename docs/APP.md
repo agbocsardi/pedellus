@@ -44,6 +44,7 @@ listener is loaded.
 | `staticRoot` | Required absolute directory holding the built PWA. Files are served with safe path resolution (no traversal, no directory listing, encoded separators are not structure), correct MIME types and `index.html` for the root; `sw.js` is always served `no-store`. |
 | `autoArchiveDays` | Optional integer ≥1, default 14. Automatically archive inactive side threads, but never while they have running or queued work. |
 | `agentName` | Optional agent display name, 1–40 printable characters, default `Pedellus`. Sent as `agent` in every `hello` reply; display only, no authority. |
+| `avatarDir` | Optional absolute directory holding custom avatar sprites and app icons. Absent uses the built-in default robot avatar and icons. |
 | `push` | Optional Web Push block: `{subject, publicKey, privateKeyEnv}`. Absent (or a private key variable that is unset at start) leaves every `push.*` request `unsupported` and sends nothing. `subject` is a `mailto:` or `https:` contact, `publicKey` is the base64url uncompressed P-256 VAPID public key, and `privateKeyEnv` names the environment variable holding the private key — the key itself is never in config. |
 
 Uploads and attachments are the existing top-level `media` opt-in — the same block Telegram uses —
@@ -53,6 +54,19 @@ not a new `app` key: with it configured, `hello.uploads` is `true` and originals
 The block is strict: an unrecognized key is refused at startup instead of being ignored, like the
 Discord block. The listener ignores Tailscale identity headers by construction: any local process
 can reach the loopback port and forge them, so the device token is the only authority.
+
+### Custom avatar sprites (`app.avatarDir`)
+
+When `app.avatarDir` is configured, the listener serves allowlisted sprites from that directory at
+`/avatar/manifest.json` and `/avatar/<name>` (regular files up to 2 MiB, contained inside the
+resolved directory, with `Content-Security-Policy: sandbox` and `X-Content-Type-Options: nosniff`):
+
+- **Status sprites**: `<state>.(svg|png|webp)` for any subset of `idle`, `queued`, `thinking`,
+  `tool`, `error`, and `offline`, plus an optional `<state>-accent.(svg|png|webp)` second frame for
+  the two-frame step animation. Extension precedence is `.svg`, `.png`, `.webp`. Missing states
+  fall back to `idle` (if provided) or the built-in default robot.
+- **App icons (optional)**: `icon-192.png`, `icon-512.png`, and `apple-touch-icon-180.png` in
+  `avatarDir` override `/icons/<name>` without modifying the built PWA directory.
 
 ## Setup
 

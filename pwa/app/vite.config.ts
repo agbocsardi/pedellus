@@ -7,6 +7,7 @@ import { VitePWA } from "vite-plugin-pwa";
 // the same origin as /v1, so all requests here are same-origin and relative.
 const proxy = {
   "/v1": { target: `http://127.0.0.1:${process.env.MOCK_PORT ?? 8791}`, ws: true },
+  "/avatar": { target: `http://127.0.0.1:${process.env.MOCK_PORT ?? 8791}` },
 };
 
 export default defineConfig({
@@ -18,6 +19,11 @@ export default defineConfig({
       srcDir: "src",
       filename: "sw.ts",
       registerType: "autoUpdate",
+      includeManifestIcons: false,
+      injectManifest: {
+        // Keep icons un-precached so gateway-configured `app.avatarDir` icon overrides take effect.
+        globIgnores: ["icons/**"],
+      },
       manifest: {
         name: "Pedellus",
         short_name: "Pedellus",

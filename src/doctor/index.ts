@@ -217,7 +217,7 @@ const TRUSTED_CONFIG_FIELDS = new Set([
   "discord", "discord.tokenEnv", "discord.allowFrom", "discord.dmAllowFrom", "discord.allowChannels",
   "discord.groupPolicy", "discord.streaming", "discord.receipts", "discord.receipts.read",
   "discord.receipts.working", "discord.receipts.delayMs",
-  "app", "app.port", "app.staticRoot", "app.autoArchiveDays", "app.agentName",
+  "app", "app.port", "app.staticRoot", "app.autoArchiveDays", "app.agentName", "app.avatarDir",
   "app.push", "app.push.subject", "app.push.publicKey", "app.push.privateKeyEnv",
   "media", "media.directory", "media.transcription", "media.transcription.enabled", "media.transcription.language",
   "media.transcription.maxDurationSeconds", "media.transcription.timeoutMs", "media.transcription.backend",
@@ -662,6 +662,14 @@ async function checkAppIndex(staticRoot: string): Promise<boolean> {
   }
 }
 
+async function checkDirectory(dirPath: string): Promise<boolean> {
+  try {
+    return (await stat(await realpath(dirPath))).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 async function checkChannels(report: Report, config: PortConfig, env: NodeJS.ProcessEnv): Promise<void> {
   const secretsFile = config.configFile === undefined
     ? false
@@ -692,6 +700,13 @@ async function checkChannels(report: Report, config: PortConfig, env: NodeJS.Pro
     } else {
       report.check("fail", "app", "configured app.staticRoot is missing index.html");
       report.note("Build the app with `npm run install:pwa && npm run build:pwa`.");
+    }
+    if (config.app.avatarDir !== undefined) {
+      if (await checkDirectory(config.app.avatarDir)) {
+        report.check("ok", "app avatar", "custom avatar directory is readable");
+      } else {
+        report.check("fail", "app avatar", "configured app.avatarDir could not be resolved as a directory");
+      }
     }
     if (config.app.push !== undefined) envCheck("app push", config.app.push.privateKeyEnv, "warn", "Web Push stays off");
   }

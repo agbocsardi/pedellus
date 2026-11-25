@@ -57,6 +57,12 @@ const UPLOAD_ERRORS: Readonly<Record<Exclude<AppUploadOutcome["status"], "create
   "too-large": [413, JSON.stringify({ error: "too_large" })],
   internal: [500, JSON.stringify({ error: "internal" })],
 });
+/** States the PWA avatar supports, and the allowlisted sprite / icon names for `app.avatarDir`. */
+const AVATAR_STATES = ["idle", "queued", "thinking", "tool", "error", "offline"] as const;
+const AVATAR_EXTENSIONS = [".svg", ".png", ".webp"] as const;
+const AVATAR_SPRITE_PATTERN = /^(idle|queued|thinking|tool|error|offline)(-accent)?\.(svg|png|webp)$/u;
+const AVATAR_ICON_NAMES = new Set(["apple-touch-icon-180.png", "icon-192.png", "icon-512.png"]);
+const AVATAR_MAX_BYTES = 2 * 1024 * 1024;
 
 /** One live authenticated device stream, handed to the adapter after the upgrade completed. */
 export interface AppDeviceSession {
@@ -171,6 +177,7 @@ function deviceCookie(header: string | undefined): string | undefined {
 export async function startAppListener(options: {
   readonly port: number;
   readonly staticRoot: string;
+  readonly avatarDir?: string;
   readonly host: AppListenerHost;
   /** Fatal listener errors after serving started; without a handler the process would crash. */
   readonly onError?: (error: unknown) => void;
@@ -181,6 +188,18 @@ export async function startAppListener(options: {
     staticRootReal = await realpath(staticRoot);
   } catch (cause) {
     throw new Error("app.staticRoot could not be resolved on this host", { cause });
+  }
+  let avatarDirReal: string | undefined;
+  if (options.avatarDir !== undefined) {
+    try {
+      const resolvedDir = await realpath(resolve(options.avatarDir));
+      if (!(await stat(resolvedDir)).isDirectory()) {
+        throw new Error("not a directory");
+      }
+      avatarDirReal = resolvedDir;
+    } catch (cause) {
+      throw new Error("app.avatarDir could not be resolved on this host", { cause });
+    }
   }
 
   const sockets = new WebSocketServer({ noServer: true, maxPayload: APP_LIMITS.frameBytes * 8 });
@@ -287,6 +306,20 @@ export async function startAppListener(options: {
       response.writeHead(400, { "content-type": "application/json" });
       response.end(JSON.stringify({ error: "bad_request" }));
       return;
+    }
+    if (path === "/avatar/manifest.json") {
+      await avatarManifestEndpoint(request, response);
+      return;
+    }
+    if (path.startsWith("/avatar/")) {
+      await avatarSpriteEndpoint(request, response, path.slice("/avatar/".length), query);
+      return;
+    }
+    if (avatarDirReal !== undefined && path.startsWith("/icons/")) {
+      const iconName = path.slice("/icons/".length);
+      if (AVATAR_ICON_NAMES.has(iconName) && await tryServeAvatarFile(request, response, iconName, false)) {
+        return;
+      }
     }
     await serveStatic(request, response);
   }
@@ -560,6 +593,120 @@ export async function startAppListener(options: {
     const encoded = encodeURIComponent(name).replace(/['()*]/gu,
       (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
     return `attachment; filename*=UTF-8''${encoded}`;
+  }
+
+  /** Resolve one allowlisted filename inside `avatarDirReal`, refusing symlinks outside it. */
+  async function resolveAvatarFile(
+    name: string,
+  ): Promise<{ readonly real: string; readonly size: number; readonly mtimeMs: number } | undefined> {
+    if (avatarDirReal === undefined) return undefined;
+    try {
+      const real = await realpath(join(avatarDirReal, name));
+      if (!real.startsWith(`${avatarDirReal}${sep}`)) return undefined;
+      const info = await stat(real);
+      if (!info.isFile() || info.size > AVATAR_MAX_BYTES) return undefined;
+      return { real, size: info.size, mtimeMs: info.mtimeMs };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Report which custom avatar state sprites exist in `app.avatarDir`, or `{ custom: false }`. */
+  async function avatarManifestEndpoint(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    const states: Record<string, { hold: string; accent?: string }> = {};
+    if (avatarDirReal !== undefined) {
+      for (const state of AVATAR_STATES) {
+        let holdUrl: string | undefined;
+        for (const ext of AVATAR_EXTENSIONS) {
+          const name = `${state}${ext}`;
+          const found = await resolveAvatarFile(name);
+          if (found !== undefined) {
+            holdUrl = `/avatar/${name}?v=${Math.trunc(found.mtimeMs)}-${found.size}`;
+            break;
+          }
+        }
+        if (holdUrl === undefined) continue;
+        let accentUrl: string | undefined;
+        for (const ext of AVATAR_EXTENSIONS) {
+          const name = `${state}-accent${ext}`;
+          const found = await resolveAvatarFile(name);
+          if (found !== undefined) {
+            accentUrl = `/avatar/${name}?v=${Math.trunc(found.mtimeMs)}-${found.size}`;
+            break;
+          }
+        }
+        states[state] = accentUrl === undefined ? { hold: holdUrl } : { hold: holdUrl, accent: accentUrl };
+      }
+    }
+    const payload = Object.keys(states).length > 0
+      ? JSON.stringify({ custom: true, states })
+      : JSON.stringify({ custom: false });
+    response.writeHead(200, {
+      "content-type": "application/json; charset=utf-8",
+      "content-length": Buffer.byteLength(payload),
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+    });
+    response.end(request.method === "HEAD" ? undefined : payload);
+  }
+
+  /** Serve one allowlisted custom sprite or icon from `app.avatarDir`. */
+  async function tryServeAvatarFile(
+    request: IncomingMessage,
+    response: ServerResponse,
+    name: string,
+    immutable: boolean,
+  ): Promise<boolean> {
+    const found = await resolveAvatarFile(name);
+    if (found === undefined) return false;
+    const handle = await open(found.real, "r");
+    try {
+      const headers: Record<string, string | number> = {
+        "content-type": staticMimeType(name),
+        "content-length": found.size,
+        "x-content-type-options": "nosniff",
+        "content-security-policy": "sandbox",
+        "cache-control": immutable ? "public, max-age=31536000, immutable" : "no-cache",
+      };
+      response.writeHead(200, headers);
+      if (request.method === "HEAD") {
+        response.end();
+        return true;
+      }
+      for await (const chunk of handle.createReadStream()) {
+        if (!response.write(chunk)) {
+          await new Promise<void>((resolveWrite) => response.once("drain", () => resolveWrite()));
+        }
+      }
+      response.end();
+      return true;
+    } finally {
+      await handle.close();
+    }
+  }
+
+  async function avatarSpriteEndpoint(
+    request: IncomingMessage,
+    response: ServerResponse,
+    rawName: string,
+    query: string,
+  ): Promise<void> {
+    let name: string | undefined;
+    try {
+      name = decodeURIComponent(rawName);
+    } catch {
+      name = undefined;
+    }
+    if (name === undefined || rawName.includes("/") || !AVATAR_SPRITE_PATTERN.test(name)) {
+      response.writeHead(404, { "content-type": "application/json" });
+      response.end(NOT_FOUND_BODY);
+      return;
+    }
+    const versioned = new URLSearchParams(query).has("v");
+    if (!(await tryServeAvatarFile(request, response, name, versioned))) {
+      response.writeHead(404, { "content-type": "application/json" });
+      response.end(NOT_FOUND_BODY);
+    }
   }
 
   async function serveStatic(request: IncomingMessage, response: ServerResponse): Promise<void> {
