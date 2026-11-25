@@ -79,14 +79,25 @@ export interface DiscordClientFactoryRequest {
 
 export type DiscordClientFactory = (request: DiscordClientFactoryRequest) => DiscordClientLike;
 
-/** The production factory: a discord.js client with non-pinging defaults and the DM channel partial. */
-const createDiscordJsClient: DiscordClientFactory = ({ module, intents, partials, restTimeoutMs }) =>
-  new module.Client({
-    intents,
-    partials: partials as never[],
-    allowedMentions: { parse: [], repliedUser: false },
-    ...(restTimeoutMs === undefined ? {} : { rest: { timeout: restTimeoutMs } }),
-  }) as unknown as DiscordClientLike;
+/**
+ * The production client options: non-pinging defaults, the DM channel partial, and no REST retries.
+ * The library would otherwise silently repeat a POST after a 5xx or a dropped connection, behind
+ * the adapter's write-ahead fence, duplicating a message Discord already created. With `retries: 0`
+ * an ambiguous failure reaches the adapter once and is quarantined; only a 429, which Discord did
+ * not process, is still waited out and resent by the library.
+ */
+export function discordJsClientOptions(request: Omit<DiscordClientFactoryRequest, "module">) {
+  return {
+    intents: request.intents,
+    partials: request.partials as never[],
+    allowedMentions: { parse: [] as never[], repliedUser: false },
+    rest: { retries: 0, ...(request.restTimeoutMs === undefined ? {} : { timeout: request.restTimeoutMs }) },
+  };
+}
+
+/** The production factory: a discord.js client built from {@link discordJsClientOptions}. */
+const createDiscordJsClient: DiscordClientFactory = ({ module, ...request }) =>
+  new module.Client(discordJsClientOptions(request)) as unknown as DiscordClientLike;
 
 type DiscordModule = typeof import("discord.js");
 type DiscordMessage = import("discord.js").Message;

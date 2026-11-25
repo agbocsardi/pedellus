@@ -15,6 +15,7 @@
 import type { Context } from "@earendil-works/chord";
 import { Type } from "typebox";
 import { defineExtension, defineTool, type ConversationId, type Extension } from "@earendil-works/pi-durable";
+import { createSingleHostRegistry, type SingleHostRegistry } from "./contracts.js";
 
 export const DISCORD_HISTORY_TOOL_NAME = "discord_history";
 
@@ -307,28 +308,10 @@ export interface DiscordHistoryHost {
 }
 
 /** One host per process, attached by the running Discord adapter and detached when it stops. */
-export interface DiscordHistoryRegistry {
-  attach(host: DiscordHistoryHost): () => void;
-  current(): DiscordHistoryHost | undefined;
-}
+export type DiscordHistoryRegistry = SingleHostRegistry<DiscordHistoryHost>;
 
 export function createDiscordHistoryRegistry(): DiscordHistoryRegistry {
-  let host: DiscordHistoryHost | undefined;
-  return {
-    attach(next) {
-      const previous = host;
-      host = next;
-      let detached = false;
-      return () => {
-        if (detached) return;
-        detached = true;
-        if (host === next) host = previous;
-      };
-    },
-    current() {
-      return host;
-    },
-  };
+  return createSingleHostRegistry<DiscordHistoryHost>();
 }
 
 export interface DiscordHistoryToolOptions {

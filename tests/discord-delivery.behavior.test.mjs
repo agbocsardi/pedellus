@@ -486,3 +486,131 @@ test('a channel removed from allowChannels loses MCP ownership and scheduled del
     await store.close();
   }
 });
+
+test('the outbox leaves terminal records alone and never copies a malformed-outbox message into a fault', { timeout: 30_000 }, async () => {
+  const { CronDeliveryOutboxError } = await import(new URL('../dist/automation/cron-delivery.js', import.meta.url).href);
+  const { runDiscord } = await import(new URL('../dist/channels/discord.js', import.meta.url).href);
+  const { withCancel } = await import('./fixtures/discord-harness.mjs');
+  const store = await openDiscordStore('outbox-terminal', {});
+  const real = store.gateway.cronOutbox;
+  const faults = [];
+  let failList = true;
+  const cronOutbox = {
+    sessions: (ctx) => real.sessions(ctx),
+    async list(sessionKey, ctx) {
+      if (failList && sessionKey === sessionKeys.channel) {
+        failList = false;
+        throw new CronDeliveryOutboxError('SYNTHETIC-PRIVATE-DETAIL');
+      }
+      return real.list(sessionKey, ctx);
+    },
+    update: (sessionKey, id, change, ctx) => real.update(sessionKey, id, change, ctx),
+    async recordFault(sessionKey, message, ctx) {
+      faults.push(message);
+      await real.recordFault(sessionKey, message, ctx);
+    },
+  };
+  const harness = syntheticTransport();
+  const scope = withCancel(context);
+  try {
+    // A settled record without text is history, not a malformed pending delivery.
+    await admitDelivery(store.gateway, sessionKeys.channel, delivery('cron:done:1', {
+      status: 'delivered', text: '', settledAt: Date.now(),
+    }));
+    const adapter = runDiscord({ ...store.gateway, cronOutbox }, harness.transport, {
+      allowFrom: [USER_ID], streaming: false,
+    }, scope.context);
+    await harness.receive(guildMessage({ id: '331', content: `<@${BOT_ID}> hello` }));
+    await until(() => harness.sent.length === 1, 'ordinary answer');
+    await admitDelivery(store.gateway, sessionKeys.channel, delivery('cron:job-9:1'));
+    await untilAsync(async () => (await outboxRecords(store.gateway, sessionKeys.channel))
+      .find((record) => record.id === 'cron:job-9:1')?.status === 'delivered', 'later delivery after the terminal one');
+    const terminal = (await outboxRecords(store.gateway, sessionKeys.channel)).find((record) => record.id === 'cron:done:1');
+    assert.equal(terminal.status, 'delivered');
+    assert.equal(terminal.error, undefined);
+    assert.deepEqual(faults, ['delivery outbox is malformed']);
+    scope.cancel(new DOMException('test finished', 'AbortError'));
+    await adapter.catch(() => undefined);
+  } finally {
+    scope.cancel(new DOMException('test finished', 'AbortError'));
+    await store.close();
+  }
+});
+
+test('a scheduled chunk is never sent without its committed intent on a live record', { timeout: 30_000 }, async () => {
+  const { CronDeliveriesDoc } = await import(new URL('../dist/automation/cron-delivery.js', import.meta.url).href);
+  const { runDiscord } = await import(new URL('../dist/channels/discord.js', import.meta.url).href);
+  const { withCancel } = await import('./fixtures/discord-harness.mjs');
+  const store = await openDiscordStore('scheduled-gone', {});
+  const real = store.gateway.cronOutbox;
+  let removed = false;
+  const cronOutbox = {
+    sessions: (ctx) => real.sessions(ctx),
+    list: (sessionKey, ctx) => real.list(sessionKey, ctx),
+    async update(sessionKey, id, change, ctx) {
+      if (id === 'cron:gone:1' && !removed) {
+        // The record is retired concurrently, just before its intent commit.
+        removed = true;
+        const conversation = await store.gateway.conversationFor(sessionKey, context);
+        await conversation.commit(async (tx) => {
+          const doc = await tx.doc(CronDeliveriesDoc, conversation.id);
+          doc.deliveries = doc.deliveries.filter((entry) => entry.id !== id);
+        }, context);
+      }
+      return real.update(sessionKey, id, change, ctx);
+    },
+    recordFault: (sessionKey, message, ctx) => real.recordFault(sessionKey, message, ctx),
+  };
+  const harness = syntheticTransport();
+  const scope = withCancel(context);
+  try {
+    const adapter = runDiscord({ ...store.gateway, cronOutbox }, harness.transport, {
+      allowFrom: [USER_ID], streaming: false,
+    }, scope.context);
+    await harness.receive(guildMessage({ id: '341', content: `<@${BOT_ID}> hello` }));
+    await until(() => harness.sent.length === 1, 'ordinary answer');
+    await admitDelivery(store.gateway, sessionKeys.channel, delivery('cron:gone:1', { text: 'GONE-RESULT' }));
+    await until(() => removed, 'intent attempted');
+    // A later record in the same session proves the scan moved past the retired one.
+    await admitDelivery(store.gateway, sessionKeys.channel, delivery('cron:after:1', { text: 'AFTER-RESULT' }));
+    await until(() => harness.texts().includes('AFTER-RESULT'), 'later delivery');
+    assert.equal(harness.texts().includes('GONE-RESULT'), false, 'a chunk was sent without a committed intent');
+    scope.cancel(new DOMException('test finished', 'AbortError'));
+    await adapter.catch(() => undefined);
+  } finally {
+    scope.cancel(new DOMException('test finished', 'AbortError'));
+    await store.close();
+  }
+});
+
+test('a rate-limit window opened mid-record holds the next scheduled chunk', { timeout: 30_000 }, async () => {
+  const store = await openDiscordStore('scheduled-cooldown', {});
+  const harness = syntheticTransport();
+  const adapter = startDiscord(store, harness, { streaming: false });
+  try {
+    await harness.receive(guildMessage({ id: '351', content: `<@${BOT_ID}> hello` }));
+    await until(() => harness.sent.length === 1, 'ordinary answer');
+    const text = `${'a'.repeat(1_900)}\n\n${'b'.repeat(1_900)}`;
+    const [first, second] = splitDiscordText(text);
+    // Hold the first scheduled chunk inside its send.
+    const held = deferred();
+    harness.state.sendGate = held.promise;
+    await admitDelivery(store.gateway, sessionKeys.channel, delivery('cron:cool:1', { text }));
+    await until(() => harness.state.inFlight === 1, 'first chunk in flight');
+    // Meanwhile an ordinary reply is rate limited, which opens the bot-wide window.
+    harness.state.nextSendFailure = new DiscordTransportError('rate limited', { outcome: 'not-sent', status: 429, retryAfterMs: 5_000 });
+    await harness.receive(guildMessage({ id: '352', content: `<@${BOT_ID}> again` }));
+    await until(() => harness.state.nextSendFailure === undefined, 'rate-limited reply');
+    held.resolve();
+    await untilAsync(async () => (await outboxRecords(store.gateway, sessionKeys.channel))
+      .find((record) => record.id === 'cron:cool:1')?.nextChunkIndex === 1, 'first chunk recorded');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(harness.texts().includes(first));
+    assert.equal(harness.texts().includes(second), false, 'the next chunk ignored the rate-limit window');
+    const record = (await outboxRecords(store.gateway, sessionKeys.channel)).find((entry) => entry.id === 'cron:cool:1');
+    assert.equal(record.status, 'pending');
+  } finally {
+    await adapter.stop();
+    await store.close();
+  }
+});

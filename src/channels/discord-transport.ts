@@ -19,7 +19,8 @@ import type {
   DiscordHistorySnapshot,
   DiscordHistoryWarning,
 } from "./discord-history.js";
-import { splitRichText } from "./telegram-rich.js";
+import { boundedLabel } from "../media/outbound.js";
+import { splitRichText } from "./markdown.js";
 
 /** Discord's per-message text bound, in UTF-16 code units (JavaScript string length). */
 export const DISCORD_TEXT_LIMIT = 2_000;
@@ -324,16 +325,9 @@ export function splitDiscordText(text: string): string[] {
   return splitRichText(text, DISCORD_TEXT_LIMIT);
 }
 
-/** Bound one line of client-supplied text: no control/bidi characters, no surrogate half. */
+/** Bound one line of client-supplied text: the shared label rules, without `[`/`]`, `(unnamed)` when empty. */
 export function boundedDiscordLabel(value: unknown, max: number): string {
-  const text = typeof value === "string" ? value : "";
-  const cleaned = text.replace(/[[\]]/gu, "").replace(/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/gu, " ")
-    .replace(/\s+/gu, " ")
-    .trim();
-  if (cleaned === "") return "(unnamed)";
-  let bounded = cleaned.slice(0, max);
-  if (bounded.length > 0 && /[\uD800-\uDBFF]/u.test(bounded[bounded.length - 1]!)) bounded = bounded.slice(0, -1);
-  return bounded;
+  return boundedLabel(value, max, { empty: "(unnamed)", stripBrackets: true });
 }
 
 /**

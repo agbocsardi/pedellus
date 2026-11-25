@@ -12,6 +12,7 @@ import {
   USER_ID,
   channelState,
   context,
+  deferred,
   dmMessage,
   flush,
   guildMessage,
@@ -109,7 +110,7 @@ test('/model selects one configured preset for this channel only', { timeout: 30
 
     await harness.receive(say('222', '/model deep'));
     await until(() => harness.sent.length === 2, 'preset applied');
-    assert.equal(harness.texts()[1], 'Model set to fixture/beta (thinking: high) for this chat.');
+    assert.equal(harness.texts()[1], 'Model set to preset deep: fixture/beta (thinking: high) for this channel.');
     const state = await channelState(store.gateway);
     assert.equal(state.controls.at(-1).command, 'model');
     assert.equal(state.controls.at(-1).status, 'applied');
@@ -372,11 +373,12 @@ async function withFlakyHost(label, failures, body) {
 
 test('a deferred control retries on the adapter cadence and releases the channel when it settles', { timeout: 30_000 }, async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.now() });
-  // Two transient failures: the first message's own delivery and the control's first flush attempt.
+  // Three transient failures: the first message's best-effort question-answer lookup at admission,
+  // its own delivery, and the control's first flush attempt.
   const store = await openDiscordStore('deferred-applied', {});
   const harness = syntheticTransport();
   const scope = withCancel(context);
-  const adapter = runDiscord(flakyGateway(store.gateway, sessionKeys.channel, 2), harness.transport, {
+  const adapter = runDiscord(flakyGateway(store.gateway, sessionKeys.channel, 3), harness.transport, {
     allowFrom: [USER_ID],
     streaming: false,
   }, scope.context);
@@ -425,7 +427,8 @@ test('an exhausted deferred control is reported unconfirmed once and never appli
       'the exhausted command is reported once instead of staying silently pending');
     assert.ok(harness.texts().every((text) => text !== 'Context reset.'), 'a reset that never ran is not claimed');
     const state = await channelState(store.gateway);
-    assert.notEqual(state.controls.at(-1).status, 'admitted');
+    // Reported and settled: no record is left admitted (a delivered report also retires it).
+    assert.equal(state.controls.some((entry) => entry.status === 'admitted'), false);
     assert.equal(state.pending.some((entry) => entry.notice === true && entry.hold === true), false,
       'no acknowledgement is left held after the terminal report');
   });
@@ -468,6 +471,124 @@ test('a callback-shaped message is consumed before admission, mention-prefixed o
     assert.ok(!persisted.includes(CODE) && !persisted.includes(STATE), 'no callback secret is stored in channel state');
   } finally {
     await adapter.stop();
+    await store.close();
+  }
+});
+
+test('an exhausted deferred /restart is reported with the restart wording and never requested', { timeout: 40_000 }, async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.now() });
+  const store = await openDiscordStore('deferred-restart', {});
+  const harness = syntheticTransport();
+  const scope = withCancel(context);
+  let requests = 0;
+  const adapter = runDiscord(flakyGateway(store.gateway, sessionKeys.channel, Number.MAX_SAFE_INTEGER), harness.transport, {
+    allowFrom: [USER_ID],
+    streaming: false,
+    restart: { supported: true, request: async () => { requests += 1; } },
+  }, scope.context);
+  try {
+    await harness.receive(guildMessage({ id: '721', content: `<@${BOT_ID}> first` }));
+    await harness.receive(say('722', '/restart'));
+    await untilAsync(async () => harness.texts().includes('Restart pending.'), 'deferred acknowledgement');
+    for (let elapsed = 0; elapsed < 40_000; elapsed += 2_000) {
+      t.mock.timers.tick(2_000);
+      await flush(4);
+      if (harness.texts().some((text) => /interrupted; outcome unknown/u.test(text))) break;
+    }
+    assert.ok(harness.texts().includes('Restart interrupted; outcome unknown. Not retried.'));
+    assert.ok(harness.texts().every((text) => !/^Command interrupted/u.test(text)), 'generic wording for a restart');
+    assert.equal(requests, 0, 'an unconfirmed restart is never requested');
+  } finally {
+    scope.cancel(new DOMException('test finished', 'AbortError'));
+    await adapter.catch(() => undefined);
+    await store.close();
+  }
+});
+
+test('reopen turns a released but unsent pending wording into the outcome, and keeps an in-flight one', { timeout: 30_000 }, async () => {
+  const store = await openDiscordStore('stale-pending', {});
+  try {
+    const { DiscordState } = await import(new URL('../dist/channels/discord.js', import.meta.url).href);
+    const conversation = await store.gateway.conversationFor(`discord:${BOT_ID}:channel-state`, context);
+    await conversation.commit(async (tx) => {
+      const doc = await tx.doc(DiscordState, conversation.id);
+      const notice = (key, extra = {}) => ({
+        key, channelId: CHANNEL_ID, sessionKey: sessionKeys.channel, senderId: USER_ID,
+        text: 'Restart pending.', admittedAtMs: Date.now(), nextChunkIndex: 0, notice: true, ...extra,
+      });
+      doc.controls.push({ key: 'm:271', command: 'restart', status: 'admitted', channelId: CHANNEL_ID, senderId: USER_ID });
+      doc.controls.push({ key: 'm:272', command: 'restart', status: 'admitted', channelId: CHANNEL_ID, senderId: USER_ID });
+      doc.pending.push(notice('m:271'));
+      doc.pending.push(notice('m:272', {
+        deliveryStatus: 'sending',
+        sendIntent: { text: 'Restart pending.', stage: 'final', chunkIndex: 0, startedAt: Date.now() },
+      }));
+      return undefined;
+    }, context);
+    const harness = syntheticTransport();
+    const adapter = startDiscord(store, harness, { streaming: false });
+    try {
+      await until(() => harness.sent.length === 2, 'two outcome notices');
+      assert.deepEqual(harness.texts(), [
+        'Restart interrupted; outcome unknown. Not retried.',
+        'Restart interrupted; outcome unknown. Not retried.',
+      ]);
+      const state = await channelState(store.gateway);
+      // The ambiguous send is quarantined, never resent, and its outcome went out separately.
+      const held = state.pending.find((entry) => entry.key === 'm:272');
+      assert.equal(held?.deliveryStatus, 'unknown');
+      assert.equal(state.controls.some((entry) => entry.status === 'admitted'), false);
+    } finally {
+      await adapter.stop();
+    }
+  } finally {
+    await store.close();
+  }
+});
+
+/** A bounded wait that does not read the clock, for checks that mock `Date`. */
+async function settleUntil(predicate, label, rounds = 5_000) {
+  for (let round = 0; round < rounds; round += 1) {
+    if (predicate()) return;
+    await flush(1);
+  }
+  throw new Error(`timed out waiting for ${label}`);
+}
+
+test('a late control outcome is a separate notice when its pending wording is already being sent', { timeout: 30_000 }, async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
+  const store = await openDiscordStore('late-in-flight', {});
+  const harness = syntheticTransport();
+  const scope = withCancel(context);
+  // A slow native reset outlives the pending-notice delay.
+  const slowReset = deferred();
+  let resetStarted = false;
+  const gateway = {
+    ...store.gateway,
+    async resetSession(key, ctx) {
+      resetStarted = true;
+      await slowReset.promise;
+      return store.gateway.resetSession(key, ctx);
+    },
+  };
+  const adapter = runDiscord(gateway, harness.transport, { allowFrom: [USER_ID], streaming: false }, scope.context);
+  try {
+    const held = deferred();
+    harness.state.sendGate = held.promise;
+    await harness.receive(say('732', '/new'));
+    await settleUntil(() => resetStarted, 'native reset running');
+    t.mock.timers.tick(30_000);
+    await settleUntil(() => harness.state.inFlight === 1, '"still pending" wording in flight');
+    slowReset.resolve();
+    // The outcome goes out on its own while the pending wording is still held in its send.
+    await settleUntil(() => harness.texts().includes('Context reset.'), 'late outcome sent as its own notice');
+    assert.equal(harness.state.inFlight, 1);
+    held.resolve();
+    await settleUntil(() => harness.texts().includes('Reset pending.'), 'pending wording finished');
+    assert.deepEqual([...harness.texts()].sort(), ['Context reset.', 'Reset pending.']);
+  } finally {
+    scope.cancel(new DOMException('test finished', 'AbortError'));
+    await adapter.catch(() => undefined);
     await store.close();
   }
 });
