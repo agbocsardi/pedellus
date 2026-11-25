@@ -17,6 +17,10 @@ const MAX_CACHED_PAGES = 64;
 const MAX_CACHED_REPLIES = 2_048;
 /** Widest entry-ID range one batched hit lookup reads; also its page limit (host maximum 200). */
 const MAX_LOOKUP_SPAN = 64;
+/** Widest gap of intervening non-hit IDs between two adjacent hits in one batched lookup window. */
+const MAX_LOOKUP_GAP = 8;
+/** Maximum intervening non-hit IDs per covered hit in one batched window (bounds waste <= 2x hits). */
+const MAX_LOOKUP_WASTE_PER_HIT = 2;
 type Coverage = Record<string, unknown>;
 type EpisodeJob = { readonly hit: HistorySummaryHit; readonly sessionKey: string; cursor?: unknown; minTime: number | null; maxTime: number | null; undated: number; malformed: number; omitted: number; unreadable: number; missing: number; sourceEntries: number };
 type CachedPage = { readonly page: MemoryPage; readonly nextToken?: string };
@@ -47,15 +51,28 @@ function summaryHit(hit: HistorySummaryHit, scope: MemoryScope, view: Awaited<Re
 }
 /**
  * The entry-ID window, at most `maxSpan` wide, that contains `target` and the most other `wanted`
- * IDs; a tie keeps the narrower window. One bounded host read of it replaces one read per hit.
+ * IDs without spanning sparse gaps or excessive intervening non-hit IDs; a tie keeps the narrower
+ * window. `wanted` must be sorted ascending and unique. One bounded host read replaces one per hit.
  */
 function lookupWindow(target: number, wanted: readonly number[], maxSpan: number): { min: number; max: number } {
   let best = { min: target, max: target, count: 1 };
-  for (const low of wanted) {
-    if (low > target || target - low >= maxSpan) continue;
-    const inside = wanted.filter((id) => id >= low && id - low < maxSpan);
-    const window = { min: low, max: Math.max(target, ...inside), count: inside.length };
-    if (window.count > best.count || (window.count === best.count && window.max - window.min < best.max - best.min)) best = window;
+  const targetIndex = wanted.indexOf(target);
+  if (targetIndex < 0 || maxSpan <= 1) return best;
+  for (let left = targetIndex; left >= 0; left--) {
+    if (left < targetIndex && wanted[left + 1]! - wanted[left]! - 1 > MAX_LOOKUP_GAP) break;
+    const min = wanted[left]!;
+    if (target - min + 1 > maxSpan) break;
+    for (let right = targetIndex; right < wanted.length; right++) {
+      if (right > targetIndex && wanted[right]! - wanted[right - 1]! - 1 > MAX_LOOKUP_GAP) break;
+      const max = wanted[right]!;
+      const span = max - min + 1;
+      if (span > maxSpan) break;
+      const count = right - left + 1;
+      if (span - count > count * MAX_LOOKUP_WASTE_PER_HIT) continue;
+      if (count > best.count || (count === best.count && max - min < best.max - best.min)) {
+        best = { min, max, count };
+      }
+    }
   }
   return best;
 }
@@ -75,6 +92,8 @@ export function createHistorySearcher(host: MemoryHost): { search: MemoryBackend
   const byToken = new Map<string, SearchState>();
   async function search(query: MemoryQuery, scope: MemoryScope, context: Context): Promise<MemoryPage> {
     clean(states, byToken); validateFilters(query, scope);
+    const episodes = episodeFilters(query, scope);
+    const filter = query.filter;
     const limit = Math.min(query.limit ?? MAX_PAGE, MAX_PAGE);
     const binding = queryKey(query, scope, "search");
     let state: SearchState;
@@ -163,40 +182,107 @@ export function createHistorySearcher(host: MemoryHost): { search: MemoryBackend
         if (state.summaryIndexDone && state.jobs.length === 0 && state.activeJob === undefined) state.complete = true;
         continue;
       }
-      const page = state.pendingHits.length > 0 || state.pendingDone
+      const fromPending = state.pendingHits.length > 0 || state.pendingDone;
+      const page = fromPending
         ? { hits: state.pendingHits, coverage: state.coverage, next: state.pendingDone ? undefined : state.indexCursor }
         : await host.search(searchQuery(query, "parts", state.indexCursor), context);
-      if (page !== undefined && state.pendingHits.length === 0 && !state.pendingDone) reads++;
+      if (!fromPending) reads++;
       state.pendingHits = []; state.pendingDone = false;
       state.indexCursor = page.next; state.coverage = { ...page.coverage }; state.freshness = { index: page.coverage };
+      const eligibleHit = (hit: HistoryHit): boolean => {
+        const owner = session(scope, hit.sessionKey);
+        if (!owner) return false;
+        if (filter?.sessions !== undefined && !filter.sessions.includes(owner.sessionKey)) return false;
+        if (filter?.channel !== undefined && (owner.channel === null || !filter.channel.includes(owner.channel))) return false;
+        if (filter?.provenance !== undefined && !filter.provenance.includes("unknown")) return false;
+        if (episodes !== undefined && !episodes.some((ep) => ep.session === owner.sessionKey && ep.start === Number(hit.episodeStartEntryId))) return false;
+        if (needsState) {
+          const episodeStart = Number(hit.episodeStartEntryId);
+          const currentReset = state.resetIds.get(hit.sessionKey) ?? null;
+          const status: "open" | "closed" = currentReset === null || episodeStart >= currentReset ? "open" : "closed";
+          if (!stateFilter.includes(status)) return false;
+        }
+        if (query.target === "messages") {
+          if (hit.role === "tool") return false;
+          if (filter?.roles !== undefined && !filter.roles.includes(hit.role as "user" | "assistant")) return false;
+          if (filter?.toolNames !== undefined || filter?.kinds !== undefined) return false;
+        } else if (query.target === "tools") {
+          if (filter?.roles !== undefined && !(filter.roles as readonly string[]).includes("tool")) return false;
+          if (filter?.toolNames !== undefined && hit.toolName !== undefined && !filter.toolNames.includes(hit.toolName)) return false;
+        }
+        return true;
+      };
       // Entries this page already read, by `session:entryId`: null when the host had no such entry,
-      // "failed" when its batched read failed. Each hit keeps its own unreadable accounting.
+      // "failed" when its exact-ID read failed. Each hit keeps its own unreadable accounting.
       const looked = new Map<string, EntryRecord | null | "failed">();
+      // Entries whose batched range read failed; read them individually so one bad row cannot drop
+      // otherwise readable hits in the same window.
+      const directIds = new Set<string>();
+      const readExact = async (hit: HistoryHit, key: string): Promise<EntryRecord | null | "failed"> => {
+        let exactPage: Awaited<ReturnType<MemoryHost["entries"]>> | undefined;
+        try { exactPage = await host.entries(hit.sessionKey, { minEntryId: hit.entryId, maxEntryId: hit.entryId, order: "ascending" }, 1, undefined, context); }
+        catch { exactPage = undefined; }
+        reads++;
+        if (exactPage === undefined) { looked.set(key, "failed"); return "failed"; }
+        sourceEntries += exactPage.items.length;
+        const found = exactPage.items.find((entry) => Number(entry.id) === Number(hit.entryId)) ?? null;
+        looked.set(key, found);
+        return found;
+      };
       const lookup = async (hitIndex: number, hit: HistoryHit): Promise<EntryRecord | null | "failed"> => {
         const key = `${hit.sessionKey}:${hit.entryId}`;
         const known = looked.get(key);
         if (known !== undefined) return known;
-        const wanted = [...new Set(page.hits.slice(hitIndex)
-          .filter((candidate) => candidate.sessionKey === hit.sessionKey && !looked.has(`${candidate.sessionKey}:${candidate.entryId}`))
-          .map((candidate) => Number(candidate.entryId)))];
-        const window = lookupWindow(Number(hit.entryId), wanted, Math.min(MAX_LOOKUP_SPAN, MAX_SOURCE_PER_CALL - sourceEntries));
+        if (directIds.has(key)) return readExact(hit, key);
+        const targetId = Number(hit.entryId);
+        const wantedSet = new Set<number>([targetId]);
+        for (let i = hitIndex + 1; i < page.hits.length; i++) {
+          const candidate = page.hits[i]!;
+          if (candidate.sessionKey !== hit.sessionKey) continue;
+          const candidateEntryKey = `${candidate.sessionKey}:${candidate.entryId}`;
+          if (looked.has(candidateEntryKey) || directIds.has(candidateEntryKey)) continue;
+          if (state.seen.has(`${candidateEntryKey}:${candidate.partIndex}`)) continue;
+          if (!eligibleHit(candidate)) continue;
+          wantedSet.add(Number(candidate.entryId));
+        }
+        const wanted = [...wantedSet].sort((a, b) => a - b);
+        const window = lookupWindow(targetId, wanted, Math.min(MAX_LOOKUP_SPAN, Math.max(1, MAX_SOURCE_PER_CALL - sourceEntries)));
+        if (window.min === window.max) return readExact(hit, key);
         const covered = wanted.filter((id) => id >= window.min && id <= window.max);
+        const coveredSet = new Set(covered);
         let recordPage: Awaited<ReturnType<MemoryHost["entries"]>> | undefined;
         try { recordPage = await host.entries(hit.sessionKey, { minEntryId: window.min as EntryId, maxEntryId: window.max as EntryId, order: "ascending" }, window.max - window.min + 1, undefined, context); }
         catch { recordPage = undefined; }
-        if (recordPage === undefined) { for (const id of covered) looked.set(`${hit.sessionKey}:${id}`, "failed"); return "failed"; }
-        reads++; sourceEntries += recordPage.items.length;
-        for (const id of covered) looked.set(`${hit.sessionKey}:${id}`, null);
-        for (const entry of recordPage.items) if (covered.includes(Number(entry.id))) looked.set(`${hit.sessionKey}:${entry.id}`, entry);
-        return looked.get(key) ?? null;
+        reads++;
+        if (recordPage === undefined) {
+          for (const id of covered) directIds.add(`${hit.sessionKey}:${id}`);
+          return readExact(hit, key);
+        }
+        sourceEntries += recordPage.items.length;
+        if (recordPage.next === undefined) {
+          for (const id of covered) looked.set(`${hit.sessionKey}:${id}`, null);
+          for (const entry of recordPage.items) if (coveredSet.has(Number(entry.id))) looked.set(`${hit.sessionKey}:${entry.id}`, entry);
+          return looked.get(key) ?? null;
+        }
+        for (const entry of recordPage.items) if (coveredSet.has(Number(entry.id))) looked.set(`${hit.sessionKey}:${entry.id}`, entry);
+        const found = looked.get(key);
+        if (found !== undefined) return found;
+        directIds.add(key);
+        return readExact(hit, key);
       };
       for (let hitIndex = 0; hitIndex < page.hits.length; hitIndex++) {
-        if (sourceEntries >= MAX_SOURCE_PER_CALL) { state.pendingHits = [...page.hits.slice(hitIndex)]; state.pendingDone = page.next === undefined; break; }
         const hit = page.hits[hitIndex]!;
+        if (!eligibleHit(hit)) continue;
         const key = `${hit.sessionKey}:${hit.entryId}:${hit.partIndex}`;
         if (state.seen.has(key)) continue;
+        const entryKey = `${hit.sessionKey}:${hit.entryId}`;
+        if (!looked.has(entryKey) && (sourceEntries >= MAX_SOURCE_PER_CALL || reads >= MAX_READS_PER_CALL || Date.now() - started >= MAX_MILLIS_PER_CALL)) {
+          state.pendingHits = [...page.hits.slice(hitIndex)];
+          state.pendingDone = page.next === undefined;
+          break;
+        }
         state.seen.add(key); if (state.seen.size > MAX_SEEN) throw new Error("history search deduplication bound reached; narrow the query or filters");
-        const owner = session(scope, hit.sessionKey); if (!owner) continue;
+        const owner = session(scope, hit.sessionKey)!;
         const entry = await lookup(hitIndex, hit);
         if (entry === "failed" || entry === null) { state.diagnostics.unreadable++; continue; }
         const projected = projectEntry(entry);

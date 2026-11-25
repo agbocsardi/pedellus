@@ -1327,6 +1327,27 @@ function samePreview(left: DigestPreview | null, right: DigestPreview | null): b
     && left.marker === right.marker;
 }
 
+function cloneEvidence(entry: DigestEvidence): DigestEvidence {
+  return {
+    ...entry,
+    preview: entry.preview === null ? null : { ...entry.preview },
+  };
+}
+
+function freezeChunk(chunk: Chunk): Chunk {
+  return Object.freeze({
+    ...chunk,
+    entries: Object.freeze(chunk.entries.map((entry) => Object.freeze({
+      ...entry,
+      preview: entry.preview === null ? null : Object.freeze({ ...entry.preview }),
+    }))),
+  });
+}
+
+function cloneEntries(entries: readonly DigestEvidence[]): DigestEvidence[] {
+  return entries.map(cloneEvidence);
+}
+
 /** Find the real episode opening even when an older cursor already consumed its prefix. */
 async function episodeStartAt(conversation: Conversation, at: EntryId, context: Context): Promise<EntryId> {
   let pageCursor: Cursor | undefined;
@@ -1447,7 +1468,7 @@ export function createDigestSource(options: DigestSourceOptions): DigestSource {
       selected = {
         key: chunkKey(chosen.session.conversationId, first, chosen.cursor.nextItemIndex,
           chosen.cursor.nextTextStart, end, chosen.cursor.pendingToolCalls, batchLimits),
-        chunk,
+        chunk: freezeChunk(chunk),
       };
       let estimatedChars: number | undefined;
       let estimatedChunks: number | undefined;
@@ -1505,7 +1526,8 @@ export function createDigestSource(options: DigestSourceOptions): DigestSource {
       }
       const key = chunkKey(conversationId, ref.firstEntryId, ref.firstItemIndex, ref.firstTextStart,
         ref.episodeEndEntryId, ref.cursor.pendingToolCalls, batchLimits);
-      const chunk = selected?.key === key ? selected.chunk : await readChunk(
+      const cached = selected?.key === key;
+      const chunk = cached ? selected!.chunk : await readChunk(
         conversation,
         ref.firstEntryId,
         ref.firstItemIndex,
@@ -1539,7 +1561,7 @@ export function createDigestSource(options: DigestSourceOptions): DigestSource {
         nextEntryId: chunk.nextEntryId,
         nextItemIndex: chunk.nextItemIndex,
         nextTextStart: chunk.nextTextStart,
-        entries: chunk.entries,
+        entries: cached ? cloneEntries(chunk.entries) : chunk.entries,
         cursor: ref.cursor,
       };
     },

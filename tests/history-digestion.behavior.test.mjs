@@ -2144,3 +2144,49 @@ test("transcript projections share one user-input kind set, including cron input
   assert.equal(projectEntry(unknown).parts.length, 0);
   assert.equal(digestion.evidenceShapeOf(unknown), undefined);
 });
+
+test("mutating readClosed() or readBatch() evidence cannot poison the cached chunk", { timeout: 20_000 }, async () => {
+  const dir = await temp("nanobot-digest-cache-isolation-");
+  const db = resolve(dir, "probe.sqlite");
+  let harness;
+  try {
+    harness = await openStore(db);
+    const conversation = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const longOutput = `${"A".repeat(400)}${"B".repeat(2_000)}${"C".repeat(400)}`;
+    await append(harness, conversation, user("CACHE-ISOLATION-USER"));
+    await append(harness, conversation, toolCallAssistant("", "call-cache-1", "read", { path: "notes.md" }));
+    await append(harness, conversation, toolResult(longOutput, "call-cache-1", "read"));
+    await append(harness, conversation, assistant("CACHE-ISOLATION-ANSWER"));
+    await append(harness, conversation, reset());
+
+    const source = sourceFor(harness, conversation);
+    const first = batched(await source.readClosed(context, undefined, undefined, { estimate: false }));
+    const originalTexts = first.entries.map((entry) => entry.text);
+    const previewIndex = first.entries.findIndex((entry) => entry.preview !== null);
+    assert.ok(previewIndex >= 0, "fixture includes a previewed tool result");
+    const originalMarker = first.entries[previewIndex].preview.marker;
+
+    // Mutate the batch returned by readClosed() in place (text, preview metadata, and array length).
+    first.entries[0].text = "TAMPERED-FROM-READ-CLOSED";
+    first.entries[previewIndex].preview.marker = "TAMPERED-MARKER";
+    first.entries.push({ ...first.entries[0], text: "EXTRA-ENTRY" });
+
+    // readBatch() hits the cached chunk and must return pristine, isolated evidence.
+    const second = await source.readBatch(first, context);
+    assert.deepEqual(second.entries.map((entry) => entry.text), originalTexts);
+    assert.equal(second.entries[previewIndex].preview.marker, originalMarker);
+
+    // Mutating readBatch()'s output must also leave subsequent cached reads untouched.
+    second.entries[0].text = "TAMPERED-FROM-READ-BATCH";
+    second.entries[previewIndex].preview.marker = "TAMPERED-MARKER-2";
+    const third = await source.readBatch(first, context);
+    assert.deepEqual(third.entries.map((entry) => entry.text), originalTexts);
+    assert.equal(third.entries[previewIndex].preview.marker, originalMarker);
+
+    await assert.rejects(() => source.acknowledge(first, context), TypeError);
+    await source.acknowledge(third, context);
+  } finally {
+    if (harness !== undefined) await harness.close(context).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});

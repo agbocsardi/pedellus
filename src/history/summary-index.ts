@@ -517,6 +517,39 @@ async function repairSummarySchema(
   }
 }
 
+async function verifyAndRepairSummaryIndex(
+  open: OpenHistoryIndex,
+): Promise<"ready" | "repaired-preserved" | "repaired-reset" | "failed"> {
+  if (!open.summaryReady) return "failed";
+  if (open.summaryVerified) return "ready";
+  let result: "ready" | "repaired-preserved" | "repaired-reset" | "failed" = "failed";
+  try {
+    const state = await summarySchemaState(open.db);
+    if (!state.objectsOk || !state.contentOk || !state.sweepOk) {
+      const ok = await repairSummarySchema(open, state);
+      open.summaryReady = ok;
+      result = !ok ? "failed" : state.contentOk ? "repaired-preserved" : "repaired-reset";
+    } else {
+      try {
+        // FTS5 external-content integrity check: compares the index with history_summaries.
+        await open.db.run(
+          "INSERT INTO history_summary_fts (history_summary_fts, rank) VALUES ('integrity-check', 1)",
+        );
+        result = "ready";
+      } catch {
+        const ok = await repairSummarySchema(open, state);
+        open.summaryReady = ok;
+        result = ok ? "repaired-preserved" : "failed";
+      }
+    }
+  } catch {
+    open.summaryReady = false;
+    result = "failed";
+  }
+  open.summaryVerified = open.summaryReady;
+  return result;
+}
+
 /**
  * Verify the summary schema shape and FTS integrity once per open. A missing/wrong table, missing
  * trigger or logical FTS drift is repaired from the stored content; if repair fails the summary index
@@ -527,27 +560,7 @@ async function repairSummarySchema(
  * transcript).
  */
 export async function ensureSummaryIndex(open: OpenHistoryIndex): Promise<boolean> {
-  if (!open.summaryReady) return false;
-  if (open.summaryVerified) return true;
-  try {
-    const state = await summarySchemaState(open.db);
-    if (!state.objectsOk || !state.contentOk || !state.sweepOk) {
-      open.summaryReady = await repairSummarySchema(open, state);
-    } else {
-      try {
-        // FTS5 external-content integrity check: compares the index with history_summaries.
-        await open.db.run(
-          "INSERT INTO history_summary_fts (history_summary_fts, rank) VALUES ('integrity-check', 1)",
-        );
-      } catch {
-        open.summaryReady = await repairSummarySchema(open, state);
-      }
-    }
-  } catch {
-    open.summaryReady = false;
-  }
-  open.summaryVerified = open.summaryReady;
-  return open.summaryReady;
+  return (await verifyAndRepairSummaryIndex(open)) !== "failed";
 }
 
 /** Content identity of one indexed summary row; a change replaces the row (and its id). */
@@ -821,22 +834,28 @@ async function summaryCounts(
   };
 }
 
+interface SummarySweepBudget {
+  readonly startedAt: number;
+  readonly deadline: number;
+  readsUsed: number;
+}
+
 /**
  * Re-read a bounded slice of stored summaries and reconcile the derived summary rows. Raw message
  * reconciliation already ran, so episode boundaries are current. A per-episode read failure removes
  * no row and never fails the summary search; missing/not-ready/malformed records remove their own row.
  * `episodesChecked` counts distinct closed episodes re-read in this pass, so it can never claim more
- * coverage than the page actually had.
+ * coverage than the page actually had. A shared `budget` caps total reads and wall-clock time across
+ * a repair retry so one search never exceeds `maxSummaryReadsPerPass` or `maxSummaryPassMs`.
  */
 async function sweepSummaries(
   open: OpenHistoryIndex,
   options: HistoryIndexOptions,
   sessions: readonly HistorySession[],
   context: Context,
+  budget: SummarySweepBudget,
 ): Promise<HistorySummarySyncReport> {
   const now = options.now ?? Date.now;
-  const startedAt = now();
-  const deadline = startedAt + HISTORY_SUMMARY_LIMITS.maxSummaryPassMs;
   const read = options.readSummary;
   const base = {
     caughtUp: true,
@@ -860,7 +879,7 @@ async function sweepSummaries(
     indexReady: open.summaryReady,
   };
   if (read === undefined || !open.summaryReady) {
-    return { ...base, elapsedMs: Math.max(0, now() - startedAt) };
+    return { ...base, elapsedMs: Math.max(0, now() - budget.startedAt) };
   }
   const perSession = Math.max(
     1,
@@ -889,11 +908,11 @@ async function sweepSummaries(
     const openStart = progress?.episode_start_entry_id ?? null;
     const known = await closedEpisodeCount(open.db, session.conversationId, openStart);
     episodesKnown += known;
-    if (episodesChecked >= HISTORY_SUMMARY_LIMITS.maxSummaryReadsPerPass || now() >= deadline) {
+    if (budget.readsUsed >= HISTORY_SUMMARY_LIMITS.maxSummaryReadsPerPass || now() >= budget.deadline) {
       if (known > 0) sessionsPending++;
       continue;
     }
-    const quota = Math.min(perSession, HISTORY_SUMMARY_LIMITS.maxSummaryReadsPerPass - episodesChecked);
+    const quota = Math.min(perSession, HISTORY_SUMMARY_LIMITS.maxSummaryReadsPerPass - budget.readsUsed);
     // Reserve part of every multi-read quota for the older round-robin, so a session with many
     // episodes can never consume its whole budget on the newest few and leave older ones unreachable.
     // With a one-read quota, alternate per conversation between the newest page and the older cursor:
@@ -914,10 +933,11 @@ async function sweepSummaries(
     let checkedHere = 0;
     if (candidates.starts.length > 0) sessionsSwept++;
     for (const episodeStart of candidates.starts) {
-      if (episodesChecked >= HISTORY_SUMMARY_LIMITS.maxSummaryReadsPerPass || now() >= deadline) {
+      if (budget.readsUsed >= HISTORY_SUMMARY_LIMITS.maxSummaryReadsPerPass || now() >= budget.deadline) {
         processedAll = false;
         break;
       }
+      budget.readsUsed++;
       episodesChecked++;
       checkedHere++;
       let view: HistorySummaryView;
@@ -1007,7 +1027,7 @@ async function sweepSummaries(
     episodesChecked,
     sessionsSwept,
     sessionsPending,
-    elapsedMs: Math.max(0, now() - startedAt),
+    elapsedMs: Math.max(0, now() - budget.startedAt),
   };
 }
 
@@ -1202,11 +1222,25 @@ export async function searchSummaryIndex(
   const open = await ensureOpen(storeId);
   const indexReady = sourceWired ? await ensureSummaryIndex(open) : open.summaryReady;
   const available = sourceWired && indexReady;
+  const cursorUnavailableError = () => new Error(
+    "History summary cursor is unavailable because the summary index is not usable in this open; "
+    + "start a fresh summary search",
+  );
+  const contractFailure = (error: unknown): Error | undefined => {
+    if (context.abortSignal?.aborted) return new Error("Operation aborted");
+    // Cursor/snapshot errors are explicit contract failures, not index unavailability.
+    if (error instanceof Error && /cursor|snapshot changed/i.test(error.message)) return error;
+    return undefined;
+  };
+  let repaired = false;
+  const repairOnce = async (): Promise<"ready" | "repaired-preserved" | "repaired-reset" | "failed"> => {
+    if (!available || repaired) return "failed";
+    repaired = true;
+    open.summaryVerified = false;
+    return verifyAndRepairSummaryIndex(open);
+  };
   if (query.cursor !== undefined && !available) {
-    throw new Error(
-      "History summary cursor is unavailable because the summary index is not usable in this open; "
-      + "start a fresh summary search",
-    );
+    throw cursorUnavailableError();
   }
   if (query.cursor !== undefined) {
     if (query.cursor.generation !== open.generation) {
@@ -1218,7 +1252,26 @@ export async function searchSummaryIndex(
     if (query.cursor.mappingSha256 !== mappingSha256) {
       throw new Error("History summary cursor does not match the current session mapping");
     }
-    await verifySummaryCursor(open.db, query.cursor, conversationIds);
+    try {
+      await verifySummaryCursor(open.db, query.cursor, conversationIds);
+    } catch (error) {
+      const failure = contractFailure(error);
+      if (failure !== undefined) throw failure;
+      if ((await repairOnce()) === "failed") {
+        open.summaryReady = false;
+        open.summaryVerified = false;
+        throw cursorUnavailableError();
+      }
+      try {
+        await verifySummaryCursor(open.db, query.cursor, conversationIds);
+      } catch (retryError) {
+        const retryFailure = contractFailure(retryError);
+        if (retryFailure !== undefined) throw retryFailure;
+        open.summaryReady = false;
+        open.summaryVerified = false;
+        throw cursorUnavailableError();
+      }
+    }
   }
 
   // Episode boundaries come from the same bounded message reconciliation raw search uses, so
@@ -1232,8 +1285,18 @@ export async function searchSummaryIndex(
     throw new Error("History summary cursor does not belong to the current indexed chat sessions");
   }
 
+  const now = options.now ?? Date.now;
+  const startedAt = now();
+  const sweepBudget: SummarySweepBudget = {
+    startedAt,
+    deadline: startedAt + HISTORY_SUMMARY_LIMITS.maxSummaryPassMs,
+    readsUsed: 0,
+  };
+  let completedSweep: HistorySummarySyncReport | undefined;
+
   const summaryPage = async (): Promise<HistorySummaryPage> => {
-    const sweep = await sweepSummaries(open, options, activeSessions, context);
+    const sweep = completedSweep ?? await sweepSummaries(open, options, activeSessions, context, sweepBudget);
+    completedSweep = sweep;
     const counts = available
       ? await summaryCounts(open.db, activeConversationIds)
       : { summaries: 0, truncated: 0, bytes: 0 };
@@ -1336,12 +1399,6 @@ export async function searchSummaryIndex(
       coverage,
     };
   };
-  const contractFailure = (error: unknown): Error | undefined => {
-    if (context.abortSignal?.aborted) return new Error("Operation aborted");
-    // Cursor/snapshot errors are explicit contract failures, not index unavailability.
-    if (error instanceof Error && /cursor|snapshot changed/i.test(error.message)) return error;
-    return undefined;
-  };
 
   try {
     return await summaryPage();
@@ -1350,21 +1407,30 @@ export async function searchSummaryIndex(
     if (failure !== undefined) throw failure;
   }
   // A summary SQL failure may be corruption the open-time check could not see. Re-verify and repair
-  // the summary layer once, then retry this page.
-  if (available) {
-    open.summaryVerified = false;
-    if (await ensureSummaryIndex(open)) {
-      try {
-        return await summaryPage();
-      } catch (error) {
-        const failure = contractFailure(error);
-        if (failure !== undefined) throw failure;
+  // the summary layer once, then retry without repeating an already-completed sweep when content
+  // rows survived and always within the original sweep read/time budget.
+  const repair = await repairOnce();
+  if (repair !== "failed") {
+    try {
+      if (repair === "repaired-reset") {
+        completedSweep = undefined;
+        if (query.cursor !== undefined) {
+          await verifySummaryCursor(open.db, query.cursor, conversationIds);
+        }
       }
+      return await summaryPage();
+    } catch (error) {
+      const failure = contractFailure(error);
+      if (failure !== undefined) throw failure;
     }
   }
   // A summary-specific SQL failure must never turn into a raw-search failure. Mark this open's
   // summary layer unavailable; the next open retries schema verification and repair.
   open.summaryReady = false;
+  open.summaryVerified = false;
+  if (query.cursor !== undefined) {
+    throw cursorUnavailableError();
+  }
   const unavailableSync: HistorySummarySyncReport = {
     caughtUp: reconciliation.caughtUp,
     episodesKnown: 0,
