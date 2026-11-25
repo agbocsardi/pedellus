@@ -2797,3 +2797,116 @@ test('cancelling a worker with an accepted steer withdraws the queued message in
     await rm(fixture.directory, { recursive: true, force: true });
   }
 });
+
+test('worktree worker environments are closed and evicted on finalize and abort while the gateway stays open', { timeout: 40_000 }, async () => {
+  const fixture = await fixtureWorkspace({ git: true });
+  const abortChildRanExec = deferred();
+  const releaseAbortChild = deferred();
+  let abortChildBlocked = false;
+  const issued = new Set();
+  const childExecIssued = new Set();
+  const store = await syntheticStore(fixture, async (transcript, options) => {
+    const input = lastUserText(transcript.messages);
+    if (input.includes('Background worker task.')) {
+      const transcriptJson = transcriptText(transcript.messages);
+      if (input.includes('WORKTREE-COMPLETE-ENV')) {
+        if (!childExecIssued.has('complete')) {
+          childExecIssued.add('complete');
+          return fauxAssistantMessage([
+            fauxToolCall('bash', { command: 'printf "%s\\n" "$TMPDIR"' }, { id: 'wt-complete-exec' }),
+          ], { stopReason: 'toolUse' });
+        }
+        const match = transcriptJson.match(/\/[^\\"\s]*nanobot-host-exec-[^\\"\s]+/);
+        return fauxAssistantMessage(`COMPLETE-DONE ${match?.[0] ?? ''}`);
+      }
+      if (input.includes('WORKTREE-ABORT-ENV')) {
+        if (!childExecIssued.has('abort')) {
+          childExecIssued.add('abort');
+          return fauxAssistantMessage([
+            fauxToolCall('bash', { command: 'printf "%s\\n" "$TMPDIR"' }, { id: 'wt-abort-exec' }),
+          ], { stopReason: 'toolUse' });
+        }
+        if (!abortChildBlocked) {
+          abortChildBlocked = true;
+          abortChildRanExec.resolve();
+          await new Promise((resolve) => {
+            const signal = options?.signal;
+            if (signal?.aborted) return resolve();
+            signal?.addEventListener('abort', () => resolve(), { once: true });
+            releaseAbortChild.promise.then(() => resolve());
+          });
+        }
+        return fauxAssistantMessage('LATE-ABORT');
+      }
+    }
+    if (input.includes('[internal worker result]')) return fauxAssistantMessage('noted');
+    if (input === 'spawn complete worktree' && !issued.has(input)) {
+      issued.add(input);
+      return fauxAssistantMessage([
+        fauxToolCall(WORKER_TOOL_NAME, {
+          action: 'start',
+          task: 'WORKTREE-COMPLETE-ENV report TMPDIR',
+          workspace_mode: 'worktree',
+        }, { id: 'start-complete-wt' }),
+      ], { stopReason: 'toolUse' });
+    }
+    if (input === 'spawn abort worktree' && !issued.has(input)) {
+      issued.add(input);
+      return fauxAssistantMessage([
+        fauxToolCall(WORKER_TOOL_NAME, {
+          action: 'start',
+          task: 'WORKTREE-ABORT-ENV report TMPDIR then wait',
+          workspace_mode: 'worktree',
+        }, { id: 'start-abort-wt' }),
+      ], { stopReason: 'toolUse' });
+    }
+    return fauxAssistantMessage('ok');
+  }, { toolAllowlist: ['read', 'write', 'bash'] });
+
+  let completeWatcher;
+  let abortWatcher;
+  try {
+    const conversation = await store.gateway.conversationFor(ORIGIN, context);
+
+    // 1. Completed worktree worker: its HostExecutionEnv temp dir is cleaned up on finalize
+    // before gateway.close().
+    completeWatcher = workerResultWatcher(store.gateway.harness, conversation.id, 'completed worktree worker result');
+    const first = await conversation.submit({ type: 'input', content: 'spawn complete worktree', requestId: 'wt-env-1' }, context);
+    assert.equal((await first.wait(context)).status, 'done');
+    const completePub = await within(completeWatcher.promise, WAIT_MS, 'completed worktree worker never reported');
+    const completeBody = messageText(workerResultEntry(completePub, conversation.id)?.model?.[0]);
+    const completeScratchMatch = completeBody.match(/\/[^\s]*nanobot-host-exec-[^\s]+/);
+    assert.ok(completeScratchMatch !== null, `worker must report its HostExecutionEnv TMPDIR: ${completeBody}`);
+    const completeScratch = completeScratchMatch[0];
+    await waitFor(async () => !(await exists(completeScratch)),
+      'completed worktree worker ToolEnvironments scratch dir to be closed and removed while gateway is open');
+
+    // 2. Aborted worktree worker: after it runs bash (allocating its ToolEnvironments), aborting it
+    // also closes and removes its HostExecutionEnv scratch dir while the gateway stays open.
+    abortWatcher = workerResultWatcher(store.gateway.harness, conversation.id, 'aborted worktree worker result');
+    const second = await conversation.submit({ type: 'input', content: 'spawn abort worktree', requestId: 'wt-env-2' }, context);
+    assert.equal((await second.wait(context)).status, 'done');
+    await within(abortChildRanExec.promise, WAIT_MS, 'abort worktree worker never finished exec');
+
+    const workers = (await store.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context)).workers;
+    const abortRecord = workers.find((record) => record.prompt.includes('WORKTREE-ABORT-ENV'));
+    assert.ok(abortRecord?.conversationId != null, 'abort worktree worker has a child conversation');
+    const abortChild = await store.gateway.harness.conversation(abortRecord.conversationId, context);
+    const abortEntries = (await abortChild.entries({ order: 'ascending' }, 100, undefined, context)).items;
+    const abortScratchMatch = JSON.stringify(abortEntries).match(/\/[^\\"\s]*nanobot-host-exec-[^\\"\s]+/);
+    assert.ok(abortScratchMatch !== null, 'abort worktree worker ran bash and recorded TMPDIR');
+    const abortScratch = abortScratchMatch[0];
+    assert.equal(await exists(abortScratch), true, 'worktree scratch dir exists while worker is live');
+
+    await store.gateway.harness.abortTask(abortRecord.taskId, context);
+    await within(abortWatcher.promise, WAIT_MS, 'aborted worktree worker never reported');
+    await waitFor(async () => !(await exists(abortScratch)),
+      'aborted worktree worker ToolEnvironments scratch dir to be closed and removed while gateway is open');
+  } finally {
+    releaseAbortChild.resolve();
+    completeWatcher?.stop();
+    abortWatcher?.stop();
+    await store.gateway.close(context);
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});

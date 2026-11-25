@@ -1799,3 +1799,98 @@ test("a stale scheduled-run recall/MCP capture never survives a reopen", { timeo
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("cronFoundation.finalize strips extensions consistently with vision off and on", { timeout: 30_000 }, async () => {
+  const { openGateway } = await load(`${pkg}/dist/runtime.js`);
+  const { parseConfig } = await load(`${pkg}/dist/config.js`);
+  const extensionNames = (agent) => (agent?.extensions ?? []).map((ext) => (typeof ext === "string" ? ext : ext.name));
+
+  for (const withVision of [false, true]) {
+    const directory = await temp(`nanobot-cron-finalize-ext-${withVision ? "vision" : "plain"}-`);
+    try {
+      const workspace = resolve(directory, "workspace");
+      await mkdir(workspace);
+      const providerId = `cron-finalize-ext-${withVision ? "vision" : "plain"}`;
+      const provider = fauxProvider({
+        provider: providerId,
+        models: [
+          { id: "chat", name: "Chat", input: ["text", "image"] },
+        ],
+      });
+      let addIssued = false;
+      provider.setResponses(Array.from({ length: 8 }, () => (transcript) => {
+        const input = userTexts(transcript.messages)[0];
+        if (input === scheduledContent("extension strip probe")) return fauxAssistantMessage("STRIP-PROBE-ANSWER");
+        if (input === "schedule extension strip probe" && !addIssued) {
+          addIssued = true;
+          return fauxAssistantMessage([
+            fauxToolCall("cron", { action: "add", message: "extension strip probe", after_seconds: 1 }, { id: "ext-strip-add" }),
+          ], { stopReason: "toolUse" });
+        }
+        return fauxAssistantMessage("Scheduled.");
+      }));
+      const models = createModels();
+      models.setProvider(provider.provider);
+
+      const config = parseConfig({
+        workspace,
+        dataDir: resolve(directory, "state"),
+        ...(withVision
+          ? {
+              modelPresets: {
+                chat: { provider: providerId, modelId: "chat" },
+              },
+              modelPreset: "chat",
+              visionHandoff: { describerPreset: "chat" },
+            }
+          : {
+              model: { provider: providerId, modelId: "chat" },
+              allowedModels: [{ provider: providerId, modelId: "chat" }],
+            }),
+        toolAllowlist: ["read"],
+        cron: { enabled: true, timeZone: "UTC" },
+        episodeSummary: { enabled: false },
+      }, directory);
+
+      const gateway = await openGateway(config, context, { models });
+      try {
+        const chat = await gateway.conversationFor("cron-conversations:finalize-ext", context);
+        const settledWatcher = changeWatcher(gateway.harness, (changes) => changes.some((change) => {
+          if (change.type !== "document" || change.record.kind !== CRON_JOBS_KIND
+            || change.conversationId !== chat.id || change.value === null) return false;
+          return Array.isArray(change.value.jobs)
+            && change.value.jobs.some((job) => job.lastOutcome?.status === "ok");
+        }), "extension strip probe run to settle");
+        try {
+          const submission = await chat.submit(
+            { type: "input", content: "schedule extension strip probe", requestId: "ext-strip-req" },
+            context,
+          );
+          assert.equal((await submission.wait(context)).status, "done");
+          const publication = await settledWatcher.promise;
+          const automationId = publication.changes.find((change) =>
+            change.type === "document" && change.record.kind === CRON_JOBS_KIND
+            && change.conversationId === chat.id)?.value?.jobs[0]?.lastOutcome?.conversationId;
+          assert.equal(typeof automationId, "number");
+
+          // Inspect immediately after finalize (no reopen): extensions must be stripped to
+          // `[visionExtension]` when vision is enabled, or `[]` when vision is off.
+          const agent = await gateway.harness.snapshot(AgentDoc, automationId, context);
+          assert.deepEqual(agent?.tools ?? [], [], "finalized cron target keeps no tools");
+          assert.deepEqual(agent?.modelTools ?? [], [], "finalized cron target keeps no modelTools");
+          assert.deepEqual(
+            extensionNames(agent),
+            withVision ? ["nanobot-vision-handoff"] : [],
+            `finalized cron target extensions must be stripped (withVision=${withVision})`,
+          );
+        } finally {
+          settledWatcher.stop();
+        }
+      } finally {
+        await gateway.close(context);
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
+});
