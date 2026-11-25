@@ -9,7 +9,7 @@
  * re-derives the thread from the host-owned session key at call time.
  *
  * Both actions name one existing regular file inside the configured workspace. The host resolves
- * that path exactly as the Telegram outbound send does (workspace-relative, no traversal, no symlink
+ * that path with the shared outbound resolver (workspace-relative, no traversal, no symlink
  * escape, one stable read) and copies it into the app file store. The durable effect is one commit:
  * a referenced file record and an assistant `message` carrying its `AttachmentInfo`. Repeating one
  * execution is idempotent because the message id is derived from the durable tool task id.
@@ -26,8 +26,9 @@ import {
   type ConversationId,
   type Extension,
 } from "@earendil-works/pi-durable";
+import { validOutboundFilePath } from "../media/outbound.js";
 import { APP_LIMITS } from "./app-protocol.js";
-import { validTelegramFilePath } from "./telegram-interactions.js";
+import { createSingleHostRegistry, type SingleHostRegistry } from "./contracts.js";
 
 export const APP_TOOL_NAME = "app";
 
@@ -75,28 +76,10 @@ export interface AppActionHost {
 }
 
 /** One host per process, attached by the running app adapter and detached when it stops. */
-export interface AppActionRegistry {
-  attach(host: AppActionHost): () => void;
-  current(): AppActionHost | undefined;
-}
+export type AppActionRegistry = SingleHostRegistry<AppActionHost>;
 
 export function createAppActionRegistry(): AppActionRegistry {
-  let host: AppActionHost | undefined;
-  return {
-    attach(next) {
-      const previous = host;
-      host = next;
-      let detached = false;
-      return () => {
-        if (detached) return;
-        detached = true;
-        if (host === next) host = previous;
-      };
-    },
-    current() {
-      return host;
-    },
-  };
+  return createSingleHostRegistry<AppActionHost>();
 }
 
 export interface AppToolOptions {
@@ -164,7 +147,7 @@ export function createAppTool(options: AppToolOptions): { readonly extension: Ex
         return errorResult("action must be send or artifact.");
       }
       const path = args.path;
-      if (!validTelegramFilePath(path)) {
+      if (!validOutboundFilePath(path, APP_ACTION_LIMITS.filePathChars)) {
         return errorResult("path must be a workspace-relative path inside the configured workspace, " +
           "for example reports/summary.html; absolute paths, `..` segments, empty segments and " +
           "Windows separators are refused.");

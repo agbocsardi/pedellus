@@ -165,7 +165,7 @@ export const CONVERSATION_COMMANDS: readonly ConversationCommand[] = [
     usage: "Usage: /mcp",
     detail: "Read-only bounded status. Ask the assistant to add, log in, log out or remove a server; no approval command is needed.",
     refusalGuarantee: "Nothing was changed.",
-    surfaces: ["cli", "telegram", "discord"],
+    surfaces: ["cli", "telegram", "discord", "app"],
   },
   {
     name: "compact",
