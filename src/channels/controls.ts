@@ -490,11 +490,11 @@ export function pruneControls<R extends { readonly status: ControlStatus }>(
   reported: (entry: R) => boolean,
   maxApplied: number = MAX_CONTROL_RECORDS,
 ): R[] {
-  const totalApplied = controls.filter((entry) => entry.status === "applied").length;
+  const totalApplied = controls.filter((entry) => entry.status === "applied" && !reported(entry)).length;
   let drop = Math.max(0, totalApplied - maxApplied);
   return controls.filter((entry) => {
     if ((entry.status === "unconfirmed" || entry.status === "refused") && !reported(entry)) return false;
-    if (entry.status !== "applied" || drop === 0) return true;
+    if (entry.status !== "applied" || reported(entry) || drop === 0) return true;
     drop -= 1;
     return false;
   });
@@ -527,8 +527,8 @@ export function recoverInterruptedControls<Key, C extends RecoverableControl, N 
     const key = access.controlKey(entry);
     const text = unconfirmedControlText(entry.command);
     const notice = pending.find((item) => item.notice === true && access.noticeKey(item) === key);
-    if (notice !== undefined) {
-      if (notice.hold === true) notice.text = text;
+    if (notice?.hold === true) {
+      notice.text = text;
       delete notice.hold;
     } else if (!access.report(entry, text)) {
       continue;

@@ -1063,7 +1063,8 @@ export async function runTelegram(
       delete notice.hold;
       return;
     }
-    if (late === undefined || text === undefined || doc.pending.length >= MAX_ADMITTED) return;
+    if (late === undefined || text === undefined) return;
+    if (doc.pending.length >= MAX_ADMITTED) throw new Error("Telegram durable output queue is full");
     const used = new Set(doc.pending.map((item) => item.updateId));
     let updateId = RESTART_LIVE_UPDATE_ID;
     while (used.has(updateId)) updateId -= 1;
@@ -1941,14 +1942,22 @@ export async function runTelegram(
         noticeKey: (item) => item.updateId,
         report(entry, text) {
           if (doc.pending.length >= MAX_ADMITTED) return false;
+          const existing = doc.pending.some((item) => item.updateId === entry.updateId);
+          let updateId = entry.updateId;
+          if (existing) {
+            const used = new Set(doc.pending.map((item) => item.updateId));
+            updateId = RESTART_LIVE_UPDATE_ID;
+            while (used.has(updateId)) updateId -= 1;
+          }
           doc.pending.push({
-            updateId: entry.updateId,
+            updateId,
             nextChunkIndex: 0,
             chatId: entry.chatId,
             sessionKey: sessionKeyFor(entry.chatId),
             senderId: entry.senderId,
             text,
             notice: true,
+            ...(existing ? { lateFor: entry.updateId } : {}),
           });
           return true;
         },
