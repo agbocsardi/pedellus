@@ -27,7 +27,6 @@ The gateway also serves `POST /v1/ask` for iOS Shortcuts (APP.md, *Shortcuts*).
   affordances.
 - [../GETTING_STARTED.md](../GETTING_STARTED.md#installable-web-app-pwa) — build,
   serve and pair it on a real gateway.
-- [2026-11-18_pwa_TODO.md](./2026-11-18_pwa_TODO.md) — plan and work log.
 - [docs/native-ios/](./docs/native-ios/) — parked native SwiftUI plan, kept for
   a possible later iOS app.
 
