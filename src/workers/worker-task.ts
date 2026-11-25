@@ -427,6 +427,16 @@ function statusOf(record: { readonly state: { readonly status: string; readonly 
 }
 
 /**
+ * The status every surface (list, inspect, transcript, steering, the app's Tasks view) shows. A
+ * task cannot end itself natively `orphaned`, so an unresolved turn commits a native `aborted`
+ * outcome while its record says `orphaned`; that pair is shown as `orphaned`, never as a
+ * cancellation. A real owner cancellation records `aborted` and stays `aborted`.
+ */
+function presentedStatus(record: Pick<WorkerRecord, "status"> | undefined, native: WorkerStatus): WorkerStatus {
+  return native === "aborted" && record?.status === "orphaned" ? "orphaned" : native;
+}
+
+/**
  * Verify one worker's native facts against a record, task and child conversation. Pure; both the
  * read-only resolver and the atomic steering admission use it, so they cannot drift apart. A
  * forged record, an unrelated task, a mismatched checkpoint and a child owned by anything else are
@@ -442,7 +452,7 @@ function workerTargetOf(
   if (record === undefined) return undefined;
   if (task === undefined) return { record, status: "missing", targetConversationId: null };
   if (task.kind !== WORKER_TASK_NAME || task.conversationId !== spawnerConversationId) return undefined;
-  const status = statusOf(task);
+  const status = presentedStatus(record, statusOf(task));
   const checkpoint = isRecord(task.state) && isRecord(task.state.checkpoint)
     ? task.state.checkpoint.targetConversationId
     : undefined;
@@ -965,7 +975,11 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
         if (record === undefined) return { state: "held" as const, submissionId: undefined };
         if (record.status === "running" || record.status === "queued") return { state: "held" as const, submissionId: undefined };
         let state = await reconcileResultDelivery(tx, conversationId, record);
-        if (state === "absent" || state === "withdrawn") {
+        // A confirmed withdrawal only advanced the attempt. The new attempt's request ID is checked
+        // in this same commit, before the admission write that ends table reads: Durable would hand
+        // back a pre-existing (possibly foreign) input under it, which must never become ours.
+        if (state === "withdrawn") state = await reconcileResultDelivery(tx, conversationId, record);
+        if (state === "absent") {
           const attempt = record.resultAttempt ?? 0;
           // Atomic admission: the ownership write below is stored with this same commit (or not at
           // all when anything in it fails), so no Stop or crash can come between the two. Durable
@@ -1197,6 +1211,9 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
             record.error = "cancelled before the worker finished";
             record.notified = reportSuppressed;
             if (reportSuppressed) {
+              // Proof of deliberate suppression, as in `finish`: the row stays evictable without an
+              // admission, unlike an ambiguous delivery that reconciliation must hold.
+              record.resultSuppressed = true;
               await consumeInterruptedRun(tx, Number(running.id), checkpoint.targetConversationId as ConversationId);
             }
           }
@@ -1295,14 +1312,14 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
       const doc = await harness.snapshot(WorkerRecordsDoc, conversationId, context);
       if (doc === undefined || !Array.isArray(doc.workers)) return [];
       const statuses = await readTasks(harness, doc.workers.map((entry) => entry.taskId), context);
-      return doc.workers.map((entry) => viewOf(entry, statuses.get(entry.taskId) ?? entry.status));
+      return doc.workers.map((entry) => viewOf(entry, presentedStatus(entry, statuses.get(entry.taskId) ?? entry.status)));
     },
 
     async inspect(harness, conversationId, taskId, context) {
       const stored = await record(harness, conversationId, taskId, context);
       if (stored === undefined) return undefined;
       const task = await harness.getTask(taskId as TaskId, context);
-      return viewOf(stored, task === undefined ? "missing" : statusOf(task));
+      return viewOf(stored, task === undefined ? "missing" : presentedStatus(stored, statusOf(task)));
     },
 
     async cancel(harness, conversationId, taskId, context) {
@@ -1365,7 +1382,7 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
         }
         if (task === undefined) return { status: "terminal", worker: "missing" } as const;
         if (task.state.status === "terminal" || task.state.status === "completing" || task.abortRequested) {
-          return { status: "terminal", worker: statusOf(task) } as const;
+          return { status: "terminal", worker: presentedStatus(record, statusOf(task)) } as const;
         }
         if (resolved.targetConversationId === null) return { status: "not_live" } as const;
         const live = await tx.doc(LiveDoc, resolved.targetConversationId);

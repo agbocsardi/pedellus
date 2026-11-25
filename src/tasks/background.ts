@@ -70,7 +70,8 @@ export const terminalFailed = <S, R>(result: R, message: string): NextTaskState<
 export type TurnWait =
   | { readonly kind: "settled"; readonly record: SubmissionRecord }
   | { readonly kind: "ended"; readonly record: SubmissionRecord }
-  | { readonly kind: "unresolved"; readonly record: SubmissionRecord };
+  /** `record` is the last state read; undefined when no status read succeeded after admission. */
+  | { readonly kind: "unresolved"; readonly record: SubmissionRecord | undefined };
 
 /** Idle observations tolerated while a newly placed submission is still being answered. */
 const TURN_WAIT_ROUNDS = 4;
@@ -87,9 +88,10 @@ const isSettled = (record: SubmissionRecord): boolean => record.status === "done
  * answer) the input in between. The abort result is therefore authoritative, and any state other
  * than a confirmed withdrawal is re-read fresh: `settled` returns that settlement, and a placed
  * input is waited for again instead of being reported as unanswered. Only a confirmed withdrawal
- * is `ended`; a rejected withdrawal, or a submission that is still queued or placed after the
- * bounded re-waits, stays `unresolved` — the input may still run, so the caller must hold, not
- * report a failure and not retry.
+ * is `ended`. Everything without proof stays `unresolved`: a rejected withdrawal, a status read or
+ * wait that faults after admission, or a submission still queued or placed after the bounded
+ * re-waits. The input may still run, so the caller must hold, not report a failure and not retry.
+ * Only the caller's own cancellation (its context aborted) is rethrown.
  */
 export async function waitForTurnAnswer(
   submission: Submission,
@@ -97,6 +99,16 @@ export async function waitForTurnAnswer(
   context: Context,
 ): Promise<TurnWait> {
   let record: SubmissionRecord | undefined;
+  const cancelled = (): boolean => context.abortSignal?.aborted === true;
+  /** A fresh status, or undefined when the read faults (an unknown, never a failure). */
+  const readStatus = async (): Promise<SubmissionRecord | undefined> => {
+    try {
+      return await submission.status(context);
+    } catch (error) {
+      if (cancelled()) throw error;
+      return undefined;
+    }
+  };
   for (let round = 0; round < TURN_WAIT_ROUNDS; round += 1) {
     const settled = submission.wait(context).then(
       (value) => ({ kind: "settled" as const, record: value as SubmissionRecord }),
@@ -110,24 +122,39 @@ export async function waitForTurnAnswer(
     void settled.catch(() => undefined);
     void idle.catch(() => undefined);
     const first = await Promise.race([settled, idle]);
-    if (first.kind === "failed") throw first.error;
+    if (first.kind === "failed") {
+      if (cancelled()) throw first.error;
+      // The admitted input's state is unknown; a fresh read may still prove a settlement.
+      const fresh = await readStatus();
+      if (fresh !== undefined && isSettled(fresh)) return { kind: "settled", record: fresh };
+      return { kind: "unresolved", record: fresh ?? record };
+    }
     if (first.kind === "settled") return first;
-    record = await submission.status(context);
+    const observed = await readStatus();
+    if (observed === undefined) return { kind: "unresolved", record };
+    record = observed;
     if (isSettled(record)) return { kind: "settled", record };
     if (record.status === "queued") {
       let outcome: Awaited<ReturnType<Submission["abort"]>> | undefined;
       let rejected = false;
-      try { outcome = await submission.abort(context); } catch { rejected = true; }
+      try {
+        outcome = await submission.abort(context);
+      } catch (error) {
+        if (cancelled()) throw error;
+        rejected = true;
+      }
       if (outcome === "aborted") return { kind: "ended", record };
       // Placed or settled since the read: trust only a fresh record.
-      record = await submission.status(context);
+      const fresh = await readStatus();
+      if (fresh === undefined) return { kind: "unresolved", record };
+      record = fresh;
       if (isSettled(record)) return { kind: "settled", record };
       // A rejected withdrawal is itself unknown: the input may still be queued or placed.
       if (rejected) return { kind: "unresolved", record };
     }
     // Placed by a successor run: wait for that run to answer it.
   }
-  return { kind: "unresolved", record: record ?? await submission.status(context) };
+  return { kind: "unresolved", record: record ?? await readStatus() };
 }
 
 /** The visible text of an entry's first model message (an assistant answer), joined without separators. */

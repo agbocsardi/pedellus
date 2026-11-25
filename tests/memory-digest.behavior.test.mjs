@@ -25,6 +25,7 @@ const [
     MEMORY_DIGEST_PROMPT_FILE,
     MEMORY_DIGEST_RESULT_ENTRY_KIND,
     MEMORY_DIGEST_TASK_NAME,
+    memoryDigestHeldReason,
     memoryDigestScopeProblem,
   },
   { DigestCursorDoc, createDigestSource },
@@ -32,6 +33,7 @@ const [
   { createModels, fauxAssistantMessage, fauxProvider, fauxThinking, fauxToolCall },
   { BACKGROUND_CONTEXT },
   { AgentDoc },
+  { Submissions },
 ] = await Promise.all([
   import(new URL('../dist/config.js', import.meta.url).href),
   import(new URL('../dist/runtime.js', import.meta.url).href),
@@ -41,6 +43,8 @@ const [
   import(`${modules}/pi-ai/dist/index.js`),
   import(`${modules}/chord/dist/context/index.js`),
   import(`${modules}/pi-durable/dist/index.js`),
+  // The Harness's own submission store, loaded from the same file, so a test can fault one read.
+  import(`${modules}/pi-durable/dist/harness/submissions.js`),
 ]);
 
 const context = BACKGROUND_CONTEXT;
@@ -870,6 +874,60 @@ test('cancellation keeps the frontier and retires the target authority', { timeo
     assert.equal(await store.gateway.harness.snapshot(ConfigToolCaptureDoc, target.id, context), undefined);
     const state = await store.gateway.harness.snapshot(AgentDoc, target.id, context);
     assert.deepEqual(state.tools ?? [], []);
+  }
+});
+
+test('an unknown turn outcome holds its unacknowledged frontier across starts and reopen', { timeout: 40_000 }, async (t) => {
+  const fixture = await fixtureWorkspace();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  // The digest turn is answered, but its wait never settles and every status read of it faults, so
+  // the run cannot prove an answer, a failure or a withdrawal: its outcome is unknown.
+  const { wait, status } = Submissions.prototype;
+  let armed = true;
+  const isDigestTurn = (record) => typeof record?.requestId === 'string' && record.requestId.startsWith('memory-digest:');
+  Submissions.prototype.status = async function patchedStatus(id, ctx) {
+    const record = await status.call(this, id, ctx);
+    if (armed && isDigestTurn(record)) throw new Error('synthetic status fault');
+    return record;
+  };
+  Submissions.prototype.wait = async function patchedWait(id, ctx) {
+    if (armed && isDigestTurn(await status.call(this, id, ctx))) return new Promise(() => {});
+    return wait.call(this, id, ctx);
+  };
+  t.after(() => Object.assign(Submissions.prototype, { wait, status }));
+  const script = () => fauxAssistantMessage('Nothing durable to keep.');
+  let store = await openStore(fixture, script);
+  let taskId;
+  try {
+    const origin = await store.gateway.conversationFor(SESSION, context);
+    await closedEpisode(store.gateway.harness, origin.id, [user(FACT_LINE), assistant('Noted.')]);
+    const started = await startDigest(store.gateway);
+    assert.equal(started.status, 'started');
+    taskId = started.taskId;
+    const task = await settleTask(store.gateway.harness, taskId);
+    armed = false;
+    assert.equal(task.state.outcome.result.outcome, 'unknown');
+    assert.equal(task.state.outcome.result.consumed, false);
+    assert.equal(await cursorDoc(store.gateway.harness, origin.id), undefined, 'nothing acknowledged the batch');
+    const calls = store.calls.length;
+    // The same unacknowledged frontier is held, not replayed.
+    assert.deepEqual(await startDigest(store.gateway), { status: 'refused', reason: memoryDigestHeldReason(taskId) });
+    assert.equal(store.calls.length, calls, 'a held start makes no provider call');
+  } finally {
+    armed = false;
+    await store.gateway.close(context);
+  }
+  store = await openStore(fixture, script);
+  try {
+    const before = store.calls.length;
+    assert.deepEqual(await startDigest(store.gateway), { status: 'refused', reason: memoryDigestHeldReason(taskId) },
+      'reopen keeps the hold; the answered turn is not proof it never ran');
+    assert.equal(store.calls.length, before);
+    const tasks = await store.gateway.harness.commit(
+      (tx) => tx.scanTasks({ kind: MEMORY_DIGEST_TASK_NAME }, 10), context);
+    assert.equal(tasks.items.length, 1, 'no second digest task was created');
+  } finally {
+    await store.gateway.close(context);
   }
 });
 

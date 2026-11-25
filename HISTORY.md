@@ -1041,6 +1041,14 @@ reopen, the config-over-seam deadline precedence, and the single native parked-t
   the schedule. Cancelling the job stops its occurrence and later ones; an already-started digest
   task is a separate native task and is cancelled through the native task controls.
 
+A run whose turn outcome stays unknown (the wait could prove neither an answer, a failure nor a
+withdrawal) ends `unknown` with its batch unacknowledged. Every later start, manual or scheduled and
+across reopen, returns `refused` naming that run instead of re-admitting the same frontier: the turn
+may already have been answered and the batch curated, so a replay would be blind. The hold lifts on
+its own only when Durable proves the run's own input settled `unanswered` without ever being placed.
+Known gap: no owner command acknowledges a held run whose turn was placed or answered; such a run
+must be inspected manually (`/digest status` shows it) and digestion stays held until then.
+
 Completion is issues-only: a failed or cancelled run admits one bounded internal Durable event,
 never a user or channel message. Its entry kind is `nanobot.memory-digest-result`, it is admitted to
 the origin conversation at the conversation-scoped request ID

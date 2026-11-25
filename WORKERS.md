@@ -255,9 +255,19 @@ crash can land between them, and a commit that fails rolls the admission back wi
 dedupes by request ID alone, so the record is marked notified only when the submission under that
 ID has placed this worker's own `nanobot.worker-result` entry in the spawning conversation — never
 while it is merely queued in the inbox, because a Stop can still withdraw a queued input. A
-confirmed withdrawal moves to the next attempt's request ID and is redelivered once. A foreign
-input holding the same request ID is not proof: the record stays unnotified, is never evicted, and
-each reopen retries without admitting a duplicate.
+confirmed withdrawal moves to the next attempt's request ID and is redelivered once; that new
+request ID is checked in the same commit before anything is admitted under it, so a pre-existing
+input there is never adopted as this worker's. A foreign input holding the current (or the next)
+request ID is not proof: the record is held (`resultHeld`), stays unnotified, is never evicted, and
+no reopen admits a duplicate or advances past it.
+
+A worker whose turn outcome is unresolved (its admitted input may still run after the task ended)
+ends natively `aborted`, because a task cannot end itself `orphaned`, while its record says
+`orphaned`. List, inspect, transcript, steering and the app's Tasks view show that pair as
+`orphaned` (the app's `failed` state), never as a cancellation; a real owner cancellation records
+`aborted` and is shown cancelled. A result that startup recovery deliberately suppressed records
+`resultSuppressed` with its terminal outcome on both the finish and the cancellation path, so the
+row stays evictable without an admission.
 
 Records written before this rule could mark `notified` while the event was still only queued (or
 settled before ownership was ever recorded). Such legacy rows are reconciled before anything is

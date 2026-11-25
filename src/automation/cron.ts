@@ -663,7 +663,7 @@ async function waitForAnswer(
   if (wait.kind === "unresolved") {
     return {
       status: "unknown",
-      error: `run outcome unknown: the admitted input can still be answered (submission is ${wait.record.status}); nothing was withdrawn or retried`,
+      error: `run outcome unknown: the admitted input can still be answered (submission is ${wait.record?.status ?? "unreadable"}); nothing was withdrawn or retried`,
       answerEntryId: null,
     };
   }

@@ -40,6 +40,8 @@ const [
   { ConfigToolCaptureDoc },
   { CODEMODE_TOOL_NAME },
   { waitForTurnAnswer },
+  { workerTask },
+  { InterruptedRunReportsDoc, addInterruptedRunReport },
 ] = await Promise.all([
   import(new URL('../dist/config.js', import.meta.url).href),
   import(new URL('../dist/runtime.js', import.meta.url).href),
@@ -51,6 +53,8 @@ const [
   import(new URL('../dist/tools/index.js', import.meta.url).href),
   import(new URL('../dist/extensions/codemode.js', import.meta.url).href),
   import(new URL('../dist/tasks/background.js', import.meta.url).href),
+  import(new URL('../dist/channels/app-tasks.js', import.meta.url).href),
+  import(new URL('../dist/recovery/interruption.js', import.meta.url).href),
 ]);
 
 const context = BACKGROUND_CONTEXT;
@@ -1025,7 +1029,7 @@ test('a foreign input holding the result request ID never marks the worker notif
   }
 });
 
-test('a queued result withdrawn by Stop stays unnotified and is redelivered once on reopen', { timeout: 40_000 }, async () => {
+async function stopWithdrawalScenario({ foreignNextAttempt }) {
   const fixture = await fixtureWorkspace();
   const releaseWorker = deferred();
   const releaseParent = deferred();
@@ -1073,6 +1077,12 @@ test('a queued result withdrawn by Stop stays unnotified and is redelivered once
     assert.equal(queued.status, 'completed');
     assert.equal(queued.notified, false, 'a queued result is not delivered yet');
     assert.equal((await submissionOf(store.gateway.harness, conversationId, workerResultRequestId(taskId))).status, 'queued');
+    if (foreignNextAttempt) {
+      // An unrelated input already holds the request ID the redelivery would use; the same Stop
+      // withdraws it too, so it settles unanswered without an entry, like a withdrawn result.
+      await conversation.submit(
+        { type: 'input', content: 'foreign next attempt', requestId: workerResultRequestId(taskId, 1) }, context);
+    }
     // Owner Stop: withdraws queued inputs, including the result event.
     const stopping = conversation.abort(context);
     releaseParent.resolve();
@@ -1080,6 +1090,10 @@ test('a queued result withdrawn by Stop stays unnotified and is redelivered once
     await waitFor(async () =>
       (await submissionOf(store.gateway.harness, conversationId, workerResultRequestId(taskId)))?.status === 'unanswered',
     'the Stop withdrawal');
+    if (foreignNextAttempt) {
+      assert.equal((await submissionOf(store.gateway.harness, conversationId, workerResultRequestId(taskId, 1)))?.status,
+        'unanswered');
+    }
     const withdrawn = await recordOf(store.gateway.harness, conversationId);
     assert.equal(withdrawn.notified, false, 'a withdrawn result must not count as delivered');
     const entries = (await conversation.entries({ order: 'ascending' }, 200, undefined, context)).items;
@@ -1093,6 +1107,18 @@ test('a queued result withdrawn by Stop stays unnotified and is redelivered once
   for (let round = 0; round < 2; round += 1) {
     const reopened = await syntheticStore(fixture, dispatcher);
     try {
+      if (foreignNextAttempt) {
+        // Reopen recovery is awaited by open: the foreign holder is unproven, so it is held.
+        const held = await recordOf(reopened.gateway.harness, conversationId);
+        assert.equal(held.notified, false);
+        assert.equal(held.resultHeld, true, 'a foreign input at the next attempt is held, not claimed');
+        assert.equal(held.resultAttempt, 1, 'the attempt never advances past an unproven holder');
+        assert.equal(held.resultSubmissionId, undefined, 'the foreign submission is never recorded as ours');
+        const conversation = await reopened.gateway.harness.conversation(conversationId, context);
+        const entries = (await conversation.entries({ order: 'ascending' }, 200, undefined, context)).items;
+        assert.equal(entries.filter((entry) => entry.kind === WORKER_RESULT_ENTRY_KIND).length, 0);
+        continue;
+      }
       await waitFor(async () => (await recordOf(reopened.gateway.harness, conversationId))?.notified === true,
         'the redelivered result');
       const conversation = await reopened.gateway.harness.conversation(conversationId, context);
@@ -1107,7 +1133,13 @@ test('a queued result withdrawn by Stop stays unnotified and is redelivered once
     }
   }
   await rm(fixture.directory, { recursive: true, force: true });
-});
+}
+
+test('a queued result withdrawn by Stop stays unnotified and is redelivered once on reopen', { timeout: 40_000 },
+  () => stopWithdrawalScenario({ foreignNextAttempt: false }));
+
+test('a foreign input at the next attempt\'s request ID is held, never claimed or advanced past', { timeout: 40_000 },
+  () => stopWithdrawalScenario({ foreignNextAttempt: true }));
 
 test('a commit that fails after admission rolls the admission back with it', async () => {
   const fixture = await fixtureWorkspace();
@@ -1387,6 +1419,125 @@ test('a turn wait reconciles a withdrawal that lost the race to placement or an 
   const stuck = fakeSubmission({ statuses: [placed], abort: 'already_placed' });
   assert.equal((await waitForTurnAnswer(stuck, idle, context)).kind, 'unresolved');
   assert.equal(stuck.aborts, 0, 'a placed input is never aborted');
+});
+
+test('a faulted withdrawal or status read stays unresolved; only the caller\'s cancellation throws', async () => {
+  const fault = () => Promise.reject(new Error('synthetic storage fault'));
+  const idle = { waitForIdle: async () => {} };
+  const queued = { type: 'input', id: 1, status: 'queued' };
+  let reads = 0;
+  // Abort rejects and so does the follow-up status read: no proof either way.
+  const doubleFault = {
+    wait: () => new Promise(() => {}),
+    status: () => (reads++ === 0 ? Promise.resolve(queued) : fault()),
+    abort: fault,
+  };
+  assert.deepEqual(await waitForTurnAnswer(doubleFault, idle, context), { kind: 'unresolved', record: queued });
+  // The very first status read after idle faults: still admitted, still unknown.
+  const unreadable = { wait: () => new Promise(() => {}), status: fault, abort: fault };
+  assert.deepEqual(await waitForTurnAnswer(unreadable, idle, context), { kind: 'unresolved', record: undefined });
+  // The wait itself faults without a cancellation: unknown, never a failure receipt.
+  const brokenWait = { wait: fault, status: fault, abort: fault };
+  assert.equal((await waitForTurnAnswer(brokenWait, { waitForIdle: () => new Promise(() => {}) }, context)).kind,
+    'unresolved');
+  // The caller's own cancellation still propagates, so a cancelled task stops cleanly.
+  const cancelled = Object.create(context, { abortSignal: { value: AbortSignal.abort() } });
+  await assert.rejects(waitForTurnAnswer(brokenWait, { waitForIdle: () => new Promise(() => {}) }, cancelled),
+    /synthetic storage fault/);
+});
+
+test('list and inspect show an unresolved worker as orphaned, and a real cancellation as aborted', async () => {
+  const foundation = createWorkerFoundation({
+    now: () => 0,
+    maxConcurrent: 1,
+    allowModel: () => true,
+    spawnModel: async () => { throw new Error('unused'); },
+    workspace: {},
+    prepare: async () => {},
+    finalize: async () => ({ result: null, error: null }),
+    trackWorkspace: () => {},
+    commit: async () => { throw new Error('unused'); },
+  });
+  const row = (taskId, status) => ({
+    taskId, requestId: `tool:${taskId}`, prompt: 'synthetic', workspaceMode: 'shared', createdAtMs: 0,
+    finishedAtMs: 1, status, result: null, error: null, conversationId: null, workspacePath: null,
+    branch: null, baseCommit: null, notified: false,
+  });
+  const harness = {
+    // An unresolved turn and an owner cancellation both end natively `aborted`.
+    snapshot: async () => ({ workers: [row(7, 'orphaned'), row(8, 'aborted')] }),
+    getTask: async (id) => ({ id, kind: WORKER_TASK_NAME, conversationId: 3,
+      state: { status: 'terminal', outcome: { status: 'aborted', reason: 'x' } } }),
+  };
+  const listed = await foundation.list(harness, 3, context);
+  assert.deepEqual(listed.map((view) => [view.taskId, view.status]), [[7, 'orphaned'], [8, 'aborted']]);
+  assert.equal((await foundation.inspect(harness, 3, 7, context)).status, 'orphaned');
+  assert.equal((await foundation.inspect(harness, 3, 8, context)).status, 'aborted');
+  assert.deepEqual(listed.map((view) => workerTask(view).state), ['failed', 'cancelled'],
+    'the app Tasks view never labels an unresolved worker cancelled');
+});
+
+test('a cancelled worker whose report startup suppressed keeps evictable suppression proof', { timeout: 30_000 }, async () => {
+  const fixture = await fixtureWorkspace();
+  const childStarted = deferred();
+  const dispatcher = async (transcript, options) => {
+    const input = lastUserText(transcript.messages);
+    if (input.includes('Background worker task.')) {
+      childStarted.resolve();
+      await new Promise((resolve) => {
+        if (options?.signal?.aborted) return resolve();
+        options?.signal?.addEventListener('abort', () => resolve(), { once: true });
+      });
+      return fauxAssistantMessage('CANCELLED-CHILD');
+    }
+    if (input === 'spawn one' && !dispatcher.issued) {
+      dispatcher.issued = true;
+      return fauxAssistantMessage([
+        fauxToolCall(WORKER_TOOL_NAME, { action: 'start', task: 'suppress me', workspace_mode: 'shared' }, { id: 'suppress-start' }),
+      ], { stopReason: 'toolUse' });
+    }
+    return fauxAssistantMessage('ok');
+  };
+  const recordOf = async (harness, conversationId) =>
+    (await harness.snapshot(WorkerRecordsDoc, conversationId, context))?.workers[0];
+  const store = await syntheticStore(fixture, dispatcher);
+  let conversationId;
+  try {
+    const conversation = await store.gateway.conversationFor(ORIGIN, context);
+    conversationId = conversation.id;
+    const spawn = await conversation.submit({ type: 'input', content: 'spawn one', requestId: 'spawn' }, context);
+    assert.equal((await spawn.wait(context)).status, 'done');
+    await within(childStarted.promise, WAIT_MS, 'the worker child turn');
+    const live = await recordOf(store.gateway.harness, conversationId);
+    assert.ok(live.conversationId !== null);
+    // Startup recovery recorded this exact run as interrupted before cancelling it.
+    await store.gateway.harness.commit(async (tx) => {
+      addInterruptedRunReport(await tx.doc(InterruptedRunReportsDoc), {
+        runTaskId: live.taskId, targetConversationId: live.conversationId, recordedAtMs: 0,
+      });
+      return undefined;
+    }, context);
+    await store.gateway.harness.abortTask(live.taskId, context);
+    await waitFor(async () => (await recordOf(store.gateway.harness, conversationId))?.status === 'aborted',
+      'the cancellation commit');
+    const cancelled = await recordOf(store.gateway.harness, conversationId);
+    assert.equal(cancelled.notified, true);
+    assert.equal(cancelled.resultSuppressed, true, 'the abort path persists suppression proof');
+  } finally {
+    await store.gateway.close(context);
+  }
+  const reopened = await syntheticStore(fixture, dispatcher);
+  try {
+    const record = await recordOf(reopened.gateway.harness, conversationId);
+    assert.equal(record.notified, true);
+    assert.notEqual(record.resultHeld, true, 'a deliberately suppressed row is never held as ambiguous');
+    const conversation = await reopened.gateway.harness.conversation(conversationId, context);
+    const entries = (await conversation.entries({ order: 'ascending' }, 200, undefined, context)).items;
+    assert.equal(entries.filter((entry) => entry.kind === WORKER_RESULT_ENTRY_KIND).length, 0);
+  } finally {
+    await reopened.gateway.close(context);
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
 });
 
 test('the active-worker bound refuses an extra start instead of queueing it', { timeout: 25_000 }, async () => {

@@ -192,6 +192,16 @@ export const MEMORY_DIGEST_NOTICE_FULL_REASON =
   "retry after an earlier run's result is admitted or its native task is settled";
 
 /** Fixed refusal when no explicit background model is configured; the foreground one is never used. */
+/**
+ * Refusal while a run's turn outcome is unknown: its unacknowledged batch is held, never replayed.
+ * No owner command acknowledges such a run yet; the hold lifts only on proof the turn never ran.
+ */
+export function memoryDigestHeldReason(taskId: number): string {
+  return `memory digest run ${taskId} ended with an unknown outcome: its turn may still have been answered and ` +
+    "its batch curated, so digestion holds that unacknowledged frontier instead of replaying it. " +
+    "/digest status shows the held run; digestion resumes once Durable proves that turn never ran.";
+}
+
 export const MEMORY_DIGEST_MODEL_REQUIRED_REASON =
   "memory digestion needs an explicit background model in digest.preset or digest.model; it never " +
   "inherits the foreground conversation's model or thinking level";
@@ -1408,7 +1418,7 @@ async function waitForAnswer(
   if (wait.kind === "unresolved") {
     return {
       status: "unknown",
-      entryId: typeof wait.record.entry === "number" ? wait.record.entry as EntryId : null,
+      entryId: typeof wait.record?.entry === "number" ? wait.record.entry as EntryId : null,
       answerEntryId: null,
       error: "the digest turn's outcome is unknown: the admitted input may still be answered after this task ended; the batch was not acknowledged",
     };
@@ -1842,6 +1852,28 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
     });
 
   const resultRequestId = (taskId: number): string => `${MEMORY_DIGEST_RESULT_REQUEST_PREFIX}${taskId}`;
+
+  /**
+   * The newest terminal run whose turn outcome is unknown, while that outcome stays unproven. Its
+   * batch was never acknowledged, so the frontier still selects it, yet the admitted turn may have
+   * been (or may still be) answered and curated: re-admitting it would be a blind replay. The hold
+   * lifts on its own only on proof the turn never ran — Durable settled the run's own input
+   * unanswered without ever placing it (for example the reopen pass withdrew it). A placed, answered
+   * or unreadable turn stays held. Read-only and before any write, so it runs inside the start
+   * commit and across reopen alike.
+   */
+  const txHeldUnknownRun = async (tx: Tx): Promise<number | undefined> => {
+    const newest = (await tx.scanTasks({ kind: MEMORY_DIGEST_TASK_NAME, status: "terminal", order: "descending" }, 1)).items[0];
+    if (newest === undefined) return undefined;
+    const result = digestResultOf(newest);
+    if (result?.outcome !== "unknown") return undefined;
+    const taskId = Number(newest.id);
+    const target = result.targetConversationId;
+    if (target === null || !Number.isSafeInteger(target) || target < 1) return taskId;
+    const turn = await tx.submissionByRequest(target as ConversationId, `memory-digest:${taskId}`);
+    const neverRan = turn !== undefined && turn.type === "input" && turn.status === "unanswered" && turn.entry === undefined;
+    return neverRan ? undefined : taskId;
+  };
 
   /**
    * The one bounded internal issue report. Fixed wording plus this run's bounded saved fields; no
@@ -2699,6 +2731,8 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
         // retry to make here: the next start after it settles takes the batch.
         return { status: "busy", taskId: running };
       }
+      const held = await options.harness().commit((tx) => txHeldUnknownRun(tx), context);
+      if (held !== undefined) return { status: "refused", reason: memoryDigestHeldReason(held) };
       // Bounded backpressure before consuming a batch: try once to admit every retained result.
       await flushPending(options.harness(), writer.id, context);
       const selected = await writer.commit((tx) => options.model(tx, writer.id), context);
@@ -2717,6 +2751,8 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
         // Re-check inside the commit so two host callers cannot both start a run for one frontier.
         const live = await txLiveTask(tx);
         if (live !== undefined) return { status: "busy", taskId: live };
+        const heldRun = await txHeldUnknownRun(tx);
+        if (heldRun !== undefined) return { status: "refused", reason: memoryDigestHeldReason(heldRun) };
         // Reserve the notice slot atomically with the task. Only a definitively reported or
         // genuinely nonreportable record may free one; an undelivered or unknown result never does.
         const notices = await tx.doc(MemoryDigestNoticesDoc, writer.id);
