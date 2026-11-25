@@ -165,6 +165,22 @@ export interface IdleRolloverConfig {
   readonly afterMinutes: number;
 }
 
+export interface ProactiveMemoryConfig {
+  readonly timeoutMs?: number;
+  readonly maxTopics?: number;
+  readonly topicGateThreshold?: number;
+  readonly topicMinProbability?: number;
+  readonly historyGateThreshold?: number;
+}
+
+export const PROACTIVE_MEMORY_DEFAULTS: Required<ProactiveMemoryConfig> = Object.freeze({
+  timeoutMs: 2000,
+  maxTopics: 5,
+  topicGateThreshold: 0.5,
+  topicMinProbability: 0.08,
+  historyGateThreshold: 0.6,
+});
+
 /**
  * Bounds for one explicitly started memory-digestion run. Absent fields keep the shared defaults;
  * the block itself neither enables nor schedules anything, and frequency stays with ordinary cron.
@@ -209,8 +225,10 @@ export interface DigestConfig {
 export interface WorkspaceContextConfig {
   /** Additional memory files in output order; system Markdown is always discovered by the loader. Defaults to []. */
   readonly memoryFiles: readonly string[];
+  /** Topic discovery in the system prompt or as per-turn hints; absent defaults to off. */
+  readonly memory?: "off" | "manifest" | "proactive";
   /**
-   * Opt-in topic memory manifest. Actually injected explicit and system files are marked loaded and
+   * Legacy opt-in topic memory manifest; mutually exclusive with memory. Actually injected explicit and system files are marked loaded and
    * the remaining `memory/**\/*.md` topics are listed for on-demand reads.
    * Absent or false leaves the snapshot unchanged.
    */
@@ -312,7 +330,7 @@ export interface PortConfig {
    */
   allowedModels?: readonly ModelReference[];
   /**
-   * The one classifier model native Code Mode `models.classify` may use. Absent means
+   * The one classifier model native Code Mode `models.classify` and host features may use. Absent means
    * classifiers are unavailable: registering a provider, or naming one of its chat models,
    * never makes a classifier reachable. The pair must be a classifier-type model in the
    * registered native/custom catalog; there is no substitution or fallback.
@@ -335,6 +353,8 @@ export interface PortConfig {
    * named preset and starts a new episode, so digest and summaries see a closed episode.
    */
   idleRollover?: IdleRolloverConfig;
+  /** Classifier bounds and thresholds, only for workspaceContext.memory: proactive. */
+  proactiveMemory?: ProactiveMemoryConfig;
   /**
    * How an owner message is placed when its CLI or Telegram conversation is busy. Optional so a host
    * that builds `PortConfig` by hand stays source-compatible; `parseConfig` always normalizes it to
@@ -672,6 +692,27 @@ function idleRolloverConfig(value: unknown): IdleRolloverConfig {
   return Object.freeze({ afterMinutes: after });
 }
 
+function proactiveMemoryConfig(value: unknown): Required<ProactiveMemoryConfig> {
+  const raw = object(value, "proactiveMemory");
+  rejectUnknownKeys(raw, Object.keys(PROACTIVE_MEMORY_DEFAULTS), "proactiveMemory");
+  const bounded = (key: keyof ProactiveMemoryConfig, min: number, max: number, integer = false): number => {
+    const selected = raw[key];
+    if (selected === undefined) return PROACTIVE_MEMORY_DEFAULTS[key];
+    if (typeof selected !== "number" || !Number.isFinite(selected)
+      || (integer && !Number.isInteger(selected)) || selected < min || selected > max) {
+      throw new Error(`proactiveMemory.${key} must be ${integer ? "an integer" : "a finite number"} from ${min} to ${max}`);
+    }
+    return selected;
+  };
+  return Object.freeze({
+    timeoutMs: bounded("timeoutMs", 100, 15000, true),
+    maxTopics: bounded("maxTopics", 1, 20, true),
+    topicGateThreshold: bounded("topicGateThreshold", 0, 1),
+    topicMinProbability: bounded("topicMinProbability", 0, 1),
+    historyGateThreshold: bounded("historyGateThreshold", 0, 1),
+  });
+}
+
 function visionHandoffConfig(
   value: unknown,
   modelPresets: Readonly<Record<string, ModelPreset>> | undefined,
@@ -752,7 +793,14 @@ function skillNames(value: unknown, label: string): readonly string[] {
 
 function workspaceContextConfig(value: unknown): WorkspaceContextConfig {
   const raw = object(value, "workspaceContext");
-  rejectUnknownKeys(raw, ["memoryFiles", "memoryManifest", "skills"], "workspaceContext");
+  rejectUnknownKeys(raw, ["memoryFiles", "memory", "memoryManifest", "skills"], "workspaceContext");
+  const memory = raw.memory;
+  if (Object.hasOwn(raw, "memory") && Object.hasOwn(raw, "memoryManifest")) {
+    throw new Error("workspaceContext.memory cannot be combined with workspaceContext.memoryManifest");
+  }
+  if (memory !== undefined && memory !== "off" && memory !== "manifest" && memory !== "proactive") {
+    throw new Error("workspaceContext.memory must be off, manifest or proactive");
+  }
   if (raw.memoryManifest !== undefined && typeof raw.memoryManifest !== "boolean") {
     throw new Error("workspaceContext.memoryManifest must be a boolean");
   }
@@ -768,20 +816,20 @@ function workspaceContextConfig(value: unknown): WorkspaceContextConfig {
       throw error;
     }
   }
-  if (memoryManifest) {
-    // The manifest is appended as one more memory source; the configured files
-    // must use names the loader accepts.
+  if (memoryManifest || memory === "manifest" || memory === "proactive") {
     try {
       validateMemoryLoadedFiles(memoryFiles);
     } catch (error) {
       if (error instanceof MemoryContextInputError) {
-        throw new Error(`workspaceContext.memoryFiles is invalid for the memory manifest: ${error.message}`);
+        const use = memory === "proactive" ? "proactive memory" : "the memory manifest";
+        throw new Error(`workspaceContext.memoryFiles is invalid for ${use}: ${error.message}`);
       }
       throw error;
     }
   }
   return Object.freeze({
     memoryFiles,
+    ...(memory === undefined ? {} : { memory }),
     ...(memoryManifest ? { memoryManifest: true } : {}),
     ...(raw.skills === undefined ? {} : { skills: workspaceSkillsConfig(raw.skills) }),
   });
@@ -1027,7 +1075,7 @@ const TOP_LEVEL_KEYS = [
   "workspace", "dataDir", "followUpMode",
   "model", "allowedModels", "thinkingLevel", "classifierModel", "modelPresets", "modelPreset", "visionHandoff",
   "toolAllowlist", "toolTimeoutSeconds", "toolSandbox", "restrictToWorkspace", "extraAllowedDirs", "bwrapPath",
-  "workspaceContext", "mcp", "cron", "workers", "codemode", "digest", "media", "episodeSummary", "idleRollover",
+  "workspaceContext", "mcp", "cron", "workers", "codemode", "digest", "media", "episodeSummary", "idleRollover", "proactiveMemory",
   "credentials", "providers", "web", "telegram", "discord", "app",
 ] as const;
 
@@ -1119,6 +1167,14 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
   }
   if (raw.workspaceContext !== undefined) {
     config.workspaceContext = workspaceContextConfig(raw.workspaceContext);
+  }
+  const proactiveMemoryEnabled = config.workspaceContext?.memory === "proactive";
+  if (proactiveMemoryEnabled && classifierModel === undefined) {
+    throw new Error("workspaceContext.memory requires classifierModel in proactive mode");
+  }
+  if (raw.proactiveMemory !== undefined) {
+    if (!proactiveMemoryEnabled) throw new Error("proactiveMemory requires workspaceContext.memory in proactive mode");
+    config.proactiveMemory = proactiveMemoryConfig(raw.proactiveMemory);
   }
   // Parsed after the workspace is resolved: a stdio server's cwd is confined to it.
   if (raw.mcp !== undefined) {

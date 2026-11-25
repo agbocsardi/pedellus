@@ -3,7 +3,7 @@ import type { PortConfig } from "../config.js";
 import { defaultShellEnvironment } from "../execution/policy.js";
 import type { OpenGatewayOptions } from "../runtime.js";
 import { loadSkillsContext, type SkillsContextRequest } from "./skills.js";
-import { loadMemoryContext, type MemoryContextResult } from "./memory.js";
+import { loadMemoryContext } from "./memory.js";
 import {
   createWorkspaceContextSnapshotProvider,
   loadWorkspaceContextSnapshot,
@@ -12,6 +12,14 @@ import {
 } from "./workspace.js";
 
 export type WorkspaceContextHostConfig = Pick<PortConfig, "workspace" | "workspaceContext">;
+
+const PROACTIVE_MEMORY_NOTICE = Object.freeze({
+  source: "memory:proactive",
+  content: "Memory under memory/system/ and configured memory files above are always loaded. "
+    + "Other workspace topic notes under memory/ and past conversations are outside this prompt. "
+    + "Advisory recall hints may appear beside user messages; inspect sources with your available "
+    + "memory or file tools before relying on a hint.",
+});
 
 /**
  * Gateway options for the local CLI/gateway host.
@@ -22,9 +30,9 @@ export type WorkspaceContextHostConfig = Pick<PortConfig, "workspace" | "workspa
  * files, explicitly named memory files and all Markdown beneath `memory/system/`.
  * Only an explicit `workspaceContext.skills` section adds Markdown skill discovery, from
  * `<workspace>/skills` and, when configured, an explicit builtin skills root.
- * Only `workspaceContext.memoryManifest: true` adds the `# Memory Tree`
- * manifest after those memory files; topic bodies stay on disk for the granted
- * native `read` tool. No identity, ambient configuration, default memory file,
+ * Manifest mode adds the `# Memory Tree` after those files, while proactive mode
+ * appends a static recall notice. Other topic bodies stay on disk.
+ * No identity, ambient configuration, default memory file,
  * package skill path, or home directory is added. The selection is copied once
  * and the loaders are still called for each conversation, so snapshots remain
  * detached and conversation-scoped.
@@ -45,9 +53,10 @@ export function workspaceContextGatewayOptions(
     workspaceRoot: config.workspace,
     memoryFiles: Object.freeze([...config.workspaceContext.memoryFiles]),
   });
-  const memoryManifest = config.workspaceContext.memoryManifest === true;
+  const memoryMode = config.workspaceContext.memory
+    ?? (config.workspaceContext.memoryManifest === true ? "manifest" : "off");
   const skills = config.workspaceContext.skills;
-  if (skills === undefined && !memoryManifest) {
+  if (skills === undefined && memoryMode === "off") {
     return {
       contextSnapshotProvider: createWorkspaceContextSnapshotProvider(() => workspace),
     };
@@ -69,15 +78,17 @@ export function workspaceContextGatewayOptions(
       const snapshot = await loadWorkspaceContextSnapshot(workspace);
       const [discovered, memory] = await Promise.all([
         skillsRequest === undefined ? undefined : loadSkillsContext(skillsRequest),
-        memoryManifest
+        memoryMode === "manifest"
           ? loadMemoryContext({
               workspaceRoot: config.workspace,
               loadedFiles: injectedMemoryFiles(snapshot),
             })
           : undefined,
       ]);
+      const document = memoryMode === "proactive" ? PROACTIVE_MEMORY_NOTICE : memory?.document;
       return {
-        ...withMemoryManifest(snapshot, memory),
+        ...snapshot,
+        ...(document === undefined ? {} : { memory: Object.freeze([...(snapshot.memory ?? []), document]) }),
         // The summary is what makes progressive loading work: the model learns that
         // unselected workspace and builtin skills exist, then loads a body on demand.
         ...(discovered === undefined || discovered.summary.length === 0
@@ -94,16 +105,4 @@ export function workspaceContextGatewayOptions(
  */
 function injectedMemoryFiles(snapshot: WorkspaceContextSnapshot): readonly string[] {
   return Object.freeze((snapshot.memory ?? []).map((document) => document.source.slice("workspace:".length)));
-}
-
-/** Append the manifest beside, not instead of, the loaded memory documents. */
-function withMemoryManifest(
-  snapshot: WorkspaceContextSnapshot,
-  memory: MemoryContextResult | undefined,
-): WorkspaceContextSnapshot {
-  if (memory?.document === undefined) return snapshot;
-  return {
-    ...snapshot,
-    memory: Object.freeze([...(snapshot.memory ?? []), memory.document]),
-  };
 }

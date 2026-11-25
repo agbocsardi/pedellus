@@ -271,6 +271,7 @@ export function createCommitEffects(report: (error: unknown) => void): CommitEff
 /** Extensions and tools this open may offer, each `undefined` when its capability is off. */
 export interface AuthorityCapabilities {
   readonly vision?: Extension;
+  readonly proactiveMemory?: Extension;
   readonly coding?: Extension;
   readonly askUser: { readonly extension: Extension };
   readonly web?: { readonly extension: Extension };
@@ -455,6 +456,8 @@ export function createAuthorityPolicy(options: AuthorityOptions) {
     const allowsContext = chat || role?.kind === "worker" || role?.kind === "scheduledRun";
     const mcp = live.mcp();
     const codeMode = live.codeMode();
+    // Rank the owner's original text before vision can insert image descriptions.
+    if (chat && caps.proactiveMemory) selected.push(caps.proactiveMemory);
     // The vision hook carries no tool or workspace authority; selecting it everywhere keeps
     // image bounding independent of tool allowlists and channel scope.
     if (caps.vision) selected.push(caps.vision);

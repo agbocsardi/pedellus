@@ -206,7 +206,7 @@ const TRUSTED_CONFIG_FIELDS = new Set([
   "workspace", "dataDir", "extraAllowedDirs", "model", "allowedModels", "modelPresets", "modelPreset",
   "classifierModel", "toolAllowlist", "toolSandbox", "bwrapPath", "toolTimeoutSeconds", "followUpMode",
   "restrictToWorkspace", "thinkingLevel",
-  "workspaceContext", "workspaceContext.memoryFiles", "workspaceContext.memoryManifest", "workspaceContext.skills",
+  "workspaceContext", "workspaceContext.memoryFiles", "workspaceContext.memory", "workspaceContext.memoryManifest", "workspaceContext.skills",
   "workspaceContext.skills.builtinSkillsRoot", "workspaceContext.skills.disabledSkills",
   "cron", "cron.enabled", "cron.timeZone", "episodeSummary", "episodeSummary.enabled", "episodeSummary.preset",
   "episodeSummary.model", "workers", "workers.enabled", "workers.maxConcurrent", "workers.preset", "workers.toolAllowlist",
@@ -224,6 +224,8 @@ const TRUSTED_CONFIG_FIELDS = new Set([
   "media.transcription.whisperCli", "media.transcription.hex",
   "web", "web.search", "web.search.keyEnv", "web.fetch",
   "mcp", "mcp.enabled", "mcp.servers", "codemode", "codemode.enabled",
+  "proactiveMemory", "proactiveMemory.timeoutMs", "proactiveMemory.maxTopics", "proactiveMemory.topicGateThreshold",
+  "proactiveMemory.topicMinProbability", "proactiveMemory.historyGateThreshold",
   "idleRollover", "idleRollover.afterMinutes", "visionHandoff", "visionHandoff.describerPreset",
   "visionHandoff.maxRawImages", "visionHandoff.maxDescriptionTokens", "visionHandoff.prompt",
 ]);
@@ -235,7 +237,7 @@ const DYNAMIC_KEY_SECTIONS = ["providers", "credentials", "modelPresets", "mcp.s
 const STRICT_OPTION_SECTIONS = [
   "app.push", "app", "discord.receipts", "discord", "workspaceContext.skills", "workspaceContext",
   "media.transcription.whisperCli", "media.transcription.hex", "media.transcription", "media",
-  "web.search", "web", "mcp", "codemode", "idleRollover", "visionHandoff", "cron", "workers", "digest",
+  "web.search", "web", "mcp", "codemode", "idleRollover", "proactiveMemory", "visionHandoff", "cron", "workers", "digest",
   "episodeSummary", "telegram",
 ] as const;
 

@@ -1,4 +1,4 @@
-# Explicit-root topic memory discovery and manifest
+# Workspace topic memory: manifest and proactive hints
 
 `src/context/memory.ts` is a read-only helper for the workspace
 Markdown memory surface. Markdown files are authoritative; Durable keeps the
@@ -13,11 +13,60 @@ in [MEMORY_RECALL.md](./MEMORY_RECALL.md); workspace coding tools remain a
 separate configured capability for file edits. This module never creates, writes,
 renames, or deletes a file, including a missing `memory/` directory.
 
-The host opt-in is `workspaceContext.memoryManifest: true`. The configured
-`workspaceContext.memoryFiles` are additional configured sources; the workspace
-loader also injects all `memory/system/**/*.md` automatically whenever workspace
-context is enabled. Only files actually injected are marked loaded in the manifest.
-Other topic bodies stay on disk. This manifest helper itself does not inject bodies.
+Set `workspaceContext.memory` to `"off"` (default), `"manifest"`, or `"proactive"`.
+The legacy `workspaceContext.memoryManifest: true` is equivalent to manifest mode;
+do not specify both fields, even with `memoryManifest: false`. Whenever workspace
+context is enabled, the loader injects configured `workspaceContext.memoryFiles` and
+all `memory/system/**/*.md`. Other topic bodies stay on disk. Only files actually
+injected are marked loaded in the manifest; the discovery helper itself does not
+inject bodies.
+
+## Proactive hints
+
+```json
+{
+  "workspaceContext": { "memory": "proactive" },
+  "classifierModel": { "provider": "typesafe", "modelId": "jev-latest" }
+}
+```
+
+Proactive mode requires the configured classifier and replaces the system prompt's
+memory tree with a static recall notice. For a new text-bearing owner input in an
+authenticated mapped chat, the host sends the configured classifier up to 4,000
+characters of the new message and up to 6,000 characters of recent owner/assistant
+text (no tool calls, results or images). It also sends paths and descriptions of
+unloaded workspace topic notes discovered on disk, not their bodies, episode
+summaries or other conversations. Startup, background runs, and resets do not
+classify by themselves. This works without Code Mode and grants no tools.
+
+In one classifier request, a yes/no relevance gate controls whether choice
+probabilities surface topic paths. Lists over 255 notes are split into balanced
+chunks (up to 255 notes each), each paired with its own yes/no relevance gate and
+ranked across passing chunks by `gateProbability * choiceProbability`. When recall
+tools are on, a separate yes/no gate can also suggest looking up prior conversations
+with `memory_search` or `memory_browse` (suppressed if reopened with `agentHistory: false`).
+Trailing batched owner inputs in the same turn are classified together as one batch
+and attached to the last input in that batch. Hints are untrusted pointers; inspect
+the source before relying on them.
+
+The optional top-level `proactiveMemory` section is accepted only in proactive
+mode. These settings and `workspaceContext` require restart; `/reload` does not
+apply them.
+
+| Field | Default | Range |
+| --- | ---: | --- |
+| `timeoutMs` | 2000 | 100–15000, integer |
+| `maxTopics` | 5 | 1–20, integer |
+| `topicGateThreshold` | 0.5 | 0–1 |
+| `topicMinProbability` | 0.08 | 0–1 |
+| `historyGateThreshold` | 0.6 | 0–1 |
+
+`timeoutMs` bounds both topic discovery and the classifier call; failure or timeout
+lets the chat proceed without a hint. Decisions (including empty ones) are stored in
+Durable per conversation. Inactive decisions outside the active context window are
+pruned first beyond 64 entries (with a 256-entry safety ceiling), so active prompt
+prefixes remain stable across tool rounds, retries, follow-up turns and reopen.
+Neither the transcript nor search results contain the injected hints.
 
 ## API
 
@@ -188,8 +237,7 @@ slice.
 
 ## Host integration
 
-`workspaceContextGatewayOptions()` reads `workspaceContext.memoryManifest`.
-When it is `true`:
+In manifest mode, `workspaceContextGatewayOptions()` appends the tree:
 
 - configuration rejects non-boolean values; `memoryFiles` has no count cap;
 - config parsing also applies `validateMemoryLoadedFiles()` so manifest and

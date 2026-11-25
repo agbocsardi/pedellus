@@ -8,7 +8,7 @@ import { STARTUP_DIAGNOSTICS } from "./startup-diagnostics.js";
 export type FailureStage = "command" | "gateway.open" | "gateway.local" | "gateway.telegram"
   | "gateway.discord" | "gateway.app" | "gateway.wait" | "gateway.close.local"
   | "gateway.close.runtime" | "gateway.lock" | "gateway.restart" | "gateway.observe"
-  | "gateway.idleRollover"
+  | "gateway.idleRollover" | "gateway.proactiveMemory"
   | `durable.${Report["kind"]}`;
 
 const ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));

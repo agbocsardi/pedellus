@@ -140,7 +140,8 @@ capability:
 ```
 
 The host also uses the same configured model, outside Code Mode and without
-granting any script or tool, for the idle-rollover continuation check (README).
+granting any script or tool, for the idle-rollover continuation check (README) and
+[proactive memory hints](./MEMORY_CONTEXT.md#proactive-hints).
 Absent `classifierModel`, classifiers are unavailable: the native nested tool is
 not registered, catalog discovery lists no classifier, and a script call fails
 without a model request. Naming a provider in `allowedModels`, `credentials` or

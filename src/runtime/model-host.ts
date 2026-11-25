@@ -192,6 +192,9 @@ export function resolveBackgroundModels(
   if (config.idleRollover !== undefined && startup.classifierGrant === undefined) {
     throw new StartupDiagnosticError("configInvalid", { detail: "idleRollover requires classifierModel" });
   }
+  if (config.workspaceContext?.memory === "proactive" && startup.classifierGrant === undefined) {
+    throw new StartupDiagnosticError("configInvalid", { detail: "workspaceContext.memory requires classifierModel in proactive mode" });
+  }
   let workerPreset: PinnedModelChoice | undefined;
   if (config.workers?.preset !== undefined) {
     const selected = presetCatalog.get(config.workers.preset);

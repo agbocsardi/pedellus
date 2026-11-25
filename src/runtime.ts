@@ -34,6 +34,7 @@ import {
   type ToolRegistration,
 } from "@earendil-works/pi-durable";
 import { CONTEXT_LIMITS } from "./context/index.js";
+import { createProactiveMemoryExtension } from "./context/proactive-memory.js";
 import { SKILL_TOOL_NAME } from "./context/skill-tool.js";
 import { CRON_TOOL_NAME } from "./automation/cron-tool.js";
 import { createMemoryTools } from "./memory/tools.js";
@@ -235,6 +236,17 @@ export async function openGateway(config: PortConfig, context: Context, options:
   // One registry for every classified conversation; role changes a foundation commit decides are
   // applied only once that commit is stored.
   const registry = new ConversationRegistry();
+  const proactiveMemoryExtension = config.workspaceContext?.memory === "proactive" && classifierGrant !== undefined
+    ? createProactiveMemoryExtension({
+      harness: () => harness!,
+      isChat: (id) => registry.isChat(id),
+      classifier: classifierGrant,
+      workspaceRoot: workspace,
+      loadedFiles: config.workspaceContext.memoryFiles,
+      historyEnabled,
+      ...(config.proactiveMemory === undefined ? {} : { config: config.proactiveMemory }),
+    })
+    : undefined;
   const effects = createCommitEffects((error) => reportFailure(error, "gateway.observe"));
   const harnessRef: { current?: HarnessType } = {};
   const openHarness = (): HarnessType => {
@@ -404,6 +416,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     toolRegistrations,
     capabilities: {
       ...(visionExtension === undefined ? {} : { vision: visionExtension }),
+      ...(proactiveMemoryExtension === undefined ? {} : { proactiveMemory: proactiveMemoryExtension }),
       ...(toolExtension === undefined ? {} : { coding: toolExtension }),
       askUser: askUserTool,
       ...(webTool === undefined ? {} : { web: webTool }),
@@ -682,7 +695,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
     }
     const registry_ = createRegistry();
     for (const extension of [
-      episodeSummaries?.extension, visionExtension, toolExtension, mcpRef.current?.extension,
+      episodeSummaries?.extension, proactiveMemoryExtension, visionExtension, toolExtension, mcpRef.current?.extension,
       mcpAdminRef.current?.extension, ...(codeModeRef.current?.extensions ?? []), skillTool?.extension,
       memoryTools?.extension, telegramTool?.extension, appTool?.extension, askUserTool.extension,
       discordHistoryTool?.extension, webTool?.extension, cronHost?.foundation.extension, cronHost?.tool.extension,
