@@ -580,7 +580,7 @@ test("an already-sleeping invalid legacy deadline is disarmed on recovery, never
 test("legacy timer recovery fails closed: fatal errors and shutdown are never reported as success", async () => {
   const cron = await load(`${pkg}/dist/automation/cron.js`);
   const { MAX_DATE_MS } = await load(`${pkg}/dist/automation/cron-schedule.js`);
-  const { recoverBeforeServing } = await load(`${pkg}/dist/cli.js`);
+  const { recoverBeforeServing, openAndRecoverBeforeServing } = await load(`${pkg}/dist/cli.js`);
   const { StartupDiagnosticError } = await load(`${pkg}/dist/startup-diagnostics.js`);
   const { withAbortSignal } = await load(`${pkg}/node_modules/@earendil-works/chord/dist/context/index.js`);
   const invalid = { id: 7, abortRequested: false, input: { jobId: "job-1", scheduledAtMs: MAX_DATE_MS + 1, generation: 1 } };
@@ -610,6 +610,33 @@ test("legacy timer recovery fails closed: fatal errors and shutdown are never re
   await assert.rejects(cron.disarmInvalidSleepingCronTimers(cancelled, withAbortSignal(stop.signal, context)));
   assert.equal(cancelled.calls.aborts, 0);
 
+  // Cancellation arriving during the final scan or final abort still rejects the sweep itself.
+  const duringScan = new AbortController();
+  await assert.rejects(
+    cron.disarmInvalidSleepingCronTimers(
+      fake({
+        commit: async (change) => {
+          const result = await change({ scanTasks: async () => ({ items: [] }) });
+          duringScan.abort();
+          return result;
+        },
+      }),
+      withAbortSignal(duringScan.signal, context),
+    ),
+  );
+  const duringAbort = new AbortController();
+  await assert.rejects(
+    cron.disarmInvalidSleepingCronTimers(
+      fake({
+        abortTask: async () => {
+          duringAbort.abort();
+          return "marked";
+        },
+      }),
+      withAbortSignal(duringAbort.signal, context),
+    ),
+  );
+
   // The startup gate turns every one of these into a fixed refusal instead of serving.
   await assert.rejects(recoverBeforeServing(fake({ abortTask: async () => { throw sealed; } }), new AbortController().signal, context),
     (error) => error instanceof StartupDiagnosticError && error.code === "cronRecovery" && error.cause === sealed);
@@ -619,5 +646,18 @@ test("legacy timer recovery fails closed: fatal errors and shutdown are never re
   const late = new AbortController();
   await assert.rejects(recoverBeforeServing(fake({ abortTask: async () => { late.abort(); return "marked"; } }), late.signal, context),
     (error) => error instanceof StartupDiagnosticError && error.code === "gatewayCanceled");
+  // A shutdown that makes openGateway itself reject also maps to gatewayCanceled, not unexpected.
+  const openStop = new AbortController();
+  await assert.rejects(
+    openAndRecoverBeforeServing(
+      async () => {
+        openStop.abort();
+        throw new Error("aborted while opening");
+      },
+      openStop.signal,
+      withAbortSignal(openStop.signal, context),
+    ),
+    (error) => error instanceof StartupDiagnosticError && error.code === "gatewayCanceled",
+  );
   await recoverBeforeServing(fake(), new AbortController().signal, context);
 });

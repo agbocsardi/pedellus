@@ -1763,10 +1763,11 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
  * timer that settled after the scan is the one benign race, and `abortTask` reports it as
  * `"terminal"` rather than throwing.
  *
- * Known limitation: Durable restores the sleep at open, before any host code can run, so between
- * open and this sweep the restored sleep still contributes its clamped native wakeup reference.
- * That window is inert (the due check holds forever for an out-of-range deadline, and the
- * fire-phase guard settles the task if it is ever run), and the SDK offers no earlier seam.
+ * Known limitation: Durable restores the sleep at open and arms its clamped native wakeup
+ * reference once scheduling is enabled (`harness.resume()` inside `openGateway()`), so between
+ * `openGateway()` returning and this sweep that reference still exists. That window is inert (the
+ * due check holds forever for an out-of-range deadline, and the fire-phase guard settles the task
+ * if it is ever run).
  */
 export async function disarmInvalidSleepingCronTimers(
   harness: Pick<Harness, "commit" | "abortTask">,
@@ -1794,5 +1795,6 @@ export async function disarmInvalidSleepingCronTimers(
     context.abortSignal?.throwIfAborted();
     if (await harness.abortTask(record.id as TaskId<CronTimerResult>, context) === "marked") disarmed += 1;
   }
+  context.abortSignal?.throwIfAborted();
   return disarmed;
 }

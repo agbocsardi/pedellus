@@ -503,9 +503,9 @@ task's own abort handler settles it "cancelled" through the ordinary scheduler; 
 wait for that. The sweep is not best-effort: a scan, commit or abort failure (such as a storage
 failure that fails the Durable session) or a shutdown during open or recovery stops startup with
 a fixed diagnostic before the local socket, any channel or `gateway.surfaces.started`. A timer
-that settled meanwhile is the one benign race and is skipped. Durable restores the sleep at open,
-before host code runs, so until the sweep its clamped native wakeup reference still exists; that
-window is inert, and the SDK has no earlier seam. Arithmetic overflow while following
+that settled meanwhile is the one benign race and is skipped. Durable restores the sleep at open
+and arms its clamped native wakeup reference once `openGateway()` calls `harness.resume()`, so
+until the CLI sweep runs that reference still exists; that window is inert. Arithmetic overflow while following
 an interval is the absence of a next slot, never a failure of the occurrence that is due right
 now: the timer admits that occurrence exactly once and the job simply stops re-arming, instead of
 the overflow discarding the whole terminal commit.

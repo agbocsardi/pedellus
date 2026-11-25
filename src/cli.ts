@@ -579,15 +579,16 @@ async function runGateway(config: LoadedConfig): Promise<void> {
     const socketPath = await gatewayOwnerSocketPath(config);
     journalEvent("gateway.starting");
     gateway = await observeOperation("gateway.open", {},
-      () => openGateway(config, context, {
-        ...workspaceContextGatewayOptions(config),
-        // The candidate loader is host-owned and fixed to the file this gateway opened from. No
-        // model, chat message or tool can name a path for a reload.
-        ...(config.configFile === undefined ? {} : { reloadConfig: () => loadConfig(config.configFile!) }),
-      }));
-    // Legacy recovery before serving; a failed recovery or a shutdown requested meanwhile stops
-    // here, before the local socket, any channel or `gateway.surfaces.started`.
-    await recoverBeforeServing(gateway.harness, stop.signal, context);
+      () => openAndRecoverBeforeServing(
+        () => openGateway(config, context, {
+          ...workspaceContextGatewayOptions(config),
+          // The candidate loader is host-owned and fixed to the file this gateway opened from. No
+          // model, chat message or tool can name a path for a reload.
+          ...(config.configFile === undefined ? {} : { reloadConfig: () => loadConfig(config.configFile!) }),
+        }),
+        stop.signal,
+        context,
+      ));
     stage = "gateway.local";
     // The gateway owns local attachments too: the CLI only names an operator path. CLI
     // originals live in a code-owned child of the validated operator media root, so a
@@ -759,6 +760,31 @@ async function runGateway(config: LoadedConfig): Promise<void> {
  * it, and a shutdown requested during open or recovery, rejects with a fixed diagnostic so the
  * caller tears down instead of binding the socket or starting channels. Nothing is swallowed.
  */
+export async function openAndRecoverBeforeServing<
+  G extends { readonly harness: Parameters<typeof disarmInvalidSleepingCronTimers>[0]; close(context: Context): Promise<void> },
+>(
+  open: () => Promise<G>,
+  signal: AbortSignal,
+  context: Context,
+): Promise<G> {
+  let gateway: G;
+  try {
+    gateway = await open();
+  } catch (cause) {
+    if (signal.aborted && !(cause instanceof StartupDiagnosticError)) {
+      throw new StartupDiagnosticError("gatewayCanceled", { cause });
+    }
+    throw cause;
+  }
+  try {
+    await recoverBeforeServing(gateway.harness, signal, context);
+  } catch (error) {
+    await gateway.close(withoutAbortSignal(context)).catch(() => {});
+    throw error;
+  }
+  return gateway;
+}
+
 export async function recoverBeforeServing(
   harness: Parameters<typeof disarmInvalidSleepingCronTimers>[0],
   signal: AbortSignal,
