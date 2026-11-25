@@ -77,7 +77,7 @@ export function workerTask(view: WorkerView): TaskInfo {
     : view.status === "aborted"
       ? "cancelled"
       : view.status === "orphaned"
-        ? "interrupted by a restart"
+        ? "interrupted — outcome unknown"
         : view.status === "failed" || view.status === "faulted" || view.status === "missing"
           ? "failed"
           : undefined;

@@ -100,16 +100,23 @@ export async function waitForTurnAnswer(
 ): Promise<TurnWait> {
   let record: SubmissionRecord | undefined;
   const cancelled = (): boolean => context.abortSignal?.aborted === true;
+  const throwIfCancelled = (): void => {
+    context.abortSignal?.throwIfAborted();
+  };
+  throwIfCancelled();
   /** A fresh status, or undefined when the read faults (an unknown, never a failure). */
   const readStatus = async (): Promise<SubmissionRecord | undefined> => {
     try {
-      return await submission.status(context);
+      const value = await submission.status(context);
+      throwIfCancelled();
+      return value;
     } catch (error) {
       if (cancelled()) throw error;
       return undefined;
     }
   };
   for (let round = 0; round < TURN_WAIT_ROUNDS; round += 1) {
+    throwIfCancelled();
     const settled = submission.wait(context).then(
       (value) => ({ kind: "settled" as const, record: value as SubmissionRecord }),
       (error: unknown) => ({ kind: "failed" as const, error }),
@@ -129,6 +136,7 @@ export async function waitForTurnAnswer(
       if (fresh !== undefined && isSettled(fresh)) return { kind: "settled", record: fresh };
       return { kind: "unresolved", record: fresh ?? record };
     }
+    throwIfCancelled();
     if (first.kind === "settled") return first;
     const observed = await readStatus();
     if (observed === undefined) return { kind: "unresolved", record };
@@ -139,6 +147,7 @@ export async function waitForTurnAnswer(
       let rejected = false;
       try {
         outcome = await submission.abort(context);
+        throwIfCancelled();
       } catch (error) {
         if (cancelled()) throw error;
         rejected = true;
@@ -154,6 +163,7 @@ export async function waitForTurnAnswer(
     }
     // Placed by a successor run: wait for that run to answer it.
   }
+  throwIfCancelled();
   return { kind: "unresolved", record: record ?? await readStatus() };
 }
 

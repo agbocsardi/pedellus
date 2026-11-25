@@ -1870,6 +1870,8 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
     const taskId = Number(newest.id);
     const target = result.targetConversationId;
     if (target === null || !Number.isSafeInteger(target) || target < 1) return taskId;
+    const conv = await tx.conversation(target as ConversationId);
+    if (conv?.owner?.taskId !== newest.id) return taskId;
     const turn = await tx.submissionByRequest(target as ConversationId, `memory-digest:${taskId}`);
     const neverRan = turn !== undefined && turn.type === "input" && turn.status === "unanswered" && turn.entry === undefined;
     return neverRan ? undefined : taskId;

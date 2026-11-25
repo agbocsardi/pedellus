@@ -414,9 +414,19 @@ function workerSteerDigest(content: string): string {
 }
 
 /** Live or terminal status of one worker task. Pure; a missing task is `missing`, never a guess. */
-function statusOf(record: { readonly state: { readonly status: string; readonly outcome?: { readonly status: string } } }): WorkerStatus {
+function statusOf(
+  record: { readonly state: { readonly status: string; readonly outcome?: { readonly status: string; readonly result?: unknown } } },
+): WorkerStatus {
   if (record.state.status === "terminal") {
     const outcome = record.state.outcome?.status;
+    if (
+      outcome === "aborted" &&
+      typeof record.state.outcome?.result === "object" &&
+      record.state.outcome.result !== null &&
+      (record.state.outcome.result as { readonly status?: unknown }).status === "orphaned"
+    ) {
+      return "orphaned";
+    }
     if (outcome === "completed" || outcome === "failed" || outcome === "aborted" || outcome === "orphaned" || outcome === "faulted") {
       return outcome;
     }

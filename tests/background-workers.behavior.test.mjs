@@ -1440,10 +1440,15 @@ test('a faulted withdrawal or status read stays unresolved; only the caller\'s c
   const brokenWait = { wait: fault, status: fault, abort: fault };
   assert.equal((await waitForTurnAnswer(brokenWait, { waitForIdle: () => new Promise(() => {}) }, context)).kind,
     'unresolved');
-  // The caller's own cancellation still propagates, so a cancelled task stops cleanly.
+  // The caller's own cancellation still propagates, even if the underlying calls would resolve.
   const cancelled = Object.create(context, { abortSignal: { value: AbortSignal.abort() } });
   await assert.rejects(waitForTurnAnswer(brokenWait, { waitForIdle: () => new Promise(() => {}) }, cancelled),
-    /synthetic storage fault/);
+    { name: 'AbortError' });
+  const answered = { type: 'input', id: 1, status: 'answered', answerEntryId: 2 };
+  await assert.rejects(
+    waitForTurnAnswer({ wait: async () => answered, status: async () => answered, abort: async () => 'already_placed' }, idle, cancelled),
+    { name: 'AbortError' },
+  );
 });
 
 test('list and inspect show an unresolved worker as orphaned, and a real cancellation as aborted', async () => {
