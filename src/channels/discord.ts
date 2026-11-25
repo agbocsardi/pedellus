@@ -86,6 +86,7 @@ import {
   recoverInterruptedControls,
   renderDigestStatus,
   renderModelListing,
+  unconfirmedControlText,
   type ChannelMutation,
   type ControlLedger,
   type ControlRecord,
@@ -509,9 +510,7 @@ export async function runDiscord(
     earlySubmissions.delete(key);
     await mutateState((doc) => {
       doc.pending = doc.pending.filter((entry) => entry.key !== key);
-      doc.controls = doc.controls.filter((entry) =>
-        !((entry.key === key || `unconfirmed:${entry.key}` === key) &&
-          (entry.status === "unconfirmed" || entry.status === "refused")));
+      dropReportedControls(doc);
     }, cleanupContext);
   };
 
@@ -742,7 +741,7 @@ export async function runDiscord(
     // admits it, so the question can neither stay open after its answer nor close without one. A
     // Gateway event is never redelivered, so a failed lookup admits the message without a claim
     // rather than losing it; the question then stays open for the next answer or its expiry.
-    const answerConversation = gateway.askSurfaces !== undefined && message.content.trim() !== ""
+    const answerConversation = gateway.askSurfaces !== undefined && claimsQuestion(commandText)
       ? await gateway.conversationFor(sessionKey, adapterContext).catch(() => undefined)
       : undefined;
     state = await stateConversation.commit(async (tx) => {
@@ -752,7 +751,7 @@ export async function runDiscord(
         throw new Error("Discord durable output queue is full");
       }
       if (answerConversation !== undefined) {
-        claimTypedQuestionAnswer(await tx.doc(AskQuestionsDoc, answerConversation.id), sessionKey, message.content, admittedAtMs);
+        claimTypedQuestionAnswer(await tx.doc(AskQuestionsDoc, answerConversation.id), sessionKey, commandText, admittedAtMs);
       }
       doc.pending.push({
         key,
@@ -1396,8 +1395,7 @@ export async function runDiscord(
     }
     await mutateState((doc) => {
       doc.pending = doc.pending.filter((entry) => !retired.has(entry.key));
-      doc.controls = doc.controls.filter((entry) => !(retired.has(entry.key) &&
-        (entry.status === "unconfirmed" || entry.status === "refused")));
+      dropReportedControls(doc);
     }, cleanupContext);
   };
 
@@ -1447,22 +1445,32 @@ export async function runDiscord(
     if (!hold) drain();
   };
 
-  /** Rewrite (when given) and release a still-queued acknowledgement; `false` when it is gone. */
+  /**
+   * Whether a queued notice is already being (or was partly) sent. Its text is fixed then: the sender
+   * removes the record when it finishes, so an outcome written into it would be dropped unseen.
+   */
+  const noticeInFlight = (item: Draft<DiscordPendingDelivery>): boolean =>
+    delivering.has(item.key) || item.sendIntent !== undefined || item.deliveryStatus !== undefined ||
+    item.nextChunkIndex > 0;
+
+  /**
+   * Rewrite (when given) and release a still-queued acknowledgement; `false` when it is gone or
+   * already in flight, so the caller queues the outcome as a separate notice instead.
+   */
   const releaseNotice = (doc: Draft<ChannelState>, key: string, text: string | undefined): boolean => {
     const notice = doc.pending.find((item) => item.notice === true && item.key === key);
-    if (notice === undefined) return false;
+    if (notice === undefined || noticeInFlight(notice)) return false;
     delete notice.hold;
     if (text !== undefined) notice.text = boundNotice(text, MAX_NOTICE_CHARS);
     return true;
   };
 
-  /** A command keeps its terminal record only while its own report is still queued. */
+  /** A command keeps its terminal record only while one of its reports is still queued. */
   const pruneRecords = (
     controls: readonly DiscordControlRecord[],
     pending: readonly DiscordPendingDelivery[],
   ): DiscordControlRecord[] => {
-    const reported = new Set(pending.filter((item) => item.notice === true).flatMap((item) =>
-      item.key.startsWith("unconfirmed:") ? [item.key, item.key.slice("unconfirmed:".length)] : [item.key]));
+    const reported = reportedControlKeys(pending);
     return pruneControls(controls, (entry) => reported.has(entry.key), MAX_UNRESOLVED_CONTROLS);
   };
 
@@ -1473,6 +1481,11 @@ export async function runDiscord(
   };
 
   const lateKey = (key: string): string => `late:${key}`;
+
+  /** Queue one control's outcome as its own `late:` notice, beside an acknowledgement that is gone or in flight. */
+  const queueLate = (doc: Draft<ChannelState>, record: DiscordControl, text: string): boolean =>
+    doc.pending.some((entry) => entry.key === lateKey(record.key)) ||
+    pushNotice(doc, lateKey(record.key), record, text, MAX_LATE_CONTROL_CHARS);
 
   /** The durable commits of one mutating control, each against this adapter's channel state. */
   const ledger: ControlLedger<string, string, DiscordControl> = {
@@ -1517,25 +1530,19 @@ export async function runDiscord(
     async markRefused(record, text, late) {
       await mutateState((doc) => {
         setControlStatus(doc, record.key, "refused");
-        if (!releaseNotice(doc, record.key, text) && late === true) {
-          pushNotice(doc, lateKey(record.key), record, text, MAX_LATE_CONTROL_CHARS);
-        }
+        if (!releaseNotice(doc, record.key, text) && late === true) queueLate(doc, record, text);
         doc.controls = pruneRecords(doc.controls, doc.pending);
       }, cleanupContext);
     },
     async markUnconfirmed(key, text, lateRecord) {
       await mutateState((doc) => {
         setControlStatus(doc, key, "unconfirmed");
-        if (!releaseNotice(doc, key, text) && lateRecord !== undefined) {
-          pushNotice(doc, lateKey(key), lateRecord, text, MAX_LATE_CONTROL_CHARS);
-        }
+        if (!releaseNotice(doc, key, text) && lateRecord !== undefined) queueLate(doc, lateRecord, text);
       }, cleanupContext);
     },
     async publishLate(record, text) {
       await mutateState((doc) => {
-        if (releaseNotice(doc, record.key, text)) return;
-        if (!doc.pending.some((entry) => entry.key === lateKey(record.key)) &&
-            !pushNotice(doc, lateKey(record.key), record, text, MAX_LATE_CONTROL_CHARS)) {
+        if (!releaseNotice(doc, record.key, text) && !queueLate(doc, record, text)) {
           throw new Error("Discord durable output queue is full");
         }
       }, cleanupContext);
@@ -1813,12 +1820,17 @@ export async function runDiscord(
         delete entry.sendIntent;
       }
     });
+    // The bot-wide rate-limit window gates every chunk, not only the record's dispatch.
+    if (!cooldownOpen()) return "kept";
     let requestStarted = false;
     try {
-      await outbox.update(sessionKey, recordId, (entry) => {
+      const intent = await outbox.update(sessionKey, recordId, (entry) => {
+        if (entry.status !== "pending") return;
         entry.status = "sending";
         entry.sendIntent = { text: chunk, chunkIndex: index, startedAt: Date.now() };
       }, adapterContext);
+      // Only a committed intent on a live pending record may precede the send.
+      if (intent?.status !== "sending" || intent.sendIntent?.chunkIndex !== index) return "kept";
       requestStarted = true;
       await transport.send({ channelId, text: chunk });
       const accepted = await outbox.update(sessionKey, recordId, (entry) => {
@@ -1925,8 +1937,9 @@ export async function runDiscord(
   };
 
   detachMcpSurface = gateway.mcpSurfaces?.attach({
-    owns: (sessionKey) => ownerChannelFor(sessionKey) !== undefined,
+    owns: (sessionKey) => adapterActive() && ownerChannelFor(sessionKey) !== undefined,
     async deliverAuthorization(sessionKey, authorization, _context) {
+      if (!adapterActive()) throw new Error("the Discord adapter is stopping");
       const owner = ownerChannelFor(sessionKey);
       if (owner === undefined) throw new Error("the requesting Discord channel is no longer authorized");
       if (authorization.expiresAtMs <= Date.now()) throw new Error("authorization URL expired before delivery");
@@ -1957,8 +1970,9 @@ export async function runDiscord(
    * admission. An ambiguous send is reported unknown, so the question is quarantined, never resent.
    */
   detachAskSurface = gateway.askSurfaces?.attach({
-    owns: (sessionKey) => ownerChannelFor(sessionKey) !== undefined,
+    owns: (sessionKey) => adapterActive() && ownerChannelFor(sessionKey) !== undefined,
     async deliverQuestion(sessionKey, question) {
+      if (!adapterActive()) throw new Error("the Discord adapter is stopping");
       const owner = ownerChannelFor(sessionKey);
       if (owner === undefined) throw new Error("the requesting Discord channel is no longer authorized");
       try {
@@ -2020,39 +2034,50 @@ export async function runDiscord(
 
   // ── Recovery on open ──────────────────────────────────────────────────────
 
-  // A control recorded but never confirmed may or may not have taken effect: report it once, never replay it.
-  if (state.controls.some((entry) => entry.status === "admitted") || state.pending.some((item) => item.hold === true)) {
-    let interrupted = 0;
-    await mutateState((doc) => {
-      interrupted = recoverInterruptedControls(doc.controls, doc.pending, {
-        controlKey: (entry) => entry.key,
-        noticeKey: (item) => item.key,
-        report: (entry, text) => pushNotice(doc, `unconfirmed:${entry.key}`, {
-          channelId: entry.channelId,
-          sessionKey: `discord:${identity}:notice:${entry.channelId}`,
-          senderId: entry.senderId,
-        }, text),
-      });
-    }, adapterContext);
-    if (interrupted > 0) {
-      console.warn(`Discord ${interrupted} control command(s) were interrupted; their effect is unconfirmed.`);
-    }
-  }
-  // A restart this store recorded was requested by the process this one replaced: confirm it is live
-  // in every channel that asked, through the same durable notice queue every other notice uses.
-  if (state.restart !== undefined && state.restart.length > 0) {
-    await mutateState((doc) => {
-      const remaining = admitRestartNotices(doc, RESTART_LIVE);
-      if (remaining.length > 0) doc.restart = remaining;
-      else delete doc.restart;
-    }, adapterContext);
-  }
-  // An unresolved write-ahead intent may have reached Discord before a crash.
-  for (const item of state.pending.filter((entry) => entry.sendIntent !== undefined || entry.deliveryStatus === "sending")) {
-    await markUnknown(item.key);
-    console.warn(`Discord delivery outcome unknown for ${item.key}; inspect the Durable channel-state record.`);
-  }
   try {
+    // A control recorded but never confirmed may or may not have taken effect: report it once, never replay it.
+    if (state.controls.some((entry) => entry.status === "admitted") || state.pending.some((item) => item.hold === true)) {
+      let interrupted = 0;
+      await mutateState((doc) => {
+        for (const entry of doc.controls) {
+          if (entry.status !== "admitted") continue;
+          const notice = doc.pending.find((item) => item.notice === true && item.key === entry.key);
+          if (notice === undefined || notice.hold === true) continue;
+          // Its "still pending" wording was released but the outcome never followed: an unsent one
+          // becomes the outcome; one whose send is already in flight or ambiguous keeps its record,
+          // and the outcome goes out as a separate notice.
+          const text = unconfirmedControlText(entry.command);
+          if (!noticeInFlight(notice)) notice.text = text;
+          else pushNotice(doc, `unconfirmed:${entry.key}`, notice, text);
+        }
+        interrupted = recoverInterruptedControls(doc.controls, doc.pending, {
+          controlKey: (entry) => entry.key,
+          noticeKey: (item) => item.key,
+          report: (entry, text) => pushNotice(doc, `unconfirmed:${entry.key}`, {
+            channelId: entry.channelId,
+            sessionKey: `discord:${identity}:notice:${entry.channelId}`,
+            senderId: entry.senderId,
+          }, text),
+        });
+      }, adapterContext);
+      if (interrupted > 0) {
+        console.warn(`Discord ${interrupted} control command(s) were interrupted; their effect is unconfirmed.`);
+      }
+    }
+    // A restart this store recorded was requested by the process this one replaced: confirm it is live
+    // in every channel that asked, through the same durable notice queue every other notice uses.
+    if (state.restart !== undefined && state.restart.length > 0) {
+      await mutateState((doc) => {
+        const remaining = admitRestartNotices(doc, RESTART_LIVE);
+        if (remaining.length > 0) doc.restart = remaining;
+        else delete doc.restart;
+      }, adapterContext);
+    }
+    // An unresolved write-ahead intent may have reached Discord before a crash.
+    for (const item of state.pending.filter((entry) => entry.sendIntent !== undefined || entry.deliveryStatus === "sending")) {
+      await markUnknown(item.key);
+      console.warn(`Discord delivery outcome unknown for ${item.key}; inspect the Durable channel-state record.`);
+    }
     await outbox.recover();
     recoveryComplete = true;
     journalEvent("discord.serving", { "queue.depth": state.pending.length });
@@ -2145,6 +2170,24 @@ function discordCommandSpecs(names: readonly string[]): DiscordCommandSpec[] {
   }));
 }
 
+/** The control one queued notice reports: its own acknowledgement or an `unconfirmed:`/`late:` follow-up. */
+function reportedControlKeys(pending: readonly DiscordPendingDelivery[]): Set<string> {
+  const keys = new Set<string>();
+  for (const item of pending) {
+    if (item.notice !== true) continue;
+    const prefix = ["unconfirmed:", "late:"].find((candidate) => item.key.startsWith(candidate));
+    keys.add(prefix === undefined ? item.key : item.key.slice(prefix.length));
+  }
+  return keys;
+}
+
+/** Drop refused/unconfirmed records once no report of them is queued; a later report keeps them. */
+function dropReportedControls(doc: Draft<DiscordChannelState>): void {
+  const reported = reportedControlKeys(doc.pending);
+  doc.controls = doc.controls.filter((entry) =>
+    !((entry.status === "unconfirmed" || entry.status === "refused") && !reported.has(entry.key)));
+}
+
 function pushAdmitted(doc: Draft<DiscordChannelState>, key: string): void {
   doc.admitted = [...doc.admitted.filter((entry) => entry !== key), key]
     .slice(-DISCORD_LIMITS.maxAdmittedKeys);
@@ -2178,6 +2221,15 @@ export function decodeDiscordSessionKey(
     return { channelId: guild[3]!, kind: guild[2] as "channel" | "thread", guildId: guild[1]! };
   }
   return undefined;
+}
+
+/**
+ * Whether a mention-stripped body may answer a pending question: it says something, and it is not a
+ * command, even when an attachment routed it to ordinary input instead of control parsing.
+ */
+function claimsQuestion(body: string): boolean {
+  if (body.trim() === "") return false;
+  return !looksLikeDiscordCommand(body) || parseDiscordInput(body).kind === "input";
 }
 
 /** Drop one leading `<@id>`/`<@!id>` token for the bot itself; the rest of the text is unchanged. */

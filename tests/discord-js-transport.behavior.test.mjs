@@ -10,7 +10,7 @@ import { test } from 'node:test';
 
 import { BOT_ID, CHANNEL_ID, context, until } from './fixtures/discord-harness.mjs';
 
-const { createDiscordJsTransport } = await import(
+const { createDiscordJsTransport, discordJsClientOptions } = await import(
   new URL('../dist/channels/discord-js.js', import.meta.url).href
 );
 const { renderDiscordHistory } = await import(new URL('../dist/channels/discord-history.js', import.meta.url).href);
@@ -879,5 +879,19 @@ test('a missing, refused or failing channel maps to its own fixed refusal', { ti
     assert.deepEqual(await transport.history(baseQuery), { ok: false, refusal: 'read-failed' });
   } finally {
     await transport.stop();
+  }
+});
+
+test('the production client never retries an ambiguous REST request behind the write-ahead fence', () => {
+  const options = discordJsClientOptions({ intents: 0, partials: [], restTimeoutMs: 5_000 });
+  assert.equal(options.rest.retries, 0);
+  assert.equal(options.rest.timeout, 5_000);
+  assert.deepEqual(options.allowedMentions, { parse: [], repliedUser: false });
+  // The real library honors it: no login and no network, only the constructed REST manager.
+  const client = new discord.Client(options);
+  try {
+    assert.equal(client.rest.options.retries, 0);
+  } finally {
+    void client.destroy();
   }
 });

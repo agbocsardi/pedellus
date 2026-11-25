@@ -123,10 +123,17 @@ unauthorized when the original sender has left `allowFrom`.
   `unknown` and never resent, including after a restart. An ambiguous preview
   edit also holds the whole answer: the owner may see only a frozen preview,
   not a delivered final answer.
+* The discord.js REST client runs with `retries: 0`, so the library never
+  silently repeats a POST after a 5xx, a timeout or a dropped connection behind
+  that fence (which would duplicate a message Discord already created). Such a
+  failure reaches the adapter once and is quarantined. The library still waits
+  out and resends a 429 on its own; Discord did not process a rate-limited
+  request, so that cannot duplicate a message.
 * Completed cron results and startup interruption notices are read from the
   gateway's channel-neutral durable outbox, delivered chunk by chunk with the
   same intent protocol, and marked `delivered`, `failed`, `withheld` or
-  `unauthorized`. They are ordinary messages with no reply reference. Only a
+  `unauthorized`. Every chunk re-checks the bot-wide rate-limit window and is
+  sent only after its intent committed on a still-pending record. They are ordinary messages with no reply reference. Only a
   `pending` record is validated for delivery; an already settled, held or
   unknown record is never re-settled, and an unreadable outbox records only the
   fixed fault `delivery outbox is malformed` or `delivery outbox could not be
@@ -144,8 +151,13 @@ unauthorized when the original sender has left `allowFrom`.
 * A command whose earlier inputs keep failing transiently is retried on the
   adapter's scan cadence (bounded) while its channel stays gated, then reported
   once as unconfirmed or applied; it is never applied twice. An interrupted
-  command found at reopen is reported once, never replayed. An interrupted
-  `/restart` always says `Restart interrupted; outcome unknown. Not retried.`
+  command found at reopen is reported once, never replayed: a released but
+  unsent "still pending" wording becomes that report, and one whose send is
+  already in flight or ambiguous is kept and the report follows separately. An
+  interrupted `/restart` always says `Restart interrupted; outcome unknown. Not
+  retried.` A final outcome that arrives while the "still pending" wording is
+  being sent goes out as its own notice, and the command's record is kept until
+  every report of it is delivered.
 * Host notices are chunked inside the same 2 000-character bound; a notice that
   exceeds its own cap keeps its head and ends with `… (truncated)` rather than
   dropping text silently.
@@ -235,11 +247,20 @@ channel that is no longer authorized. There are no buttons: the owner answers
 with an ordinary message in the same channel (mentioning or replying to the bot
 in a mention-gated guild). That message claims the oldest delivered question of
 that exact session in the same commit that admits it, then reaches the model as
-a normal turn. Commands, OAuth callbacks, unlisted senders and other sessions
-never claim it. An ambiguous question send is quarantined as unknown and never
-resent. If the chat's conversation cannot be resolved at admission, the message
-is still admitted (a Gateway event is not redelivered) and the question stays
-open for the next answer or its expiry.
+a normal turn. Commands (including a command sent with an attachment), a bare
+mention, OAuth callbacks, unlisted senders and other sessions never claim it.
+An ambiguous question send is quarantined as unknown and never resent; the
+surface refuses delivery once the adapter is stopping, and a failed startup
+detaches it.
+
+Two honest limits: a question becomes claimable only once the tool marks its
+delivery complete, so in a multi-question batch an answer typed while later
+questions are still being sent may arrive as an ordinary message without
+claiming; and the conversation lookup for the claim is best effort. If that
+lookup fails at admission, the message is still admitted (a Gateway event is
+never redelivered, so failing admission would lose it) and the question stays
+open for the next answer or its expiry, whereas Telegram fails and retries the
+admission instead.
 
 ## Bounded and default-deny behavior
 
@@ -308,8 +329,11 @@ session isolation, attribution, chunking, mentions, receipts, referenced
 attachments, the input bound, bots, strict config keys, chunked/withheld/
 unauthorized/unknown scheduled delivery, interruption notices, restart
 confirmation, deferred-control retry and exhaustion (including the restart
-wording), `ask_user` delivery and typed-answer claiming, typing pauses during
-tool rounds, terminal outbox records, pre-send intents, callback
+wording), stale pending wording at reopen, late outcomes beside an in-flight
+notice, `ask_user` delivery and typed-answer claiming (commands and bare
+mentions excluded), surface detachment on failed startup, typing pauses during
+tool rounds, terminal outbox records, per-chunk scheduled intents and cooldown,
+the REST client's disabled retries, pre-send intents, callback
 interception, progressive edits, the real event/interaction/error mapping,
 startup ingress capture and replay, rate-limit cooldowns, control-admission
 failure, unconfirmed-control pruning, scheduled intent-commit failure, quoted-text
