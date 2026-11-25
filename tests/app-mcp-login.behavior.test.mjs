@@ -326,3 +326,35 @@ test('a foreign or replayed app callback is refused without storing it', { timeo
     await channel.close();
   }
 });
+
+test('/mcp on the app lists the configured servers read-only, like Telegram and Discord', { timeout: 60_000 }, async () => {
+  const mcp = await startOAuthMcp();
+  const channel = await openLoginChannel('mcp-command', { mcp });
+  let device;
+  try {
+    device = await helloDevice(channel.base, await channel.pair('phone'));
+    assert.ok(device.response('h1').commands.some((command) => command.name === 'mcp'), 'hello offers /mcp');
+    const notices = () => device.events('message').filter((event) => event.role === 'notice').map((event) => event.text);
+    const control = async (id, fields) => {
+      const before = notices().length;
+      device.send({ type: 'req', id, op: 'control', ...fields });
+      await device.wait(() => device.response(id) !== undefined && notices().length > before, `${id} notice`);
+      assert.equal(device.response(id).ok, true);
+      return notices().at(-1);
+    };
+
+    const listing = await control('m1', { command: 'mcp' });
+    assert.match(listing, /^MCP servers in this gateway's live configuration: 1$/mu);
+    assert.match(listing, /^- remote \(.*oauth\): /mu);
+    assert.match(listing, /OAuth logins waiting for a callback: none\./u);
+    assert.match(await control('m2', { command: 'mcp', args: 'login' }), /^Usage: \/mcp \(no arguments\)\. Nothing was sent/u);
+    assert.match(await control('m3', { command: 'help', args: 'mcp' }), /^Usage: \/mcp\n/u);
+    // Read-only: no turn ran and nothing was admitted to the model.
+    assert.equal(channel.captured.length, 0);
+    assert.equal((await appState(channel.gateway)).controls.length, 0);
+  } finally {
+    await device?.close();
+    await mcp.close();
+    await channel.close();
+  }
+});

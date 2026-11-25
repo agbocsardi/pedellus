@@ -14,9 +14,10 @@
  *   Because replay is idempotent by cursor there is no external send to fence: the log append is
  *   the delivery, so Telegram's held-unknown boundary cannot arise here. APP.md documents this
  *   reconciliation of the two channels' delivery models;
- * - a mutating control (`new`, `abort`) is admitted with a held acknowledgement and a durable
- *   record before its native call, gates the chat's inputs, and reports applied/refused/unconfirmed
- *   exactly like the Telegram controls;
+ * - a mutating control (`new`, `abort`, `model`, `digest`, `restart`) runs on the shared control
+ *   coordinator (`controls.ts`): a held acknowledgement and a durable record before its native call,
+ *   the thread's earlier inputs placed first with their attachments, and an applied, refused or
+ *   unconfirmed report, exactly like the Telegram and Discord controls;
  * - scheduled cron results and interruption notices arrive through the same channel-neutral
  *   durable outbox, authorized by this channel's own admission evidence and deduplicated by the
  *   outbox record id.
@@ -28,28 +29,23 @@
  * stored. The completion is one fixed notice in that thread. It also owns an `ask_user` surface: a
  * durable `question` event is the channel's delivery path, so the append is a definite delivery.
  */
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { defineDoc, AssistantEntry, ConversationBusy, InboxDoc, LiveDoc, UserEntry } from "@earendil-works/pi-durable";
+import { randomBytes } from "node:crypto";
+import { defineDoc, AssistantEntry, InboxDoc, LiveDoc, UserEntry } from "@earendil-works/pi-durable";
 import type { Context, Draft } from "@earendil-works/chord";
 import { copyJson } from "@earendil-works/chord";
 import { withCancel, withoutAbortSignal, withTelemetry } from "@earendil-works/chord/context";
 import type { TelemetrySpan } from "@earendil-works/pi-telemetry";
 import { journalEvent, observeOperation } from "../observability.js";
-import type { Conversation, ConversationId, EntryId, Harness, Submission, SubmissionId, SubmissionRecord, Tx } from "@earendil-works/pi-durable";
-import type { OwnerInputContent } from "../history/idle-rollover.js";
+import type { Conversation, ConversationId, EntryId, Harness, Submission, Tx } from "@earendil-works/pi-durable";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { FollowUpMode } from "../config.js";
-import type { CronDeliveryOutbox, CronDeliveryRecord } from "../automation/cron-delivery.js";
-import { CronDeliveryOutboxError } from "../automation/cron-delivery.js";
-import { originOccurrencePending } from "../automation/cron.js";
+import type { CronDeliveryRecord } from "../automation/cron-delivery.js";
+import { renderMcpListing } from "../mcp/admin.js";
 import { looksLikeOAuthCallback } from "../mcp/surface.js";
 import { createAppLoginSurface } from "./app-login.js";
 import { isTurnInterruptionNotice } from "../recovery/interruption.js";
-import { inProcessTerminalConversation } from "../terminal/conversation.js";
-import { renderBackgroundStatus, type BackgroundStatus } from "../background-status.js";
 import { CHANNEL_STATE_SESSION_SUFFIX } from "../history/scope.js";
 import {
-  conversationCommandNames,
   conversationCommandRefusal,
   conversationCommandUsage,
   conversationDetailBlock,
@@ -57,32 +53,62 @@ import {
   findConversationCommand,
   offeredConversationCommands,
 } from "../help/commands.js";
-import { renderMemoryDigestStart, renderMemoryDigestStatus } from "../history/memory-digest.js";
-import { AskQuestionsDoc, cancelPendingQuestions, claimOutcomeText, claimQuestionAnswer, claimTypedQuestionAnswer, type AskQuestionsDocument, type AskSurfaceRegistry } from "../questions/index.js";
+import { AskQuestionsDoc, cancelPendingQuestions, claimOutcomeText, claimQuestionAnswer, claimTypedQuestionAnswer, type AskQuestionsDocument } from "../questions/index.js";
 import {
   openQuestionEvent,
   questionMarkOf,
   reconcileQuestionEvents,
   type AppQuestionMarksByThread,
 } from "./app-questions.js";
-import { RESTART_BUSY_MESSAGE, RestartBusyError } from "../restart.js";
-import type {
-  GatewayMcpAdmin,
-  GatewayMemoryDigest,
-  GatewayModelList,
-  GatewayModelPresets,
-  GatewayModelSelection,
-} from "../runtime.js";
+import type { GatewayModelPresets, GatewayModelSelection } from "../runtime.js";
+import {
+  createSingleHostRegistry,
+  detectHostCapabilities,
+  offeredChannelCommandNames,
+  type ChannelGateway,
+  type HostRestartController,
+  type StatusDocumentReader,
+} from "./contracts.js";
+import {
+  admitOwedRestartNotices,
+  createControlCoordinator,
+  createRestartRequester,
+  executeChannelControl,
+  executeNewSession,
+  handleOAuthCallback,
+  matchingPresetName,
+  MCP_UNAVAILABLE_HOST,
+  MODEL_LISTING_UNAVAILABLE,
+  modelPresetRefusal,
+  parseModelArgument,
+  pruneControls,
+  readModelListing,
+  readStatusNotice,
+  recoverInterruptedControls,
+  renderDigestStatus,
+  renderModelListing,
+  RESTART_LIVE,
+  type ControlLedger,
+  type ControlOutcome,
+  type ControlRecord,
+} from "./controls.js";
+import { createOutboxDrainer } from "./outbox-drainer.js";
+import {
+  createPreviewWatcher,
+  isLiveGenerating,
+  resolveOwnerBusyMode,
+  resolveSharedDeliveryGroup,
+  SubmissionOrderQueue,
+  type SubmissionSlot,
+} from "./turn-runtime.js";
 import { taskCancelReceipt, type AppTaskCancelResult, type AppTaskList } from "./app-tasks.js";
 import {
   APP_CLOSE,
   APP_LIMITS,
   APP_MAIN_THREAD,
-  APP_PAIR_ALPHABET,
   APP_PROTOCOL_VERSION,
   APP_QUESTION_OPTION_IDS,
   APP_REQUEST_OPS,
-  APP_STATIC_TYPES,
   parseHelloCursor,
   parseQuestionId,
   validAppAgentName,
@@ -90,14 +116,11 @@ import {
   validVapidPublicKey,
   validVapidSubject,
   appPresetInfos,
-  validAppLabel,
-  validThreadTitle,
   parseThreadId,
   parsePushSubscription,
   validAppPresetName,
   type AppCommandInfo,
   type AppControlRecord,
-  type AppMutation,
   type AppDeviceRecord,
   type AppDurableEvent,
   type AppErrorCode,
@@ -111,31 +134,16 @@ import {
 import { createAppPushDispatcher, pushPayload, type AppPushDispatcher, type AppPushOptions } from "./app-push.js";
 import { absorbActivity, activityForWire, emptyActivity, type ActivityTally } from "./app-activity.js";
 import { startAppListener, type AppDeviceSession, type AppSessionHooks } from "./app-listener.js";
-import {
-  APP_SHORTCUT_LIMITS,
-  activeShortcut,
-  askOutcomeForAdmissionError,
-  createAskWaiters,
-  createShortcutRateLimiter,
-  hashShortcutToken,
-  newAskKey,
-  newShortcutToken,
-  parseAskRequest,
-  type AppAskOutcome,
-  type AppShortcutCreated,
-  type AppShortcutListing,
-  type AppShortcutRecord,
-  type AppShortcutRefusal,
-} from "./app-shortcuts.js";
+import type { AppShortcutRecord } from "./app-shortcuts.js";
 import {
   AppFileRejected,
   createAppFiles,
-  APP_DEFAULT_TYPE,
   type AppMediaOptions,
 } from "./app-files.js";
-import { APP_ACTION_LIMITS, type AppActionHost, type AppActionRegistry } from "./app-tool.js";
-import { validTelegramFilePath } from "./telegram-interactions.js";
-import { readTelegramOutboundFile, TelegramOutboundRejected, type TelegramOutboundRejection } from "./telegram-outbound-media.js";
+import { createAppActionHost } from "./app-actions.js";
+import { createAppDevices, type AppConsole } from "./app-devices.js";
+import { canOpenSideThread, createAppThreads, openThread, setArchived, threadInfo } from "./app-threads.js";
+import type { AppActionRegistry } from "./app-tool.js";
 import {
   isReaction,
   reactionChangeSummary,
@@ -144,28 +152,34 @@ import {
   type AppReactionNote,
 } from "./app-reactions.js";
 
+export type {
+  AppConsole,
+  AppDeviceListing,
+  AppPairingCreated,
+  AppPairingRefusal,
+} from "./app-devices.js";
+export { AppThreadCapacityError, threadInfo } from "./app-threads.js";
+
 /** Preserve the original mapped chat and its history. */
 export const APP_CHAT_SESSION_KEY = "app:chat";
 export const APP_STATE_SESSION_KEY = `app${CHANNEL_STATE_SESSION_SUFFIX}`;
-export const sessionForThread = (thread: string): string =>
-  thread === APP_MAIN_THREAD ? APP_CHAT_SESSION_KEY : `${APP_CHAT_SESSION_KEY}:${thread}`;
-const threadOf = (record: { readonly thread?: string }): string => record.thread ?? APP_MAIN_THREAD;
+export function sessionForThread(thread: string): string {
+  return thread === APP_MAIN_THREAD ? APP_CHAT_SESSION_KEY : `${APP_CHAT_SESSION_KEY}:${thread}`;
+}
+export function threadOf(record: { readonly thread?: string }): string {
+  return record.thread ?? APP_MAIN_THREAD;
+}
 
-const CONTROL_PENDING_NOTICE_MS = 30_000;
 const PREVIEW_COALESCE_MS = 700;
 /** Tool steps are coalesced like previews; the first change of a turn goes out at once. */
 const ACTIVITY_COALESCE_MS = 400;
 /** Entries read per transcript page while deriving a turn's activity steps. */
 const ACTIVITY_SCAN_PAGE = 200;
 const MAX_DELIVERY_FAILURES = 10;
-const MAX_CONTROL_ATTEMPTS = 10;
 const SCHEDULED_SCAN_INTERVAL_MS = 2_000;
 const MAX_SCHEDULED_ACTIVE = 4;
 const MAX_NOTICE_CHARS = 1_500;
 const DAY_MS = 86_400_000;
-/** A fork or first admission would exceed the host's snapshot-slot cap; nothing was created. */
-export class AppThreadCapacityError extends Error {}
-class ThreadCreateConflict extends Error {}
 const MAX_LATE_CONTROL_CHARS = 4_000;
 const QUEUE_FULL = "app durable output queue is full";
 
@@ -234,11 +248,13 @@ export const AppState = defineDoc<AppChannelState>({
   }),
 });
 
-export interface AppGateway {
-  readonly harness?: Pick<Harness, "submission">;
-  conversationFor(sessionKey: string, context: Context): Promise<Conversation>;
-  /** Decides a prepared idle rollover just before an owner input is submitted; absent means none. */
-  beforeOwnerInput?(sessionKey: string, conversationId: ConversationId, content: OwnerInputContent, context: Context): Promise<void>;
+/**
+ * The app channel's host surface: the shared channel gateway plus the thread, task, preset and
+ * registry operations only this channel uses.
+ */
+export interface AppGateway extends ChannelGateway {
+  /** Submission lookup for a recovered input, and the read-only snapshot reader `status` uses. */
+  readonly harness?: Pick<Harness, "submission"> & StatusDocumentReader;
   forkAppThread?(
     stateId: ConversationId, thread: string, from: AppThreadOrigin,
     init: (doc: Draft<AppChannelState>) => void, context: Context,
@@ -250,19 +266,10 @@ export interface AppGateway {
   appSnapshotRoom?(tx: Tx): Promise<boolean>;
   /** Create the thread's mapping and snapshot now; `full` reports the snapshot-slot cap. */
   reserveAppThread?(thread: string, context: Context): Promise<"ok" | "full">;
-  /** Host-authenticated durable outbox for completed cron results and interruption notices. */
-  cronOutbox?: CronDeliveryOutbox;
-  /** Optional host model catalog for the `status` and `model` controls. */
-  listModels?(sessionKey: string, context: Context): Promise<GatewayModelList>;
-  selectModelPreset?(sessionKey: string, name: string, context: Context): Promise<GatewayModelSelection>;
   /** Read-only host preset catalog (no conversation involved); `undefined` without named presets. */
   modelPresets?(): GatewayModelPresets | undefined;
   /** Read-only selected model of a mapped key; `undefined` when unmapped, rejects when unreadable. */
   selectedModel?(sessionKey: string, context: Context): Promise<GatewayModelSelection | undefined>;
-  /** Manual memory-digestion entry for `digest` and `digest status`. */
-  memoryDigest?: GatewayMemoryDigest;
-  /** Optional bounded background snapshot for the `status` control. */
-  backgroundStatus?(sessionKey: string, context: Context): Promise<BackgroundStatus>;
   /**
    * The Tasks view (`tasks`): that thread's own workers and scheduled jobs, newest first and
    * bounded. Read-only; an unmapped thread lists nothing and creates nothing.
@@ -273,55 +280,14 @@ export interface AppGateway {
    * the existing durable paths; a task that is not this thread's own reports `unknown` untouched.
    */
   appTaskCancel?(sessionKey: string, task: string, context: Context): Promise<AppTaskCancelResult>;
-  /**
-   * Paired reset for `new`: a native reset plus the host's prompt-snapshot rebuild in one
-   * operation, refused atomically while a run is live. Absent keeps the plain native reset.
-   */
-  resetSession?(
-    sessionKey: string,
-    context: Context,
-  ): Promise<import("../runtime.js").GatewaySessionReset>;
   /** Live operator console registry; the running adapter attaches its pairing host here. */
   appConsole?: AppConsoleRegistry;
-  /** Idle-rollover notices; the running adapter attaches its divider writer here. */
   /**
    * Model-tool host registry for agent file delivery (`send`/`artifact`). The running adapter
    * attaches here; without a live host a mapped app chat still sees the tool but every call is
    * refused, because no channel can deliver it.
    */
   appActions?: AppActionRegistry;
-  /**
-   * Live owner-question surfaces. The running adapter attaches one host for the mapped threads of
-   * this channel; `ask_user` delivers only to the exact session that host owns.
-   */
-  askSurfaces?: AskSurfaceRegistry;
-  /**
-   * MCP management host: supplies the login lifecycle a callback-shaped `send` is offered to
-   * before admission. Absent when this host has no MCP management at all.
-   */
-  mcpAdmin?: GatewayMcpAdmin;
-  /** Live owner surfaces for direct MCP login delivery; the running adapter attaches here. */
-  mcpSurfaces?: import("../mcp/surface.js").McpSurfaceRegistry;
-}
-
-/** Terminal pairing console results, rendered by `src/channels/app-operator-cli.ts`. */
-export type AppPairingCreated = { readonly code: string; readonly expiresAtMs: number };
-export type AppDeviceListing = {
-  readonly label: string;
-  readonly createdAtMs: number;
-  readonly revokedAtMs?: number;
-};
-export type AppPairingRefusal = "label-in-use" | "device-limit" | "pairing-limit" | "invalid-label";
-
-/** The operator console this adapter serves over the gateway's private local socket. */
-export interface AppConsole {
-  pair(label?: string): Promise<AppPairingCreated | { readonly refused: AppPairingRefusal }>;
-  devices(): Promise<readonly AppDeviceListing[]>;
-  revoke(label: string): Promise<"revoked" | "missing" | "invalid-label">;
-  /** Create one shortcut token; it is returned once and only its hash is stored. */
-  shortcutAdd(label: string): Promise<AppShortcutCreated | { readonly refused: AppShortcutRefusal }>;
-  shortcuts(): Promise<readonly AppShortcutListing[]>;
-  shortcutRevoke(label: string): Promise<"revoked" | "missing" | "invalid-label">;
 }
 
 export interface AppConsoleRegistry {
@@ -331,26 +297,12 @@ export interface AppConsoleRegistry {
 }
 
 export function createAppConsoleRegistry(): AppConsoleRegistry {
-  let live: AppConsole | undefined;
-  return {
-    attach(host: AppConsole) {
-      live = host;
-      let detached = false;
-      return () => {
-        if (detached) return;
-        detached = true;
-        if (live === host) live = undefined;
-      };
-    },
-    console: () => live,
-  };
+  const registry = createSingleHostRegistry<AppConsole>();
+  return { attach: (host) => registry.attach(host), console: () => registry.current() };
 }
 
-export type AppRestartHost = {
-  readonly supported: boolean;
-  /** Called at most once, only after the command's acknowledgement is durable. */
-  request(): Promise<void>;
-};
+/** Host process replacement for the `restart` control: the shared host restart controller. */
+export type AppRestartHost = HostRestartController;
 
 export type AppOptions = {
   /** Explicit loopback port from the strict `app` config block; tests may request an ephemeral 0. */
@@ -385,96 +337,45 @@ type LiveSocket = {
   lastSent: number;
 };
 
-type DeferredControl = {
-  readonly key: string;
-  readonly thread: string;
-  readonly command: AppMutation;
-  readonly option?: string;
-  readonly earlierKeys: ReadonlySet<string>;
-};
-
-type ControlOutcome =
-  | { readonly kind: "applied"; readonly text?: string; readonly requestRestart?: true }
-  | { readonly kind: "refused"; readonly text: string }
-  | { readonly kind: "deferred" }
-  | { readonly kind: "abandoned" };
-
-type SubmissionSlot = { readonly prior: Promise<void>; release(): void };
-
 /** One durable event without its cursor, distributive over the union. */
 type WithoutCursor<T> = T extends { cursor: number } ? Omit<T, "cursor"> : never;
 type AppEventInput = WithoutCursor<AppDurableEvent> & { thread: string | AppThreadInfo };
 /** A durable `message` as callers hand it over, before `appendMessage` sizes its frame. */
 type AppMessageInput = Omit<Extract<AppEventInput, { event: "message" }>, "part">;
 
-export function threadInfo(doc: AppChannelState, thread: string): AppThreadInfo | undefined {
-  return doc.threads?.find((entry) => entry.id === thread);
+/** One `send` admission's result, whether it came from a device socket or a shortcut request. */
+export type SendAdmission =
+  | { readonly kind: "admitted"; readonly duplicate: boolean }
+  | { readonly kind: "error"; readonly error: AppErrorCode }
+  | { readonly kind: "stopped" };
+
+/**
+ * What the extracted app modules (devices, threads, actions) share with the running adapter: the
+ * state document, its commits and the fan-out after a commit appended durable events.
+ */
+export interface AppCore {
+  readonly gateway: AppGateway;
+  readonly now: () => number;
+  /** The adapter's live context. */
+  readonly context: Context;
+  readonly stateConversation: Conversation;
+  /** The last committed copy of the app state document. */
+  state(): AppChannelState;
+  /** One commit of the app state document; the returned copy becomes `state()`. */
+  mutateState(
+    change: (doc: Draft<AppChannelState>, tx: Tx) => void | Promise<void>,
+    commitContext?: Context,
+  ): Promise<AppChannelState>;
+  /** Push newly appended durable events to every streaming device and wake shortcut asks. */
+  publish(): void;
+  /** Content-free Web Push to subscribed devices without an open stream. */
+  notifyPush(thread: string): void;
+  /** True once the adapter is stopping or its context aborted. */
+  stopped(): boolean;
 }
 
-function openThread(doc: AppChannelState, thread: string): boolean {
-  return threadInfo(doc, thread)?.archived === false;
-}
-
-function canOpenSideThread(doc: AppChannelState): boolean {
-  return (doc.threads?.filter((entry) => entry.id !== APP_MAIN_THREAD && !entry.archived).length ?? 0) <
-    APP_LIMITS.maxOpenThreads;
-}
-
-function setArchived(doc: Draft<AppChannelState>, info: Draft<AppThreadInfo>, at: string, reason?: "manual" | "idle"): void {
-  info.archived = reason !== undefined;
-  if (reason === undefined) delete info.archivedReason;
-  else info.archivedReason = reason;
-  // Idle archive does not make an inactive thread more recent than an active one.
-  if (reason !== "idle" && info.lastAt < at) info.lastAt = at;
-  appendEvent(doc, { event: "thread", thread: { ...info } });
-}
-
-/** The saved extensions an agent artifact may have, and the exact stored type each is served with. */
-const ARTIFACT_TYPES: Readonly<Record<string, string>> = Object.freeze({
-  html: "text/html",
-  htm: "text/html",
-  svg: "image/svg+xml",
-});
-
-function extensionOfFilename(name: string): string {
-  const dot = name.lastIndexOf(".");
-  return dot < 0 ? "" : name.slice(dot + 1).toLowerCase();
-}
-
-/** One stored type for an agent `send`: the known extension's base type, otherwise generic bytes. */
-function sentFileType(name: string): string {
-  const extension = extensionOfFilename(name);
-  const known = extension === "" ? undefined : APP_STATIC_TYPES[`.${extension}`];
-  return known?.split(";", 1)[0] ?? APP_DEFAULT_TYPE;
-}
-
-/** Fixed pre-send refusal text; never includes a host path, byte count or raw error. */
-function agentFileRefusal(action: "send" | "artifact", reason: TelegramOutboundRejection): string {
-  const maxMiB = action === "artifact" ? APP_LIMITS.artifactBytes / (1024 * 1024) : APP_LIMITS.uploadBytes / (1024 * 1024);
-  switch (reason) {
-    case "unsafe-path":
-      return "the path must be an existing regular file inside the configured workspace";
-    case "not-found":
-      return "no such file exists inside the configured workspace";
-    case "not-a-file":
-      return "the path is not a regular file";
-    case "too-large":
-      return `the file is larger than ${maxMiB} MiB`;
-    case "empty":
-      return "the file is empty";
-    case "unreadable":
-      return "the file could not be read as one stable snapshot";
-    case "unsupported-format":
-      return action === "artifact" ? "an artifact must be a .html, .htm or .svg file" : "the file cannot be delivered";
-  }
-}
-
-/** The model-facing receipt for one delivered agent file; bounded, workspace-relative, no bytes. */
-function agentFileReceipt(action: "send" | "artifact", path: string, size: number): string {
-  return action === "artifact"
-    ? `Delivered the workspace file ${path} as a sandboxed artifact (${size} bytes).`
-    : `Delivered the workspace file ${path} as one attachment (${size} bytes).`;
-}
+/** One admitted app control: the shared record plus the inputs that were queued before it. */
+type AppControl = ControlRecord<string, string> & { readonly earlierKeys: Set<string> };
 
 /** Resolve an app message, not an arbitrary entry ID, to a typed committed transcript entry. */
 export async function appForkEntry(
@@ -509,60 +410,14 @@ export async function appForkEntry(
   return raw.id;
 }
 
-// ── Pure helpers ─────────────────────────────────────────────────────────────
+// ── The durable event log ────────────────────────────────────────────────────
 
-const sha256 = (value: string): string => createHash("sha256").update(value, "utf8").digest("hex");
-
-/** Constant-time comparison of one presented value against a stored hex digest. */
-function sameDigest(presented: string, storedHash: string): boolean {
-  const known = Buffer.from(storedHash, "hex");
-  const candidate = createHash("sha256").update(presented, "utf8").digest();
-  return known.length === candidate.length && timingSafeEqual(known, candidate);
-}
-
-function newDeviceToken(): string {
-  return randomBytes(32).toString("base64url");
-}
-
-function newPairingCode(): string {
-  let code = "";
-  const bytes = randomBytes(APP_LIMITS.pairCodeChars);
-  for (let index = 0; index < APP_LIMITS.pairCodeChars; index += 1) {
-    code += APP_PAIR_ALPHABET[bytes[index]! % APP_PAIR_ALPHABET.length]!;
-  }
-  return code;
-}
-
-/** The protocol alphabet without `I`/`O`, matched case-insensitively. */
-function validPairingCode(code: string): boolean {
-  if (code.length !== APP_LIMITS.pairCodeChars) return false;
-  for (const character of code.toUpperCase()) {
-    if (!APP_PAIR_ALPHABET.includes(character)) return false;
-  }
-  return true;
-}
-
-function requestIdFor(key: string): string {
+export function requestIdFor(key: string): string {
   return `app:send:${key}`;
 }
 
-/** The run's first input: it identifies the run across tool rounds, which only ever append inputs. */
-function firstInput(inputs: readonly SubmissionId[]): SubmissionId | undefined {
-  let first = inputs[0];
-  for (const id of inputs) if (first === undefined || id < first) first = id;
-  return first;
-}
-
-function answeredTogether(record: SubmissionRecord, answer: number): boolean {
-  return record.type === "input" && record.status === "done" && record.answer === answer;
-}
-
-function isConversationBusy(error: unknown): boolean {
-  return error instanceof ConversationBusy || (error instanceof Error && error.name === "ConversationBusy");
-}
-
 /** `send` key idempotency window: entries are pruned by age only, so the window is really seven days. */
-function pruneKeys<T extends { readonly atMs: number }>(keys: readonly T[], nowMs: number): T[] {
+export function pruneKeys<T extends { readonly atMs: number }>(keys: readonly T[], nowMs: number): T[] {
   return keys.filter((entry) => nowMs - entry.atMs < APP_LIMITS.sendKeyTtlMs);
 }
 
@@ -583,7 +438,7 @@ function pruneEvents(doc: Draft<AppChannelState>): void {
   }
 }
 
-function appendEvent(doc: Draft<AppChannelState>, event: AppEventInput): void {
+export function appendEvent(doc: Draft<AppChannelState>, event: AppEventInput): void {
   const cursor = doc.nextCursor;
   doc.nextCursor = cursor + 1;
   // An idle rollover is not activity: it must not delay the idle auto-archive.
@@ -653,7 +508,7 @@ function messageFrameBytes(
  * a text needing more than `maxMessageParts` keeps its leading parts and truncates the last, which
  * is marked and reported (APP.md, known bounds). Callers keep their `settled` after this call.
  */
-function appendMessage(doc: Draft<AppChannelState>, event: AppMessageInput): void {
+export function appendMessage(doc: Draft<AppChannelState>, event: AppMessageInput): void {
   const first = doc.nextCursor;
   if (messageFrameBytes(event, first) <= APP_LIMITS.frameBytes) {
     appendEvent(doc, event);
@@ -693,7 +548,7 @@ function rememberAnswer(doc: Draft<AppChannelState>, id: string, thread: string,
   else doc.answerAnchors[id] = { thread, at };
 }
 
-function hasEventId(doc: Draft<AppChannelState>, id: string): boolean {
+export function hasEventId(doc: Draft<AppChannelState>, id: string): boolean {
   return doc.events.some((event) => event.event === "message" && event.id === id);
 }
 
@@ -723,7 +578,7 @@ function latestReaction(
  * Append this thread's missing `question` events and keep the marks they leave, in the caller's own
  * commit. Returns true when the app has new question state to replay.
  */
-function publishQuestionEvents(
+export function publishQuestionEvents(
   doc: Draft<AppChannelState>,
   questions: Draft<AskQuestionsDocument>,
   thread: string,
@@ -737,81 +592,48 @@ function publishQuestionEvents(
   return reconciled.events.length > 0;
 }
 
-/**
- * Keep every unresolved control record, only the most recent applied ones, and a reported terminal
- * record only while its report is still queued — the same bounds the Telegram controls log keeps.
- */
-function pruneControls(controls: readonly AppControlRecord[], pending: readonly AppPendingInput[]): AppControlRecord[] {
-  const totalApplied = controls.filter((entry) => entry.status === "applied").length;
-  let drop = Math.max(0, totalApplied - APP_LIMITS.maxUnresolvedControls);
-  const reported = new Set(pending.filter((item) => item.notice === true).map((item) => item.key));
-  return controls.filter((entry) => {
-    if ((entry.status === "unconfirmed" || entry.status === "refused") && !reported.has(entry.key)) return false;
-    if (entry.status !== "applied" || drop === 0) return true;
-    drop -= 1;
-    return false;
-  });
+/** Keep the control log bounded: a terminal record stays only while its report is still queued. */
+function pruneAppControls(doc: Draft<AppChannelState>): void {
+  const reported = new Set(doc.pending.filter((item) => item.notice === true).map((item) => item.key));
+  doc.controls = pruneControls(doc.controls, (entry) => reported.has(entry.key), APP_LIMITS.maxUnresolvedControls);
 }
 
-const CONTROL_ACK: Record<AppMutation, string> = {
-  new: "Context reset.",
-  abort: "Idle. Queue cleared.",
-  model: "Model selected.",
-  restart: "Restart requested; checking active work.",
-  digest: "Digest requested.",
-};
-const CONTROL_PENDING: Record<AppMutation, string> = {
-  new: "Reset pending.",
-  abort: "Still stopping. New messages are held.",
-  model: "Model change pending.",
-  restart: "Restart pending.",
-  digest: "Digest pending; not started yet.",
-};
-const UNCONFIRMED_CONTROL = "Command interrupted; outcome unknown. Send it again if needed.";
-/** An interrupted restart is never repeated automatically, and resending it is the caller's decision. */
-const UNCONFIRMED_RESTART = "Restart interrupted; outcome unknown. Not retried.";
-/** The confirmation the replacement process owes the thread that asked for `restart`. */
-const RESTART_LIVE = "Restarted.";
-/** The host refused the replacement, so this process is still serving. */
-const RESTART_FAILED = "Restart refused. Gateway still running.";
-const RESTART_ALREADY_REQUESTED =
-  "A restart was already requested in this gateway and is still stopping it; this restart was not requested again.";
-const RESTART_REQUEST_FAILED =
-  "A restart was already requested in this gateway and the host refused it, so the gateway is still running. " +
-  "This restart was not requested again; fix the host and start the gateway yourself.";
-const MODEL_LISTING_UNAVAILABLE =
-  "Model choices are unavailable right now: this chat's host model catalog could not be read. Nothing changed.";
-const MODEL_PRESETS_UNAVAILABLE =
-  "Named model presets are not configured in this deployment, so /model <name> and /model default are unavailable. " +
-  "Nothing was changed; /model lists the current selection read only, and this command never rewrites the configuration.";
-/** At most this many configured presets or models in one listing notice. */
-const MAX_MODEL_CHOICES = 50;
-const CALLBACK_UNAVAILABLE_TEXT =
-  "No MCP login is available in this host; the callback was not stored or sent to the assistant.";
-const CALLBACK_UNHANDLED_TEXT =
-  "This OAuth callback was not accepted. It was not sent to the assistant and was not stored.";
-const RESET_BUSY = "Reset refused: chat busy. Abort or retry when idle.";
+/** Queue one host notice in the caller's commit; the sequence stamp makes its event id unique. */
+function queueNotice(
+  doc: Draft<AppChannelState>, key: string, thread: string, text: string, nowMs: number, hold?: true,
+): void {
+  const noticeSeq = doc.nextNoticeSeq;
+  doc.nextNoticeSeq = noticeSeq + 1;
+  doc.pending.push({ key, thread, text, admittedAtMs: nowMs, notice: true, noticeSeq, ...(hold ? { hold } : {}) });
+}
+
+/**
+ * Commit one control's `applied` status. Only the transition records its effects: a `restart` owes
+ * the asking thread a live confirmation, and a `new` appends the one durable `divider` context
+ * boundary. A record already applied changes nothing, so a repeated commit never adds a second
+ * divider (a divider has no event id to recognise it by).
+ */
+export function commitControlApplied(
+  doc: Draft<AppChannelState>,
+  control: { readonly key: string; readonly thread: string; readonly command: string },
+  at: string,
+): void {
+  const entry = doc.controls.find((item) => item.key === control.key);
+  if (entry?.status === "applied") return;
+  if (entry !== undefined) entry.status = "applied";
+  // The host replaces the process only after this commit, so the owed confirmation is durable first.
+  if (control.command === "restart" && entry !== undefined) {
+    const owed = doc.restart ?? [];
+    if (!owed.includes(control.thread)) doc.restart = [...owed, control.thread].slice(-APP_LIMITS.maxOpenThreads - 1);
+  }
+  pruneAppControls(doc);
+  if (control.command === "new") appendEvent(doc, { event: "divider", thread: control.thread, at, reason: "new" });
+}
+
+const RESET_BUSY = "Reset refused: thread busy. /abort or retry /new when idle.";
 const RESET_UNREPAIRED = "Reset refused: open questions could not be checked. Nothing changed; try again.";
 const ARCHIVED_CONTROL_TEXT =
   "That command was not applied: its thread is archived. Restore the thread first.";
-
-/** Replay wording for a command this adapter recorded before a restart; it is never run twice. */
-function replayControlText(entry: AppControlRecord): string {
-  if (entry.command === "restart") {
-    return entry.status === "applied"
-      ? "That /restart was already requested before this process restarted, so it is not requested again."
-      : "That /restart was interrupted before it was confirmed: it may or may not have restarted the gateway, and it " +
-        "is not requested again.";
-  }
-  if (entry.status === "applied") return "That command was already applied before a restart, so it was not run again.";
-  if (entry.status === "refused") {
-    return "That command was refused before any effect and will not be retried; send it again if it is still needed.";
-  }
-  if (entry.status === "unconfirmed") {
-    return "That command was already reported as interrupted; send it again if you still need it.";
-  }
-  return UNCONFIRMED_CONTROL;
-}
 
 /** Bound one host notice; a shortened notice says so instead of dropping its tail silently. */
 function boundNotice(text: string, limit: number): string {
@@ -822,112 +644,10 @@ function boundNotice(text: string, limit: number): string {
   return `${text.slice(0, end)}${marker}`;
 }
 
-/** One printable, single-line label for host-generated notice text. */
-function boundedLabel(value: unknown, max: number): string {
-  const text = typeof value === "string" ? value : "";
-  const cleaned = text.replace(/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/gu, " ").replace(/\s+/gu, " ").trim();
-  if (cleaned === "") return "(unnamed)";
-  let bounded = cleaned.slice(0, max);
-  if (bounded.length > 0 && /[\uD800-\uDBFF]/u.test(bounded[bounded.length - 1]!)) bounded = bounded.slice(0, -1);
-  return bounded;
-}
-
 /** A fixed usage notice: the catalogue's app line, a no-argument note, and the no-effect tail. */
 function usageNotice(name: string): string {
   const argumentsNote = findConversationCommand(name)?.args === undefined ? " (no arguments)." : "";
   return `${conversationCommandUsage(name, "app")}${argumentsNote} Nothing was sent to the assistant.`;
-}
-
-type ModelArgument =
-  | { readonly kind: "list" }
-  | { readonly kind: "preset"; readonly name: string }
-  | { readonly kind: "usage" };
-
-/** Bound a `model` argument to the shape the config itself accepts: one name, never a selector triple. */
-function parseModelArgument(args: string): ModelArgument {
-  if (args === "") return { kind: "list" };
-  const parts = args.split(/\s+/u);
-  if (parts.length !== 1) return { kind: "usage" };
-  const name = parts[0]!;
-  // The shared preset-token validator: whatever the hello projection would drop, the control
-  // refuses too, instead of accepting names the advertised presets can never include.
-  if (!validAppPresetName(name)) return { kind: "usage" };
-  return { kind: "preset", name };
-}
-
-/** The configured preset this thread currently uses, matched by provider/model/thinking. */
-function matchingPresetName(
-  presets: GatewayModelList["presets"], selected: GatewayModelSelection,
-): string | undefined {
-  return presets?.find((preset) => preset.provider === selected.provider &&
-    preset.modelId === selected.modelId && (preset.thinkingLevel ?? "off") === selected.thinkingLevel)?.name;
-}
-
-/** The read-only `model` listing, the same projection Telegram and Discord render. */
-function modelListingText(listing: GatewayModelList): string {
-  const selectedLine = `Current model: ${boundedLabel(listing.selected.provider, 80)}/` +
-    `${boundedLabel(listing.selected.modelId, 160)} (thinking: ${boundedLabel(listing.selected.thinkingLevel, 32)}).`;
-  const presets = listing.presets ?? [];
-  if (presets.length === 0) {
-    const rows = listing.models.slice(0, MAX_MODEL_CHOICES).map((choice) => {
-      const current = choice.provider === listing.selected.provider && choice.modelId === listing.selected.modelId;
-      const levels = choice.thinkingLevels.map((level) => boundedLabel(level, 32)).join(", ");
-      return `  ${current ? "* " : "  "}${boundedLabel(choice.provider, 80)} ${boundedLabel(choice.modelId, 160)} ` +
-        `— ${boundedLabel(choice.name, 160)} [thinking: ${levels === "" ? "off" : levels}]`;
-    });
-    if (listing.models.length > MAX_MODEL_CHOICES) rows.push(`  … ${listing.models.length - MAX_MODEL_CHOICES} more allowed models omitted`);
-    return [
-      selectedLine,
-      "Named model presets are not configured in this deployment, so /model <name> and /model default are " +
-        "unavailable here; this command never rewrites the configuration.",
-      "Configured direct choices (read only; the direct selection belongs to the local CLI):",
-      ...rows,
-    ].join("\n");
-  }
-  const selectedPreset = matchingPresetName(listing.presets, listing.selected);
-  const rows = presets.slice(0, MAX_MODEL_CHOICES).map((preset) => {
-    const isDefault = preset.name === listing.defaultPreset;
-    return `  ${preset.name === selectedPreset ? "* " : "  "}${boundedLabel(preset.name, 80)} — ` +
-      `${boundedLabel(preset.provider, 80)} ${boundedLabel(preset.modelId, 160)} ` +
-      `[thinking: ${boundedLabel(preset.thinkingLevel ?? "off", 32)}]${isDefault ? " (default)" : ""}`;
-  });
-  if (presets.length > MAX_MODEL_CHOICES) rows.push(`  … ${presets.length - MAX_MODEL_CHOICES} more named presets omitted`);
-  return [
-    selectedLine,
-    ...(listing.defaultPreset === undefined ? [] : [`Configured default preset: ${boundedLabel(listing.defaultPreset, 80)}.`]),
-    "Named model presets (see /help model to select one):",
-    ...rows,
-    "A selection applies to this thread only and lasts while the gateway stays open; a restart restores the " +
-      "configured default and prepared requests keep their model.",
-  ].join("\n");
-}
-
-/** Why one stored outbox record cannot be delivered as-is, or `undefined` when it is usable. */
-function pendingRecordProblem(value: unknown): string | undefined {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    return "delivery outbox contains an unusable record";
-  }
-  const record = value as Record<string, unknown>;
-  if (typeof record.id !== "string" || record.id === "") {
-    return "delivery outbox contains an unusable record";
-  }
-  if (typeof record.status !== "string" || !["pending", "sending", "unknown", "withheld", "delivered", "failed", "unauthorized"].includes(record.status)) {
-    return "delivery record has an invalid status";
-  }
-  if (record.status !== "pending") return undefined;
-  if (typeof record.sessionKey !== "string" || record.sessionKey === "") {
-    return "delivery record has no origin session";
-  }
-  if (typeof record.text !== "string" || record.text.trim() === "") {
-    return "delivery record has no text";
-  }
-  return undefined;
-}
-
-function outboxFaultMessage(error: unknown): string {
-  return error instanceof CronDeliveryOutboxError
-    ? "delivery outbox is malformed"
-    : "delivery outbox could not be read";
 }
 
 function aborted(signal: AbortSignal | undefined): Promise<void> {
@@ -1050,53 +770,29 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   const delivering = new Set<string>();
   const failedThisCycle = new Set<string>();
   const deliveryFailures = new Map<string, number>();
-  const submissionChains = new Map<string, Promise<void>>();
+  /** Per-thread submission order, shared by deliveries, control flushes and archive fences. */
+  const order = new SubmissionOrderQueue<string>();
   const earlySubmissions = new Map<string, Submission>();
-  /** Gate only the chat whose control or archive is in progress. */
-  const controlPendingSet = new Set<string>();
-  const archiving = new Set<string>();
-  const deferredControls = new Map<string, DeferredControl>();
-  const controlFailures = new Map<string, number>();
-  const runningControls = new Set<string>();
-  const pendingControls = new Set<Promise<void>>();
-  /** Pairing failures inside the rolling one-minute window; in-memory, so a restart clears it. */
-  const pairingFailures: number[] = [];
-  /** Shortcut ask windows, per token hash; in-memory like the pairing failures. */
-  const shortcutRate = createShortcutRateLimiter(now);
-  /** Shortcut asks waiting for their durable `settled`; woken by every state commit. */
-  const askWaiters = createAskWaiters(() => state.events);
   const active = new Set<Promise<void>>();
   const activeReplies = new Map<string, number>();
   let activeNotices = 0;
   let fatal: unknown;
   let stopping = false;
+  const stopped = (): boolean => stopping || signal?.aborted === true;
   /**
    * Optional host operations, resolved once. A narrow SDK host keeps new, abort/stop and help only;
    * the rest are neither listed in `hello.commands` nor applied.
    */
-  const hostCommands: Record<string, boolean> = {
-    new: true,
-    abort: true,
-    stop: true,
-    help: true,
-    status: typeof gateway.listModels === "function",
-    model: typeof gateway.listModels === "function" && typeof gateway.selectModelPreset === "function",
-    restart: options.restart?.supported === true,
-    digest: typeof gateway.memoryDigest?.start === "function" && typeof gateway.memoryDigest?.status === "function",
-  };
+  const capabilities = detectHostCapabilities(gateway, options.restart);
   /** The catalogued app commands this host really implements, in catalogue order. */
-  const offeredCommands = conversationCommandNames("app").filter((name) => hostCommands[name] === true);
+  const offeredCommands = offeredChannelCommandNames("app", capabilities);
   const commandInfos: AppCommandInfo[] = offeredConversationCommands("app", offeredCommands).map((command) => ({
     name: command.name,
     ...(command.args === undefined ? {} : { args: command.args }),
     summary: command.summary,
     usage: conversationCommandUsage(command.name, "app"),
   }));
-  let restartHostRequested = false;
-  let restartHostRequestFailed = false;
   let recoveryComplete = false;
-  const scheduledActive = new Set<string>();
-  const scheduledTasks = new Set<Promise<void>>();
   let scheduledScanning = false;
   let scanTimer: ReturnType<typeof setInterval> | undefined;
   const statuses = new Map<string, string>();
@@ -1168,7 +864,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   const pushEventsToSockets = (): void => {
     // Every commit that appends events funnels through here; a settled shortcut ask resolves from
     // the log before the sockets are pushed, so an ask never polls.
-    askWaiters.wake();
+    devices.wake();
     for (const socket of sockets.values()) pushEvents(socket);
   };
 
@@ -1213,7 +909,9 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         continue;
       }
       // A thread without a mapped conversation yet runs the configured default preset.
-      const name = selected === undefined ? host.defaultPreset : matchingPresetName(host.presets, selected);
+      const name = selected === undefined
+        ? host.defaultPreset
+        : matchingPresetName({ models: [], selected, presets: host.presets });
       const preset = name !== undefined && listed.has(name) ? name : null;
       if (!openThread(state, thread)) continue;
       const frame = JSON.stringify({ type: "event", event: "model", thread, preset });
@@ -1222,6 +920,36 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       }
     }
   }
+
+  // ── Extracted modules: devices, threads and the model tool's file delivery ──
+
+  const core: AppCore = {
+    gateway,
+    now,
+    context: adapterContext,
+    stateConversation,
+    state: () => state,
+    mutateState,
+    publish: () => pushEventsToSockets(),
+    notifyPush: (thread) => notifyPush(thread),
+    stopped,
+  };
+  const devices = createAppDevices({
+    core,
+    askWaitMs,
+    admitSend: (deviceId, frame) => admitSend(deviceId, frame),
+    closeDevice(deviceId) {
+      sockets.get(deviceId)?.session.close(APP_CLOSE.unauthorized, "revoked");
+    },
+  });
+  const threads = createAppThreads({
+    core,
+    archiveAfterMs,
+    gated: (thread) => controls.gated(thread),
+    submitInOrder: (thread, work) => order.submitInOrder(thread, work),
+    drain: () => drain(),
+    pushModelEvents: (list) => pushModelEvents(list),
+  });
 
   // ── Sockets ───────────────────────────────────────────────────────────────
 
@@ -1313,13 +1041,13 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           return;
         }
         case "thread.create":
-          await createThread(frame, sendOk, sendError);
+          await threads.create(frame, sendOk, sendError);
           return;
         case "thread.rename":
-          await renameThread(frame, sendOk, sendError);
+          await threads.rename(frame, sendOk, sendError);
           return;
         case "thread.archive":
-          await archiveThread(frame, sendOk, sendError);
+          await threads.archive(frame, sendOk, sendError);
           return;
         case "push.key":
           if (options.push === undefined) return sendError("unsupported");
@@ -1491,191 +1219,6 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     sendOk();
   }
 
-  // ── Thread lifecycle ──────────────────────────────────────────────────────
-
-  async function createThread(
-    frame: Record<string, unknown>,
-    sendOk: (body: Record<string, unknown>) => void,
-    sendError: (error: AppErrorCode) => void,
-  ): Promise<void> {
-    const key = frame.key;
-    const title = frame.title === undefined ? "New thread" : frame.title;
-    if (typeof key !== "string" || !APP_LIMITS.idPattern.test(key) || !validThreadTitle(title)) {
-      return sendError("bad_request");
-    }
-    const raw = frame.from;
-    let from: AppThreadOrigin | undefined;
-    if (raw !== undefined) {
-      if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return sendError("bad_request");
-      const { thread, messageId } = raw as Record<string, unknown>;
-      const source = parseThreadId(thread);
-      if (source === undefined || typeof messageId !== "string" || messageId.length === 0 || messageId.length > 256) {
-        return sendError("bad_request");
-      }
-      from = { thread: source, messageId };
-    }
-    const prior = state.createKeys?.find((entry) => entry.key === key);
-    if (prior !== undefined) return sendOk({ thread: prior.thread, duplicate: true });
-    if (from !== undefined && (!openThread(state, from.thread) || archiving.has(from.thread))) return sendError("bad_request");
-    let thread: string;
-    do { thread = `t_${randomBytes(18).toString("base64url")}`; } while (threadInfo(state, thread) !== undefined);
-    const register = (doc: Draft<AppChannelState>) => {
-      if (doc.createKeys?.some((entry) => entry.key === key) || !canOpenSideThread(doc) ||
-          threadInfo(doc, thread) !== undefined ||
-          (from !== undefined && (!openThread(doc, from.thread) || archiving.has(from.thread)))) {
-        throw new ThreadCreateConflict();
-      }
-      const atMs = now();
-      const at = new Date(atMs).toISOString();
-      const info = { id: thread, title, archived: false, createdAt: at, lastAt: at, ...(from === undefined ? {} : { origin: from }) };
-      doc.threads!.push(info);
-      doc.createKeys = pruneKeys([...(doc.createKeys ?? []), { key, atMs, thread }], atMs);
-      appendEvent(doc, { event: "thread", thread: { ...info } });
-    };
-    try {
-      if (from === undefined) {
-        if (gateway.createAppThread === undefined) await mutateState(register);
-        else {
-          await gateway.createAppThread(stateConversation.id, thread, register, adapterContext);
-          await mutateState(() => undefined);
-        }
-      } else if (!await gateway.forkAppThread?.(stateConversation.id, thread, from, register, adapterContext)) {
-        return sendError("bad_request");
-      } else {
-        await mutateState(() => undefined);
-      }
-    } catch (error) {
-      if (error instanceof AppThreadCapacityError) return sendError("not_ready");
-      if (!(error instanceof ThreadCreateConflict)) throw error;
-      const latest = await mutateState(() => undefined);
-      const existing = latest.createKeys?.find((entry) => entry.key === key);
-      return existing === undefined ? sendError("bad_request") : sendOk({ thread: existing.thread, duplicate: true });
-    }
-    sendOk({ thread, duplicate: false });
-    pushEventsToSockets();
-    await pushModelEvents([thread]);
-  }
-
-  async function renameThread(
-    frame: Record<string, unknown>,
-    sendOk: () => void,
-    sendError: (error: AppErrorCode) => void,
-  ): Promise<void> {
-    const thread = parseThreadId(frame.thread);
-    const title = frame.title;
-    if (thread === undefined || thread === APP_MAIN_THREAD || !validThreadTitle(title)) {
-      return sendError("bad_request");
-    }
-    let found = false;
-    await mutateState((doc) => {
-      const info = threadInfo(doc, thread);
-      if (info === undefined) return;
-      found = true;
-      if (info.title === title) return;
-      info.title = title;
-      info.lastAt = new Date(now()).toISOString();
-      appendEvent(doc, { event: "thread", thread: { ...info } });
-    });
-    if (!found) return sendError("bad_request");
-    sendOk();
-    pushEventsToSockets();
-  }
-
-  async function archiveThread(
-    frame: Record<string, unknown>,
-    sendOk: () => void,
-    sendError: (error: AppErrorCode) => void,
-  ): Promise<void> {
-    const thread = parseThreadId(frame.thread);
-    const archived = frame.archived;
-    if (thread === undefined || thread === APP_MAIN_THREAD || typeof archived !== "boolean") {
-      return sendError("bad_request");
-    }
-    const info = threadInfo(state, thread);
-    if (info === undefined) return sendError("bad_request");
-    if (archiving.has(thread) || controlPendingSet.has(thread)) return sendError("not_ready");
-    if (info.archived === archived) return sendOk();
-    archiving.add(thread);
-    try {
-      // Fence app submissions until the abort and archive commit are both complete. Inputs
-      // already submitted settle through the native record; never start a turn just to abort it.
-      const applied = await submitInOrder(thread, async () => {
-        const conversation = archived ? await gateway.conversationFor(sessionForThread(thread), adapterContext) : undefined;
-        if (conversation !== undefined) await conversation.abort(adapterContext);
-        let changed = false;
-        state = await stateConversation.commit(async (tx) => {
-          const doc = await tx.doc(AppState, stateConversation.id);
-          if (!archived && (!canOpenSideThread(doc) || await gateway.appSnapshotRoom?.(tx) === false)) {
-            return copyJson(doc) as unknown as AppChannelState;
-          }
-          if (conversation !== undefined) {
-            const retired = new Set<string>();
-            for (const item of doc.pending) {
-              if (item.notice === true || threadOf(item) !== thread) continue;
-              if (await tx.submissionByRequest(conversation.id, requestIdFor(item.key)) !== undefined) continue;
-              appendEvent(doc, { event: "settled", thread, key: item.key, outcome: "aborted" });
-              retired.add(item.key);
-            }
-            doc.pending = doc.pending.filter((item) => !retired.has(item.key));
-            // An archived thread has no question surface, so its open cards can never be answered and
-            // the record would block every later ask. Repair a delivery mark lost in a crash first, in
-            // this same commit: a quarantined question whose card is still live must be cancelled with
-            // the archive, not reopened by a later repair. Restoring the thread does not reopen them.
-            const questions = await tx.doc(AskQuestionsDoc, conversation.id);
-            publishQuestionEvents(doc, questions, thread, now());
-            cancelPendingQuestions(questions);
-            publishQuestionEvents(doc, questions, thread, now());
-          }
-          const entry = threadInfo(doc, thread)!;
-          setArchived(doc, entry, new Date(now()).toISOString(), archived ? "manual" : undefined);
-          changed = true;
-          return copyJson(doc) as unknown as AppChannelState;
-        }, adapterContext);
-        return changed;
-      });
-      if (!applied) return sendError("bad_request");
-      if (!archived) await gateway.reserveAppThread?.(thread, adapterContext);
-      sendOk();
-      pushEventsToSockets();
-    } finally {
-      archiving.delete(thread);
-      drain();
-    }
-  }
-
-  async function scanIdleThreads(): Promise<void> {
-    if (gateway.appThreadBusy === undefined) return;
-    const atMs = now();
-    const at = new Date(atMs).toISOString();
-    const expired = (info: AppThreadInfo) => info.id !== APP_MAIN_THREAD && !info.archived &&
-      atMs - Date.parse(info.lastAt) >= archiveAfterMs && !archiving.has(info.id) && !controlPendingSet.has(info.id);
-    if (!state.threads?.some(expired)) return;
-    // The idle archive cancels a thread's questions exactly like a manual archive, so it needs the
-    // same repair. A question document is addressed by its conversation id, which a session key
-    // cannot be resolved to inside the commit: resolve the candidate threads' conversations first,
-    // and leave any thread that only became eligible since then to the next scan.
-    const conversations = new Map<string, Conversation>();
-    for (const info of state.threads ?? []) {
-      if (!expired(info) || state.pending.some((item) => threadOf(item) === info.id)) continue;
-      conversations.set(info.id, await gateway.conversationFor(sessionForThread(info.id), adapterContext));
-    }
-    state = await stateConversation.commit(async (tx) => {
-      const doc = await tx.doc(AppState, stateConversation.id);
-      for (const info of doc.threads ?? []) {
-        const conversation = conversations.get(info.id);
-        if (!expired(info) || conversation === undefined || doc.pending.some((item) => threadOf(item) === info.id) ||
-            await gateway.appThreadBusy!(tx, info.id)) continue;
-        const questions = await tx.doc(AskQuestionsDoc, conversation.id);
-        publishQuestionEvents(doc, questions, info.id, atMs);
-        cancelPendingQuestions(questions);
-        publishQuestionEvents(doc, questions, info.id, atMs);
-        setArchived(doc, info, at, "idle");
-      }
-      return copyJson(doc) as unknown as AppChannelState;
-    }, adapterContext);
-    pushEventsToSockets();
-  }
-
   // ── Ingress ───────────────────────────────────────────────────────────────
 
   /**
@@ -1690,7 +1233,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   ): Promise<void> {
     const thread = parseThreadId(frame.thread === undefined ? APP_MAIN_THREAD : frame.thread);
     if (thread === undefined || !openThread(state, thread)) return sendError("bad_request");
-    if (archiving.has(thread)) return sendError("not_ready");
+    if (threads.archiving(thread)) return sendError("not_ready");
     const questionId = parseQuestionId(frame.question);
     const option = frame.option;
     if (questionId === undefined || typeof option !== "string" || !APP_QUESTION_OPTION_IDS.includes(option)) {
@@ -1703,7 +1246,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       const conversation = await gateway.conversationFor(sessionKey, adapterContext);
       await mutateState(async (doc, tx) => {
         if (!openThread(doc, thread)) { blocked = "bad_request"; return; }
-        if (archiving.has(thread)) { blocked = "not_ready"; return; }
+        if (threads.archiving(thread)) { blocked = "not_ready"; return; }
         const questions = await tx.doc(AskQuestionsDoc, conversation.id);
         // Repair a delivery mark lost in a crash before the claim reads the record, so a live open
         // card is answerable even when a read already quarantined it.
@@ -1753,12 +1296,6 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     }
   }
 
-  /** One `send` admission's result, whether it came from a device socket or a shortcut request. */
-  type SendAdmission =
-    | { readonly kind: "admitted"; readonly duplicate: boolean }
-    | { readonly kind: "error"; readonly error: AppErrorCode }
-    | { readonly kind: "stopped" };
-
   /**
    * A `send`'s attachment ids: `undefined` for none, `"bad"` for a list that refuses the request.
    * Upload ids are the only attachment authority: this device's, unexpired, unused, bounded. An
@@ -1793,7 +1330,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     try {
       await mutateState((doc) => {
         if (!openThread(doc, thread)) { blocked = "bad_request"; return; }
-        if (archiving.has(thread)) { blocked = "not_ready"; return; }
+        if (threads.archiving(thread)) { blocked = "not_ready"; return; }
         // A key whose echo or notice is still in the log is a duplicate even if its window entry
         // was pruned.
         if (doc.sendKeys.some((entry) => entry.key === key) || hasEventId(doc, `send:${key}`) ||
@@ -1810,18 +1347,16 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     if (blocked !== undefined) return sendError(blocked);
     if (duplicate) return sendOk({ duplicate: true });
 
-    let reply: string;
-    if (gateway.mcpAdmin === undefined) {
-      reply = CALLBACK_UNAVAILABLE_TEXT;
-    } else {
-      try {
-        const result = await gateway.mcpAdmin.submitCallback(sessionForThread(thread), text, adapterContext);
-        reply = result.handled ? result.text : CALLBACK_UNHANDLED_TEXT;
-      } catch {
-        // A failure to offer the callback still must not echo, store or model the text.
-        reply = CALLBACK_UNHANDLED_TEXT;
-      }
-    }
+    // A failure to offer the callback still must not echo, store or model the text: the shared
+    // handler answers only fixed wording or the lifecycle's own credential-free text.
+    const admin = gateway.mcpAdmin;
+    const reply = (await handleOAuthCallback(
+      admin === undefined
+        ? undefined
+        : (callback) => admin.submitCallback(sessionForThread(thread), callback, adapterContext),
+      text,
+      { scope: "thread" },
+    )).text;
     let appended = false;
     try {
       await mutateState((doc) => {
@@ -1852,7 +1387,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   async function admitSend(deviceId: string | undefined, frame: Record<string, unknown>): Promise<SendAdmission> {
     const thread = parseThreadId(frame.thread === undefined ? APP_MAIN_THREAD : frame.thread);
     if (thread === undefined || !openThread(state, thread)) return { kind: "error", error: "bad_request" };
-    if (archiving.has(thread)) return { kind: "error", error: "not_ready" };
+    if (threads.archiving(thread)) return { kind: "error", error: "not_ready" };
     const key = frame.key;
     const text = frame.text;
     const attachmentIds = attachmentIdsFor(frame.attachments);
@@ -1900,7 +1435,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     try {
       await mutateState(async (doc, tx) => {
         if (!openThread(doc, thread)) { blocked = "bad_request"; return; }
-        if (archiving.has(thread)) { blocked = "not_ready"; return; }
+        if (threads.archiving(thread)) { blocked = "not_ready"; return; }
         if (doc.sendKeys.some((entry) => entry.key === key)) return;
         if (doc.pending.some((entry) => entry.key === key && entry.notice !== true)) return;
         // A key whose echo is still in the log is a duplicate even if its window entry was pruned.
@@ -1988,7 +1523,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     if (typeof callback === "string" && looksLikeOAuthCallback(callback)) {
       const thread = parseThreadId(frame.thread === undefined ? APP_MAIN_THREAD : frame.thread);
       if (thread === undefined || !openThread(state, thread)) return sendError("bad_request");
-      if (archiving.has(thread)) return sendError("not_ready");
+      if (threads.archiving(thread)) return sendError("not_ready");
       if (attachmentIdsFor(frame.attachments) === "bad") return sendError("bad_request");
       const key = frame.key;
       if (typeof key !== "string" || !APP_LIMITS.idPattern.test(key)) return sendError("bad_request");
@@ -2017,7 +1552,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     const thread = parseThreadId(frame.thread === undefined ? APP_MAIN_THREAD : frame.thread);
     const message = frame.message;
     const emoji = frame.emoji;
-    if (thread === undefined || !openThread(state, thread) || archiving.has(thread)) return sendError("bad_request");
+    if (thread === undefined || !openThread(state, thread) || threads.archiving(thread)) return sendError("bad_request");
     if (typeof message !== "string" || message.length === 0 || message.length > 256) return sendError("bad_request");
     if (emoji !== null && !isReaction(emoji)) return sendError("bad_request");
     let blocked: AppErrorCode | undefined;
@@ -2025,7 +1560,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       await mutateState((doc) => {
         // Rechecked inside the commit exactly as a send does: an archive may have landed, or be in
         // flight, while this request waited for its own commit.
-        if (!openThread(doc, thread) || archiving.has(thread)) { blocked = "bad_request"; return; }
+        if (!openThread(doc, thread) || threads.archiving(thread)) { blocked = "bad_request"; return; }
         const target = findDurableMessage(doc, thread, message);
         // A gateway `notice` is neither the owner's nor the agent's message. Summarising it would
         // attribute the gateway's own text to the owner, so it is not a target at all.
@@ -2058,37 +1593,28 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
 
   // ── Delivery of admitted work ─────────────────────────────────────────────
 
-  const beginSubmission = (thread: string): SubmissionSlot => {
-    const prior = submissionChains.get(thread) ?? Promise.resolve();
-    let open!: () => void;
-    const held = new Promise<void>((resolve) => { open = resolve; });
-    const tail = prior.then(() => held);
-    submissionChains.set(thread, tail);
-    let released = false;
-    return {
-      prior,
-      release: () => {
-        if (released) return;
-        released = true;
-        open();
-        if (submissionChains.get(thread) === tail) submissionChains.delete(thread);
-      },
-    };
-  };
-
   const drain = (): void => {
-    if (stopping || signal?.aborted || !recoveryComplete) return;
+    if (stopped() || !recoveryComplete) return;
+    // A thread's notices keep admission order behind an acknowledgement that is still held, so a
+    // later notice can never overtake a control's outcome in the same thread.
+    const heldThreads = new Set<string>();
     for (const item of [...state.pending]) {
       const notice = item.notice === true;
-      if (item.hold === true || item.held === true) continue;
       const thread = threadOf(item);
+      if (item.hold === true) {
+        heldThreads.add(thread);
+        continue;
+      }
+      if (item.held === true) continue;
+      if (notice && heldThreads.has(thread)) continue;
       if (notice ? activeNotices >= 8 : (activeReplies.get(thread) ?? 0) >= 8) continue;
-      if (!notice && (controlPendingSet.has(thread) || archiving.has(thread))) continue;
+      // A gated thread holds its inputs; a notice is never a model submission, so it still goes out.
+      if (!notice && (controls.gated(thread) || threads.archiving(thread))) continue;
       if (delivering.has(item.key) || failedThisCycle.has(item.key)) continue;
       delivering.add(item.key);
       if (notice) activeNotices += 1;
       else activeReplies.set(thread, (activeReplies.get(thread) ?? 0) + 1);
-      const slot = beginSubmission(thread);
+      const slot = order.beginSubmission(thread);
       const task = observeOperation("gateway.app.delivery", {
         "send.key": item.key, notice, "queue.depth": state.pending.length,
         attempt: (deliveryFailures.get(item.key) ?? 0) + 1,
@@ -2105,11 +1631,19 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         }
         active.delete(task);
         delivering.delete(item.key);
-        if (!stopping && !signal?.aborted) drain();
+        if (!stopped()) drain();
       });
       active.add(task);
     }
   };
+
+  /** The request IDs of this thread's admitted owner inputs, read just before a busy-mode decision. */
+  const ownerRequestIds = (thread: string): string[] => state.pending
+    .filter((candidate) => candidate.notice !== true && threadOf(candidate) === thread)
+    .map((candidate) => requestIdFor(candidate.key));
+
+  const submissionMode = (conversation: Conversation, current: AppPendingInput): Promise<"steer" | "followUp"> =>
+    resolveOwnerBusyMode(conversation, current.whenBusy, ownerRequestIds(threadOf(current)), adapterContext);
 
   const deliver = async (item: AppPendingInput, slot: SubmissionSlot, trace: TelemetrySpan): Promise<void> => {
     const thread = threadOf(item);
@@ -2140,12 +1674,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       () => gateway.conversationFor(sessionForThread(thread), adapterContext), trace);
     trace.setAttributes({ "conversation.id": conversation.id });
     const requestId = requestIdFor(item.key);
-    const watch = await conversation.watch(adapterContext);
-    let previewTimer: ReturnType<typeof setTimeout> | undefined;
-    let previewWork: Promise<void> | undefined;
-    let previewDirty = false;
-    let latestPreview = "";
-    let submissionId: SubmissionId | undefined;
+    let submissionId: number | undefined;
     let watchStopped = false;
     // Live activity: the run's tool steps, derived from its committed transcript entries and sent
     // as non-durable events whenever they change (protocol v2, "Activity").
@@ -2154,25 +1683,6 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     let activityWork: Promise<void> | undefined;
     let activityDirty = false;
     let activitySent: string | undefined;
-    const schedulePreview = () => {
-      if (previewTimer !== undefined || watchStopped || signal?.aborted) return;
-      previewTimer = setTimeout(() => {
-        previewTimer = undefined;
-        if (previewWork !== undefined) return;
-        previewDirty = false;
-        previewWork = publishPreview(latestPreview).catch(() => undefined).finally(() => {
-          previewWork = undefined;
-          if (previewDirty && !watchStopped && !signal?.aborted) schedulePreview();
-        });
-      }, PREVIEW_COALESCE_MS);
-      previewTimer.unref?.();
-    };
-    const queuePreview = (text: string) => {
-      if (watchStopped) return;
-      latestPreview = text;
-      previewDirty = true;
-      schedulePreview();
-    };
     const publishPreview = async (text: string): Promise<void> => {
       if (text.trim() === "" || signal?.aborted) return;
       // A preview must fit one frame; the final message carries the whole answer, so a cut is honest.
@@ -2246,22 +1756,14 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       const wire = activityForWire(tally, APP_LIMITS.maxActivitySteps);
       return wire.steps.length === 0 ? undefined : wire;
     };
-    type LiveView = {
-      run?: { inputs?: SubmissionId[]; first?: EntryId };
-      generation?: unknown;
-    };
     const syncStatus = (view: { docs: Record<string, unknown> }, queued = false): void => {
-      const live = view.docs["pi.live"] as LiveView | undefined;
+      const live = view.docs["pi.live"] as Parameters<typeof isLiveGenerating>[0];
       const inbox = view.docs["pi.inbox"] as { items?: unknown[] } | undefined;
       if (live?.run === undefined) {
         broadcastStatus(thread, queued || (inbox?.items?.length ?? 0) > 0 ? "queued" : "idle");
         return;
       }
-      const generation = live.generation;
-      const generating = generation !== null && typeof generation === "object" &&
-        (!("deferred" in (generation as object)) || (generation as { deferred?: unknown }).deferred === undefined) &&
-        (!("retry" in (generation as object)) || (generation as { retry?: unknown }).retry === undefined);
-      broadcastStatus(thread, generating ? "thinking" : "tool");
+      broadcastStatus(thread, isLiveGenerating(live) ? "thinking" : "tool");
     };
     const refreshStatus = () => conversation.commit(async (tx) => {
       syncStatus({ docs: {
@@ -2269,33 +1771,38 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         "pi.inbox": await tx.doc(InboxDoc, conversation.id),
       } });
     }, adapterContext);
-    try {
-      watch.start(async (call) => {
-        // Durable's watches never send Chord's recoverable `failed` call; it ends instead.
-        if (call.kind !== "value") return;
-        const live = call.value.docs["pi.live"] as LiveView | undefined;
-        syncStatus(call.value, submissionId === undefined);
-        const inputs = live?.run?.inputs;
-        if (submissionId === undefined || inputs === undefined || !inputs.includes(submissionId)) return;
+    // One preview per run: the run's first input owns the single live preview and activity stream.
+    const watcher = await createPreviewWatcher({
+      conversation,
+      context: adapterContext,
+      delayMs: PREVIEW_COALESCE_MS,
+      publish: publishPreview,
+      onFrame(view, frame) {
+        syncStatus(view, submissionId === undefined);
+        if (!frame.inRun) return;
         // The run's first entry bounds its activity scan; it is kept for the final answer's steps.
-        if (live?.run?.first !== undefined) activityFrom = live.run.first;
-        // One activity stream per run, like the preview: the run's first input owns it.
-        if (submissionId === firstInput(inputs)) queueActivity();
-        // One preview per run: the run's first input owns the single live preview.
-        if (submissionId !== firstInput(inputs)) return;
-        const text = (live as {
-          generation?: { message?: { content?: { type: string; text?: string }[] } };
-        } | undefined)?.generation?.message?.content
-          ?.flatMap((part) => part.type === "text" && part.text ? [part.text] : []).join("");
-        if (text) queuePreview(text);
-      });
+        if (frame.live?.run?.first !== undefined) activityFrom = frame.live.run.first as EntryId;
+        if (frame.ownsRun) queueActivity();
+      },
+      ...(signal === undefined ? {} : { signal }),
+    });
+    const stopPreviewWatch = async (): Promise<void> => {
+      if (watchStopped) return;
+      watchStopped = true;
+      try {
+        await watcher.stop();
+      } finally {
+        await stopActivity();
+      }
+    };
+    try {
       let submission = earlySubmissions.get(item.key);
       earlySubmissions.delete(item.key);
       if (submission === undefined) {
         const whenBusy = await submissionMode(conversation, item);
         // Recheck after the last await before submitting. Archive retires unsubmitted input;
         // a native submission may still settle after archive and must not be submitted again.
-        if (archiving.has(thread) || !openThread(state, thread)) {
+        if (threads.archiving(thread) || !openThread(state, thread)) {
           const existing = await conversation.commit((tx) => tx.submissionByRequest(conversation.id, requestId), adapterContext);
           if (existing === undefined) return;
           submission = await gateway.harness?.submission(existing.id, adapterContext);
@@ -2312,7 +1819,8 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       }
       slot.release();
       submissionId = submission.id;
-      syncStatus(watch.value);
+      watcher.setSubmission(submission.id);
+      syncStatus(watcher.value);
       trace.setAttributes({ "submission.id": submission.id });
       const settled = await observeOperation("gateway.app.settlement", { "submission.id": submission.id },
         () => submission.wait(adapterContext), trace);
@@ -2342,19 +1850,6 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     } finally {
       await stopPreviewWatch();
     }
-
-    async function stopPreviewWatch() {
-      if (watchStopped) return;
-      if (previewTimer !== undefined) {
-        clearTimeout(previewTimer);
-        previewTimer = undefined;
-      }
-      watchStopped = true;
-      previewDirty = false;
-      await watch.stop();
-      await stopActivity();
-      await previewWork;
-    }
   };
 
   /** A failed or aborted settlement settles exactly this key; failures are never grouped by text. */
@@ -2383,20 +1878,13 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     steps?: { steps: AppActivityStep[]; omitted?: number },
   ): Promise<void> => {
     let appended = false;
-    state = await stateConversation.commit(async (tx) => {
-      const doc = await tx.doc(AppState, stateConversation.id);
-      const members: { key: string; submissionId: number }[] = [];
-      for (const candidate of doc.pending) {
-        if (candidate.notice === true || threadOf(candidate) !== thread) continue;
-        const record = await tx.submissionByRequest(conversation.id, requestIdFor(candidate.key));
-        if (record !== undefined && answeredTogether(record, answerEntry)) {
-          members.push({ key: candidate.key, submissionId: record.id });
-        }
-      }
-      members.sort((left, right) => left.submissionId - right.submissionId || (left.key < right.key ? -1 : 1));
-      const retired = new Set(members.map((member) => member.key));
+    await mutateState(async (doc, tx) => {
+      const group = await resolveSharedDeliveryGroup(tx, conversation.id, doc.pending
+        .filter((candidate) => candidate.notice !== true && threadOf(candidate) === thread)
+        .map((candidate) => ({ key: candidate.key, requestId: requestIdFor(candidate.key) })), answerEntry);
+      const retired = new Set(group.keys);
       const answerId = thread === APP_MAIN_THREAD ? `answer:${answerEntry}` : `answer:${thread}:${answerEntry}`;
-      if (members.length > 0 && !hasEventId(doc, answerId)) {
+      if (group.keys.length > 0 && !hasEventId(doc, answerId)) {
         rememberAnswer(doc, answerId, thread, answerEntry);
         appendMessage(doc, {
           event: "message",
@@ -2405,24 +1893,23 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
           role: "assistant",
           text: answerText,
           at: new Date(now()).toISOString(),
-          ...(members[0] === undefined ? {} : { key: members[0].key }),
+          ...(group.owner === undefined ? {} : { key: group.owner }),
           ...(steps === undefined ? {} : { steps: steps.steps, ...(steps.omitted === undefined ? {} : { omitted: steps.omitted }) }),
         });
-        for (const member of members) {
-          appendEvent(doc, { event: "settled", thread, key: member.key, outcome: "answered" });
+        for (const key of group.keys) {
+          appendEvent(doc, { event: "settled", thread, key, outcome: "answered" });
         }
         appended = true;
       }
       doc.pending = doc.pending.filter((entry) => !retired.has(entry.key));
-      doc.controls = pruneControls(doc.controls, doc.pending);
-      return copyJson(doc) as unknown as AppChannelState;
+      pruneAppControls(doc);
     }, cleanupContext);
     pushEventsToSockets();
     if (appended) notifyPush(thread);
   };
 
   /** A repeatedly failing delivery is held for inspection, exactly like the other channels. */
-  async function holdFailedDelivery(key: string, error: unknown): Promise<void> {
+  async function holdFailedDelivery(key: string, _error: unknown): Promise<void> {
     const attempts = (deliveryFailures.get(key) ?? 0) + 1;
     deliveryFailures.set(key, attempts);
     if (attempts < MAX_DELIVERY_FAILURES) return;
@@ -2432,7 +1919,6 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       if (item !== undefined) item.held = true;
     }, cleanupContext).catch(() => undefined);
     console.warn(`App delivery for ${key} is held after ${attempts} failure(s); inspect the app channel state.`);
-    void error;
   }
 
   const forget = async (key: string): Promise<void> => {
@@ -2445,32 +1931,6 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     }, cleanupContext);
   };
 
-  // ── Owner busy-mode ────────────────────────────────────────────────────────
-
-  /** Whether this conversation's current run may take a steer from this channel. */
-  const ownerRun = async (conversation: Conversation, thread: string): Promise<boolean> =>
-    conversation.commit(async (tx) => {
-      const live = await tx.doc(LiveDoc, conversation.id);
-      const inputs = live.run?.inputs;
-      if (inputs === undefined || inputs.length === 0) return false;
-      if (await originOccurrencePending(tx, conversation.id)) return false;
-      const first = firstInput(inputs);
-      for (const candidate of state.pending) {
-        if (candidate.notice === true || threadOf(candidate) !== thread) continue;
-        const record = await tx.submissionByRequest(conversation.id, requestIdFor(candidate.key));
-        if (record?.id === first) return true;
-      }
-      return false;
-    }, adapterContext);
-
-  const submissionMode = async (
-    conversation: Conversation,
-    current: AppPendingInput,
-  ): Promise<"steer" | "followUp"> => {
-    if (current.whenBusy !== "steer") return "followUp";
-    return (await ownerRun(conversation, threadOf(current))) ? "steer" : "followUp";
-  };
-
   // ── Controls ──────────────────────────────────────────────────────────────
 
   async function handleControlFrame(
@@ -2480,7 +1940,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   ): Promise<void> {
     const thread = parseThreadId(frame.thread === undefined ? APP_MAIN_THREAD : frame.thread);
     if (thread === undefined || !openThread(state, thread)) return sendError("bad_request");
-    if (archiving.has(thread)) return sendError("not_ready");
+    if (threads.archiving(thread)) return sendError("not_ready");
     const command = frame.command;
     const rawArgs = frame.args ?? "";
     if (typeof command !== "string" || typeof rawArgs !== "string" ||
@@ -2494,18 +1954,13 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     }
     const args = rawArgs.trim();
     const key = thread === APP_MAIN_THREAD ? `c:${frame.id as string}` : `c:${thread}:${frame.id as string}`;
+    const sessionKey = sessionForThread(thread);
     const recorded = state.controls.find((entry) => entry.key === key);
     if (recorded !== undefined) {
-      // While the command is still applying its acknowledgement is still held: a reused request id
-      // is simply answered, and the notice the command itself releases remains the visible result.
-      // Marking it unconfirmed or releasing the ack here would misreport a live command.
-      if (state.pending.some((entry) => entry.key === key && entry.hold === true) || deferredControls.has(key)) {
-        sendOk();
-        return;
-      }
-      // The command was durably admitted before its effect, so a replay reports it instead of rerunning.
-      if (recorded.status === "admitted") await markControlUnconfirmed(key);
-      await admitNotice(thread, key, replayControlText(recorded));
+      // The command was durably admitted before its effect, so a replay reports it instead of
+      // rerunning. While it is still applying here, its own held acknowledgement is the answer.
+      const text = await controls.replay(recorded);
+      if (text !== undefined) await admitNotice(thread, key, text);
       sendOk();
       drain();
       return;
@@ -2516,7 +1971,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       sendOk();
       drain();
     };
-    let mutation: AppMutation;
+    let mutation: AppControl["command"];
     let option: string | undefined;
     switch (command) {
       case "help": {
@@ -2529,35 +1984,46 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       }
       case "status":
         if (args !== "") return notice(usageNotice("status"));
-        return notice(await statusNotice(thread));
+        return notice(await readStatusNotice(gateway, sessionKey, "thread", adapterContext));
+      case "mcp": {
+        const admin = gateway.mcpAdmin;
+        if (!capabilities.mcp || admin === undefined) return notice(MCP_UNAVAILABLE_HOST);
+        if (args !== "") return notice(usageNotice("mcp"));
+        // Read-only status; management itself is the model tool acting for this authenticated thread.
+        return notice(renderMcpListing(await admin.list(adapterContext), MAX_NOTICE_CHARS));
+      }
       case "model": {
         const argument = parseModelArgument(args);
-        if (argument.kind === "usage") return notice(usageNotice("model"));
-        const listing = await readModelListing(thread);
+        // The shared preset-token validator: whatever the hello projection would drop, the control
+        // refuses too, instead of accepting names the advertised presets can never include.
+        if (argument.kind === "usage" || (argument.kind === "preset" && !validAppPresetName(argument.name))) {
+          return notice(usageNotice("model"));
+        }
+        const listing = await readModelListing(gateway, sessionKey, adapterContext);
         if (argument.kind === "list") {
-          return notice(listing === undefined ? MODEL_LISTING_UNAVAILABLE : modelListingText(listing), MAX_LATE_CONTROL_CHARS);
+          return notice(listing === undefined
+            ? MODEL_LISTING_UNAVAILABLE
+            : renderModelListing(listing, { scope: "thread" }), MAX_LATE_CONTROL_CHARS);
         }
-        if (listing === undefined) return notice(MODEL_LISTING_UNAVAILABLE);
-        if (listing.presets === undefined) return notice(MODEL_PRESETS_UNAVAILABLE);
-        if (argument.name !== "default" && !listing.presets.some((preset) => preset.name === argument.name)) {
-          return notice(`Unknown model preset ${boundedLabel(argument.name, 80)}: nothing was changed. ` +
-            "Use /model to list the configured presets.");
-        }
+        const refusal = modelPresetRefusal(listing, argument.name);
+        if (refusal !== undefined) return notice(refusal);
         mutation = "model";
         option = argument.name;
         break;
       }
       case "digest":
         // Read-only bounded status: no scan, no model call and no cursor change.
-        if (args.toLowerCase() === "status") return notice(await digestStatusNotice(thread));
+        if (args.toLowerCase() === "status") return notice(await renderDigestStatus(gateway, sessionKey, adapterContext));
         if (args !== "") return notice(usageNotice("digest"));
         mutation = "digest";
         break;
-      case "restart":
+      case "restart": {
         if (args !== "") return notice(usageNotice("restart"));
-        if (restartHostRequested) return notice(restartHostRequestFailed ? RESTART_REQUEST_FAILED : RESTART_ALREADY_REQUESTED);
+        const refusal = restartRequester.admissionRefusal();
+        if (refusal !== undefined) return notice(refusal);
         mutation = "restart";
         break;
+      }
       case "new":
       case "abort":
       case "stop":
@@ -2571,9 +2037,11 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     }
     // A mutating control: the visible result arrives later as `message{role:"notice"}`.
     try {
-      await admitControl(thread, key, mutation, option);
+      await controls.admit({
+        key, scope: thread, command: mutation, ...(option === undefined ? {} : { option }), earlierKeys: new Set(),
+      });
     } catch (error) {
-      if (stopping || signal?.aborted) return;
+      if (stopped()) return;
       if (error instanceof Error && error.message === QUEUE_FULL) {
         sendError("not_ready");
         return;
@@ -2590,740 +2058,205 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     await mutateState((doc) => {
       if (doc.pending.some((entry) => entry.key === key)) return;
       if (doc.pending.length >= APP_LIMITS.maxPending) throw new Error(QUEUE_FULL);
-      const noticeSeq = doc.nextNoticeSeq;
-      doc.nextNoticeSeq = noticeSeq + 1;
-      doc.pending.push({
-        key,
-        thread,
-        text: boundNotice(text, limit),
-        admittedAtMs: now(),
-        notice: true,
-        noticeSeq,
-      });
+      queueNotice(doc, key, thread, boundNotice(text, limit), now());
     });
     drain();
   };
 
-  async function admitControl(thread: string, key: string, command: AppMutation, option?: string): Promise<void> {
-    if (controlPendingSet.has(thread)) {
-      await admitNotice(thread, key, "Previous command pending. This command wasn't started; retry later.");
-      return;
-    }
-    if (state.controls.filter((entry) => entry.status === "admitted" || entry.status === "unconfirmed").length >=
-        APP_LIMITS.maxUnresolvedControls) {
-      await admitNotice(thread, key,
-        `Too many control commands are still unconfirmed (limit ${APP_LIMITS.maxUnresolvedControls}); this ${command} ` +
-        "was not started and was not sent to the assistant. Wait for them to finish or restart the gateway.");
-      return;
-    }
-    controlPendingSet.add(thread);
-    const earlierKeys = new Set<string>();
-    try {
+  /** Rewrite (bounded) and release a still-queued acknowledgement; `undefined` when it is gone. */
+  const releaseAck = (doc: Draft<AppChannelState>, key: string, text: string | undefined, limit: number): boolean => {
+    const notice = doc.pending.find((item) => item.notice === true && item.key === key);
+    if (notice === undefined) return false;
+    if (text !== undefined) notice.text = boundNotice(text, limit);
+    delete notice.hold;
+    return true;
+  };
+
+  /** A final outcome after its acknowledgement was already delivered: one fresh notice, if it fits. */
+  const queueLate = (doc: Draft<AppChannelState>, record: AppControl, text: string): void => {
+    if (doc.pending.some((item) => item.key === record.key) || doc.pending.length >= APP_LIMITS.maxPending) return;
+    queueNotice(doc, record.key, record.scope, boundNotice(text, MAX_LATE_CONTROL_CHARS), now());
+  };
+
+  const setControlStatus = (doc: Draft<AppChannelState>, key: string, status: AppControlRecord["status"]): void => {
+    const entry = doc.controls.find((item) => item.key === key);
+    if (entry !== undefined) entry.status = status;
+  };
+
+  /** The shared coordinator's durable commits, each one commit of the app state document. */
+  const ledger: ControlLedger<string, string, AppControl> = {
+    status: (key) => state.controls.find((entry) => entry.key === key)?.status,
+    unresolved: () => state.controls.filter((entry) => entry.status === "admitted" || entry.status === "unconfirmed").length,
+    async admit(record, ackText) {
       await mutateState((doc) => {
+        // The owner inputs already queued in this thread are placed before the control's effect.
         for (const item of doc.pending) {
-          if (item.notice !== true && threadOf(item) === thread) earlierKeys.add(item.key);
+          if (item.notice !== true && threadOf(item) === record.scope) record.earlierKeys.add(item.key);
         }
-        if (!doc.controls.some((entry) => entry.key === key)) {
-          doc.controls = pruneControls([...doc.controls, {
-            key, thread, command, ...(option === undefined ? {} : { option }), status: "admitted" as const,
-          }], doc.pending);
+        if (!doc.controls.some((entry) => entry.key === record.key)) {
+          doc.controls = [...doc.controls, {
+            key: record.key, thread: record.scope, command: record.command,
+            ...(record.option === undefined ? {} : { option: record.option }), status: "admitted" as const,
+          }];
+          pruneAppControls(doc);
         }
-        if (!doc.pending.some((entry) => entry.key === key)) {
+        if (!doc.pending.some((entry) => entry.key === record.key)) {
           if (doc.pending.length >= APP_LIMITS.maxPending) throw new Error(QUEUE_FULL);
-          const noticeSeq = doc.nextNoticeSeq;
-          doc.nextNoticeSeq = noticeSeq + 1;
-          doc.pending.push({
-            key,
-            thread,
-            text: CONTROL_ACK[command],
-            admittedAtMs: now(),
-            notice: true,
-            noticeSeq,
-            hold: true,
-          });
+          queueNotice(doc, record.key, record.scope, ackText, now(), true);
         }
       });
-    } catch (error) {
-      controlPendingSet.delete(thread);
-      throw error;
-    }
-    const record: DeferredControl = { key, thread, command, ...(option === undefined ? {} : { option }), earlierKeys };
-    runningControls.add(thread);
-    const run = applyControl(record);
-    let ack: "waiting" | "pending" | "applied" | "refused" = "waiting";
-    const pendingTimer = setTimeout(() => {
-      if (ack !== "waiting") return;
-      ack = "pending";
-      void releaseControlNotice(key, CONTROL_PENDING[command]).catch(() => undefined);
-    }, CONTROL_PENDING_NOTICE_MS);
-    pendingTimer.unref?.();
-    const task = run.then(async (outcome) => {
-      if (outcome.kind === "refused") {
-        const wasWaiting = ack === "waiting";
-        ack = "refused";
-        await markControlRefused(key, outcome.text).catch(() => undefined);
-        if (!wasWaiting) await publishLateControlNotice(record.thread, key, outcome.text).catch(() => undefined);
-        return;
-      }
-      if (outcome.kind !== "applied") {
-        if (ack !== "waiting") return;
-        ack = "pending";
-        if (outcome.kind === "deferred") {
-          await releaseControlNotice(key, CONTROL_PENDING[command]).catch(() => undefined);
-        }
-        return;
-      }
-      if (ack !== "waiting") {
-        if (outcome.text !== undefined) {
-          await publishLateControlNotice(record.thread, key, outcome.text).catch(() => undefined);
-        }
-        if (outcome.requestRestart === true) requestRestart();
-        return;
-      }
-      ack = "applied";
-      try {
-        await releaseControlNotice(key, outcome.text ?? CONTROL_ACK[command]);
-      } catch {
-        // A failed release leaves the held notice for the next open to report; the command is done.
-      }
-      if (outcome.requestRestart === true) requestRestart();
-    }, (error: unknown) => {
-      // The record stays `admitted` and the acknowledgement stays held: a reopen reports unconfirmed.
-      if (signal?.aborted) return;
-      fatal ??= error;
-      scope.cancel(error instanceof Error ? error : new Error("App control command failed"));
-    }).catch(() => undefined).finally(() => {
-      clearTimeout(pendingTimer);
-      pendingControls.delete(task);
-      runningControls.delete(thread);
-      if (!stopping && !signal?.aborted) {
-        if (!deferredControls.has(key)) controlPendingSet.delete(thread);
-        drain();
-      }
-    });
-    pendingControls.add(task);
-    drain();
-  }
-
-  /** Apply one recorded control after its earlier inputs were placed, recording the truthful outcome. */
-  async function applyControl(record: DeferredControl): Promise<ControlOutcome> {
-    // An archived or archiving thread never receives a control effect, even one admitted while it
-    // was open: manual archive is refused while a control is pending, so this fails closed.
-    if (archiving.has(record.thread) || !openThread(state, record.thread)) {
-      return { kind: "refused", text: ARCHIVED_CONTROL_TEXT };
-    }
-    try {
-      for (const earlier of state.pending.filter((item) => record.earlierKeys.has(item.key))) {
-        const conversation = await gateway.conversationFor(sessionForThread(record.thread), adapterContext);
-        await submitInOrder(record.thread, async () => {
-          const whenBusy = await submissionMode(conversation, earlier);
-          if (!state.pending.some((item) => item.key === earlier.key) ||
-              archiving.has(record.thread) || !openThread(state, record.thread)) return;
-          await gateway.beforeOwnerInput?.(sessionForThread(record.thread), conversation.id, earlier.text, adapterContext);
-          const submission = await conversation.submit({
-            type: "input", content: earlier.text, requestId: requestIdFor(earlier.key), whenBusy,
-          }, adapterContext);
-          // The normal delivery path reuses this turn, so a control-forced input is answered once.
-          earlySubmissions.set(earlier.key, submission);
-          return submission;
-        });
-      }
-    } catch (error) {
-      if (signal?.aborted) throw error;
-      const attempts = (controlFailures.get(record.key) ?? 0) + 1;
-      if (attempts < MAX_CONTROL_ATTEMPTS) {
-        controlFailures.set(record.key, attempts);
-        deferredControls.set(record.key, record);
-        return { kind: "deferred" };
-      }
-      controlFailures.delete(record.key);
-      deferredControls.delete(record.key);
-      await markControlUnconfirmed(record.key).catch(() => undefined);
-      return { kind: "abandoned" };
-    }
-    let outcome: ControlOutcome;
-    if (record.command === "new") {
-      outcome = await applyNewSession(record.thread);
-    } else if (record.command === "abort") {
-      const conversation = await gateway.conversationFor(sessionForThread(record.thread), adapterContext);
-      await conversation.abort(adapterContext);
-      outcome = { kind: "applied" };
-    } else if (record.command === "digest") {
-      outcome = await applyDigest(record.thread);
-    } else if (record.command === "restart") {
-      // No conversation effect: the record and its acknowledgement are durable first, and the host
-      // replacement is requested only after that acknowledgement was released.
-      outcome = { kind: "applied", text: CONTROL_ACK.restart, requestRestart: true };
-    } else {
-      outcome = await applyModelPreset(record);
-    }
-    if (outcome.kind !== "applied") return outcome;
-    if (record.command === "model") await pushModelEvents([record.thread]);
-    await mutateState((doc) => {
-      const entry = doc.controls.find((item) => item.key === record.key);
-      if (entry !== undefined) entry.status = "applied";
-      // The host replaces the process only after this commit, so the owed confirmation is durable first.
-      if (record.command === "restart" && entry !== undefined) {
-        const owed = doc.restart ?? [];
-        if (!owed.includes(record.thread)) doc.restart = [...owed, record.thread].slice(-APP_LIMITS.maxOpenThreads - 1);
-      }
-      doc.controls = pruneControls(doc.controls, doc.pending);
-      // The context boundary the app renders as a durable divider event.
-      if (record.command === "new" && !hasEventId(doc, `divider:${record.key}`)) {
-        appendEvent(doc, { event: "divider", thread: record.thread, at: new Date(now()).toISOString(), reason: "new" });
-      }
-    }, adapterContext);
-    controlFailures.delete(record.key);
-    deferredControls.delete(record.key);
-    return outcome;
-  }
-
-  /** `new`: a native reset plus, when the host offers it, the prompt-snapshot rebuild. */
-  async function applyNewSession(thread: string): Promise<ControlOutcome> {
-    const resetSession = gateway.resetSession;
-    if (resetSession === undefined) {
-      const conversation = await gateway.conversationFor(sessionForThread(thread), adapterContext);
-      await conversation.reset(undefined, adapterContext);
-      // A context boundary retires questions the new context can no longer answer. Repair a delivery
-      // mark lost in a crash first, in this same commit: a quarantined question whose card is still
-      // live must be cancelled by the reset, not reopened by a repair that runs after it.
-      if (gateway.askSurfaces !== undefined) {
-        let changed = false;
-        await mutateState(async (doc, tx) => {
-          const questions = await tx.doc(AskQuestionsDoc, conversation.id);
-          changed = publishQuestionEvents(doc, questions, thread, now());
-          cancelPendingQuestions(questions);
-          changed = publishQuestionEvents(doc, questions, thread, now()) || changed;
-        });
-        if (changed) pushEventsToSockets();
-      }
-      return { kind: "applied" };
-    }
-    try {
-      // The host's reset cancels pending questions in its own commit, so repair a quarantined question
-      // whose card is still live before that commit reads the record. Otherwise the repair below would
-      // reopen a question the reset had already skipped, and a tap could answer into the new context.
-      // If that repair fails, the reset is refused: proceeding would let the repair after it reopen a
-      // question the reset skipped.
-      if (gateway.askSurfaces !== undefined) {
-        const repaired = await reconcileThreadQuestions(thread).then(() => true, (error: unknown) => {
-          if (!signal?.aborted) journalEvent("app.question.reconcile_failed", {}, error);
-          return false;
-        });
-        if (!repaired) return { kind: "refused", text: RESET_UNREPAIRED };
-      }
-      const result = await resetSession(sessionForThread(thread), adapterContext);
-      if (result.status === "busy") return { kind: "refused", text: RESET_BUSY };
-      // The host reset cancels pending questions in its own commit; publish their final state so an
-      // already-rendered card can no longer be answered. This read is also where a crash between
-      // admitting a question and delivering it is quarantined honestly. Publishing that state is
-      // not part of the reset's contract, so it never turns an applied reset into a failure.
-      if (gateway.askSurfaces !== undefined) {
-        await reconcileThreadQuestions(thread).catch((error: unknown) => {
-          if (!signal?.aborted) journalEvent("app.question.reconcile_failed", {}, error);
-        });
-      }
-      return { kind: "applied" };
-    } catch (error) {
-      if (isConversationBusy(error)) return { kind: "refused", text: RESET_BUSY };
-      throw error;
-    }
-  }
-
-  /** Retry deferred commands on the adapter's own scan cadence, like the Telegram poll cadence. */
-  const resumeDeferredControls = (): void => {
-    if (stopping || signal?.aborted) return;
-    for (const [key, record] of deferredControls) {
-      if (runningControls.has(record.thread)) continue;
-      const durable = state.controls.find((entry) => entry.key === key);
-      if (durable === undefined || durable.status !== "admitted") {
-        deferredControls.delete(key);
-        controlFailures.delete(key);
-        controlPendingSet.delete(record.thread);
-        continue;
-      }
-      runningControls.add(record.thread);
-      const task = applyControl(record).then(async (outcome) => {
-        if (outcome.kind === "deferred") return;
-        deferredControls.delete(key);
-        controlFailures.delete(key);
-        if (outcome.kind === "applied") {
-          const text = outcome.text ?? CONTROL_ACK[record.command];
-          if (state.pending.some((entry) => entry.key === key && entry.hold === true)) {
-            await releaseControlNotice(key, text).catch(() => undefined);
-          } else {
-            await publishLateControlNotice(record.thread, key, text).catch(() => undefined);
-          }
-          if (outcome.requestRestart === true) requestRestart();
-        } else if (outcome.kind === "refused") {
-          if (state.pending.some((entry) => entry.key === key && entry.hold === true)) {
-            await markControlRefused(key, outcome.text).catch(() => undefined);
-          } else {
-            await publishLateControlNotice(record.thread, key, outcome.text).catch(() => undefined);
-          }
-        } else if (outcome.kind === "abandoned") {
-          await markControlUnconfirmed(key).catch(() => undefined);
-        }
-        controlPendingSet.delete(record.thread);
-      }, (error: unknown) => {
-        if (signal?.aborted) return;
-        fatal ??= error;
-        scope.cancel(error instanceof Error ? error : new Error("App deferred control failed"));
-      }).catch(() => undefined).finally(() => {
-        pendingControls.delete(task);
-        runningControls.delete(record.thread);
-        if (!stopping && !signal?.aborted) drain();
+    },
+    async markApplied(record) {
+      await mutateState((doc) => {
+        commitControlApplied(doc, { key: record.key, thread: record.scope, command: record.command },
+          new Date(now()).toISOString());
       });
-      pendingControls.add(task);
-    }
+      pushEventsToSockets();
+    },
+    async release(key, text) {
+      await mutateState((doc) => { releaseAck(doc, key, text, MAX_NOTICE_CHARS); }, cleanupContext);
+      drain();
+    },
+    async markRefused(record, text, late) {
+      await mutateState((doc) => {
+        setControlStatus(doc, record.key, "refused");
+        if (!releaseAck(doc, record.key, text, MAX_LATE_CONTROL_CHARS) && late === true) queueLate(doc, record, text);
+        pruneAppControls(doc);
+      }, cleanupContext);
+      drain();
+    },
+    async markUnconfirmed(key, text, lateRecord) {
+      await mutateState((doc) => {
+        setControlStatus(doc, key, "unconfirmed");
+        if (!releaseAck(doc, key, text, MAX_NOTICE_CHARS) && lateRecord !== undefined) queueLate(doc, lateRecord, text);
+      }, cleanupContext);
+      drain();
+    },
+    async publishLate(record, text) {
+      await mutateState((doc) => {
+        if (!releaseAck(doc, record.key, text, MAX_LATE_CONTROL_CHARS)) queueLate(doc, record, text);
+      }, cleanupContext);
+      drain();
+    },
+    async refuse(record, text) {
+      await admitNotice(record.scope, record.key, text);
+    },
   };
-
-  /** Publish the held acknowledgement, optionally as the still-pending wording. */
-  const releaseControlNotice = async (key: string, text?: string): Promise<void> => {
-    await mutateState((doc) => {
-      const notice = doc.pending.find((item) => item.notice === true && item.key === key);
-      if (notice === undefined) return;
-      if (text !== undefined) notice.text = text.slice(0, MAX_NOTICE_CHARS);
-      delete notice.hold;
-    }, cleanupContext);
-    drain();
-  };
-
-  const markControlUnconfirmed = async (key: string): Promise<void> => {
-    await mutateState((doc) => {
-      const entry = doc.controls.find((item) => item.key === key);
-      if (entry !== undefined) entry.status = "unconfirmed";
-      const notice = doc.pending.find((item) => item.notice === true && item.key === key);
-      if (notice !== undefined) {
-        notice.text = UNCONFIRMED_CONTROL;
-        delete notice.hold;
-      }
-    }, adapterContext);
-    drain();
-  };
-
-  const markControlRefused = async (key: string, text: string): Promise<void> => {
-    await mutateState((doc) => {
-      const entry = doc.controls.find((item) => item.key === key);
-      if (entry !== undefined) entry.status = "refused";
-      const notice = doc.pending.find((item) => item.notice === true && item.key === key);
-      if (notice !== undefined) {
-        notice.text = text.slice(0, MAX_NOTICE_CHARS);
-        delete notice.hold;
-      }
-      doc.controls = pruneControls(doc.controls, doc.pending);
-    }, cleanupContext);
-    drain();
-  };
-
-  /** A final outcome published after its "still pending" wording; never loses the only answer. */
-  const publishLateControlNotice = async (thread: string, key: string, text: string): Promise<void> => {
-    await mutateState((doc) => {
-      const notice = doc.pending.find((item) => item.key === key);
-      if (notice !== undefined) {
-        if (notice.notice === true) {
-          notice.text = text.slice(0, MAX_LATE_CONTROL_CHARS);
-          delete notice.hold;
-        }
-        return;
-      }
-      if (doc.pending.length >= APP_LIMITS.maxPending) return;
-      const noticeSeq = doc.nextNoticeSeq;
-      doc.nextNoticeSeq = noticeSeq + 1;
-      doc.pending.push({
-        key,
-        thread,
-        text: text.slice(0, MAX_LATE_CONTROL_CHARS),
-        admittedAtMs: now(),
-        notice: true,
-        noticeSeq,
-      });
-    }, cleanupContext);
-    drain();
-  };
-
-  /** `model <preset>`: the host's per-session preset selection, exactly as Telegram and Discord apply it. */
-  async function applyModelPreset(record: DeferredControl): Promise<ControlOutcome> {
-    const select = gateway.selectModelPreset;
-    if (select === undefined) return { kind: "refused", text: "Model selection is unavailable in this host; nothing was changed." };
-    try {
-      const selection = await select.call(gateway, sessionForThread(record.thread), record.option ?? "default", adapterContext);
-      return {
-        kind: "applied",
-        text: `Model set to ${boundedLabel(selection.provider, 80)}/${boundedLabel(selection.modelId, 160)} ` +
-          `(thinking: ${boundedLabel(selection.thinkingLevel, 32)}) for this thread.`,
-      };
-    } catch (error) {
-      if (isConversationBusy(error)) {
-        return { kind: "refused", text: "Model selection refused: thread busy. Abort or retry when idle." };
-      }
-      return { kind: "refused", text: "Model selection was refused; nothing was changed." };
-    }
-  }
-
-  /** `digest`: start one bounded digestion batch for this thread's own conversation. */
-  async function applyDigest(thread: string): Promise<ControlOutcome> {
-    const host = gateway.memoryDigest;
-    if (host === undefined) return { kind: "refused", text: "Memory digestion is unavailable in this host. Nothing was started." };
-    const conversation = await gateway.conversationFor(sessionForThread(thread), adapterContext);
-    const result = await host.start({
-      id: conversation.id,
-      commit: (change, context) => conversation.commit(change, context),
-    }, adapterContext);
-    return result.status === "refused"
-      ? { kind: "refused", text: renderMemoryDigestStart(result) }
-      : { kind: "applied", text: renderMemoryDigestStart(result) };
-  }
-
-  /** Bounded read-only `digest status`; it creates no task and reads no chat transcript. */
-  async function digestStatusNotice(thread: string): Promise<string> {
-    const host = gateway.memoryDigest!;
-    const conversation = await gateway.conversationFor(sessionForThread(thread), adapterContext);
-    return renderMemoryDigestStatus(await host.status({
-      id: conversation.id,
-      commit: (change, context) => conversation.commit(change, context),
-    }, adapterContext));
-  }
-
-  /** The host model catalog is per-session, so this thread's mapped conversation must exist first. */
-  async function readModelListing(thread: string): Promise<GatewayModelList | undefined> {
-    if (gateway.listModels === undefined) return undefined;
-    try {
-      await gateway.conversationFor(sessionForThread(thread), adapterContext);
-      return await gateway.listModels(sessionForThread(thread), adapterContext);
-    } catch {
-      return undefined;
-    }
-  }
-
-  /**
-   * Ask the host to replace this process, at most once per adapter lifetime. A refusal is a known
-   * no-effect, so it is reported to the threads that asked and never upgraded into a success claim.
-   */
-  function requestRestart(): void {
-    if (restartHostRequested) return;
-    const host = options.restart;
-    if (host === undefined || !host.supported) return;
-    restartHostRequested = true;
-    void host.request().catch((error: unknown) => {
-      const busy = error instanceof RestartBusyError;
-      restartHostRequestFailed = !busy;
-      if (busy) restartHostRequested = false;
-      console.warn(busy
-        ? "App /restart was refused while live work is active; the gateway keeps running."
-        : "App /restart request was refused by the host; the gateway keeps running.");
-      void mutateState((doc) => {
-        admitRestartNotices(doc, busy ? RESTART_BUSY_MESSAGE : RESTART_FAILED);
-      }, cleanupContext).then(() => {
-        if (!stopping && !signal?.aborted) drain();
-      }).catch(() => undefined);
-    });
-  }
 
   /**
    * Queue one ordinary notice per recorded restart thread: the live confirmation in a replacement
    * process, or the host-refusal report in the process that stayed up. Threads that do not fit stay owed.
    */
-  function admitRestartNotices(doc: Draft<AppChannelState>, text: string): void {
-    const remaining: string[] = [];
-    for (const thread of doc.restart ?? []) {
-      if (!openThread(doc, thread)) continue;
-      if (doc.pending.length >= APP_LIMITS.maxPending) {
-        remaining.push(thread);
-        continue;
-      }
-      const noticeSeq = doc.nextNoticeSeq;
-      doc.nextNoticeSeq = noticeSeq + 1;
-      doc.pending.push({ key: `restart:${noticeSeq}`, thread, text, admittedAtMs: now(), notice: true, noticeSeq });
-    }
+  const admitRestartNotices = (doc: Draft<AppChannelState>, text: string): void => {
+    const remaining = admitOwedRestartNotices(doc.restart ?? [], (thread) => {
+      if (doc.pending.length >= APP_LIMITS.maxPending) return false;
+      queueNotice(doc, `restart:${doc.nextNoticeSeq}`, thread, text, now());
+      return true;
+    }, (thread) => openThread(doc, thread));
     if (remaining.length > 0) doc.restart = remaining;
     else delete doc.restart;
-  }
+  };
 
-  /** Bounded point-in-time metadata of this chat, exactly the Telegram `/status` projection. */
-  async function statusNotice(thread: string): Promise<string> {
-    try {
-      let listing: import("../runtime.js").GatewayModelList | undefined;
-      try {
-        await gateway.conversationFor(sessionForThread(thread), adapterContext);
-        listing = await gateway.listModels!(sessionForThread(thread), adapterContext);
-      } catch {
-        listing = undefined;
+  /** The one host restart request of this adapter lifetime; a refusal is reported, never retried. */
+  const restartRequester = createRestartRequester(options.restart, {
+    label: "App",
+    onRefused(text) {
+      void mutateState((doc) => admitRestartNotices(doc, text), cleanupContext).then(() => {
+        if (!stopped()) drain();
+      }).catch(() => undefined);
+    },
+  });
+
+  const controls = createControlCoordinator<string, string, AppControl, AppPendingInput>({
+    ledger,
+    order,
+    flush: {
+      inputs: (record) => state.pending.filter((item) => record.earlierKeys.has(item.key)),
+      async prepareInput(earlier, record) {
+        // Withdrawn or delivered meanwhile, or the thread is closing: nothing to place.
+        if (!state.pending.some((item) => item.key === earlier.key) ||
+            threads.archiving(record.scope) || !openThread(state, record.scope)) return undefined;
+        // The same full content a normal delivery submits: text plus every stored attachment.
+        return files.prepare(earlier.attachments, earlier.text, signal);
+      },
+      async submit(earlier, content, record) {
+        const sessionKey = sessionForThread(record.scope);
+        const conversation = await gateway.conversationFor(sessionKey, adapterContext);
+        const whenBusy = await submissionMode(conversation, earlier);
+        await gateway.beforeOwnerInput?.(sessionKey, conversation.id, content, adapterContext);
+        const submission = await conversation.submit({
+          type: "input", content: typeof content === "string" ? content : [...content],
+          requestId: requestIdFor(earlier.key), whenBusy,
+        }, adapterContext);
+        // The normal delivery path reuses this turn, so a control-forced input is answered once.
+        earlySubmissions.set(earlier.key, submission);
+      },
+    },
+    async execute(record) {
+      // An archived or archiving thread never receives a control effect, even one admitted while it
+      // was open: manual archive is refused while a control is pending, so this fails closed.
+      if (threads.archiving(record.scope) || !openThread(state, record.scope)) {
+        return { kind: "refused", text: ARCHIVED_CONTROL_TEXT };
       }
-      const conversation = await gateway.conversationFor(sessionForThread(thread), adapterContext);
-      const status = await inProcessTerminalConversation(conversation).status(adapterContext);
-      const selection = listing?.selected;
-      const model = selection === undefined
-        ? (status.model === undefined ? "unknown" : `${status.model.provider}/${status.model.modelId}`)
-        : `${selection.provider}/${selection.modelId} (thinking: ${selection.thinkingLevel})`;
-      let background: string[] = [];
-      try {
-        if (typeof gateway.backgroundStatus === "function") {
-          background = renderBackgroundStatus(await gateway.backgroundStatus(sessionForThread(thread), adapterContext));
-        }
-      } catch {
-        background = [];
-      }
-      return [
-        "Status for this chat (no model call, no configuration change):",
-        `Model: ${model.slice(0, 240)}`,
-        status.run === undefined
-          ? "Run: idle"
-          : `Run: running (turn ${status.run.taskId}, ${status.run.inputs} input(s)` +
-            `${status.run.attempt === undefined ? "" : `, generation attempt ${status.run.attempt}`})`,
-        `Queued native inputs: ${status.inbox.total}`,
-        ...background,
-        "Only this chat's own records were read; no other chat's transcript, prompt or tool argument is included.",
-      ].join("\n");
-    } catch {
-      return "Status is unavailable right now: this chat's conversation metadata could not be read. " +
-        "No model call was made and nothing changed.";
-    }
-  }
-
-  const submitInOrder = async <T>(thread: string, work: () => Promise<T>): Promise<T> => {
-    const slot = beginSubmission(thread);
-    try {
-      await slot.prior;
-      return await work();
-    } finally {
-      slot.release();
-    }
-  };
-
-  // ── Pairing, devices and the operator console ─────────────────────────────
-
-  const prunePairings = (doc: Draft<AppChannelState>): void => {
-    const nowMs = now();
-    doc.pairings = doc.pairings.filter((pairing) => pairing.expiresAtMs > nowMs);
-  };
-
-  const labelInUse = (doc: Draft<AppChannelState>, label: string): boolean =>
-    doc.devices.some((device) => device.revokedAtMs === undefined && device.label === label) ||
-    doc.pairings.some((pairing) => pairing.label === label);
-
-  const consoleHost: AppConsole = {
-    async pair(label) {
-      const trimmed = label === undefined ? undefined : label.trim();
-      if (trimmed !== undefined && !validAppLabel(trimmed)) return { refused: "invalid-label" };
-      let created: AppPairingCreated | undefined;
-      let refused: AppPairingRefusal | undefined;
-      let chosenLabel = "";
-      await mutateState((doc) => {
-        prunePairings(doc);
-        if (doc.devices.filter((device) => device.revokedAtMs === undefined).length >= APP_LIMITS.maxDevices) {
-          refused = "device-limit";
-          return;
-        }
-        if (doc.pairings.length >= APP_LIMITS.maxPairings) {
-          refused = "pairing-limit";
-          return;
-        }
-        // Without a console label the device names itself at redemption (any valid label not
-        // already used by an active device); with one, the device must send exactly that label.
-        const chosen = trimmed;
-        if (chosen !== undefined && labelInUse(doc, chosen)) {
-          refused = "label-in-use";
-          return;
-        }
-        for (let attempt = 0; attempt < 8; attempt += 1) {
-          const code = newPairingCode();
-          const hash = sha256(code);
-          if (doc.pairings.some((pairing) => pairing.codeHash === hash)) continue;
-          doc.pairings.push({
-            codeHash: hash,
-            ...(chosen === undefined ? {} : { label: chosen }),
-            createdAtMs: now(),
-            expiresAtMs: now() + APP_LIMITS.pairTtlMs,
-          });
-          chosenLabel = chosen ?? "";
-          created = { code, expiresAtMs: now() + APP_LIMITS.pairTtlMs };
-          return;
-        }
-        refused = "pairing-limit";
-      });
-      if (refused !== undefined) return { refused };
-      journalEvent("app.pairing.created", chosenLabel === "" ? {} : { "pairing.label": chosenLabel });
-      return created!;
+      if (record.command === "new") return applyNewSession(record.scope);
+      const outcome = await executeChannelControl(gateway, {
+        command: record.command,
+        sessionKey: sessionForThread(record.scope),
+        ...(record.option === undefined ? {} : { option: record.option }),
+      }, adapterContext, { scope: "thread" });
+      if (outcome.kind === "applied" && record.command === "model") await pushModelEvents([record.scope]);
+      return outcome;
     },
-    async devices() {
-      return state.devices
-        .map((device) => ({
-          label: device.label,
-          createdAtMs: device.createdAtMs,
-          ...(device.revokedAtMs === undefined ? {} : { revokedAtMs: device.revokedAtMs }),
-        }))
-        .sort((left, right) => left.createdAtMs - right.createdAtMs);
+    requestRestart: () => restartRequester.request(),
+    onFatal(error) {
+      fatal ??= error;
+      scope.cancel(error instanceof Error ? error : new Error("App control command failed"));
     },
-    async revoke(label) {
-      if (!validAppLabel(label)) return "invalid-label";
-      let revokedId: string | undefined;
-      await mutateState((doc) => {
-        const entry = doc.devices.find((device) => device.revokedAtMs === undefined && device.label === label);
-        if (entry === undefined) return;
-        entry.revokedAtMs = now();
-        // The subscription is device authority: revoking the device drops it with the token.
-        delete entry.pushSubscription;
-        revokedId = entry.id;
-      });
-      if (revokedId === undefined) return "missing";
-      const socket = sockets.get(revokedId);
-      if (socket !== undefined) socket.session.close(APP_CLOSE.unauthorized, "revoked");
-      journalEvent("app.device.revoked", { "device.label": label });
-      return "revoked";
-    },
-    async shortcutAdd(label) {
-      const trimmed = label.trim();
-      if (!validAppLabel(trimmed)) return { refused: "invalid-label" };
-      let created: AppShortcutCreated | undefined;
-      let refused: AppShortcutRefusal | undefined;
-      await mutateState((doc) => {
-        const current = doc.shortcuts ?? [];
-        if (current.filter((entry) => entry.revokedAtMs === undefined).length >= APP_SHORTCUT_LIMITS.maxShortcuts) {
-          refused = "shortcut-limit";
-          return;
-        }
-        if (current.some((entry) => entry.revokedAtMs === undefined && entry.label === trimmed)) {
-          refused = "label-in-use";
-          return;
-        }
-        const token = newShortcutToken();
-        const createdAtMs = now();
-        // The token is returned once to the console and never stored: only its hash joins the state.
-        doc.shortcuts = [...current, { label: trimmed, tokenHash: hashShortcutToken(token), createdAtMs }];
-        created = { label: trimmed, token, createdAtMs };
-      });
-      if (refused !== undefined) return { refused };
-      // The token is never journalled; the journal's projection does not carry labels either.
-      journalEvent("app.shortcut.created");
-      return created!;
-    },
-    async shortcuts() {
-      return (state.shortcuts ?? [])
-        .map((entry) => ({
-          label: entry.label,
-          createdAtMs: entry.createdAtMs,
-          ...(entry.revokedAtMs === undefined ? {} : { revokedAtMs: entry.revokedAtMs }),
-        }))
-        .sort((left, right) => left.createdAtMs - right.createdAtMs);
-    },
-    async shortcutRevoke(label) {
-      if (!validAppLabel(label)) return "invalid-label";
-      let revoked = false;
-      await mutateState((doc) => {
-        const entry = (doc.shortcuts ?? []).find((item) => item.revokedAtMs === undefined && item.label === label);
-        if (entry === undefined) return;
-        entry.revokedAtMs = now();
-        revoked = true;
-      });
-      if (!revoked) return "missing";
-      journalEvent("app.shortcut.revoked");
-      return "revoked";
-    },
-  };
-
-  /** Rolling failure window for `POST /v1/pair`; in-memory, so a restart clears it. */
-  const countPairingFailure = (): void => {
-    const nowMs = now();
-    while (pairingFailures.length > 0 && nowMs - pairingFailures[0]! >= APP_LIMITS.pairRateWindowMs) {
-      pairingFailures.shift();
-    }
-    pairingFailures.push(nowMs);
-  };
-
-  const pairingRateLimited = (): boolean => {
-    const nowMs = now();
-    while (pairingFailures.length > 0 && nowMs - pairingFailures[0]! >= APP_LIMITS.pairRateWindowMs) {
-      pairingFailures.shift();
-    }
-    return pairingFailures.length > APP_LIMITS.pairRateMax;
-  };
-
-  async function pairRedeem(code: string, label: string): Promise<
-    | { readonly status: "created"; readonly token: string }
-    | { readonly status: "bad-request" }
-    | { readonly status: "invalid" }
-    | { readonly status: "rate-limited" }
-  > {
-    if (pairingRateLimited()) return { status: "rate-limited" };
-    if (!validPairingCode(code) || !validAppLabel(label)) {
-      countPairingFailure();
-      return { status: "bad-request" };
-    }
-    let token: string | undefined;
-    await mutateState((doc) => {
-      prunePairings(doc);
-      const pairing = doc.pairings.find((entry) => sameDigest(code.toUpperCase(), entry.codeHash));
-      if (pairing === undefined) return;
-      if (pairing.label !== undefined && pairing.label !== label) return;
-      if (doc.devices.some((device) => device.revokedAtMs === undefined && device.label === label)) return;
-      // An unlabelled code cannot take a label another outstanding code was created for.
-      if (pairing.label === undefined && doc.pairings.some((entry) => entry !== pairing && entry.label === label)) return;
-      if (doc.devices.filter((device) => device.revokedAtMs === undefined).length >= APP_LIMITS.maxDevices) return;
-      // Single use: the code is consumed exactly when the device record is created.
-      doc.pairings = doc.pairings.filter((entry) => !sameDigest(code.toUpperCase(), entry.codeHash));
-      token = newDeviceToken();
-      doc.devices.push({
-        id: randomBytes(16).toString("hex"),
-        label,
-        tokenHash: sha256(token),
-        createdAtMs: now(),
-      });
-    });
-    if (token === undefined) {
-      countPairingFailure();
-      return { status: "invalid" };
-    }
-    journalEvent("app.device.paired", { "device.label": label });
-    return { status: "created", token };
-  }
-
-  const authenticate = async (token: string): Promise<{ deviceId: string; label: string } | undefined> => {
-    if (token.length === 0 || token.length > 256) return undefined;
-    const device = state.devices.find((entry) =>
-      entry.revokedAtMs === undefined && sameDigest(token, entry.tokenHash));
-    return device === undefined ? undefined : { deviceId: device.id, label: device.label };
-  };
+    drain: () => drain(),
+    active: () => !stopped(),
+    maxUnresolved: APP_LIMITS.maxUnresolvedControls,
+  });
 
   /**
-   * `POST /v1/ask`: one shortcut token admits one owner message through the same `admitSend` path
-   * as a device `send` (same bounds, idempotency by key, echo event and pending record, so every
-   * paired device sees the message and its answer), then waits up to `askWaitMs` for that key's
-   * durable `settled`. A shortcut token reaches nothing else: not the stream, files, pairing, push
-   * or controls.
+   * `new`: the shared native (or host-paired) reset, plus this channel's question repair. A context
+   * boundary retires questions the new context can no longer answer, so a delivery mark lost in a
+   * crash is repaired in the right order: before a host reset (which cancels pending questions in
+   * its own commit; a failed repair refuses the reset), or in the cancel commit after a plain one.
    */
-  async function askShortcut(
-    token: string,
-    request: unknown,
-    requestSignal: AbortSignal | undefined,
-  ): Promise<AppAskOutcome> {
-    // Unknown and revoked tokens are indistinguishable: both are simply not an active shortcut.
-    const shortcut = activeShortcut(state.shortcuts, token);
-    if (shortcut === undefined) return { status: "unauthorized" };
-    // Only an authenticated token spends its own window; an unknown one never reaches this point.
-    if (!shortcutRate.allow(shortcut.tokenHash)) return { status: "rate-limited" };
-    const parsed = parseAskRequest(request);
-    if (parsed.kind !== "ok") return { status: parsed.kind };
-    // Callback-shaped text is taken by a device `send` before admission and offered to the MCP
-    // login lifecycle; it never becomes a turn, so no `settled` could ever arrive for it. An ask
-    // cannot start a login exchange either, so it is refused up front as a bad request.
-    if (looksLikeOAuthCallback(parsed.request.text)) return { status: "bad-request" };
-    if (stopping || signal?.aborted) return { status: "internal" };
-    const thread = parsed.request.thread ?? APP_MAIN_THREAD;
-    const key = parsed.request.key ?? newAskKey();
-    const admission = await admitSend(undefined, { thread, key, text: parsed.request.text });
-    if (admission.kind === "stopped") return { status: "internal" };
-    if (admission.kind === "error") return askOutcomeForAdmissionError(admission.error);
-    const waited = await askWaiters.wait(thread, key, askWaitMs, requestSignal);
-    if (waited.outcome === "answered") return { status: "answered", text: waited.text };
-    // Still running: the answer arrives in the app as usual, and the caller gets the admitted key.
-    if (waited.outcome === "timeout") return { status: "pending", key };
-    return { status: waited.outcome };
+  async function applyNewSession(thread: string): Promise<ControlOutcome> {
+    const sessionKey = sessionForThread(thread);
+    const paired = gateway.resetSession !== undefined;
+    if (paired && gateway.askSurfaces !== undefined) {
+      const repaired = await reconcileThreadQuestions(thread).then(() => true, (error: unknown) => {
+        if (!signal?.aborted) journalEvent("app.question.reconcile_failed", {}, error);
+        return false;
+      });
+      if (!repaired) return { kind: "refused", text: RESET_UNREPAIRED };
+    }
+    const outcome = await executeNewSession(gateway, sessionKey, adapterContext, { busyText: RESET_BUSY });
+    if (outcome.kind !== "applied" || gateway.askSurfaces === undefined) return outcome;
+    if (paired) {
+      // Publishing the host-cancelled questions' final state is not part of the reset's contract,
+      // so it never turns an applied reset into a failure.
+      await reconcileThreadQuestions(thread).catch((error: unknown) => {
+        if (!signal?.aborted) journalEvent("app.question.reconcile_failed", {}, error);
+      });
+      return outcome;
+    }
+    const conversation = await gateway.conversationFor(sessionKey, adapterContext);
+    let changed = false;
+    await mutateState(async (doc, tx) => {
+      const questions = await tx.doc(AskQuestionsDoc, conversation.id);
+      changed = publishQuestionEvents(doc, questions, thread, now());
+      cancelPendingQuestions(questions);
+      changed = publishQuestionEvents(doc, questions, thread, now()) || changed;
+    });
+    if (changed) pushEventsToSockets();
+    return outcome;
   }
 
   // ── Scheduled results and interruption notices ────────────────────────────
 
-  const outbox = gateway.cronOutbox;
   const threadForSession = (sessionKey: string): string | undefined => {
     if (sessionKey === APP_CHAT_SESSION_KEY) return APP_MAIN_THREAD;
     const prefix = `${APP_CHAT_SESSION_KEY}:`;
@@ -3349,57 +2282,58 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     if (changed) pushEventsToSockets();
   };
 
-  const updateScheduled = async (
-    sessionKey: string,
-    id: string,
-    change: (entry: Draft<CronDeliveryRecord>) => void,
-    commitContext: Context = adapterContext,
-  ): Promise<CronDeliveryRecord | undefined> => {
-    if (outbox === undefined) return undefined;
-    return outbox.update(sessionKey, id, change, commitContext);
-  };
+  /**
+   * The archived-origin room check, read at most once per scan this adapter requests and only when
+   * an archived origin has a result waiting: `undefined` means not read yet.
+   */
+  let snapshotBlocked: boolean | undefined;
 
-  const reportOutboxFault = async (sessionKey: string, message: string): Promise<void> => {
-    if (outbox === undefined) return;
-    await outbox.recordFault(sessionKey, message, cleanupContext).catch(() => undefined);
-  };
-
-  const deliverScheduled = async (sessionKey: string, record: CronDeliveryRecord): Promise<void> => {
-    if (outbox === undefined) return;
-    const thread = threadForSession(sessionKey);
-    if (record.sessionKey !== sessionKey || thread === undefined) {
-      await updateScheduled(sessionKey, record.id, (entry) => {
-        entry.status = "failed";
-        entry.settledAt = now();
-        entry.error = "outbox session does not match its origin";
-      }, cleanupContext);
-      return;
-    }
-    if (record.text.trim() === "") {
-      await updateScheduled(sessionKey, record.id, (entry) => {
-        entry.status = "failed";
-        entry.settledAt = now();
-        entry.error = "delivery text is empty";
-      }, cleanupContext);
-      return;
-    }
+  /**
+   * The host's durable outbox, drained with the shared bookkeeping (validation, quarantine, the
+   * origin hold and bounded concurrency). The app's own send is the event-log append: restoring an
+   * archived origin, appending the message and settling the record share one outbox commit, so a
+   * stale scan can never append again, even after the original event was trimmed. There is no
+   * write-ahead send intent, so nothing here can be left `sending` or `unknown`.
+   */
+  const outboxDrainer = createOutboxDrainer<string>({
+    outbox: gateway.cronOutbox,
+    context: adapterContext,
+    cleanupContext,
+    label: "App",
+    maxActive: MAX_SCHEDULED_ACTIVE,
+    now,
+    active: () => !stopped(),
+    decodeSession: threadForSession,
     // Authorization is this channel's own durable admission evidence, never the session string alone.
-    if (!hasOrigin(thread)) {
-      await updateScheduled(sessionKey, record.id, (entry) => {
-        entry.status = "withheld";
-        entry.withheldSince = now();
-        entry.error = "app chat has no durable admission evidence";
-      }, cleanupContext);
-      console.warn(`App scheduled delivery withheld for ${record.id}: no durable origin admission evidence.`);
-      return;
-    }
+    authorizeOrigin: (thread) => hasOrigin(thread)
+      ? { status: "deliver" }
+      : { status: "withheld", reason: "app chat has no durable admission evidence" },
+    async admitDispatch(_sessionKey, thread, record) {
+      // A capacity-blocked archived origin consumes no dispatch slot — neither for the open-thread
+      // cap nor for the snapshot cap: its result waits in the outbox until room exists, and every
+      // other thread (main included) keeps flowing.
+      if (isTurnInterruptionNotice(record) || threadInfo(state, thread)?.archived !== true) return true;
+      if (!canOpenSideThread(state)) return false;
+      if (snapshotBlocked === undefined) {
+        const room = gateway.appSnapshotRoom;
+        snapshotBlocked = room === undefined ? false
+          : !(await stateConversation.commit((tx) => room(tx), adapterContext).catch(() => true));
+      }
+      return !snapshotBlocked;
+    },
+    observe: (_sessionKey, _thread, record, run) =>
+      observeOperation("gateway.app.scheduled_delivery", { "delivery.id": record.id }, run),
+    deliverRecord: (sessionKey, thread, record) => deliverScheduled(sessionKey, thread, record),
+  });
+
+  async function deliverScheduled(sessionKey: string, thread: string, record: CronDeliveryRecord): Promise<"kept"> {
+    const outbox = gateway.cronOutbox!;
     const id = thread === APP_MAIN_THREAD ? `outbox:${record.id}` : `outbox:${thread}:${record.id}`;
-    // The restore, event append and settlement share a commit. Replaying a stale scan cannot
-    // append again, even after the original event has been trimmed.
     let restored = false;
     let appended = false;
     await outbox.update(sessionKey, record.id, async (entry, tx) => {
-      if (entry.status !== "pending" || entry.sessionKey !== sessionKey || archiving.has(thread)) return;
+      // Still pending and still this origin; an archive in flight keeps it for the next scan.
+      if (entry.status !== "pending" || entry.sessionKey !== sessionKey || threads.archiving(thread)) return;
       const doc = await tx.doc(AppState, stateConversation.id);
       const info = threadInfo(doc, thread);
       if (info === undefined) return;
@@ -3425,75 +2359,9 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     pushEventsToSockets();
     if (appended) notifyPush(thread);
     if (restored) await gateway.reserveAppThread?.(thread, adapterContext);
-  };
-
-  const scanScheduled = async (): Promise<void> => {
-    if (outbox === undefined || stopping || signal?.aborted) return;
-    // Snapshot room is read once per scan, lazily and only when an archived origin needs it.
-    let snapshotBlocked: boolean | undefined;
-    for (const { sessionKey } of await outbox.sessions(adapterContext)) {
-      if (stopping || signal?.aborted) return;
-      if (threadForSession(sessionKey) === undefined) continue;
-      let records: readonly unknown[];
-      try {
-        records = await outbox.list(sessionKey, adapterContext);
-      } catch (error) {
-        await reportOutboxFault(sessionKey, outboxFaultMessage(error));
-        continue;
-      }
-      for (const value of records) {
-        if (stopping || signal?.aborted) return;
-        const problem = pendingRecordProblem(value);
-        if (problem !== undefined) {
-          const candidate = value as { id?: unknown };
-          if (typeof candidate.id === "string" && candidate.id !== "") {
-            try {
-              await updateScheduled(sessionKey, candidate.id, (entry) => {
-                entry.status = "failed";
-                entry.settledAt = now();
-                entry.error = problem;
-              }, cleanupContext);
-            } catch (error) {
-              await reportOutboxFault(sessionKey, outboxFaultMessage(error));
-            }
-          } else {
-            await reportOutboxFault(sessionKey, problem);
-          }
-          continue;
-        }
-        const record = value as CronDeliveryRecord;
-        // A capacity-blocked archived origin consumes no dispatch slot — neither for the
-        // open-thread cap nor for the snapshot cap: its result waits in the outbox until
-        // room exists, and every other thread (main included) keeps flowing.
-        const originThread = threadForSession(sessionKey);
-        if (!isTurnInterruptionNotice(record) && originThread !== undefined &&
-            threadInfo(state, originThread)?.archived === true) {
-          if (!canOpenSideThread(state)) continue;
-          if (snapshotBlocked === undefined) {
-            snapshotBlocked = gateway.appSnapshotRoom === undefined ? false
-              : !(await stateConversation.commit((tx) => gateway.appSnapshotRoom!(tx), adapterContext)
-                .catch(() => true));
-          }
-          if (snapshotBlocked) continue;
-        }
-        const deliveryKey = JSON.stringify([sessionKey, record.id]);
-        if (record.status !== "pending" || scheduledActive.has(deliveryKey)) continue;
-        if (scheduledActive.size >= MAX_SCHEDULED_ACTIVE) return;
-        scheduledActive.add(deliveryKey);
-        const task = Promise.resolve()
-          .then(() => observeOperation("gateway.app.scheduled_delivery", { "delivery.id": record.id },
-            () => deliverScheduled(sessionKey, record)))
-          .catch(() => {
-            // Keep the durable record pending; the next scan retries it.
-          })
-          .finally(() => {
-            scheduledActive.delete(deliveryKey);
-            scheduledTasks.delete(task);
-          });
-        scheduledTasks.add(task);
-      }
-    }
-  };
+    // The record was settled (or left pending) in the commit above.
+    return "kept";
+  }
 
   /** Discard unreferenced uploads past their TTL; a failed pass is retried by the next scan. */
   const pruneUploads = async (): Promise<void> => {
@@ -3502,11 +2370,12 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   };
 
   const requestScheduledScan = (): void => {
-    if (scheduledScanning || stopping || signal?.aborted) return;
+    if (scheduledScanning || stopped()) return;
     scheduledScanning = true;
-    const task = scanIdleThreads().catch((error: unknown) => {
+    snapshotBlocked = undefined;
+    const task = threads.scanIdle().catch((error: unknown) => {
       if (!signal?.aborted) journalEvent("app.auto_archive.failed", {}, error);
-    }).then(scanScheduled).catch(() => undefined).finally(() => {
+    }).then(() => outboxDrainer.scan()).catch(() => undefined).finally(() => {
       scheduledScanning = false;
       active.delete(task);
     });
@@ -3515,76 +2384,28 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
 
   /** A fresh authenticated admission restores the origin evidence, releasing withheld results. */
   const releaseWithheld = async (thread: string): Promise<void> => {
-    if (outbox === undefined || stopping || signal?.aborted || !hasOrigin(thread)) return;
-    const sessionKey = sessionForThread(thread);
-    let records: readonly unknown[];
-    try {
-      records = await outbox.list(sessionKey, adapterContext);
-    } catch {
-      return;
-    }
-    let released = false;
-    for (const value of records) {
-      if (value === null || typeof value !== "object" || Array.isArray(value)) continue;
-      const record = value as { id?: unknown; status?: unknown };
-      if (record.status !== "withheld" || typeof record.id !== "string" || record.id === "") continue;
-      try {
-        await updateScheduled(sessionKey, record.id, (entry) => {
-          entry.status = "pending";
-          delete entry.withheldSince;
-          delete entry.error;
-        }, adapterContext);
-        released = true;
-      } catch {
-        // The scan retries or quarantines it; admission itself must still succeed.
-      }
-    }
-    if (released) requestScheduledScan();
+    if (stopped() || !hasOrigin(thread)) return;
+    await outboxDrainer.releaseWithheld(sessionForThread(thread));
   };
 
   // ── Recovery on open ───────────────────────────────────────────────────────
 
   // A control recorded but never confirmed may or may not have taken effect: report once, never replay.
-  const unresolved = state.controls.filter((entry) => entry.status === "admitted");
-  const heldNotices = state.pending.some((item) => item.hold === true);
-  if (unresolved.length > 0 || heldNotices) {
+  if (state.controls.some((entry) => entry.status === "admitted") || state.pending.some((item) => item.hold === true)) {
+    let interrupted = 0;
     await mutateState((doc) => {
-      for (const entry of doc.controls) {
-        if (entry.status !== "admitted") continue;
-        const interrupted = entry.command === "restart" ? UNCONFIRMED_RESTART : UNCONFIRMED_CONTROL;
-        const notice = doc.pending.find((item) => item.notice === true && item.key === entry.key);
-        if (notice !== undefined) {
-          if (notice.hold === true) notice.text = interrupted;
-          delete notice.hold;
-          entry.status = "unconfirmed";
-          continue;
-        }
-        if (doc.pending.length >= APP_LIMITS.maxPending) continue;
-        const noticeSeq = doc.nextNoticeSeq;
-        doc.nextNoticeSeq = noticeSeq + 1;
-        doc.pending.push({
-          key: entry.key,
-          thread: threadOf(entry),
-          text: interrupted,
-          admittedAtMs: now(),
-          notice: true,
-          noticeSeq,
-        });
-        entry.status = "unconfirmed";
-      }
-      for (const notice of doc.pending) {
-        if (notice.hold !== true) continue;
-        const record = doc.controls.find((entry) => entry.key === notice.key);
-        if (record === undefined) {
-          notice.text = UNCONFIRMED_CONTROL;
-          delete notice.hold;
-        } else if (record.status === "applied") {
-          delete notice.hold;
-        }
-      }
+      interrupted = recoverInterruptedControls(doc.controls, doc.pending, {
+        controlKey: (entry) => entry.key,
+        noticeKey: (item) => item.key,
+        report(entry, text) {
+          if (doc.pending.length >= APP_LIMITS.maxPending) return false;
+          queueNotice(doc, entry.key, threadOf(entry), text, now());
+          return true;
+        },
+      });
     }, adapterContext);
-    if (unresolved.length > 0) {
-      console.warn(`App ${unresolved.length} control command(s) were interrupted; their effect is unconfirmed.`);
+    if (interrupted > 0) {
+      console.warn(`App ${interrupted} control command(s) were interrupted; their effect is unconfirmed.`);
     }
   }
 
@@ -3594,140 +2415,21 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     await mutateState((doc) => admitRestartNotices(doc, RESTART_LIVE), adapterContext);
   }
 
-  /**
-   * The model tool's live host. Every call re-derives the thread from the host-owned session key,
-   * rechecks that the thread is open, reads one bounded workspace file through the same resolver
-   * the Telegram send uses, and commits the referenced record with the assistant message. A call
-   * whose referenced record already exists is answered from that record without touching the file.
-   * Nothing the model supplied decides the thread, the device or the storage path.
-   */
-  const actionHost: AppActionHost = {
-    async act(sessionKey, callId, request, ctx) {
-      if (stopping || signal?.aborted || ctx.abortSignal?.aborted) {
-        return { ok: false, text: "The app channel is stopping, so no file was delivered." };
-      }
-      const thread = threadForSession(sessionKey);
-      if (thread === undefined) {
-        return { ok: false, text: "This conversation is not an app chat thread, so no file was delivered." };
-      }
-      if (!openThread(state, thread)) {
-        return { ok: false, text: "This app thread is archived, so no file was delivered." };
-      }
-      if (options.media === undefined || !files.available) {
-        return { ok: false, text: "App file storage is not configured, so no file could be delivered." };
-      }
-      // Defence in depth: the model schema already restricts these, so a decline here means the
-      // caller bypassed the declared surface.
-      if (request.action !== "send" && request.action !== "artifact") {
-        return { ok: false, text: "Unknown app file action; nothing was delivered." };
-      }
-      if (!validTelegramFilePath(request.path)) {
-        return { ok: false, text: "The file was not delivered: " +
-          agentFileRefusal(request.action, "unsafe-path") + "." };
-      }
-      if (request.caption !== undefined && request.caption.length > APP_ACTION_LIMITS.captionChars) {
-        return { ok: false, text: "The file was not delivered: the caption is too long." };
-      }
-      if (request.title !== undefined && request.title.length > APP_ACTION_LIMITS.titleChars) {
-        return { ok: false, text: "The file was not delivered: the title is too long." };
-      }
-      const action = request.action;
-      const maxBytes = action === "artifact" ? APP_LIMITS.artifactBytes : APP_LIMITS.uploadBytes;
-      // One identity per tool execution: a recovered run adopts its own copy instead of storing a
-      // second one, and the message id below makes the durable effect idempotent.
-      const messageId = `agent:${callId}`;
-      // A finished execution of this same tool task already committed its message and referenced
-      // record. That record is the anchor (referenced records are never pruned, unlike the trimmed
-      // event log), so report the receipt again without reading the workspace or storing anything:
-      // a file that was deleted or changed since then cannot turn a delivered file into a failure
-      // or an orphan copy.
-      const committed = await files.agentCommit(messageId);
-      if (committed !== undefined) return { ok: true, text: agentFileReceipt(action, request.path, committed.size) };
-      let file;
-      try {
-        file = await readTelegramOutboundFile({
-          workspace: options.media.workspace,
-          path: request.path,
-          kind: "document",
-          maxBytes,
-        });
-      } catch (error) {
-        const reason = error instanceof TelegramOutboundRejected ? error.reason : "unreadable";
-        return { ok: false, text: `The file was not delivered: ${agentFileRefusal(action, reason)}.` };
-      }
-      const extension = extensionOfFilename(file.filename);
-      const artifactType = ARTIFACT_TYPES[extension];
-      if (action === "artifact" && artifactType === undefined) {
-        return { ok: false, text: "The file was not delivered: an artifact must be a .html, .htm or .svg file." };
-      }
-      const stored = await files.storeAgent({
-        identity: `app:agent:${callId}`,
-        messageId,
-        name: file.filename,
-        type: action === "artifact" ? artifactType! : sentFileType(file.filename),
-        kind: action === "artifact" ? "artifact" : "file",
-        bytes: file.bytes,
-        maxBytes,
-      });
-      if (stored.status !== "stored") {
-        const text = stored.status === "unavailable"
-          ? "App file storage is not configured, so no file could be delivered."
-          : stored.status === "too-large"
-            ? `The file was not delivered: it is larger than ${maxBytes / (1024 * 1024)} MiB.`
-            : stored.status === "empty"
-              ? "The file was not delivered: the file is empty."
-              : "The file was not delivered: it could not be stored.";
-        return { ok: false, text };
-      }
-      let appended = false;
-      try {
-        state = await stateConversation.commit(async (tx) => {
-          const doc = await tx.doc(AppState, stateConversation.id);
-          // A recovered execution finds its own message: it appends nothing and stores nothing new.
-          if (hasEventId(doc, messageId)) return copyJson(doc) as unknown as AppChannelState;
-          appendMessage(doc, {
-            event: "message",
-            thread,
-            id: messageId,
-            role: "assistant",
-            text: action === "artifact" ? (request.title ?? "") : (request.caption ?? ""),
-            at: new Date(now()).toISOString(),
-            attachments: [{ ...stored.file.info }],
-          });
-          await files.admitAgent(tx, stored.file);
-          appended = true;
-          return copyJson(doc) as unknown as AppChannelState;
-        }, ctx);
-      } catch (error) {
-        await stored.file.discard();
-        if (error instanceof AppFileRejected) {
-          return { ok: false, text: "App file storage is full, so no file was delivered." };
-        }
-        return { ok: false, text: "The file could not be attached, so no message was delivered." };
-      }
-      if (!appended) {
-        // The in-commit check (the authority) found the message already present, so no record of
-        // this execution was admitted; drop a copy only this execution stored.
-        await stored.file.discard();
-      } else {
-        pushEventsToSockets();
-        notifyPush(thread);
-      }
-      return { ok: true, text: agentFileReceipt(action, request.path, stored.file.record.size) };
-    },
-  };
+  const actionHost = createAppActionHost({
+    core, files, workspace: options.media?.workspace, threadForSession,
+  });
 
   // The listener opens only after recovery, so no socket can observe pre-recovery state.
   const listener = await startAppListener({
     port: options.port,
     staticRoot: options.staticRoot,
     host: {
-      pairRedeem: (code, label) => pairRedeem(code, label),
-      authenticate: (token) => authenticate(token),
+      pairRedeem: (code, label) => devices.pairRedeem(code, label),
+      authenticate: (token) => devices.authenticate(token),
       onSocket: (session, hooks) => onSocket(session, hooks),
       upload: (device, request) => files.upload({ deviceId: device.deviceId, ...request }),
       // A shortcut token is its own credential class: only `POST /v1/ask` resolves it.
-      ask: (token, request, requestSignal) => askShortcut(token, request, requestSignal),
+      ask: (token, request, requestSignal) => devices.ask(token, request, requestSignal),
       // Any paired device may fetch a file once a durable message references it; nothing else.
       download: async (_device, id) => {
         const file = await files.download(id);
@@ -3759,7 +2461,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       });
     }
   }
-  const detachConsole = gateway.appConsole?.attach(consoleHost);
+  const detachConsole = gateway.appConsole?.attach(devices.console);
   const detachActions = gateway.appActions?.attach(actionHost);
   // A question is delivered by appending its `open` event: this log is the channel's delivery path,
   // so the append is definite and needs none of Telegram's external-send fencing. Only a mapped,
@@ -3831,7 +2533,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   await pruneUploads();
   scanTimer = setInterval(() => {
     failedThisCycle.clear();
-    resumeDeferredControls();
+    controls.resumeDeferred();
     drain();
     requestScheduledScan();
     void pruneUploads();
@@ -3850,7 +2552,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     for (const socket of sockets.values()) socket.session.close(1001, "stopping");
     sockets.clear();
     scope.cancel(new DOMException("App adapter stopped", "AbortError"));
-    await Promise.allSettled([...active, ...pendingControls, ...scheduledTasks]);
+    await Promise.allSettled([...active, controls.idle(), outboxDrainer.idle()]);
     await push?.close();
     await listener.close().catch(() => undefined);
   }

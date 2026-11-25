@@ -10,10 +10,18 @@ shared limits, close codes and hello/thread shapes from `src/channels/generated/
 (a generated mirror of `pwa/protocol/v2.ts`, refreshed by `npm run build` and checked by
 `npm run typecheck`) and adds the gateway-only bounds and pure validation;
 `src/channels/app-listener.ts` owns transport mechanics (sockets, bodies, cookies, MIME types,
-path safety); `src/channels/app.ts` owns admission, the durable event log, controls, pairing and
-the operator console; `src/channels/app-files.ts` owns uploads, their durable records, attachment
-context and the download lookup; `src/channels/app-tool.ts` is the model-facing `app` file tool,
-whose live host the adapter attaches.
+path safety); `src/channels/app.ts` owns admission, the durable event log and its framing, the
+socket request router, delivery and the control ledger, and wires the rest;
+`src/channels/app-devices.ts` owns pairing, device and shortcut authentication, revocation, the
+rate windows, the operator console and `POST /v1/ask`; `src/channels/app-threads.ts` owns thread
+create, fork, rename, archive/restore and the idle auto-archive; `src/channels/app-files.ts` owns
+uploads, their durable records, attachment context and the download lookup;
+`src/channels/app-tool.ts` is the model-facing `app` file tool, whose live host
+(`src/channels/app-actions.ts`) the adapter attaches. Control ordering, the read-only command
+renderers, startup control recovery, the restart request and OAuth callback interception are the
+shared channel engine (`src/channels/controls.ts`); submission order, owner busy-mode, shared
+answers and previews come from `src/channels/turn-runtime.ts`; the cron outbox is drained by
+`src/channels/outbox-drainer.ts`; workspace file reads use `src/media/outbound.ts`.
 
 Status: supervised Linux deployment and iPhone/iPad pairing over `tailscale serve`
 succeeded; broader on-device streaming, Web Push delivery, kill/reopen replay and
@@ -353,15 +361,23 @@ A badge appears only once the durable `reaction` event arrives — there is no o
 
 The `control` op takes `command` (a name from `hello.commands`) and optional `args` (≤ 1 000
 characters), acting on its thread. The app surface is `new`, `abort`/`stop`, `status`, `model
-[preset]`, `digest [status]`, `restart` and `help [command]`, each offered only when the host
-implements it; CLI-only commands (`tools`, `refresh`, `compact`, `reload`) and `mcp`/`notices`
-are not listed. They map to the same host operations the Telegram and Discord commands use: `new` is the paired reset (native reset plus prompt-snapshot rebuild,
+[preset]`, `digest [status]`, `mcp`, `restart` and `help [command]`, each offered only when the host
+implements it (`mcp` needs a gateway opened from a configuration file); CLI-only commands (`tools`,
+`refresh`, `compact`, `reload`) and Telegram's `notices` are not listed. They map to the same host operations the Telegram and Discord commands use: `new` is the paired reset (native reset plus prompt-snapshot rebuild,
 refused atomically while a run is live) and appends a durable `divider{reason:"new"}` event;
-`abort` withdraws this chat's queued inputs and stops its live work; `status` is the bounded
-read-only projection. The visible result of every control arrives as a `message{role:"notice"}`
+`abort` withdraws this thread's queued inputs and stops its live work; `status` is the bounded
+read-only projection worded for "this thread", naming the host selection with its thinking level
+and matching preset; `mcp` is the same bounded read-only server and pending-login listing
+Telegram and Discord render (management stays the model's `mcp` tool acting for this thread). The
+visible result of every control arrives as a `message{role:"notice"}`
 event, with the same acknowledgement texts (`Context reset.`, `Idle. Queue cleared.`), the same
 held acknowledgement until the native call returns, the same 30-second still-pending wording, and
-the same at-most-once control records with replay reporting. `model <preset>` applies to that
+the same at-most-once control records with replay reporting. Owner inputs queued in the thread
+before a mutating control are placed ahead of its effect with their full content, attachments
+included; a later notice in that thread never overtakes the held acknowledgement. A `restart`
+that is interrupted, or abandoned because an earlier input could never be placed, reports
+`Restart interrupted; outcome unknown. Not retried.` and is never requested. A `new` appends its
+divider only on the transition to applied, so it is recorded once. `model <preset>` applies to that
 thread only until restart; `digest` starts one batch for that thread's conversation; `restart`
 records the requesting thread durably, then asks the host once, and the replacement posts
 `Restarted.` there (a host refusal is reported instead). An unlisted name is `unsupported`;
@@ -645,13 +661,16 @@ channel's durable log or frames, and no `steps` on a turn without tools), a stee
 once with a settled per
 key, reconnect without loss, controls with their replay reporting, the `hello.commands`
 catalogue with `model`/`help`/`digest`/`restart` arguments, usage notices and `unsupported`, a seeded reopen (interrupted
-command reported, held acknowledgement released, a pre-restart turn still answered), a failed run
+command reported, held acknowledgement released, a pre-restart turn still answered), a control
+placing an earlier undelivered input with its attachment, a later notice held behind a control's
+acknowledgement, one divider per applied `new`, the restart interruption wording on reopen and on
+an unplaceable earlier input, a failed run
 (`settled{failed}` with the error presence state), revocation, oversize frames and callback
 interception. `tests/app-mcp-login.behavior.test.mjs` covers the login surface with the loopback
 OAuth fixture: the URL reaching every hello'd device as a `login` frame and no durable event,
 channel state, push payload or transcript, the no-device cancellation, a pasted callback's fixed
 notice and completion, and stale, foreign, replayed and cross-thread callbacks refused with fixed
-text. v2 coverage includes thread lifecycle, search and list limits, concurrent turns and
+text, and `/mcp` listing the configured server read-only. v2 coverage includes thread lifecycle, search and list limits, concurrent turns and
 replay, fork context and scope checks after reopen, idle archive, interruption recovery, and cron restore.
 Files coverage: the opt-in (upload and `send.attachments` refused without `media`, `hello.uploads`),
 a durable upload record with byte-for-byte storage, the advertised and streamed `413` with nothing

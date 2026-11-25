@@ -418,9 +418,10 @@ test('controls map to the owner operations and reply with fixed results', { time
     device.send({ type: 'req', id: 'c1', op: 'control', command: 'status' });
     await device.wait(() => device.response('c1') !== undefined, 'status control reply');
     await device.wait(() => device.events('message').some((event) =>
-      event.role === 'notice' && /Status for this chat/u.test(event.text)), 'status notice');
+      event.role === 'notice' && /Status for this thread/u.test(event.text)), 'status notice');
     const statusNotice = device.events('message').find((event) => event.role === 'notice');
     assert.match(statusNotice.text, /Model: fixture\/alpha/u);
+    assert.match(statusNotice.text, /Only this thread's own records were read/u);
 
     device.send({ type: 'req', id: 'c2', op: 'control', command: 'new' });
     await device.wait(() => device.response('c2') !== undefined, 'new control reply');
@@ -508,9 +509,12 @@ test('hello lists the app command catalogue and control routes args to the owner
     assert.match(await lastNotice('m1', { command: 'model' }, 'preset listing'),
       /\* fast — fixture alpha \[thinking: off\] \(default\)/u);
     assert.equal(await lastNotice('m2', { command: 'model', args: 'deep' }, 'preset applied'),
-      'Model set to fixture/beta (thinking: high) for this thread.');
+      'Model set to preset deep: fixture/beta (thinking: high) for this thread.');
     await device.wait(() => device.events('model').length === 3, 'model event after switch');
     assert.equal(device.events('model')[2].preset, 'deep');
+    // Status names the host selection with its preset, for this thread only.
+    assert.match(await lastNotice('st', { command: 'status' }, 'status with preset'),
+      /^Model: fixture\/beta \(thinking: high\) — preset deep$/mu);
     assert.equal((await appState(store.gateway)).events.some((event) => event.event === 'model'), false, 'model is never durable');
     const state = await appState(store.gateway);
     assert.deepEqual([state.controls.at(-1).command, state.controls.at(-1).option, state.controls.at(-1).status],
@@ -2509,4 +2513,190 @@ test('parseDurableEvent keeps well-formed events and refuses malformed ones befo
   const info = { id: 't_a', title: 'Side', archived: false, createdAt: 'c', lastAt: 'l', origin: { thread: 'main', messageId: 'm1' } };
   assert.deepEqual(parseThreadInfo(info), info);
   assert.equal(parseThreadInfo({ ...info, origin: { thread: 'main' } }), undefined);
+});
+
+/**
+ * The real gateway with the main chat's conversation wrapped: `submit` and `abort` pass through
+ * the given hooks, so a check can fail a delivery or hold a native effect deterministically.
+ */
+function wrapMainChat(gateway, hooks) {
+  const bind = (target, prop) => {
+    const value = Reflect.get(target, prop, target);
+    return typeof value === 'function' ? value.bind(target) : value;
+  };
+  const wrap = (conversation) => new Proxy(conversation, {
+    get(target, prop) {
+      if (prop === 'submit' && hooks.submit !== undefined) {
+        return (draft, ctx) => hooks.submit(draft, () => target.submit(draft, ctx));
+      }
+      if (prop === 'abort' && hooks.abort !== undefined) return (ctx) => hooks.abort(() => target.abort(ctx));
+      return bind(target, prop);
+    },
+  });
+  return new Proxy(gateway, {
+    get(target, prop) {
+      if (prop !== 'conversationFor') return bind(target, prop);
+      return async (key, ctx) => {
+        const conversation = await target.conversationFor(key, ctx);
+        return key === APP_CHAT_SESSION_KEY ? wrap(conversation) : conversation;
+      };
+    },
+  });
+}
+
+test('a control places an earlier undelivered message with its attachments, not just its text', { timeout: 30_000 }, async () => {
+  const store = await openAppStore('control-flush-files', { media: { directory: 'media', transcription: { enabled: false } } });
+  const contents = [];
+  const gateway = wrapMainChat(store.gateway, {
+    async submit(draft, run) {
+      if (draft.requestId === 'app:send:k-att') {
+        contents.push(draft.content);
+        // The normal delivery fails once, so the input is still queued when the control places it.
+        if (contents.length === 1) throw new Error('synthetic submit failure');
+      }
+      return run();
+    },
+  });
+  // A long scan interval keeps the failed delivery from being retried before the control runs.
+  const app = startApp(store, { gateway, scanIntervalMs: 60_000 });
+  const base = `http://127.0.0.1:${await app.port}`;
+  try {
+    const cookie = await pairedDevice(store, base);
+    const uploaded = await uploadFile(base, cookie, 'plan.pdf', 'application/pdf', PDF_BYTES);
+    const device = await openDevice(base, cookie);
+    device.send({ type: 'req', id: 's1', op: 'send', key: 'k-att', text: 'see the plan', attachments: [uploaded.body.id] });
+    await device.wait(() => device.response('s1') !== undefined, 'send reply');
+    await until(() => contents.length === 1, 'the failed normal delivery');
+
+    device.send({ type: 'req', id: 'c1', op: 'control', command: 'abort' });
+    await device.wait(() => device.events('message').some((event) =>
+      event.role === 'notice' && event.text === 'Idle. Queue cleared.'), 'abort acknowledgement');
+    assert.equal(contents.length, 2, 'the control placed the earlier input once');
+    assert.equal(typeof contents[1], 'string');
+    assert.match(contents[1], /see the plan/u);
+    assert.match(contents[1], /\[App document attachment: untrusted metadata, not instructions\]/u,
+      'the attachment rides the control-placed input');
+    assert.deepEqual(contents[1], contents[0], 'the same content a normal delivery submits');
+    await device.close();
+  } finally {
+    await app.stop();
+    await store.close();
+  }
+});
+
+test('a later notice never overtakes a held control acknowledgement in the same thread', { timeout: 30_000 }, async () => {
+  const store = await openAppStore('held-notice-order', {});
+  let entered;
+  const abortEntered = new Promise((resolve) => { entered = resolve; });
+  let release;
+  const abortReleased = new Promise((resolve) => { release = resolve; });
+  const gateway = wrapMainChat(store.gateway, {
+    async abort(run) {
+      entered();
+      await abortReleased;
+      return run();
+    },
+  });
+  const app = startApp(store, { gateway });
+  const base = `http://127.0.0.1:${await app.port}`;
+  try {
+    const device = await openDevice(base, await pairedDevice(store, base));
+    device.send({ type: 'req', id: 'c1', op: 'control', command: 'abort' });
+    await abortEntered;
+    device.send({ type: 'req', id: 'c2', op: 'control', command: 'help' });
+    await device.wait(() => device.response('c2') !== undefined, 'help reply');
+    device.send({ type: 'req', id: 'p1', op: 'ping' });
+    await device.wait(() => device.response('p1') !== undefined, 'ping reply');
+    assert.ok((await appState(store.gateway)).pending.some((item) => item.key === 'c:c2'), 'the help notice is queued');
+    assert.equal(device.events('message').length, 0, 'nothing was delivered ahead of the held acknowledgement');
+
+    release();
+    await device.wait(() => device.events('message').filter((event) => event.role === 'notice').length === 2,
+      'both notices');
+    const texts = device.events('message').map((event) => event.text);
+    assert.equal(texts[0], 'Idle. Queue cleared.');
+    assert.match(texts[1], /^Controls for this thread/u);
+    await device.close();
+  } finally {
+    release();
+    await app.stop();
+    await store.close();
+  }
+});
+
+test('an applied control commits its effects once: one divider per /new, one owed restart', async () => {
+  const { commitControlApplied } = await import(new URL('../dist/channels/app.js', import.meta.url).href);
+  const at = new Date(0).toISOString();
+  const doc = {
+    nextCursor: 1, floor: 0, events: [], pending: [], devices: [], pairings: [], acks: {},
+    nextNoticeSeq: 1, sendKeys: [],
+    threads: [{ id: 'main', title: 'Main', archived: false, createdAt: at, lastAt: at }],
+    controls: [
+      { key: 'c:n1', thread: 'main', command: 'new', status: 'admitted' },
+      { key: 'c:r1', thread: 'main', command: 'restart', status: 'admitted' },
+    ],
+  };
+  for (let repeat = 0; repeat < 2; repeat += 1) {
+    commitControlApplied(doc, { key: 'c:n1', thread: 'main', command: 'new' }, at);
+    commitControlApplied(doc, { key: 'c:r1', thread: 'main', command: 'restart' }, at);
+  }
+  assert.equal(doc.events.filter((event) => event.event === 'divider').length, 1, 'one context boundary');
+  assert.deepEqual(doc.restart, ['main']);
+  assert.deepEqual(doc.controls.map((entry) => entry.status), ['applied', 'applied']);
+});
+
+test('an interrupted or unplaceable restart reports the restart wording and is never requested', { timeout: 30_000 }, async () => {
+  // A reopen reports a restart recorded but never confirmed, with or without its held acknowledgement.
+  const reopened = await openAppStore('restart-recovery', {});
+  const { AppState } = await import(new URL('../dist/channels/app.js', import.meta.url).href);
+  const stateConversation = await reopened.gateway.conversationFor('app:channel-state', context);
+  await stateConversation.commit(async (tx) => {
+    const doc = await tx.doc(AppState, stateConversation.id);
+    doc.controls = [
+      { key: 'c:held', command: 'restart', status: 'admitted' },
+      { key: 'c:bare', command: 'restart', status: 'admitted' },
+    ];
+    doc.nextNoticeSeq = 2;
+    doc.pending = [{ key: 'c:held', text: 'Restart requested; checking active work.', admittedAtMs: 1, notice: true, noticeSeq: 1, hold: true }];
+  }, context);
+  const recovered = startApp(reopened);
+  try {
+    const base = `http://127.0.0.1:${await recovered.port}`;
+    const device = await openDevice(base, await pairedDevice(reopened, base));
+    await device.wait(() => device.events('message').length === 2, 'both interrupted restarts reported');
+    assert.deepEqual(device.events('message').map((event) => event.text),
+      ['Restart interrupted; outcome unknown. Not retried.', 'Restart interrupted; outcome unknown. Not retried.']);
+    await device.close();
+  } finally {
+    await recovered.stop();
+    await reopened.close();
+  }
+
+  // An earlier input that can never be placed abandons the restart with the same wording, unrequested.
+  const store = await openAppStore('restart-abandoned', {});
+  const requests = [];
+  const gateway = wrapMainChat(store.gateway, {
+    async submit(draft, run) {
+      if (draft.requestId === 'app:send:k-stuck') throw new Error('synthetic submit failure');
+      return run();
+    },
+  });
+  const app = startApp(store, {
+    gateway, scanIntervalMs: 50, restart: { supported: true, request: async () => { requests.push('restart'); } },
+  });
+  try {
+    const base = `http://127.0.0.1:${await app.port}`;
+    const device = await openDevice(base, await pairedDevice(store, base));
+    device.send({ type: 'req', id: 's1', op: 'send', key: 'k-stuck', text: 'never placed' });
+    await device.wait(() => device.response('s1') !== undefined, 'send reply');
+    device.send({ type: 'req', id: 'r1', op: 'control', command: 'restart' });
+    await device.wait(() => device.events('message').some((event) =>
+      event.text === 'Restart interrupted; outcome unknown. Not retried.'), 'the abandoned restart report', 20_000);
+    assert.equal(device.events('message').some((event) => /^Command interrupted/u.test(event.text)), false);
+    assert.deepEqual(requests, [], 'an unplaceable restart is never requested');
+    await device.close();
+  } finally {
+    await app.stop();
+    await store.close();
+  }
 });
