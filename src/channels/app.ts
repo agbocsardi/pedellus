@@ -607,23 +607,33 @@ function pruneAppControls(doc: Draft<AppChannelState>): void {
   const queued = new Set(doc.pending.filter((item) => item.notice === true).map((item) => item.key));
   const reported = new Set(doc.reportedControls ?? []);
   let controls = pruneControls(doc.controls, (entry) => queued.has(entry.key) || reported.has(entry.key), max);
-  // A delivered terminal report is kept only for replay, the newest within the same bound.
-  const delivered = controls.filter((entry) => (entry.status === "unconfirmed" || entry.status === "refused") &&
-    !queued.has(entry.key) && reported.has(entry.key));
-  if (delivered.length > max) {
-    const dropped = new Set(delivered.slice(0, delivered.length - max).map((entry) => entry.key));
-    controls = controls.filter((entry) => !dropped.has(entry.key));
+  // Keep at most `max` reported replay records total (oldest evicted first when not actively queued).
+  const reportedEntries = controls.filter((entry) => (entry.status === "unconfirmed" || entry.status === "refused") &&
+    reported.has(entry.key));
+  if (reportedEntries.length > max) {
+    let excess = reportedEntries.length - max;
+    const dropped = new Set<string>();
+    for (const entry of reportedEntries) {
+      if (excess <= 0) break;
+      if (queued.has(entry.key)) continue;
+      dropped.add(entry.key);
+      excess -= 1;
+    }
+    if (dropped.size > 0) controls = controls.filter((entry) => !dropped.has(entry.key));
   }
   doc.controls = controls;
   const present = new Set(controls.map((entry) => entry.key));
   const kept = [...reported].filter((key) => present.has(key));
+  if (kept.length > max) kept.splice(0, kept.length - max);
   if (kept.length > 0) doc.reportedControls = kept;
   else delete doc.reportedControls;
 }
 
-/** Whether this thread has a control acknowledgement still held; later notices wait behind it. */
+/** Whether this thread has a control acknowledgement still pending append; later notices wait behind it. */
 function heldAcknowledgement(doc: AppChannelState, thread: string): boolean {
-  return doc.pending.some((item) => item.hold === true && threadOf(item) === thread);
+  const controlKeys = new Set(doc.controls.map((entry) => entry.key));
+  return doc.pending.some((item) => item.notice === true && threadOf(item) === thread &&
+    (item.hold === true || controlKeys.has(item.key)));
 }
 
 /** Queue one host notice in the caller's commit; the sequence stamp makes its event id unique. */
@@ -1376,8 +1386,12 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         if (doc.sendKeys.some((entry) => entry.key === key) || hasEventId(doc, `send:${key}`) ||
             hasEventId(doc, `notice:${noticeKey}`) || doc.pending.some((entry) => entry.key === noticeKey) ||
             doc.events.some((event) => event.event === "message" && event.id.startsWith(`notice:${noticeKey}#`))) return;
+        if (doc.pending.length >= APP_LIMITS.maxPending) { blocked = "not_ready"; return; }
         duplicate = false;
         doc.sendKeys = pruneKeys([...doc.sendKeys, { key, atMs: now() }], now());
+        // Reserve the notice slot before offering the callback so a full queue never consumes an
+        // OAuth callback without delivering its receipt.
+        queueNotice(doc, noticeKey, thread, "", now(), true);
       });
     } catch (error) {
       if (stopping || signal?.aborted) return;
@@ -1399,8 +1413,19 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       { scope: "thread" },
     )).text;
     try {
-      // Through the thread's notice queue, so the receipt never overtakes a held acknowledgement.
-      await admitNotice(thread, noticeKey, reply);
+      // Release the reserved notice slot with the receipt text; still ordered behind any held ack.
+      await mutateState((doc) => {
+        const reserved = doc.pending.find((entry) => entry.notice === true && entry.key === noticeKey);
+        if (reserved !== undefined) {
+          reserved.text = boundNotice(reply, MAX_NOTICE_CHARS);
+          delete reserved.hold;
+        } else if (doc.pending.length < APP_LIMITS.maxPending) {
+          queueNotice(doc, noticeKey, thread, boundNotice(reply, MAX_NOTICE_CHARS), now());
+        } else {
+          throw new Error(QUEUE_FULL);
+        }
+      });
+      drain();
     } catch (error) {
       if (stopping || signal?.aborted) return;
       journalEvent("app.send.failed", {}, error);
@@ -2112,7 +2137,14 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
 
   /** A final outcome after its acknowledgement was already delivered: one fresh notice, if it fits. */
   const queueLate = (doc: Draft<AppChannelState>, record: AppControl, text: string): void => {
-    if (doc.pending.some((item) => item.key === record.key) || doc.pending.length >= APP_LIMITS.maxPending) return;
+    if (doc.pending.some((item) => item.key === record.key)) return;
+    if (doc.pending.length >= APP_LIMITS.maxPending) {
+      // Even if the late notice cannot fit in the queue, retain the control in reportedControls
+      // so pruning cannot delete an unconfirmed /restart record and allow replay to re-run it.
+      const existing = doc.reportedControls ?? [];
+      if (!existing.includes(record.key)) doc.reportedControls = [...existing, record.key];
+      return;
+    }
     queueNotice(doc, record.key, record.scope, boundNotice(text, MAX_LATE_CONTROL_CHARS), now());
   };
 
