@@ -549,7 +549,11 @@ test("an already-sleeping invalid legacy deadline is disarmed on recovery, never
 
     const disarmed = await cron.disarmInvalidSleepingCronTimers(harness, context);
     assert.equal(disarmed, 1, "exactly the invalid sleeping timer is disarmed");
+    // The committed abort mark is the disarm postcondition: an abort mark does not wait for a
+    // sleep, so the task already left the wake computation before any settlement.
+    assert.equal((await harness.getTask(invalidTimerId, context)).abortRequested, true);
     assert.equal(await cron.disarmInvalidSleepingCronTimers(harness, context), 0, "the sweep is idempotent");
+    await harness.waitForTask(invalidTimerId, context);
     const settled = await harness.getTask(invalidTimerId, context);
     assert.equal(settled.state.status, "terminal");
     assert.equal(settled.state.outcome.status, "aborted");
@@ -571,4 +575,49 @@ test("an already-sleeping invalid legacy deadline is disarmed on recovery, never
     if (harness !== undefined) await harness.close(context).catch(() => {});
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("legacy timer recovery fails closed: fatal errors and shutdown are never reported as success", async () => {
+  const cron = await load(`${pkg}/dist/automation/cron.js`);
+  const { MAX_DATE_MS } = await load(`${pkg}/dist/automation/cron-schedule.js`);
+  const { recoverBeforeServing } = await load(`${pkg}/dist/cli.js`);
+  const { StartupDiagnosticError } = await load(`${pkg}/dist/startup-diagnostics.js`);
+  const { withAbortSignal } = await load(`${pkg}/node_modules/@earendil-works/chord/dist/context/index.js`);
+  const invalid = { id: 7, abortRequested: false, input: { jobId: "job-1", scheduledAtMs: MAX_DATE_MS + 1, generation: 1 } };
+  const fake = (overrides = {}) => {
+    const calls = { aborts: 0 };
+    return {
+      calls,
+      commit: async (change) => change({ scanTasks: async () => ({ items: [invalid] }) }),
+      abortTask: async () => { calls.aborts += 1; return "marked"; },
+      ...overrides,
+    };
+  };
+
+  // A storage/session failure while committing the abort mark propagates, never a disarm count.
+  const sealed = new Error("synthetic session failure");
+  await assert.rejects(cron.disarmInvalidSleepingCronTimers(fake({ abortTask: async () => { throw sealed; } }), context),
+    (error) => error === sealed);
+  await assert.rejects(cron.disarmInvalidSleepingCronTimers(fake({ commit: async () => { throw sealed; } }), context),
+    (error) => error === sealed);
+  // A timer that settled after the scan is the one benign race.
+  assert.equal(await cron.disarmInvalidSleepingCronTimers(fake({ abortTask: async () => "terminal" }), context), 0);
+
+  // A cancelled context stops before any abort is committed.
+  const stop = new AbortController();
+  stop.abort();
+  const cancelled = fake();
+  await assert.rejects(cron.disarmInvalidSleepingCronTimers(cancelled, withAbortSignal(stop.signal, context)));
+  assert.equal(cancelled.calls.aborts, 0);
+
+  // The startup gate turns every one of these into a fixed refusal instead of serving.
+  await assert.rejects(recoverBeforeServing(fake({ abortTask: async () => { throw sealed; } }), new AbortController().signal, context),
+    (error) => error instanceof StartupDiagnosticError && error.code === "cronRecovery" && error.cause === sealed);
+  await assert.rejects(recoverBeforeServing(fake(), stop.signal, withAbortSignal(stop.signal, context)),
+    (error) => error instanceof StartupDiagnosticError && error.code === "gatewayCanceled");
+  // A shutdown that arrives after a successful sweep still stops startup before serving.
+  const late = new AbortController();
+  await assert.rejects(recoverBeforeServing(fake({ abortTask: async () => { late.abort(); return "marked"; } }), late.signal, context),
+    (error) => error instanceof StartupDiagnosticError && error.code === "gatewayCanceled");
+  await recoverBeforeServing(fake(), new AbortController().signal, context);
 });

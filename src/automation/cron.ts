@@ -1748,30 +1748,40 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
 /**
  * Recovery sweep for legacy damage, run once by the host that owns the process before it serves
  * anything: a timer task persisted by an older build can sleep on a deadline beyond the shared
- * renderable bound. Durable restores such a sleep at open and keeps it in the host's wake state
- * with a clamped native wakeup reference, and because the deadline can never come due, nothing
- * ever runs the phase that would settle it. The sweep disarms exactly those timers through the
- * supported abort path: `abortTask` makes a sleeping task runnable regardless of its deadline,
- * and the timer's own abort handler settles it "cancelled" without arming an occurrence, so the
- * restored sleep and its native wakeup reference are gone before the gateway serves. Valid
- * timers are untouched (the filter is exact), job records are not mutated, and owner inspection
- * and cancellation keep working through the ordinary paths. The residual without this sweep is
- * only an inert sleep plus its clamped native wakeup, never an executed occurrence: the due check
- * holds forever for an out-of-range deadline, and the fire-phase guard settles the task if it is
- * ever run anyway.
+ * renderable bound. Durable restores such a sleep at open and, because the deadline can never come
+ * due, nothing would ever run the phase that settles it. The sweep commits an abort mark on exactly
+ * those timers through the supported `abortTask` path. Durable's public task contract is that an
+ * abort mark does not wait for a sleep's `until`, so the committed mark itself ends the sleep: the
+ * task leaves the wake computation and becomes runnable, and the timer's own abort handler later
+ * settles it "cancelled" through the ordinary scheduler without arming an occurrence. The sweep
+ * therefore does not wait for that settlement (an unbounded wait, which as `waitForTask` would also
+ * resume scheduling early). Valid timers are untouched (the filter is exact), already-marked timers
+ * are skipped, and job records are not mutated.
+ *
+ * Nothing here is best-effort: a scan, commit or abort failure (for example a storage failure that
+ * fails the Durable session) and a cancelled `context` reject, so the caller can refuse to serve. A
+ * timer that settled after the scan is the one benign race, and `abortTask` reports it as
+ * `"terminal"` rather than throwing.
+ *
+ * Known limitation: Durable restores the sleep at open, before any host code can run, so between
+ * open and this sweep the restored sleep still contributes its clamped native wakeup reference.
+ * That window is inert (the due check holds forever for an out-of-range deadline, and the
+ * fire-phase guard settles the task if it is ever run), and the SDK offers no earlier seam.
  */
 export async function disarmInvalidSleepingCronTimers(
-  harness: Pick<Harness, "commit" | "abortTask" | "waitForTask">,
+  harness: Pick<Harness, "commit" | "abortTask">,
   context: Context,
 ): Promise<number> {
   const invalid: TaskRecord<JsonValue, JsonValue, JsonValue>[] = [];
   let cursor: Cursor | undefined;
   do {
+    context.abortSignal?.throwIfAborted();
     const page = await harness.commit(
       (tx) => tx.scanTasks({ kind: CRON_TIMER_TASK_NAME, status: "sleeping" }, 1_000, cursor),
       context,
     );
     for (const record of page.items) {
+      if (record.abortRequested) continue;
       const input = parseOccurrenceInput(record.input);
       if (input !== undefined && (input.scheduledAtMs < 0 || input.scheduledAtMs > MAX_DATE_MS)) {
         invalid.push(record);
@@ -1781,17 +1791,8 @@ export async function disarmInvalidSleepingCronTimers(
   } while (cursor !== undefined);
   let disarmed = 0;
   for (const record of invalid) {
-    try {
-      // The abort mark makes the sleep runnable immediately; waiting keeps the recovery complete
-      // before the caller starts serving.
-      if (await harness.abortTask(record.id as TaskId<CronTimerResult>, context) === "marked") {
-        await harness.waitForTask(record.id as TaskId<CronTimerResult>, context);
-      }
-      disarmed += 1;
-    } catch {
-      // A record too damaged for the abort path keeps its inert sleep; the fire-phase guard still
-      // settles it if anything ever runs it. Recovery is best-effort and never blocks startup.
-    }
+    context.abortSignal?.throwIfAborted();
+    if (await harness.abortTask(record.id as TaskId<CronTimerResult>, context) === "marked") disarmed += 1;
   }
   return disarmed;
 }

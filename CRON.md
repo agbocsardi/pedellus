@@ -496,9 +496,16 @@ reference that fires and re-arms without dispatching anything, never an executed
 it remains cancellable through the abort path. Because such a restored sleep would otherwise sit
 on that residual forever, the gateway start (`runGateway`) runs one recovery sweep
 (`disarmInvalidSleepingCronTimers`) over the public task APIs: it scans sleeping cron timers,
-disarms exactly those whose persisted deadline is out of range through the task's own abort
-handler, and touches nothing else; valid timers, job records and owner cancellation are
-unaffected, and a sweep failure never blocks startup. Arithmetic overflow while following
+commits an abort mark on exactly those whose persisted deadline is out of range, and touches
+nothing else; valid timers, job records and owner cancellation are unaffected. Durable's contract
+is that an abort mark does not wait for a sleep, so the committed mark ends the sleep and the
+task's own abort handler settles it "cancelled" through the ordinary scheduler; the sweep does not
+wait for that. The sweep is not best-effort: a scan, commit or abort failure (such as a storage
+failure that fails the Durable session) or a shutdown during open or recovery stops startup with
+a fixed diagnostic before the local socket, any channel or `gateway.surfaces.started`. A timer
+that settled meanwhile is the one benign race and is skipped. Durable restores the sleep at open,
+before host code runs, so until the sweep its clamped native wakeup reference still exists; that
+window is inert, and the SDK has no earlier seam. Arithmetic overflow while following
 an interval is the absence of a next slot, never a failure of the occurrence that is due right
 now: the timer admits that occurrence exactly once and the job simply stops re-arming, instead of
 the overflow discarding the whole terminal commit.

@@ -585,11 +585,9 @@ async function runGateway(config: LoadedConfig): Promise<void> {
         // model, chat message or tool can name a path for a reload.
         ...(config.configFile === undefined ? {} : { reloadConfig: () => loadConfig(config.configFile!) }),
       }));
-    // Legacy recovery before serving: disarm cron timers an older build left sleeping on a
-    // deadline no clock can reach. The sweep uses the public task APIs, touches exactly those
-    // timers, and settles them through their own abort handler without arming an occurrence;
-    // it is best-effort and never blocks or fails startup.
-    await disarmInvalidSleepingCronTimers(gateway.harness, context);
+    // Legacy recovery before serving; a failed recovery or a shutdown requested meanwhile stops
+    // here, before the local socket, any channel or `gateway.surfaces.started`.
+    await recoverBeforeServing(gateway.harness, stop.signal, context);
     stage = "gateway.local";
     // The gateway owns local attachments too: the CLI only names an operator path. CLI
     // originals live in a code-owned child of the validated operator media root, so a
@@ -753,6 +751,25 @@ async function runGateway(config: LoadedConfig): Promise<void> {
   journalEvent("gateway.stopped", { isError: failure !== undefined });
   if (failure !== undefined) throw failure.error;
   if (restart.accepted()) replaceGatewayProcess();
+}
+
+/**
+ * Startup recovery gate between opening the gateway and serving it. The cron sweep disarms legacy
+ * timers sleeping on unreachable deadlines (see `disarmInvalidSleepingCronTimers`); any failure of
+ * it, and a shutdown requested during open or recovery, rejects with a fixed diagnostic so the
+ * caller tears down instead of binding the socket or starting channels. Nothing is swallowed.
+ */
+export async function recoverBeforeServing(
+  harness: Parameters<typeof disarmInvalidSleepingCronTimers>[0],
+  signal: AbortSignal,
+  context: Context,
+): Promise<void> {
+  try {
+    await disarmInvalidSleepingCronTimers(harness, context);
+  } catch (cause) {
+    throw new StartupDiagnosticError(signal.aborted ? "gatewayCanceled" : "cronRecovery", { cause });
+  }
+  if (signal.aborted) throw new StartupDiagnosticError("gatewayCanceled");
 }
 
 /**

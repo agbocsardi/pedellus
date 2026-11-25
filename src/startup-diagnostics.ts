@@ -60,6 +60,10 @@ export const STARTUP_DIAGNOSTICS = Object.freeze({
     "`pedellus recovery --config <path>` with this configuration to inspect and cancel a blocked prepared " +
     "dispatch, or omit `--config` for the default primary configuration, then start again " +
     "(diagnostic details suppressed)",
+  cronRecovery:
+    "startup could not finish recovering legacy scheduled timers, so nothing was served; check the journal " +
+    "and start the gateway again (diagnostic details suppressed)",
+  gatewayCanceled: "gateway start was cancelled before anything was served (diagnostic details suppressed)",
   unexpected: "command failed; diagnostic details suppressed",
 } as const);
 
