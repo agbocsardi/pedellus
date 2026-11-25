@@ -75,7 +75,7 @@ export interface CronOperatorJob {
   /** One bounded line of the scheduled instruction. */
   readonly message: string;
   readonly lastOutcome: {
-    readonly status: "ok" | "error";
+    readonly status: "ok" | "error" | "unknown";
     readonly finishedAtMs: number;
     readonly error: string | null;
   } | null;

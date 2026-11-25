@@ -39,6 +39,14 @@ import {
   readOneOffQueue,
   type CronOneOffQueueEntry,
 } from "./cron-conversations.js";
+import {
+  extractAssistantText,
+  terminalAborted,
+  terminalCompleted,
+  terminalFailed,
+  waitForTurnAnswer,
+  type ConversationCommitter,
+} from "../tasks/background.js";
 
 export const CRON_EXTENSION_NAME = "nanobot.cron";
 /** Entry kind for a scheduled input placed by the cron run. */
@@ -91,7 +99,8 @@ export interface CronOutcome {
   readonly [key: string]: JsonValue;
   readonly scheduledAtMs: number;
   readonly finishedAtMs: number;
-  readonly status: "ok" | "error";
+  /** `unknown` is an unresolved wait: the admitted input may still be answered after the run ended. */
+  readonly status: "ok" | "error" | "unknown";
   readonly error: string | null;
   readonly conversationId: number;
 }
@@ -237,7 +246,8 @@ export interface CronRunResult {
   readonly [key: string]: JsonValue;
   readonly jobId: string;
   readonly scheduledAtMs: number;
-  readonly outcome: "ok" | "error" | "cancelled" | "superseded" | "missing";
+  /** `unknown` is an unresolved wait: the admitted input may still be answered after the run ended. */
+  readonly outcome: "ok" | "error" | "unknown" | "cancelled" | "superseded" | "missing";
   readonly error: string | null;
 }
 
@@ -265,10 +275,7 @@ export interface CronActor {
  * The committing handle cron needs for a conversation's job document. A tool call and a host both
  * commit conversation-scoped documents, so neither needs the full `Conversation` surface.
  */
-export interface CronConversationWriter {
-  readonly id: ConversationId;
-  commit<T>(change: (tx: Tx) => T | Promise<T>, context: Context): Promise<T>;
-}
+export type CronConversationWriter = ConversationCommitter;
 /**
  * One run's durable preparation or finalization. Preparation runs in the commit that chooses the
  * run's target conversation; finalization runs in the commit that records the run's terminal result
@@ -587,16 +594,6 @@ function parseOccurrenceInput(value: unknown): CronOccurrenceInput | undefined {
 const occurrenceKey = (jobId: string, scheduledAtMs: number): string =>
   `cron:${jobId}:${scheduledAtMs}`;
 const copyJob = (job: Draft<CronJob> | CronJob): CronJob => copyJson(job) as unknown as CronJob;
-const terminalCompleted = <S extends { phase: string }, R>(result: R): NextTaskState<S, R> =>
-  ({ status: "terminal", outcome: { status: "completed", result } });
-const terminalAborted = <S extends { phase: string }, R>(
-  result: R, reason: string,
-): NextTaskState<S, R> => ({ status: "terminal", outcome: { status: "aborted", reason, result } });
-const terminalFailed = <S extends { phase: string }, R>(
-  result: R, message: string,
-): NextTaskState<S, R> =>
-  ({ status: "terminal", outcome: { status: "failed", error: { message }, result } });
-
 const timerResult = (
   input: CronOccurrenceInput, outcome: CronTimerResult["outcome"], reason: string | null,
 ): CronTimerResult => ({
@@ -610,16 +607,14 @@ const runResult = (
 const zeroInput: CronOccurrenceInput = { jobId: "", scheduledAtMs: 0, generation: 0 };
 
 interface WaitSettlement {
-  readonly status: "ok" | "error";
+  readonly status: "ok" | "error" | "unknown";
   readonly error: string | null;
   readonly answerEntryId: EntryId | null;
 }
 /** An answer whose first line is exactly this marker reports that the occurrence failed. */
 const CRON_FAILURE_MARKER = "[FAILED]";
 function reportsFailure(entry: { readonly model?: readonly unknown[] } | undefined): boolean {
-  const message = entry?.model?.[0] as { content?: readonly { type: string; text?: string }[] } | undefined;
-  const body = (message?.content ?? []).flatMap((part) => part.type === "text" ? [part.text ?? ""] : []).join("");
-  return body.trimStart().split(/\r?\n/, 1)[0]!.trim() === CRON_FAILURE_MARKER;
+  return extractAssistantText(entry).trimStart().split(/\r?\n/, 1)[0]!.trim() === CRON_FAILURE_MARKER;
 }
 function outcomeOf(record: SubmissionRecord): WaitSettlement {
   if (record.status === "done" && record.type === "input") {
@@ -659,34 +654,25 @@ async function chatIdleForOccurrence(
  * Wait for the native submission, but also notice a run that ended without answering it.
  * Durable's default `afterFailedRun: "keep"` leaves the input queued, so waiting only on
  * `submission.wait()` would never finish. Once the target is idle, a still-queued input has no
- * run left to answer it: withdraw it, record the error, and let the next timer continue.
+ * run left to answer it: withdraw it, record the error, and let the next timer continue. An
+ * unresolved wait is neither: the admitted input may still be answered later, so the occurrence
+ * records `unknown`, withdraws nothing and never retries the same input.
  */
 async function waitForAnswer(
   submission: Submission, conversation: ConversationHandle, context: Context,
 ): Promise<WaitSettlement> {
-  const settled = submission.wait(context).then(
-    (record) => ({ kind: "settled" as const, record }),
-    (error: unknown) => ({ kind: "failed" as const, error }),
-  );
-  const idle = conversation.waitForIdle(context).then(
-    () => ({ kind: "idle" as const }),
-    (error: unknown) => ({ kind: "failed" as const, error }),
-  );
-  // A losing side may reject later; it must not become an unhandled rejection.
-  void settled.catch(() => {});
-  void idle.catch(() => {});
-  const first = await Promise.race([settled, idle]);
-  if (first.kind === "failed") throw first.error;
-  if (first.kind === "settled") return outcomeOf(first.record);
-  const record = await submission.status(context);
-  if (record.status === "done" || record.status === "unanswered") return outcomeOf(record);
-  if (record.status === "queued") {
-    // A later unrelated input must not place and run this occurrence after it was recorded failed.
-    try { await submission.abort(context); } catch { /* it may have been placed first */ }
+  const wait = await waitForTurnAnswer(submission, conversation, context);
+  if (wait.kind === "settled") return outcomeOf(wait.record);
+  if (wait.kind === "unresolved") {
+    return {
+      status: "unknown",
+      error: `run outcome unknown: the admitted input can still be answered (submission is ${wait.record?.status ?? "unreadable"}); nothing was withdrawn or retried`,
+      answerEntryId: null,
+    };
   }
   return {
     status: "error",
-    error: `run ended before answering (submission is ${record.status})`,
+    error: `run ended before answering (submission is ${wait.record.status})`,
     answerEntryId: null,
   };
 }
@@ -764,6 +750,32 @@ function runTargetOf(record: Awaited<ReturnType<Harness["getTask"]>>): Conversat
     return checkpoint.targetConversationId as ConversationId;
   }
   return null;
+}
+
+/** A live background cron run's task-owned target, recovered from its durable checkpoint. */
+export interface CronBackgroundTarget {
+  readonly originConversationId: ConversationId;
+  readonly targetConversationId: ConversationId;
+}
+
+/**
+ * The target of one non-terminal cron run whose checkpoint already chose it. A background run's
+ * target is task-owned and deliberately absent from the SessionMap, so it is restored from the run
+ * task itself. An origin-mode run's target is the origin, which the map already restores.
+ */
+export function cronBackgroundTarget(task: unknown): CronBackgroundTarget | undefined {
+  if (!isRecord(task) || task.kind !== CRON_RUN_TASK_NAME) return undefined;
+  const { conversationId, state } = task;
+  if (!Number.isSafeInteger(conversationId) || (conversationId as number) < 1) return undefined;
+  if (!isRecord(state) || state.status === "terminal" || state.status === "completing") return undefined;
+  if (!isRecord(state.checkpoint)) return undefined;
+  const targetConversationId = state.checkpoint.targetConversationId;
+  if (!Number.isSafeInteger(targetConversationId) || (targetConversationId as number) < 1) return undefined;
+  if (targetConversationId === conversationId) return undefined;
+  return {
+    originConversationId: conversationId as ConversationId,
+    targetConversationId: targetConversationId as ConversationId,
+  };
 }
 
 async function viewsOf(
@@ -1540,14 +1552,19 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
       // retired; the origin-mode target is the origin conversation itself and keeps its policy.
       // A digest occurrence queues no user/channel delivery: only a failed or cancelled digest run's
       // internal issue report reaches the origin agent, a successful run is silent, and the job
-      // record keeps this bounded status for `cron list`.
-      await retireTarget(tx, conversationId, targetConversationId, copyJob(job), input, intentOf(job) === "digest" ? null : {
+      // record keeps this bounded status for `cron list`. An unresolved wait delivers nothing: the
+      // admitted input may still be answered, and a delivered failure receipt would misreport it.
+      await retireTarget(tx, conversationId, targetConversationId, copyJob(job), input, intentOf(job) === "digest" || settlement.status === "unknown" ? null : {
         status: settlement.status,
         error: settlement.error,
         answerEntryId: settlement.answerEntryId,
       }, context);
       return terminalCompleted<CronRunCheckpoint, CronRunResult>(
-        runResult(input, settlement.status === "ok" ? "ok" : "error", settlement.error),
+        runResult(
+          input,
+          settlement.status === "ok" ? "ok" : settlement.status === "unknown" ? "unknown" : "error",
+          settlement.error,
+        ),
       );
     }, context);
   }

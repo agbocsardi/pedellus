@@ -2113,3 +2113,34 @@ test("a fresh start beyond the verification bound is refused loudly and skips no
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("transcript projections share one user-input kind set, including cron input", async () => {
+  const { CRON_INPUT_ENTRY_KIND } = await load(`${pkg}/dist/automation/cron.js`);
+  const transcript = await load(`${pkg}/dist/history/transcript.js`);
+  const { renderEntry } = await load(`${pkg}/dist/history/summary-source.js`);
+  const { projectEntry } = await load(`${pkg}/dist/memory/history-source.js`);
+  const { browsedEntry } = await load(`${pkg}/dist/history/entry-view.js`);
+  const digestion = await load(`${pkg}/dist/history/digestion.js`);
+
+  assert.deepEqual([...transcript.USER_INPUT_ENTRY_KINDS].sort(), [CRON_INPUT_ENTRY_KIND, "pi.user"].sort());
+  // The digestion re-exports are the shared implementations, not copies.
+  assert.equal(digestion.clipPreview, transcript.clipPreview);
+  assert.equal(digestion.COMPACT_PREVIEW_MARKER, transcript.COMPACT_PREVIEW_MARKER);
+  assert.equal(DIGEST_PREVIEW_CHARS, transcript.PREVIEW_CHARS);
+
+  const cron = {
+    id: 7,
+    kind: CRON_INPUT_ENTRY_KIND,
+    model: [{ role: "user", content: [{ type: "text", text: "daily check" }, { type: "image", data: "x" }], timestamp: 1_000 }],
+  };
+  assert.equal(renderEntry(cron).text, "[User]: daily check");
+  assert.equal(renderEntry(cron).message, true);
+  assert.deepEqual(projectEntry(cron).parts.map((part) => [part.role, part.body]), [["user", "daily check"]]);
+  assert.equal(browsedEntry(cron, "messages", 100)?.label, "user (cron)");
+  assert.equal(digestion.evidenceShapeOf(cron)?.role, "user");
+
+  const unknown = { ...cron, kind: "nanobot.unknown" };
+  assert.equal(renderEntry(unknown).text, "");
+  assert.equal(projectEntry(unknown).parts.length, 0);
+  assert.equal(digestion.evidenceShapeOf(unknown), undefined);
+});

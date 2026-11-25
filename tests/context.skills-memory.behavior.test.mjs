@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { readdirSync, readlinkSync } from "node:fs";
+import { link, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { registerHooks } from "node:module";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -8,7 +11,9 @@ import {
   loadMemoryContext,
   validateMemoryTopicPath,
 } from "../dist/context/memory.js";
-import { loadSkillsContext } from "../dist/context/skills.js";
+import { SkillsContextInputError, loadSkillsContext } from "../dist/context/skills.js";
+import { MemoryContextFileError } from "../dist/context/memory.js";
+import { createNotesBackend } from "../dist/memory/notes.js";
 
 async function tempRoot(t) {
   const root = await mkdtemp(join(tmpdir(), "nanobot-context-sizes-"));
@@ -160,4 +165,158 @@ test("a spaced or non-ASCII topic is writable through the topic-path guard", () 
   for (const path of ["memory/daily notes/2026-01-01.md", "memory/über.md", "memory/a b/c d.md"]) {
     assert.equal(validateMemoryTopicPath(path), path);
   }
+});
+
+test("skills requests refuse inherited fields instead of treating them as present", async (t) => {
+  const root = await tempRoot(t);
+  // An inherited builtinSkillsRoot used to report found with an undefined value.
+  const request = Object.create({ builtinSkillsRoot: root });
+  request.workspaceRoot = root;
+  await assert.rejects(loadSkillsContext(request), (error) =>
+    error instanceof SkillsContextInputError && /builtinSkillsRoot must be an own data property/.test(error.message));
+  const inheritedRoot = Object.create({ workspaceRoot: root });
+  await assert.rejects(loadSkillsContext(inheritedRoot), SkillsContextInputError);
+});
+
+test("pinned skill and memory reads skip links and hard-link aliases visibly", async (t) => {
+  const root = await tempRoot(t);
+  await writeFiles(root, {
+    "skills/plain/SKILL.md": "---\ndescription: plain skill\n---\nbody",
+    "outside/SKILL.md": "---\ndescription: outside\n---\nbody",
+    "memory/kept.md": "# Kept topic",
+    "outside/topic.md": "# Outside topic",
+  });
+  await mkdir(join(root, "skills", "linked"));
+  await symlink(join(root, "outside", "SKILL.md"), join(root, "skills", "linked", "SKILL.md"));
+  await mkdir(join(root, "skills", "aliased"));
+  await link(join(root, "outside", "SKILL.md"), join(root, "skills", "aliased", "SKILL.md"));
+  await link(join(root, "outside", "topic.md"), join(root, "memory", "alias.md"));
+
+  const skills = await loadSkillsContext({ workspaceRoot: root });
+  assert.deepEqual(skills.discovered.map((skill) => skill.name), ["plain"]);
+  assert.deepEqual(skills.skipped, [
+    { name: "aliased", reason: "hardlinked-file" },
+    { name: "linked", reason: "symlinked-file" },
+  ]);
+
+  const memory = await loadMemoryContext({ workspaceRoot: root });
+  assert.deepEqual(memory.entries.map((entry) => entry.path), ["memory/kept.md"]);
+  assert.match(memory.manifest, /1 memory files skipped/);
+});
+
+async function listenSocket(t, path) {
+  const server = createServer();
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(path, resolve);
+  });
+  t.after(() => new Promise((resolve) => server.close(() => resolve())));
+}
+
+test("a Unix socket is a non-regular entry: skipped as a skill, rejected as a loaded memory file", async (t) => {
+  const root = await tempRoot(t);
+  await writeFiles(root, { "skills/plain/SKILL.md": "---\ndescription: plain\n---\nbody" });
+  await mkdir(join(root, "skills", "sock"));
+  await listenSocket(t, join(root, "skills", "sock", "SKILL.md"));
+  await mkdir(join(root, "memory"));
+  await listenSocket(t, join(root, "memory", "socket.md"));
+
+  const skills = await loadSkillsContext({ workspaceRoot: root });
+  assert.deepEqual(skills.discovered.map((skill) => skill.name), ["plain"]);
+  assert.deepEqual(skills.skipped, []);
+
+  await assert.rejects(
+    loadMemoryContext({ workspaceRoot: root, loadedFiles: ["memory/socket.md"] }),
+    (error) => error instanceof MemoryContextFileError && error.kind === "not-regular" && error.source === "memory/socket.md",
+  );
+  // As a discovered topic it is not a regular file entry and never blocks the manifest.
+  const memory = await loadMemoryContext({ workspaceRoot: root });
+  assert.deepEqual(memory.entries, []);
+});
+
+test("a notes description line with an embedded line separator keeps the heading fallback", async (t) => {
+  const root = await tempRoot(t);
+  await writeFiles(root, {
+    "memory/separated.md": "---\ndescription: first\u2028second\n---\n# Heading Fallback\nbody",
+    "memory/plain.md": "---\ndescription: 'Quoted plain'\n---\nbody",
+  });
+  const backend = createNotesBackend();
+  t.after(() => backend.close());
+  const page = await backend.browse(
+    { target: "notes", limit: 10 },
+    { storeId: "synthetic", workspaceRoot: root, memoryFiles: [], sessions: [] },
+  );
+  assert.deepEqual(
+    page.hits.map((hit) => [hit.source.path, hit.excerpt]),
+    [["memory/plain.md", "Quoted plain"], ["memory/separated.md", "Heading Fallback"]],
+  );
+});
+
+function fdTargetExists(target) {
+  let entries;
+  try {
+    entries = readdirSync("/proc/self/fd");
+  } catch {
+    return false;
+  }
+  for (const entry of entries) {
+    try {
+      if (readlinkSync(`/proc/self/fd/${entry}`) === target) return true;
+    } catch {
+      // The descriptor may close between readdir and readlink.
+    }
+  }
+  return false;
+}
+
+test("a failed parent close never leaks the open note descriptor", async (t) => {
+  if (typeof registerHooks !== "function") {
+    t.skip("module.registerHooks is unavailable on this runtime");
+    return;
+  }
+  const root = await tempRoot(t);
+  const note = join(root, "memory", "note.md");
+  await writeFiles(root, { "memory/note.md": "---\ndescription: leak probe\n---\n# Leak Probe\nbody" });
+  // Node gives every FileHandle a per-instance `close`, so a prototype patch cannot inject a
+  // failure. Route a fresh copy of the notes backend to a shim whose first created handle fails
+  // its close for real after closing: that first handle is the note's parent directory, closed in
+  // `noteHandle`'s cleanup while the note descriptor is already open.
+  const shim = `data:text/javascript,${encodeURIComponent([
+    'import * as real from "node:fs/promises";',
+    "export * from 'node:fs/promises';",
+    "let armed = true;",
+    "export const open = async (...args) => {",
+    "  const handle = await real.open(...args);",
+    "  if (armed) {",
+    "    armed = false;",
+    "    const close = handle.close;",
+    "    handle.close = async () => {",
+    "      await close.call(handle);",
+    '      throw Object.assign(new Error("synthetic parent close failure"), { code: "EIO" });',
+    "    };",
+    "  }",
+    "  return handle;",
+    "};",
+  ].join("\n"))}`;
+  const marker = "notes.js?close-failure";
+  const hooks = registerHooks({
+    resolve(specifier, context, nextResolve) {
+      if (specifier === "node:fs/promises" && String(context.parentURL).includes(marker)) {
+        return { url: shim, shortCircuit: true };
+      }
+      return nextResolve(specifier, context);
+    },
+  });
+  t.after(() => hooks.deregister());
+  const notesModule = await import(new URL(`../dist/memory/notes.js?close-failure`, import.meta.url).href);
+  const backend = notesModule.createNotesBackend();
+  t.after(() => backend.close());
+  const scope = { storeId: "synthetic", workspaceRoot: root, memoryFiles: [], sessions: [] };
+  const ref = { kind: "note", path: "memory/note.md", fingerprint: "synthetic" };
+  await assert.rejects(
+    backend.read({ ref, limit: 64 }, ref, scope),
+    /Note is unsafe, changed, unreadable or no longer available/,
+  );
+  assert.equal(fdTargetExists(note), false, "the note descriptor does not survive the failed parent close");
+  assert.equal(fdTargetExists(join(root, "memory")), false, "the parent directory is closed behind its failing close");
 });

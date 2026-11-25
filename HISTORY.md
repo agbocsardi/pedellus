@@ -677,7 +677,7 @@ summaries can incur provider costs.
   Truncation is never silent.
   Ordinary message text is cut at its head with a `[... N more characters truncated]` marker. A tool
   call's arguments or a tool result that does not fit is quoted through the same memory-recall
-  head-tail preview (`clipPreview` in `digestion.ts`): a beginning, an omission marker naming how many
+  head-tail preview (`clipPreview` in `transcript.ts`, shared with `digestion.ts`): a beginning, an omission marker naming how many
   characters were left out and the durable `entry:<id>/tool-call|tool-result/<key>` reference of the
   original item, then an end. That preview uses the rest of the entry bound, so any later part of the
   entry is reported with the same counted marker instead of disappearing, and a remaining bound too
@@ -1040,6 +1040,14 @@ reopen, the config-over-seam deadline precedence, and the single native parked-t
   arms the next occurrence in its own deterministic commit; a slow or failed digest cannot stop
   the schedule. Cancelling the job stops its occurrence and later ones; an already-started digest
   task is a separate native task and is cancelled through the native task controls.
+
+A run whose turn outcome stays unknown (the wait could prove neither an answer, a failure nor a
+withdrawal) ends `unknown` with its batch unacknowledged. Every later start, manual or scheduled and
+across reopen, returns `refused` naming that run instead of re-admitting the same frontier: the turn
+may already have been answered and the batch curated, so a replay would be blind. The hold lifts on
+its own only when Durable proves the run's own input settled `unanswered` without ever being placed.
+Known gap: no owner command acknowledges a held run whose turn was placed or answered; such a run
+must be inspected manually (`/digest status` shows it) and digestion stays held until then.
 
 Completion is issues-only: a failed or cancelled run admits one bounded internal Durable event,
 never a user or channel message. Its entry kind is `nanobot.memory-digest-result`, it is admitted to

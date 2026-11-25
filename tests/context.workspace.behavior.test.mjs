@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdirSync, readdirSync, readlinkSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { chmod, link, mkdir, mkdtemp, open, rm, symlink, writeFile } from "node:fs/promises";
+import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -801,4 +802,49 @@ test("identity source limits count code points and revoked proxies are typed inp
   const revokedIdentity = Proxy.revocable({ source: "session:x", content: "identity" }, {});
   revokedIdentity.revoke();
   await assert.rejects(load(root, { identity: revokedIdentity.proxy }), isInputError);
+});
+
+test("a failed close during root traversal never leaks the newly opened directory", async (t) => {
+  if (typeof registerHooks !== "function") {
+    t.skip("module.registerHooks is unavailable on this runtime");
+    return;
+  }
+  const root = await tempRoot(t);
+  // Node gives every FileHandle a per-instance `close`, so a prototype patch can never inject a
+  // failure. Route a fresh copy of fs-safe.js to a shim instead: its second close really closes and
+  // then fails. The traversal closes `/` cleanly and fails on the tmpdir handle right after
+  // the workspace-root directory was opened, so a leaked new descriptor is visible as an open fd
+  // targeting the root.
+  const shim = `data:text/javascript,${encodeURIComponent([
+    'import * as real from "node:fs/promises";',
+    "export * from 'node:fs/promises';",
+    "let closes = 0;",
+    "export const open = async (...args) => {",
+    "  const handle = await real.open(...args);",
+    "  const close = handle.close;",
+    "  handle.close = async () => {",
+    "    await close.call(handle);",
+    "    closes += 1;",
+    '    if (closes === 2) throw Object.assign(new Error("synthetic close failure"), { code: "EIO" });',
+    "  };",
+    "  return handle;",
+    "};",
+  ].join("\n"))}`;
+  const marker = "fs-safe.js?close-failure";
+  const hooks = registerHooks({
+    resolve(specifier, context, nextResolve) {
+      if (specifier === "node:fs/promises" && String(context.parentURL).includes(marker)) {
+        return { url: shim, shortCircuit: true };
+      }
+      return nextResolve(specifier, context);
+    },
+  });
+  t.after(() => hooks.deregister());
+  const fsSafe = await import(new URL(`../dist/context/fs-safe.js?close-failure`, import.meta.url).href);
+  const failures = [];
+  await assert.rejects(
+    fsSafe.openAbsoluteDirectoryNoFollow(root, (error) => { failures.push(error); return error; }),
+    (error) => failures.length === 1 && error.code === "EIO" && error.message === "synthetic close failure",
+  );
+  assert.equal(fdTargetExists(root), false, "no descriptor survives the failed traversal");
 });

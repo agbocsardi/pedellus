@@ -18,21 +18,42 @@
  * whose directory name is unsafe or whose files are symlinks are reported in
  * `skipped` rather than dropped without trace.
  *
- * Scope is accidental damage, not adversarial confinement: no content-size
- * budget applies, UTF-8 failures are rejected, and symlinked skill entries are
- * skipped. There is no `/proc/self/fd` pinning or post-read race verification.
+ * Reads are pinned like the workspace loader (see `fs-safe.ts`): beneath each
+ * explicitly named root, skill directories and `SKILL.md` files are opened
+ * through `/proc/self/fd` without following symlinks, hard-link aliases are
+ * refused (reported in `skipped`), and a file that changes during its read is
+ * a failure. The root path itself may contain symlinks because the host named
+ * it; `<workspaceRoot>/skills` may not be a symlink. No content-size budget
+ * applies and UTF-8 failures are rejected. There is no whole-tree recheck after
+ * all reads. Linux-only, like the rest of the workspace loaders.
  */
 import { constants } from "node:fs";
-import { access, lstat, readFile, readdir, stat } from "node:fs/promises";
-import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { access, readdir, stat } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
+import { delimiter, join, resolve } from "node:path";
 import { CONTEXT_LIMITS, type ContextSkillSnapshot } from "./index.js";
+import {
+  CONTROL_CHARACTERS,
+  DIRECTORY_FLAGS,
+  FsSafeError,
+  SAFE_ASCII_NAME as SAFE_SKILL_NAME,
+  clipCodePoints,
+  decodeUtf8,
+  errorCode,
+  frontmatterField,
+  isRecord,
+  openPinned,
+  openRootDirectory,
+  ownDataField as ownDataFieldWith,
+  pinnedFsSupported,
+  procFdPath,
+  readPinnedFile,
+  validatedRoot as validatedRootWith,
+} from "./fs-safe.js";
 
 /** Deterministic provenance prefixes. */
 const WORKSPACE_SOURCE_PREFIX = "workspace:skills/";
 const BUILTIN_SOURCE_PREFIX = "builtin:skills/";
-const RESTRICTED_ROOTS = Object.freeze(["/proc", "/sys", "/dev"]);
-const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
-const SAFE_SKILL_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const FRONTMATTER = /^---\s*\r?\n([\s\S]*?)\r?\n---\s*(?:\r?\n|$)/;
 const FRONTMATTER_KEY = /^[A-Za-z0-9_.-]+$/;
 
@@ -108,7 +129,12 @@ export interface SkillRequirements {
 }
 
 /** A directory entry that looks like a skill but is refused before its body is read. */
-export type SkippedSkillReason = "unsafe-name" | "name-too-long" | "symlinked-skill" | "symlinked-file";
+export type SkippedSkillReason =
+  | "unsafe-name"
+  | "name-too-long"
+  | "symlinked-skill"
+  | "symlinked-file"
+  | "hardlinked-file";
 
 export interface SkippedSkill {
   /** Bounded, control-character-free directory name only; never an absolute path. */
@@ -185,27 +211,12 @@ interface LoadState {
   readonly skipped: SkippedSkill[];
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  if (value === null || typeof value !== "object") return false;
-  try {
-    return !Array.isArray(value);
-  } catch {
-    return false;
-  }
-}
+const inputError = (message: string): Error => new SkillsContextInputError(message);
+const pinnedError = (kind: FsSafeError["kind"], source: string): Error => new FsSafeError(kind, source);
 
+/** Own data properties only: an inherited or accessor-backed field is refused, never read. */
 function ownDataField(value: unknown, key: string, label: string): { found: boolean; value: unknown } {
-  if (value === null || (typeof value !== "object" && typeof value !== "function")) {
-    throw new SkillsContextInputError(`${label} must be an object`);
-  }
-  const descriptor = Object.getOwnPropertyDescriptor(value, key);
-  if (descriptor === undefined) {
-    return { found: key in value, value: undefined };
-  }
-  if (!Object.hasOwn(descriptor, "value")) {
-    throw new SkillsContextInputError(`${label}.${key} must be an own data property`);
-  }
-  return { found: true, value: descriptor.value };
+  return ownDataFieldWith(value, key, label, inputError);
 }
 
 function ownArray(value: unknown, label: string): readonly unknown[] {
@@ -213,25 +224,8 @@ function ownArray(value: unknown, label: string): readonly unknown[] {
   return value;
 }
 
-function isWithin(parent: string, child: string): boolean {
-  const path = relative(parent, child);
-  return path === "" || (path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path));
-}
-
 function validatedRoot(value: unknown, label: string): string {
-  if (typeof value !== "string" || value.length === 0 ||
-      value.length > SKILLS_CONTEXT_LIMITS.maxRootChars ||
-      !isAbsolute(value) || CONTROL_CHARACTERS.test(value)) {
-    throw new SkillsContextInputError(`${label} must be an explicit absolute path`);
-  }
-  const root = resolve(value);
-  if (root === sep) throw new SkillsContextInputError(`${label} must not be the filesystem root`);
-  for (const restricted of RESTRICTED_ROOTS) {
-    if (isWithin(restricted, root)) {
-      throw new SkillsContextInputError(`${label} must not be inside a restricted system directory`);
-    }
-  }
-  return root;
+  return validatedRootWith(value, label, { maxChars: SKILLS_CONTEXT_LIMITS.maxRootChars }, inputError);
 }
 
 function validatedNames(value: unknown, label: string): readonly string[] {
@@ -263,47 +257,26 @@ function validatedEnvironment(value: unknown): Readonly<Record<string, string | 
   return Object.freeze(environment);
 }
 
-function failureKind(code: string | undefined): SkillFileFailureKind {
-  if (code === "EACCES" || code === "EPERM") return "unreadable";
-  return "io";
-}
-
-function fileFailure(error: unknown, source: string): SkillsContextFileError {
+/** Map a pinned-read failure onto this module's stable file-error kinds. */
+function skillFileError(error: unknown, source: string): SkillsContextFileError {
   if (error instanceof SkillsContextFileError) return error;
-  return new SkillsContextFileError(failureKind((error as NodeJS.ErrnoException | null)?.code), source);
+  const kind = error instanceof FsSafeError ? error.kind : undefined;
+  if (kind === "unreadable" || kind === "encoding") return new SkillsContextFileError(kind, source);
+  return new SkillsContextFileError("io", source);
 }
 
-async function assertDirectory(path: string, label: string): Promise<void> {
-  let info;
-  try {
-    info = await stat(path);
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException | null)?.code;
-    if (code === "ENOENT") throw new SkillsContextInputError(`${label} must exist`);
-    if (code === "EACCES" || code === "EPERM") throw new SkillsContextInputError(`${label} is not readable`);
-    if (code === "ENOTDIR") throw new SkillsContextInputError(`${label} must be a directory`);
-    throw new SkillsContextInputError(`${label} cannot be read`);
+/** Open a host-named root; symlinks in its own path are followed, nothing beneath it is. */
+async function openDirectory(path: string, label: string): Promise<FileHandle> {
+  if (!pinnedFsSupported()) {
+    throw new SkillsContextInputError("Skills context loading requires Linux /proc/self/fd and O_NOFOLLOW support");
   }
-  if (!info.isDirectory()) throw new SkillsContextInputError(`${label} must be a directory`);
-}
-
-function decodeUtf8(buffer: Buffer, source: string): string {
-  try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(buffer);
-  } catch {
-    throw new SkillsContextFileError("encoding", source);
-  }
-}
-
-function clipCodePoints(value: string, limit: number): string {
-  let count = 0;
-  let end = 0;
-  for (const character of value) {
-    if (count >= limit) return value.slice(0, end);
-    end += character.length;
-    count++;
-  }
-  return value;
+  return openRootDirectory(path, (error) => {
+    const code = errorCode(error);
+    if (code === "ENOENT") return new SkillsContextInputError(`${label} must exist`);
+    if (code === "EACCES" || code === "EPERM") return new SkillsContextInputError(`${label} is not readable`);
+    if (code === "ENOTDIR") return new SkillsContextInputError(`${label} must be a directory`);
+    return new SkillsContextInputError(`${label} cannot be read`);
+  });
 }
 
 function deepFreeze<T>(value: T): T {
@@ -391,12 +364,10 @@ function parseFrontmatter(content: string): FrontmatterParse {
   let reason: SkillMetadataReason | undefined;
   for (let index = 0; index < lines.length; index++) {
     const line = lines[index]!;
-    if (!line.trim() || line.trimStart().startsWith("#") || /^[ \t]/.test(line)) continue;
-    const colon = line.indexOf(":");
-    if (colon <= 0) continue;
-    const key = line.slice(0, colon).trim();
-    if (!FRONTMATTER_KEY.test(key)) continue;
-    const raw = line.slice(colon + 1).trim();
+    if (!line.trim() || /^[ \t]/.test(line)) continue;
+    const field = frontmatterField(line);
+    if (field === undefined || !FRONTMATTER_KEY.test(field.key)) continue;
+    const { key, value: raw } = field;
     if (key !== "metadata") {
       if (raw.length > 0) parsed[key] = parseScalar(raw);
       continue;
@@ -575,8 +546,12 @@ function recordSkipped(state: LoadState, name: string, reason: SkippedSkillReaso
   }));
 }
 
+/**
+ * Scan one pinned skills directory. `skills/` beneath the workspace root is
+ * opened without following a symlink; a builtin root is the host-named root.
+ */
 async function scanSkillRoot(
-  rootPath: string,
+  root: FileHandle,
   sourcePrefix: string,
   workspaceRelative: boolean,
   state: LoadState,
@@ -584,9 +559,8 @@ async function scanSkillRoot(
 ): Promise<void> {
   let entries;
   try {
-    entries = await readdir(rootPath, { withFileTypes: true });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") return;
+    entries = await readdir(procFdPath(root.fd), { withFileTypes: true });
+  } catch {
     throw new SkillsContextFileError("unreadable", sourcePrefix);
   }
   entries.sort((left, right) => left.name.localeCompare(right.name));
@@ -609,28 +583,38 @@ async function scanSkillRoot(
     }
 
     const source = `${sourcePrefix}${entry.name}/SKILL.md`;
-    const skillFile = join(rootPath, entry.name, "SKILL.md");
-    let info;
+    let directory: FileHandle;
     try {
-      info = await lstat(skillFile);
+      directory = await openPinned(root, entry.name, DIRECTORY_FLAGS, source, pinnedError);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") continue;
-      throw fileFailure(error, source);
+      const kind = (error as FsSafeError).kind;
+      if (kind === "missing") continue;
+      if (kind === "symlink") {
+        recordSkipped(state, entry.name, "symlinked-skill");
+        continue;
+      }
+      throw skillFileError(error, source);
     }
-    if (info.isSymbolicLink()) {
-      recordSkipped(state, entry.name, "symlinked-file");
-      continue;
-    }
-    if (!info.isFile()) continue;
-
     let buffer: Buffer;
     try {
-      buffer = await readFile(skillFile);
+      ({ buffer } = await readPinnedFile(directory, "SKILL.md", source, pinnedError));
     } catch (error) {
-      throw fileFailure(error, source);
+      const kind = (error as FsSafeError).kind;
+      if (kind === "missing" || kind === "not-regular") continue;
+      if (kind === "symlink") {
+        recordSkipped(state, entry.name, "symlinked-file");
+        continue;
+      }
+      if (kind === "hardlink") {
+        recordSkipped(state, entry.name, "hardlinked-file");
+        continue;
+      }
+      throw skillFileError(error, source);
+    } finally {
+      await directory.close().catch(() => undefined);
     }
 
-    const content = decodeUtf8(buffer, source);
+    const content = decodeUtf8(buffer, () => new SkillsContextFileError("encoding", source));
     const frontmatter = parseFrontmatter(content);
     state.records.push({
       name: entry.name,
@@ -643,6 +627,22 @@ async function scanSkillRoot(
         ...(frontmatter.reason !== undefined ? { reason: frontmatter.reason } : {}),
       }),
     });
+  }
+}
+
+/** `<workspaceRoot>/skills`; absent means no workspace skills and is never created. */
+async function scanWorkspaceSkills(workspace: FileHandle, state: LoadState): Promise<void> {
+  let skills: FileHandle;
+  try {
+    skills = await openPinned(workspace, "skills", DIRECTORY_FLAGS, WORKSPACE_SOURCE_PREFIX, pinnedError);
+  } catch (error) {
+    if ((error as FsSafeError).kind === "missing") return;
+    throw new SkillsContextFileError("unreadable", WORKSPACE_SOURCE_PREFIX);
+  }
+  try {
+    await scanSkillRoot(skills, WORKSPACE_SOURCE_PREFIX, true, state);
+  } finally {
+    await skills.close().catch(() => undefined);
   }
 }
 
@@ -719,13 +719,21 @@ export async function loadSkillsContext(
     ownDataField(request, "environment", "Skills context request").value,
   );
 
-  await assertDirectory(workspaceRoot, "workspaceRoot");
   const state: LoadState = { records: [], skipped: [] };
-  await scanSkillRoot(join(workspaceRoot, "skills"), WORKSPACE_SOURCE_PREFIX, true, state);
+  const workspace = await openDirectory(workspaceRoot, "workspaceRoot");
+  try {
+    await scanWorkspaceSkills(workspace, state);
+  } finally {
+    await workspace.close().catch(() => undefined);
+  }
   if (builtinRoot !== undefined) {
-    await assertDirectory(builtinRoot, "builtinSkillsRoot");
-    const workspaceNames = new Set(state.records.map((record) => record.name));
-    await scanSkillRoot(builtinRoot, BUILTIN_SOURCE_PREFIX, false, state, workspaceNames);
+    const builtin = await openDirectory(builtinRoot, "builtinSkillsRoot");
+    try {
+      const workspaceNames = new Set(state.records.map((record) => record.name));
+      await scanSkillRoot(builtin, BUILTIN_SOURCE_PREFIX, false, state, workspaceNames);
+    } finally {
+      await builtin.close().catch(() => undefined);
+    }
   }
 
   const discovered: DiscoveredSkill[] = [];

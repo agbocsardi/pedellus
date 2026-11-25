@@ -84,7 +84,6 @@ import {
   type Extension,
   type Harness,
   type HookRegistration,
-  type NextTaskState,
   type Submission,
   type SubmissionRecord,
   type Task,
@@ -96,7 +95,7 @@ import {
 } from "@earendil-works/pi-durable";
 import { createEditTool, createWriteTool } from "@earendil-works/pi-durable/tools";
 import { supportsExclusiveFileCreate } from "../execution/host.js";
-import { CRON_INPUT_ENTRY_KIND } from "../automation/cron.js";
+import { MEMORY_DIR, PROTECTED_MEMORY_NAMES, SAFE_ASCII_NAME } from "../context/fs-safe.js";
 import { loadMemoryContext } from "../context/memory.js";
 import { loadSkillsContext } from "../context/skills.js";
 import type {
@@ -107,11 +106,20 @@ import type {
   DigestSource,
 } from "./digestion.js";
 import { DIGEST_RUN_LIMITS_DEFAULT, digestRunLimitsFrom, validateDigestRunLimits, type DigestRunLimits } from "./digest-limits.js";
+import { InterruptedRunReportsDoc } from "../recovery/interruption.js";
 import {
-  consumeInterruptedRunReport,
-  InterruptedRunReportsDoc,
-  interruptedRunReportPending,
-} from "../recovery/interruption.js";
+  consumeInterruptedRun,
+  extractAssistantText,
+  interruptedRunSuppressed,
+  placedEntryOf,
+  resultEntryMatches as committedResultMatches,
+  terminalAborted,
+  terminalCompleted,
+  terminalFailed,
+  waitForTurnAnswer,
+  withdrawTargetWork,
+  type ConversationCommitter,
+} from "../tasks/background.js";
 
 export const MEMORY_DIGEST_TASK_NAME = "nanobot.memory-digest";
 export const MEMORY_DIGEST_EXTENSION_NAME = "nanobot.memory-digest";
@@ -184,6 +192,16 @@ export const MEMORY_DIGEST_NOTICE_FULL_REASON =
   "retry after an earlier run's result is admitted or its native task is settled";
 
 /** Fixed refusal when no explicit background model is configured; the foreground one is never used. */
+/**
+ * Refusal while a run's turn outcome is unknown: its unacknowledged batch is held, never replayed.
+ * No owner command acknowledges such a run yet; the hold lifts only on proof the turn never ran.
+ */
+export function memoryDigestHeldReason(taskId: number): string {
+  return `memory digest run ${taskId} ended with an unknown outcome: its turn may still have been answered and ` +
+    "its batch curated, so digestion holds that unacknowledged frontier instead of replaying it. " +
+    "/digest status shows the held run; digestion resumes once Durable proves that turn never ran.";
+}
+
 export const MEMORY_DIGEST_MODEL_REQUIRED_REASON =
   "memory digestion needs an explicit background model in digest.preset or digest.model; it never " +
   "inherits the foreground conversation's model or thinking level";
@@ -279,8 +297,6 @@ failed run, never as successful work.
 const LIVE_STATUSES = ["pending", "running", "waiting", "sleeping", "completing"] as const;
 type LiveStatus = (typeof LIVE_STATUSES)[number];
 
-const SAFE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
-const LEGACY_NAMES = new Set(["MEMORY.md", "HISTORY.md"]);
 
 /**
  * Why a workspace-relative path is outside the memory curation scope, or undefined when it is in
@@ -295,7 +311,7 @@ export function memoryDigestScopeProblem(path: string): string | undefined {
   for (const segment of segments) {
     if (segment.length === 0) return "the path has an empty segment";
     if (segment === "." || segment === "..") return "the path has a relative segment";
-    if (!SAFE_SEGMENT.test(segment)) return "the path has an unsafe segment";
+    if (!SAFE_ASCII_NAME.test(segment)) return "the path has an unsafe segment";
   }
   if (!path.endsWith(".md")) return "only Markdown files are curated";
   const base = segments[segments.length - 1]!;
@@ -304,8 +320,8 @@ export function memoryDigestScopeProblem(path: string): string | undefined {
       ? undefined
       : "only SOUL.md, USER.md, memory/**/*.md and skills/<name>/SKILL.md are curated";
   }
-  if (segments[0] === "memory") {
-    return LEGACY_NAMES.has(base) ? `${base} is a legacy name and is not curated` : undefined;
+  if (segments[0] === MEMORY_DIR) {
+    return PROTECTED_MEMORY_NAMES.has(base) ? `${base} is a legacy name and is not curated` : undefined;
   }
   if (segments[0] === "skills") {
     if (segments.length !== 3 || base !== "SKILL.md") return "only skills/<name>/SKILL.md is curated";
@@ -934,7 +950,7 @@ export type MemoryDigestCheckpoint = {
   readonly usageUnknown?: boolean;
 };
 
-export type MemoryDigestOutcome = "digested" | "noop" | "consumed" | "failed" | "aborted";
+export type MemoryDigestOutcome = "digested" | "noop" | "consumed" | "failed" | "aborted" | "unknown";
 
 /** Bounded, value-only outcome. The run's own transcript keeps the full answer. */
 export interface MemoryDigestRunResult {
@@ -974,10 +990,7 @@ export interface MemoryDigestRunResult {
   readonly diffChars?: number | null;
 }
 
-export interface MemoryDigestWriter {
-  readonly id: ConversationId;
-  commit<T>(change: (tx: Tx) => T | Promise<T>, context: Context): Promise<T>;
-}
+export type MemoryDigestWriter = ConversationCommitter;
 
 export type MemoryDigestStartResult =
   | {
@@ -1366,26 +1379,8 @@ function consumedThrough(cursor: DigestCursor, input: MemoryDigestTaskInput): bo
   return cursor.nextTextStart >= input.nextTextStart;
 }
 
-function terminalCompleted(result: MemoryDigestRunResult): NextTaskState<MemoryDigestCheckpoint, MemoryDigestRunResult> {
-  return { status: "terminal", outcome: { status: "completed", result } };
-}
-
-function terminalFailed(
-  result: MemoryDigestRunResult,
-  message: string,
-): NextTaskState<MemoryDigestCheckpoint, MemoryDigestRunResult> {
-  return { status: "terminal", outcome: { status: "failed", error: { message }, result } };
-}
-
-function terminalAborted(
-  result: MemoryDigestRunResult,
-  reason: string,
-): NextTaskState<MemoryDigestCheckpoint, MemoryDigestRunResult> {
-  return { status: "terminal", outcome: { status: "aborted", reason, result } };
-}
-
 interface Settlement {
-  readonly status: "ok" | "error";
+  readonly status: "ok" | "error" | "unknown";
   /** Committed input entry of the turn, when the submission placed one. */
   readonly entryId: EntryId | null;
   readonly answerEntryId: EntryId | null;
@@ -1412,39 +1407,32 @@ function settlementOf(record: SubmissionRecord): Settlement {
   return { status: "error", entryId: null, answerEntryId: null, error: "the digest turn settled without an answer" };
 }
 
-/** Wait for the native submission, but notice a turn that ended without answering it. */
+/** Wait for the native submission, but notice a turn that ended without answering it. An unresolved wait is neither answered nor failed: its outcome is `unknown`, so nothing is reported as a failure and no captured authority is withdrawn while the admitted input can still run. */
 async function waitForAnswer(
   submission: Submission,
   conversation: Pick<ConversationHandle, "waitForIdle">,
   context: Context,
 ): Promise<Settlement> {
-  const settled = submission.wait(context).then(
-    (record) => ({ kind: "settled" as const, record }),
-    (error: unknown) => ({ kind: "failed" as const, error }),
-  );
-  const idle = conversation.waitForIdle(context).then(
-    () => ({ kind: "idle" as const }),
-    (error: unknown) => ({ kind: "failed" as const, error }),
-  );
-  void settled.catch(() => undefined);
-  void idle.catch(() => undefined);
-  const first = await Promise.race([settled, idle]);
-  if (first.kind === "failed") throw first.error;
-  if (first.kind === "settled") return settlementOf(first.record);
-  const record = await submission.status(context);
-  if (record.status === "done" || record.status === "unanswered") return settlementOf(record);
-  try { await submission.abort(context); } catch { /* already placed or settled */ }
+  const wait = await waitForTurnAnswer(submission, conversation, context);
+  if (wait.kind === "settled") return settlementOf(wait.record);
+  if (wait.kind === "unresolved") {
+    return {
+      status: "unknown",
+      entryId: typeof wait.record?.entry === "number" ? wait.record.entry as EntryId : null,
+      answerEntryId: null,
+      error: "the digest turn's outcome is unknown: the admitted input may still be answered after this task ended; the batch was not acknowledged",
+    };
+  }
   return {
     status: "error",
-    entryId: typeof record.entry === "number" ? record.entry as EntryId : null,
+    entryId: typeof wait.record.entry === "number" ? wait.record.entry as EntryId : null,
     answerEntryId: null,
     error: "the digest turn ended before answering its batch",
   };
 }
 
 function answerText(entry: { readonly model?: readonly unknown[] } | undefined): string | null {
-  const message = entry?.model?.[0] as AssistantMessage | undefined;
-  const body = (message?.content.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("") ?? "").trim();
+  const body = extractAssistantText(entry).trim();
   return body === "" ? null : bounded(body, MEMORY_DIGEST_LIMITS.maxAnswerChars);
 }
 
@@ -1819,6 +1807,10 @@ function estimateEpisode(batch: DigestBatch): { tokens: number; requests: number
 }
 
 export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
+  // Resolved per read, so a closing Harness is an unreadable record rather than a thrown phase.
+  const lazyHarnessReader = {
+    snapshot: (doc: typeof InterruptedRunReportsDoc, context: Context) => options.harness().snapshot(doc, context),
+  };
   const limits = options.limits ?? DIGEST_RUN_LIMITS_DEFAULT;
   validateDigestRunLimits(limits);
   if (!Number.isSafeInteger(options.episodesPerRun ?? 1) || (options.episodesPerRun ?? 1) < 1) {
@@ -1862,6 +1854,28 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
   const resultRequestId = (taskId: number): string => `${MEMORY_DIGEST_RESULT_REQUEST_PREFIX}${taskId}`;
 
   /**
+   * The newest terminal run whose turn outcome is unknown, while that outcome stays unproven. Its
+   * batch was never acknowledged, so the frontier still selects it, yet the admitted turn may have
+   * been (or may still be) answered and curated: re-admitting it would be a blind replay. The hold
+   * lifts on its own only on proof the turn never ran — Durable settled the run's own input
+   * unanswered without ever placing it (for example the reopen pass withdrew it). A placed, answered
+   * or unreadable turn stays held. Read-only and before any write, so it runs inside the start
+   * commit and across reopen alike.
+   */
+  const txHeldUnknownRun = async (tx: Tx): Promise<number | undefined> => {
+    const newest = (await tx.scanTasks({ kind: MEMORY_DIGEST_TASK_NAME, status: "terminal", order: "descending" }, 1)).items[0];
+    if (newest === undefined) return undefined;
+    const result = digestResultOf(newest);
+    if (result?.outcome !== "unknown") return undefined;
+    const taskId = Number(newest.id);
+    const target = result.targetConversationId;
+    if (target === null || !Number.isSafeInteger(target) || target < 1) return taskId;
+    const turn = await tx.submissionByRequest(target as ConversationId, `memory-digest:${taskId}`);
+    const neverRan = turn !== undefined && turn.type === "input" && turn.status === "unanswered" && turn.entry === undefined;
+    return neverRan ? undefined : taskId;
+  };
+
+  /**
    * The one bounded internal issue report. Fixed wording plus this run's bounded saved fields; no
    * file content, no raw provider error dump and no channel send. The agent in the origin
    * conversation decides what, if anything, to relay to its user.
@@ -1892,37 +1906,19 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
     return lines.join("\n");
   };
 
-  /** The entry one submission has actually placed, if any. A queued input has none yet. */
-  const placedEntryOf = (record: SubmissionRecord): EntryId | undefined => {
-    if (record.type !== "input") return undefined;
-    if (record.status === "placed" || record.status === "done") return record.entry;
-    return record.status === "unanswered" ? record.entry : undefined;
-  };
-
   /**
    * Durable dedupes an input by request ID alone, not by entry kind. Before treating a request ID
    * as this result's admission, the placed entry must be this task's internal result in this exact
    * origin conversation. A queued, missing or foreign entry is not proof and never marks reported.
    */
-  const resultEntryMatches = async (
+  const resultEntryMatches = (
     harness: Harness,
     origin: ConversationId,
     taskId: number,
     entryId: EntryId | undefined,
     context: Context,
-  ): Promise<boolean> => {
-    if (entryId === undefined) return false;
-    try {
-      const entry = await harness.commit((tx) => tx.entry(entryId), context);
-      return entry !== undefined
-        && entry.conversationId === origin
-        && entry.kind === MEMORY_DIGEST_RESULT_ENTRY_KIND
-        && isRecord(entry.data)
-        && entry.data.taskId === taskId;
-    } catch {
-      return false;
-    }
-  };
+  ): Promise<boolean> =>
+    committedResultMatches(harness, origin, { kind: MEMORY_DIGEST_RESULT_ENTRY_KIND, taskId }, entryId, context);
 
   /**
    * Keep a terminal run visible when its record is missing and Durable holds a foreign or queued
@@ -2097,20 +2093,6 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
     }
   };
 
-  /** Stop the target's own pending work. Best effort; the terminal commit still retires authority. */
-  const withdrawTarget = async (
-    runtime: Pick<TaskRuntime<MemoryDigestTaskInput, MemoryDigestCheckpoint, MemoryDigestRunResult, object>, "conversation">,
-    target: ConversationId,
-    context: Context,
-  ): Promise<void> => {
-    try {
-      const conversation = await runtime.conversation(target, context);
-      if (conversation !== undefined) await conversation.abort(context);
-    } catch {
-      // A retired capture is the durable guarantee; this only stops extra work sooner.
-    }
-  };
-
   const runTask: Task<MemoryDigestTaskInput, MemoryDigestCheckpoint, MemoryDigestRunResult, object> =
     defineTask<MemoryDigestTaskInput, MemoryDigestCheckpoint, MemoryDigestRunResult>({
       name: MEMORY_DIGEST_TASK_NAME,
@@ -2155,7 +2137,8 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
 
           /** Terminal commit: retire captured authority and record the bounded outcome. */
           const finish = async (
-            settle: { readonly status: "completed" } | { readonly status: "failed"; readonly message: string },
+            settle: { readonly status: "completed" } | { readonly status: "failed"; readonly message: string }
+              | { readonly status: "unknown"; readonly message: string },
             result: MemoryDigestRunResult,
             answerEntryId: EntryId | null,
           ): Promise<void> => {
@@ -2205,16 +2188,12 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
             // terminal result are one commit, so a reopen cannot resurrect the report.
             let reportSuppressed = false;
             if (target !== null && settle.status === "failed") {
-              try {
-                reportSuppressed = interruptedRunReportPending(
-                  await options.harness().snapshot(InterruptedRunReportsDoc, context), Number(running.id), target);
-              } catch {
-                // An unreadable record must not fail the terminal commit; the run reports as usual.
-              }
+              // An unreadable record must not fail the terminal commit; the run reports as usual.
+              reportSuppressed = await interruptedRunSuppressed(lazyHarnessReader, Number(running.id), target, context);
             }
             await runtime.commit(async (tx) => {
               if (reportSuppressed) {
-                consumeInterruptedRunReport(await tx.doc(InterruptedRunReportsDoc), Number(running.id), target!);
+                await consumeInterruptedRun(tx, Number(running.id), target!);
               }
               if (target !== null) {
                 try {
@@ -2248,7 +2227,9 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
               };
               return settle.status === "completed"
                 ? terminalCompleted(next)
-                : terminalFailed(next, settle.message);
+                : settle.status === "unknown"
+                  ? terminalAborted(next, settle.message)
+                  : terminalFailed(next, settle.message);
             }, context);
             if (nextInput !== undefined) return;
             try {
@@ -2275,9 +2256,31 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
             await finish({ status: "failed", message: result.error ?? "failed" }, result, settlement.answerEntryId);
           };
 
+          /** An unresolved turn is held, not failed: the batch stays unacknowledged and the target keeps its captured authority for the reopen pass to prune. */
+          const holdUnknown = async (error: string | null): Promise<void> => {
+            const result: MemoryDigestRunResult = {
+              outcome: "unknown",
+              error: error === null ? null : bounded(error, MEMORY_DIGEST_LIMITS.maxErrorChars),
+              sessionKey: parsed?.sessionKey ?? null,
+              conversationId: parsed?.conversationId ?? null,
+              throughEntryId: parsed?.throughEntryId ?? null,
+              complete: parsed?.complete ?? null,
+              evidenceEntries: 0,
+              consumed: false,
+              targetConversationId: target === null ? null : Number(target),
+              answerEntryId: settlement.answerEntryId === null ? null : Number(settlement.answerEntryId),
+              answer: null,
+            };
+            await finish(
+              { status: "unknown", message: result.error ?? "the digest turn's outcome is unknown" },
+              result,
+              settlement.answerEntryId,
+            );
+          };
+
           if (parsed === undefined) {
             // A damaged record still retires whatever target it already prepared.
-            if (target !== null) await withdrawTarget(runtime, target, context);
+            if (target !== null) await withdrawTargetWork(runtime, target, context);
             const result: MemoryDigestRunResult = {
               outcome: "failed",
               error: "memory digest task input is invalid",
@@ -2306,7 +2309,7 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
           if (consumedThrough(cursor, parsed)) {
             // An earlier attempt acknowledged this batch and then crashed before its terminal
             // commit. Nothing is re-run: report the durable truth and let this task settle.
-            if (target !== null) await withdrawTarget(runtime, target, context);
+            if (target !== null) await withdrawTargetWork(runtime, target, context);
             const result: MemoryDigestRunResult = {
               outcome: "consumed",
               error: null,
@@ -2374,7 +2377,7 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
           // The model chosen at start must still be configured. A narrowed catalog never silently
           // substitutes another model: this run fails closed without a provider call or cursor move.
           if (!options.allowModel(parsed.model)) {
-            if (target !== null) await withdrawTarget(runtime, target, context);
+            if (target !== null) await withdrawTargetWork(runtime, target, context);
             await failed("the digest model is no longer in the configured model catalog");
             return;
           }
@@ -2395,7 +2398,7 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
             try {
               use = await digestRunUsage(options.harness(), target, parsed.limits, context);
             } catch (error) {
-              await withdrawTarget(runtime, target, context);
+              await withdrawTargetWork(runtime, target, context);
               await failed(
                 `the digest run's spending budget could not be read: ` +
                 `${error instanceof Error ? error.message : String(error)}`,
@@ -2403,7 +2406,7 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
               return;
             }
             if (!parsed.limits.spendingAdmissionOnly && use.successfulRequests >= parsed.limits.maxRequests) {
-              await withdrawTarget(runtime, target, context);
+              await withdrawTargetWork(runtime, target, context);
               await failed(
                 "memory digestion reached its configured successful-response budget before another request; " +
                 "the batch was not acknowledged",
@@ -2411,7 +2414,7 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
               return;
             }
             if (use.unaccountedResponses > 0) {
-              await withdrawTarget(runtime, target, context);
+              await withdrawTargetWork(runtime, target, context);
               await failed(
                 "memory digestion cannot verify a committed response's reported usage; " +
                 "the batch was not acknowledged",
@@ -2419,7 +2422,7 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
               return;
             }
             if (!parsed.limits.spendingAdmissionOnly && use.chargedInputTokens >= parsed.limits.maxInputTokens) {
-              await withdrawTarget(runtime, target, context);
+              await withdrawTargetWork(runtime, target, context);
               await failed(
                 "memory digestion reached its configured input-token budget before another request; " +
                 "the batch was not acknowledged",
@@ -2472,7 +2475,7 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
             prompt = await loadCurationPrompt(options.workspaceRoot);
             index = await loadWorkspaceIndex(options.workspaceRoot);
           } catch (error) {
-            await withdrawTarget(runtime, targetId, context);
+            await withdrawTargetWork(runtime, targetId, context);
             await failed(
               `the digest prompt or workspace index could not be read: ${error instanceof Error ? error.message : String(error)}`,
             );
@@ -2480,7 +2483,7 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
           }
 
           if (deadline !== null && clock() >= deadline) {
-            await withdrawTarget(runtime, targetId, context);
+            await withdrawTargetWork(runtime, targetId, context);
             await failed("the digest turn exceeded its time budget before it settled");
             return;
           }
@@ -2526,7 +2529,7 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
               } finally {
                 disarm?.();
               }
-              if (settlement.status !== "ok") await withdrawTarget(runtime, targetId, context);
+              if (settlement.status === "error") await withdrawTargetWork(runtime, targetId, context);
             }
           } catch (error) {
             if (runtime.signal.aborted) return;
@@ -2538,6 +2541,14 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
             };
           }
           if (runtime.signal.aborted) return;
+
+          if (settlement.status === "unknown") {
+            // Hold: the admitted input may still answer in the target conversation, so the batch is
+            // not acknowledged, no failure is reported, and the target's captured authority is
+            // left for the reopen pass to prune once the task is terminal.
+            await holdUnknown(settlement.error);
+            return;
+          }
 
           if (settlement.status !== "ok") {
             const transcript = await digestTranscriptUse(options.harness(), targetId, parsed.limits, context)
@@ -2554,7 +2565,7 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
           // unverifiable range or an empty report fails the batch without an acknowledgement, and the
           // same accounting applies to a resumed attempt after a reopen.
           if (settlement.entryId === null || settlement.answerEntryId === null) {
-            await withdrawTarget(runtime, targetId, context);
+            await withdrawTargetWork(runtime, targetId, context);
             await failed(TURN_FAILURE_REASONS.unverifiable);
             return;
           }
@@ -2573,7 +2584,7 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
             checked = { status: "failed", reason: TURN_FAILURE_REASONS.unverifiable };
           }
           if (checked.status !== "ok") {
-            await withdrawTarget(runtime, targetId, context);
+            await withdrawTargetWork(runtime, targetId, context);
             await failed(checked.reason);
             return;
           }
@@ -2644,15 +2655,11 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
             // An unreadable frontier is reported as not consumed; the cursor is never inferred.
           }
         }
-        if (target !== null) await withdrawTarget(runtime, target, context);
+        if (target !== null) await withdrawTargetWork(runtime, target, context);
         let reportSuppressed = false;
         if (target !== null) {
-          try {
-            reportSuppressed = interruptedRunReportPending(
-              await options.harness().snapshot(InterruptedRunReportsDoc, context), Number(running.id), target);
-          } catch {
-            // Same bounded rule: an unreadable record never blocks the cancellation commit.
-          }
+          // Same bounded rule: an unreadable record never blocks the cancellation commit.
+          reportSuppressed = await interruptedRunSuppressed(lazyHarnessReader, Number(running.id), target, context);
         }
         const result: MemoryDigestRunResult = {
           outcome: "aborted",
@@ -2676,7 +2683,7 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
         };
         await runtime.commit(async (tx) => {
           if (reportSuppressed) {
-            consumeInterruptedRunReport(await tx.doc(InterruptedRunReportsDoc), Number(running.id), target!);
+            await consumeInterruptedRun(tx, Number(running.id), target!);
           }
           if (target !== null) {
             try {
@@ -2724,6 +2731,8 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
         // retry to make here: the next start after it settles takes the batch.
         return { status: "busy", taskId: running };
       }
+      const held = await options.harness().commit((tx) => txHeldUnknownRun(tx), context);
+      if (held !== undefined) return { status: "refused", reason: memoryDigestHeldReason(held) };
       // Bounded backpressure before consuming a batch: try once to admit every retained result.
       await flushPending(options.harness(), writer.id, context);
       const selected = await writer.commit((tx) => options.model(tx, writer.id), context);
@@ -2742,6 +2751,8 @@ export function createMemoryDigest(options: MemoryDigestOptions): MemoryDigest {
         // Re-check inside the commit so two host callers cannot both start a run for one frontier.
         const live = await txLiveTask(tx);
         if (live !== undefined) return { status: "busy", taskId: live };
+        const heldRun = await txHeldUnknownRun(tx);
+        if (heldRun !== undefined) return { status: "refused", reason: memoryDigestHeldReason(heldRun) };
         // Reserve the notice slot atomically with the task. Only a definitively reported or
         // genuinely nonreportable record may free one; an undelivered or unknown result never does.
         const notices = await tx.doc(MemoryDigestNoticesDoc, writer.id);

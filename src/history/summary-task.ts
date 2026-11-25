@@ -59,6 +59,7 @@ import {
   type TaskRuntime,
   type Tx,
 } from "@earendil-works/pi-durable";
+import { terminalAborted, terminalCompleted, terminalFailed } from "../tasks/background.js";
 import { EPISODE_SUMMARIZER_VERSION, EpisodeDoc, type HistoryEpisode } from "./episodes.js";
 import {
   EPISODE_SUMMARY_FAILURES,
@@ -162,13 +163,6 @@ Title: <one short line>
 ## Keywords
 
 Aim for at most ${EPISODE_SUMMARY_SOURCE_LIMITS.targetSummaryTokens} tokens of final summary text; use less when sufficient. This target applies only to the final summary, not hidden reasoning. Do not include reasoning or a token-count report in the answer. Preserve exact identifiers, paths, commands and error text when they matter.`;
-
-const terminalCompleted = <S extends { phase: string }, R>(result: R): NextTaskState<S, R> =>
-  ({ status: "terminal", outcome: { status: "completed", result } });
-const terminalAborted = <S extends { phase: string }, R>(result: R, reason: string): NextTaskState<S, R> =>
-  ({ status: "terminal", outcome: { status: "aborted", reason, result } });
-const terminalFailed = <S extends { phase: string }, R>(result: R, message: string): NextTaskState<S, R> =>
-  ({ status: "terminal", outcome: { status: "failed", error: { message }, result } });
 
 function foldPrompt(previous: string | null, transcript: string, coverage: EpisodeSummaryCoverage): string {
   const count = coverage.truncatedEntries;

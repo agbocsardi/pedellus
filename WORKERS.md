@@ -249,7 +249,33 @@ formatted deterministically (no summarizer model call), labeled as internal, and
 worker output is untrusted data rather than user instructions. When steering was accepted, it reports
 how many messages were part of the live worker and whether any had to be cancelled at completion.
 Its admission uses the conversation-scoped request ID `nanobot.worker-result:<taskId>`, and a reopen
-re-attempts any admission a crash interrupted: a retry cannot duplicate the parent turn.
+re-attempts any admission a crash interrupted: a retry cannot duplicate the parent turn. The
+admission and the record's ownership of it (the native submission ID) are one commit, so no Stop or
+crash can land between them, and a commit that fails rolls the admission back with it. Durable
+dedupes by request ID alone, so the record is marked notified only when the submission under that
+ID has placed this worker's own `nanobot.worker-result` entry in the spawning conversation — never
+while it is merely queued in the inbox, because a Stop can still withdraw a queued input. A
+confirmed withdrawal moves to the next attempt's request ID and is redelivered once; that new
+request ID is checked in the same commit before anything is admitted under it, so a pre-existing
+input there is never adopted as this worker's. A foreign input holding the current (or the next)
+request ID is not proof: the record is held (`resultHeld`), stays unnotified, is never evicted, and
+no reopen admits a duplicate or advances past it.
+
+A worker whose turn outcome is unresolved (its admitted input may still run after the task ended)
+ends natively `aborted`, because a task cannot end itself `orphaned`, while its record says
+`orphaned`. List, inspect, transcript, steering and the app's Tasks view show that pair as
+`orphaned` (the app's `failed` state), never as a cancellation; a real owner cancellation records
+`aborted` and is shown cancelled. A result that startup recovery deliberately suppressed records
+`resultSuppressed` with its terminal outcome on both the finish and the cancellation path, so the
+row stays evictable without an admission.
+
+Records written before this rule could mark `notified` while the event was still only queued (or
+settled before ownership was ever recorded). Such legacy rows are reconciled before anything is
+admitted or evicted for them: one whose submission is still queued with this worker's entry is
+downgraded to pending and delivered by the normal path; one whose entry is placed is confirmed; one
+that settled without a placed entry and without recorded ownership is an unknown outcome — it is
+kept forever (`resultHeld` on the record), reported as neither delivered nor failed, never pruned
+and never resubmitted under that request ID. Inspect held rows manually.
 
 Nothing here writes a channel outbox or sends user-facing text. The worker never messages the user.
 The spawning agent decides what, if anything, to relay.

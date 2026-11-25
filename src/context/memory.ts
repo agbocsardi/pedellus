@@ -18,27 +18,48 @@
  * and description, and carries deterministic provenance labels that never
  * contain the absolute root.
  *
- * Scope is accidental damage, not adversarial confinement: reads use normal
- * filesystem calls with no content-size budget. Symlinked topic entries are
- * skipped rather than followed; an explicitly named loaded file that is a
- * symlink is rejected. There is no `/proc/self/fd` pinning and no post-read
- * race verification, so a swap between the check and the read is not detected.
+ * Reads are pinned like the workspace loader (see `fs-safe.ts`): beneath the
+ * explicitly named root, every directory is opened through `/proc/self/fd`
+ * with `O_DIRECTORY | O_NOFOLLOW`, files with `O_NOFOLLOW`, hard-link aliases are
+ * refused, and a file that changes during its read or whose name no longer
+ * names the read inode is a failure. Symlinked topic entries are skipped rather
+ * than followed; an explicitly named loaded file that is a symlink is rejected.
+ * The root path itself may contain symlinks because the host named it. There is
+ * no content-size budget and no whole-tree recheck after all reads, so a swap
+ * after a file's own check is not detected. Linux-only, like the rest of the
+ * workspace loaders.
  */
-import { constants } from "node:fs";
-import type { BigIntStats } from "node:fs";
-import { lstat, open, readdir, stat } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { readdir } from "node:fs/promises";
 import { CONTEXT_LIMITS, type ContextDocumentSnapshot } from "./index.js";
+import {
+  CONTROL_CHARACTERS,
+  DIRECTORY_FLAGS,
+  FsSafeError,
+  type FileErrorFactory,
+  MEMORY_DIR,
+  MEMORY_SYSTEM_DIR as SYSTEM_DIR,
+  PROTECTED_MEMORY_NAMES as PROTECTED_NAMES,
+  clipCodePoints as codePointPrefix,
+  codePointCount,
+  decodeUtf8,
+  errorCode,
+  frontmatterField,
+  isRecord,
+  openPinned,
+  openRootDirectory,
+  ownDataField as ownDataFieldWith,
+  pinnedFsSupported,
+  procFdPath,
+  readPinnedFile,
+  safeMemorySegment,
+  unquoteFrontmatter,
+  validatedRoot as validatedRootWith,
+} from "./fs-safe.js";
 
 /** Deterministic provenance prefixes. */
 const WORKSPACE_SOURCE_PREFIX = "workspace:";
 const MANIFEST_SOURCE = "memory:manifest";
-const MEMORY_DIR = "memory";
-const SYSTEM_DIR = "system";
-const RESTRICTED_ROOTS = Object.freeze(["/proc", "/sys", "/dev"]);
-const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
-const PROTECTED_NAMES = Object.freeze(new Set(["MEMORY.md", "HISTORY.md"]));
 
 /**
  * Discovery limits. There is no entry cap: every discovered topic and every
@@ -140,73 +161,18 @@ interface FrontmatterSplit {
   readonly body: string;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  if (value === null || typeof value !== "object") return false;
-  try {
-    return !Array.isArray(value);
-  } catch {
-    return false;
-  }
-}
+const inputError = (message: string): Error => new MemoryContextInputError(message);
+const fileError: FileErrorFactory = (kind, source) => new MemoryContextFileError(kind, source);
 
 function ownDataField(value: unknown, key: string, label: string): { found: boolean; value: unknown } {
-  if (value === null || (typeof value !== "object" && typeof value !== "function")) {
-    throw new MemoryContextInputError(`${label} must be an object`);
-  }
-  let descriptor: PropertyDescriptor | undefined;
-  try {
-    descriptor = Object.getOwnPropertyDescriptor(value, key);
-  } catch {
-    throw new MemoryContextInputError(`${label}.${key} is unreadable`);
-  }
-  if (descriptor === undefined) {
-    let inherited = false;
-    try {
-      inherited = key in value;
-    } catch {
-      inherited = true;
-    }
-    if (inherited) throw new MemoryContextInputError(`${label}.${key} must be an own data property`);
-    return { found: false, value: undefined };
-  }
-  if (!Object.hasOwn(descriptor, "value")) {
-    throw new MemoryContextInputError(`${label}.${key} must be an own data property`);
-  }
-  return { found: true, value: descriptor.value };
-}
-
-function isWithin(parent: string, child: string): boolean {
-  const path = relative(parent, child);
-  return path === "" || (path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path));
+  return ownDataFieldWith(value, key, label, inputError);
 }
 
 function validatedRoot(value: unknown): string {
-  if (typeof value !== "string" || value.length === 0 ||
-      value.length > MEMORY_CONTEXT_LIMITS.maxRootChars ||
-      !isAbsolute(value) || CONTROL_CHARACTERS.test(value)) {
-    throw new MemoryContextInputError("workspaceRoot must be an explicit absolute path");
-  }
-  const root = resolve(value);
-  if (root === sep) throw new MemoryContextInputError("workspaceRoot must not be the filesystem root");
-  if (root.split(sep).some((component) => component.toLowerCase() === ".nanobot")) {
-    throw new MemoryContextInputError("workspaceRoot must not overlap the default ~/.nanobot location");
-  }
-  for (const restricted of RESTRICTED_ROOTS) {
-    if (isWithin(restricted, root)) {
-      throw new MemoryContextInputError("workspaceRoot must not be inside a restricted system directory");
-    }
-  }
-  return root;
-}
-
-/**
- * Path-segment rule: any name the filesystem may hold, except control
- * characters, dot segments, and Unicode line separators (which would break one
- * entry per line in the manifest). This is a locator shape, never a content cap.
- */
-function safeMemorySegment(segment: string): boolean {
-  return segment.length > 0 && segment !== "." && segment !== ".." &&
-    !CONTROL_CHARACTERS.test(segment) && !/[\u2028\u2029]/.test(segment);
+  return validatedRootWith(value, "workspaceRoot", {
+    maxChars: MEMORY_CONTEXT_LIMITS.maxRootChars,
+    refuseNanobot: true,
+  }, inputError);
 }
 
 /**
@@ -274,59 +240,31 @@ export function validateMemoryLoadedFiles(value: unknown): readonly string[] {
   return Object.freeze(paths);
 }
 
-function failureKind(code: string | undefined): MemoryFileFailureKind {
-  switch (code) {
-    case "ENOENT":
-      return "missing";
-    case "ELOOP":
-      return "symlink";
-    case "EACCES":
-    case "EPERM":
-      return "unreadable";
-    case "ENOTDIR":
-      return "not-directory";
-    case "EISDIR":
-      return "not-regular";
-    default:
-      return "io";
+/** Open the host-named root; symlinks in its own path are followed, nothing beneath it is. */
+async function openWorkspaceDirectory(rootPath: string): Promise<FileHandle> {
+  if (!pinnedFsSupported()) {
+    throw new MemoryContextInputError("Memory context loading requires Linux /proc/self/fd and O_NOFOLLOW support");
   }
-}
-
-function fileFailure(error: unknown, source: string): MemoryContextFileError {
-  if (error instanceof MemoryContextFileError) return error;
-  return new MemoryContextFileError(failureKind((error as NodeJS.ErrnoException | null)?.code), source);
-}
-
-async function assertWorkspaceDirectory(rootPath: string): Promise<void> {
-  let info;
-  try {
-    info = await stat(rootPath);
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException | null)?.code;
-    if (code === "ENOENT") throw new MemoryContextInputError("workspaceRoot must exist");
-    if (code === "EACCES" || code === "EPERM") throw new MemoryContextInputError("workspaceRoot is not readable");
-    if (code === "ENOTDIR") throw new MemoryContextInputError("workspaceRoot must be a directory");
-    throw new MemoryContextInputError("workspaceRoot cannot be read");
-  }
-  if (!info.isDirectory()) throw new MemoryContextInputError("workspaceRoot must be a directory");
+  return openRootDirectory(rootPath, (error) => {
+    const code = errorCode(error);
+    if (code === "ENOENT") return new MemoryContextInputError("workspaceRoot must exist");
+    if (code === "EACCES" || code === "EPERM") return new MemoryContextInputError("workspaceRoot is not readable");
+    if (code === "ENOTDIR") return new MemoryContextInputError("workspaceRoot must be a directory");
+    return new MemoryContextInputError("workspaceRoot cannot be read");
+  });
 }
 
 /** A missing `memory/` means no topics; it is never created. */
-async function hasMemoryDirectory(rootPath: string): Promise<boolean> {
-  const path = join(rootPath, MEMORY_DIR);
-  let info;
+async function openMemoryDirectory(root: FileHandle): Promise<FileHandle | undefined> {
   try {
-    info = await lstat(path);
+    return await openPinned(root, MEMORY_DIR, DIRECTORY_FLAGS, MEMORY_DIR, (kind, source) => new FsSafeError(kind, source));
   } catch (error) {
-    const code = (error as NodeJS.ErrnoException | null)?.code;
-    if (code === "ENOENT") return false;
+    const kind = (error as FsSafeError).kind;
+    if (kind === "missing") return undefined;
+    if (kind === "symlink") throw new MemoryContextInputError("workspace memory directory must not be a symlink");
+    if (kind === "not-directory") throw new MemoryContextInputError("workspace memory must be a directory");
     throw new MemoryContextInputError("workspace memory directory cannot be read");
   }
-  if (info.isSymbolicLink()) {
-    throw new MemoryContextInputError("workspace memory directory must not be a symlink");
-  }
-  if (!info.isDirectory()) throw new MemoryContextInputError("workspace memory must be a directory");
-  return true;
 }
 
 function directorySource(segments: readonly string[]): string {
@@ -334,7 +272,7 @@ function directorySource(segments: readonly string[]): string {
 }
 
 async function scanTopics(
-  memoryDirPath: string,
+  directory: FileHandle,
   segments: readonly string[],
   state: ScanState,
   found: string[],
@@ -342,12 +280,8 @@ async function scanTopics(
   if (state.truncated) return;
   let entries;
   try {
-    entries = await readdir(memoryDirPath, { withFileTypes: true });
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException | null)?.code;
-    // A subdirectory that disappears mid-scan contributes nothing; the caller
-    // keeps the entries it has already discovered.
-    if (code === "ENOENT") return;
+    entries = await readdir(procFdPath(directory.fd), { withFileTypes: true });
+  } catch {
     throw new MemoryContextFileError("unreadable", directorySource(segments));
   }
 
@@ -375,7 +309,22 @@ async function scanTopics(
         state.refused++;
         continue;
       }
-      await scanTopics(join(memoryDirPath, name), nextSegments, state, found);
+      let child: FileHandle;
+      try {
+        child = await openPinned(directory, name, DIRECTORY_FLAGS, directorySource(nextSegments),
+          (kind, source) => new FsSafeError(kind, source));
+      } catch (error) {
+        // A subdirectory that disappears (or is swapped for a link) mid-scan
+        // contributes nothing; the caller keeps what it already discovered.
+        const kind = (error as FsSafeError).kind;
+        if (kind === "missing" || kind === "symlink") continue;
+        throw new MemoryContextFileError("unreadable", directorySource(nextSegments));
+      }
+      try {
+        await scanTopics(child, nextSegments, state, found);
+      } finally {
+        await child.close().catch(() => undefined);
+      }
       continue;
     }
     if (!entry.isFile() || !name.endsWith(".md") || PROTECTED_NAMES.has(name)) continue;
@@ -402,24 +351,6 @@ function locatorBoundName(name: string): boolean {
   return name.length <= MEMORY_CONTEXT_LIMITS.maxPathSegmentChars && safeMemorySegment(name);
 }
 
-function codePointCount(value: string): number {
-  let count = 0;
-  for (const _character of value) count++;
-  return count;
-}
-
-function codePointPrefix(value: string, limit: number): string {
-  if (limit <= 0) return "";
-  let count = 0;
-  let end = 0;
-  for (const character of value) {
-    if (count >= limit) return value.slice(0, end);
-    end += character.length;
-    count++;
-  }
-  return value;
-}
-
 function clipDescription(value: string): string {
   // A manifest entry stays one line and carries no control characters.
   const singleLine = value.replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
@@ -440,13 +371,9 @@ function splitFrontmatter(content: string): FrontmatterSplit {
   if (content[closeEnd] === "\r") closeEnd++;
   if (content[closeEnd] === "\n") closeEnd++;
   for (const line of content.slice(openLength, end).split(/\r?\n/)) {
-    if (line.trimStart().startsWith("#")) continue;
-    const colon = line.indexOf(":");
-    if (colon <= 0) continue;
-    const key = line.slice(0, colon).trim().toLowerCase();
-    if (!key) continue;
-    const value = line.slice(colon + 1).trim().replace(/^["']+|["']+$/g, "");
-    meta.set(key, value);
+    const field = frontmatterField(line);
+    if (field === undefined) continue;
+    meta.set(field.key.toLowerCase(), unquoteFrontmatter(field.value));
   }
   return { meta, body: content.slice(closeEnd) };
 }
@@ -465,101 +392,30 @@ function parseEntry(content: string): { description: string; bodyChars: number }
   return { description: "(missing description)", bodyChars };
 }
 
-function decodeUtf8(buffer: Buffer, source: string): string {
-  try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(buffer);
-  } catch {
-    throw new MemoryContextFileError("encoding", source);
-  }
-}
-
-/** A failed `fstat` is a file failure for this topic, never an untyped rejection of the whole load. */
-async function statHandle(handle: FileHandle, path: string): Promise<BigIntStats> {
-  try {
-    return await handle.stat({ bigint: true });
-  } catch (error) {
-    throw fileFailure(error, path);
-  }
-}
-
 /**
  * Read one file only to derive its manifest entry. The body is discarded;
- * callers read topic content on demand with the native `read` tool.
+ * callers read topic content on demand with the native `read` tool. Every
+ * ancestor below the root is opened without following a symlink, so a
+ * symlinked `memory/` or `memory/system/` is refused instead of read through.
  */
 async function readManifestEntry(
-  rootPath: string,
+  root: FileHandle,
   path: string,
 ): Promise<{ description: string; bodyChars: number }> {
   const segments = path.split("/");
-  // Check every ancestor below the workspace root. `lstat` on the full path
-  // would resolve an intermediate symlink and read through it; a symlinked
-  // `memory/` or `memory/system/` must be refused instead. The root itself is
-  // accepted because the host named it explicitly.
-  let parentPath = rootPath;
-  for (const segment of segments.slice(0, -1)) {
-    parentPath = join(parentPath, segment);
-    let parentInfo;
-    try {
-      parentInfo = await lstat(parentPath);
-    } catch (error) {
-      throw fileFailure(error, path);
-    }
-    if (parentInfo.isSymbolicLink()) throw new MemoryContextFileError("symlink", path);
-    if (!parentInfo.isDirectory()) throw new MemoryContextFileError("not-directory", path);
-  }
-
-  const absolute = join(rootPath, ...segments);
-  let info;
+  const name = segments.pop()!;
+  const opened: FileHandle[] = [];
+  let parent = root;
   try {
-    info = await lstat(absolute);
-  } catch (error) {
-    throw fileFailure(error, path);
-  }
-  if (info.isSymbolicLink()) throw new MemoryContextFileError("symlink", path);
-  if (!info.isFile()) throw new MemoryContextFileError("not-regular", path);
-
-  const flags = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
-  const handle: FileHandle = await open(absolute, flags).catch((error: unknown) => {
-    throw fileFailure(error, path);
-  });
-  let buffer: Buffer;
-  try {
-    const before = await statHandle(handle, path);
-    if (!before.isFile()) throw new MemoryContextFileError("not-regular", path);
-    if (before.nlink !== 1n) throw new MemoryContextFileError("hardlink", path);
-    const size = Number(before.size);
-    if (!Number.isSafeInteger(size)) {
-      throw new MemoryContextFileError("io", path);
+    for (const segment of segments) {
+      parent = await openPinned(parent, segment, DIRECTORY_FLAGS, path, fileError);
+      opened.push(parent);
     }
-    try {
-      buffer = Buffer.alloc(size);
-    } catch (error) {
-      // A size the runtime cannot allocate is a read failure for this file, not
-      // a silent skip or an untyped crash; the body is never partially parsed.
-      throw fileFailure(error, path);
-    }
-    let offset = 0;
-    while (offset < size) {
-      let bytesRead: number;
-      try {
-        ({ bytesRead } = await handle.read(buffer, offset, size - offset, offset));
-      } catch (error) {
-        throw fileFailure(error, path);
-      }
-      if (bytesRead === 0) throw new MemoryContextFileError("changed", path);
-      offset += bytesRead;
-    }
-    const after = await statHandle(handle, path);
-    if (before.dev !== after.dev || before.ino !== after.ino || before.nlink !== after.nlink ||
-        before.size !== after.size || before.mtimeNs !== after.mtimeNs ||
-        before.ctimeNs !== after.ctimeNs) {
-      throw new MemoryContextFileError("changed", path);
-    }
+    const { buffer } = await readPinnedFile(parent, name, path, fileError);
+    return parseEntry(decodeUtf8(buffer, () => new MemoryContextFileError("encoding", path)));
   } finally {
-    await handle.close().catch(() => undefined);
+    for (const handle of opened.reverse()) await handle.close().catch(() => undefined);
   }
-
-  return parseEntry(decodeUtf8(buffer, path));
 }
 
 function comparePaths(left: string, right: string): number {
@@ -629,40 +485,49 @@ export async function loadMemoryContext(request: MemoryContextRequest): Promise<
   const loadedFiles = validateMemoryLoadedFiles(loadedField.found ? loadedField.value : undefined);
   const loaded = new Set(loadedFiles);
 
-  await assertWorkspaceDirectory(rootPath);
-  const state: ScanState = { scanned: 0, truncated: false, refused: 0 };
-  const topics: string[] = [];
-  if (await hasMemoryDirectory(rootPath)) {
-    await scanTopics(join(rootPath, MEMORY_DIR), [], state, topics);
-  }
-
-  // Every discovered topic and every explicitly loaded file is listed; there is
-  // no entry cap, so nothing is hidden behind a count.
-  const shown = [...new Set([...loadedFiles, ...topics])].sort(comparePaths);
-
+  const root = await openWorkspaceDirectory(rootPath);
   const entries: MemoryTopicEntry[] = [];
+  const state: ScanState = { scanned: 0, truncated: false, refused: 0 };
   let skipped = 0;
-  for (const path of shown) {
-    const isLoaded = loaded.has(path);
-    let parsed: { description: string; bodyChars: number };
-    try {
-      parsed = await readManifestEntry(rootPath, path);
-    } catch (error) {
-      // A discovered topic may be stale, unreadable or not UTF-8; that must not
-      // block Gateway reopen. Explicitly loaded files stay loud.
-      if (!isLoaded && error instanceof MemoryContextFileError) {
-        skipped++;
-        continue;
+  try {
+    const topics: string[] = [];
+    const memory = await openMemoryDirectory(root);
+    if (memory !== undefined) {
+      try {
+        await scanTopics(memory, [], state, topics);
+      } finally {
+        await memory.close().catch(() => undefined);
       }
-      throw error;
     }
-    entries.push(Object.freeze({
-      path,
-      source: `${WORKSPACE_SOURCE_PREFIX}${path}`,
-      state: isLoaded ? "loaded" : "topic",
-      description: parsed.description,
-      bodyChars: parsed.bodyChars,
-    }));
+
+    // Every discovered topic and every explicitly loaded file is listed; there is
+    // no entry cap, so nothing is hidden behind a count.
+    const shown = [...new Set([...loadedFiles, ...topics])].sort(comparePaths);
+
+    for (const path of shown) {
+      const isLoaded = loaded.has(path);
+      let parsed: { description: string; bodyChars: number };
+      try {
+        parsed = await readManifestEntry(root, path);
+      } catch (error) {
+        // A discovered topic may be stale, unreadable or not UTF-8; that must not
+        // block Gateway reopen. Explicitly loaded files stay loud.
+        if (!isLoaded && error instanceof MemoryContextFileError) {
+          skipped++;
+          continue;
+        }
+        throw error;
+      }
+      entries.push(Object.freeze({
+        path,
+        source: `${WORKSPACE_SOURCE_PREFIX}${path}`,
+        state: isLoaded ? "loaded" : "topic",
+        description: parsed.description,
+        bodyChars: parsed.bodyChars,
+      }));
+    }
+  } finally {
+    await root.close().catch(() => undefined);
   }
 
   const manifest = buildManifest(entries, skipped, state.refused, state.truncated);

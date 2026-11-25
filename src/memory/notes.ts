@@ -1,9 +1,20 @@
-import { constants } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { open, readdir } from "node:fs/promises";
 import type { BigIntStats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import { isAbsolute, resolve, sep } from "node:path";
+import {
+  CONTROL_CHARACTERS,
+  DIRECTORY_FLAGS,
+  FILE_FLAGS,
+  LINE_SEPARATORS,
+  RESTRICTED_ROOTS,
+  isWithin,
+  openAbsoluteDirectoryNoFollow,
+  pinnedChildPath as childPath,
+  procFdPath,
+  unquoteFrontmatter,
+} from "../context/fs-safe.js";
 import type { MemoryBackend, MemoryCoverage, MemoryHit, MemoryPage, MemoryQuery, MemoryReadPage, MemoryScope } from "./contracts.js";
 import { decodeToken, encodeRef, encodeToken, hash } from "./validation.js";
 
@@ -12,42 +23,34 @@ const FILES_PER_PASS = 32;
 const TTL = 10 * 60_000;
 const MAX_SNAPSHOTS = 48;
 const MAX_METADATA_CHARS = 1_048_576;
-const CONTROL = /[\u0000-\u001f\u007f\u2028\u2029]/;
 type Note = { path: string; identity: string; fingerprint?: string; description?: string; matched?: boolean };
 type Snapshot = { id: string; secret: string; root: string; authority: string; key: string; notes: Note[]; position: number; unreadable: number; expires: number };
 type NoteRead = { fingerprint: string; description: string; matched: boolean; content: string; total: number };
 
 function fail(message: string): never { throw new Error(message); }
 function validPath(path: unknown): path is string {
-  return typeof path === "string" && path.length <= 1_024 && path.startsWith("memory/") && path.endsWith(".md") && !path.includes("\\") && !CONTROL.test(path) && !path.split("/").some((part) => !part || part === "." || part === "..");
+  return typeof path === "string" && path.length <= 1_024 && path.startsWith("memory/") && path.endsWith(".md") && !path.includes("\\") && !CONTROL_CHARACTERS.test(path) && !LINE_SEPARATORS.test(path) && !path.split("/").some((part) => !part || part === "." || part === "..");
 }
 function scopeIdentity(scope: MemoryScope): { root: string; authority: string } {
   if (!scope.storeId || !isAbsolute(scope.workspaceRoot) || !Array.isArray(scope.memoryFiles) || scope.memoryFiles.some((path) => !validPath(path))) fail("Notes scope is invalid");
   const root = resolve(scope.workspaceRoot);
-  if (root === sep || ["/proc", "/sys", "/dev"].some((path) => root === path || root.startsWith(`${path}/`))) fail("Notes workspace is not allowed");
+  if (root === sep || RESTRICTED_ROOTS.some((path) => isWithin(path, root))) fail("Notes workspace is not allowed");
   return { root, authority: hash({ storeId: scope.storeId, root, memoryFiles: [...scope.memoryFiles].sort() }) };
 }
 function identity(info: BigIntStats): string { return [info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs, info.nlink].join(":"); }
 function directoryIdentity(info: BigIntStats): string { return [info.dev, info.ino, info.mtimeNs, info.ctimeNs].join(":"); }
-function childPath(parent: FileHandle, name: string): string { return `/proc/self/fd/${parent.fd}/${name}`; }
-const DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 /** Linux dirfd-style traversal: each component is opened beneath a pinned descriptor, never a checked pathname. */
-async function directory(root: string): Promise<FileHandle> {
-  let handle = await open("/", DIRECTORY_FLAGS);
-  try {
-    for (const part of root.split("/").filter(Boolean)) {
-      const next = await open(childPath(handle, part), DIRECTORY_FLAGS);
-      await handle.close(); handle = next;
-    }
-    return handle;
-  } catch { await handle.close().catch(() => undefined); return fail("Notes directory is unavailable or unsafe"); }
+function directory(root: string): Promise<FileHandle> {
+  return openAbsoluteDirectoryNoFollow(root, () => new Error("Notes directory is unavailable or unsafe"));
 }
 async function beneath(root: string, relative: string): Promise<FileHandle> {
   let handle = await directory(root);
   try {
     for (const part of relative.split("/").filter(Boolean)) {
       const next = await open(childPath(handle, part), DIRECTORY_FLAGS);
-      await handle.close(); handle = next;
+      // Own the new descriptor before closing the previous one, so a failed close cannot leak it.
+      const previous = handle; handle = next;
+      await previous.close();
     }
     return handle;
   } catch (error) { await handle.close().catch(() => undefined); throw error; }
@@ -56,14 +59,27 @@ async function noteHandle(root: string, path: string): Promise<FileHandle> {
   if (!validPath(path)) return fail("Note path is outside the memory scope");
   const parts = path.split("/"); const name = parts.pop()!;
   const parent = await beneath(root, parts.join("/"));
+  let handle: FileHandle | undefined;
+  let failure: unknown; let failed = false;
   try {
-    const handle = await open(childPath(parent, name), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-    try {
-      const info = await handle.stat({ bigint: true });
-      if (!info.isFile() || info.nlink !== 1n) fail("Note is not a safe regular file");
-      return handle;
-    } catch (error) { await handle.close().catch(() => undefined); throw error; }
-  } finally { await parent.close(); }
+    handle = await open(childPath(parent, name), FILE_FLAGS);
+    const info = await handle.stat({ bigint: true });
+    if (!info.isFile() || info.nlink !== 1n) fail("Note is not a safe regular file");
+  } catch (error) {
+    failed = true; failure = error;
+    await handle?.close().catch(() => undefined);
+    handle = undefined;
+  }
+  try {
+    await parent.close();
+  } catch (closeError) {
+    // The already-open note descriptor must not leak behind a failed parent close, and the note's
+    // own error, when there was one, stays the propagated one instead of being masked.
+    await handle?.close().catch(() => undefined);
+    if (!failed) throw closeError;
+  }
+  if (failed) throw failure;
+  return handle!;
 }
 /** A manifest is captured fully on the first call. Bounds refuse explicitly, never claim partial enumeration is complete. */
 async function manifest(root: string, configured: readonly string[]): Promise<{ notes: Note[]; unreadable: number }> {
@@ -80,7 +96,7 @@ async function manifest(root: string, configured: readonly string[]): Promise<{ 
     try {
       const before = await handle.stat({ bigint: true });
       dirs.push({ path, identity: directoryIdentity(before) });
-      const entries = await readdir(`/proc/self/fd/${handle.fd}`, { withFileTypes: true });
+      const entries = await readdir(procFdPath(handle.fd), { withFileTypes: true });
       for (const entry of entries) {
         if (++scanned > MAX_MANIFEST_ENTRIES) fail("Notes manifest exceeds the 100000-entry bound; narrow the workspace before browsing");
         const child = `${path}/${entry.name}`;
@@ -132,8 +148,10 @@ async function readNote(root: string, path: string, options: { expectedIdentity?
       if (firstLine) { firstLine = false; if (value === "---") { inHeader = true; return; } }
       if (inHeader) {
         if (value.startsWith("---")) { inHeader = false; if (headerDescription) { descriptionValue = headerDescription; metadataDone = true; } return; }
+        // Deliberately the original pattern: `.` stops at embedded U+2028/U+2029, so such a line is
+        // not a description and the first heading is used instead.
         const match = /^\s*description\s*:\s*(.*)$/i.exec(value);
-        if (match) headerDescription = match[1]!.trim().replace(/^["']+|["']+$/g, "");
+        if (match) headerDescription = unquoteFrontmatter(match[1]!.trim());
         if (!firstHeading && value.trim().startsWith("#")) firstHeading = value.trim().replace(/^#+/, "").trim();
       } else if (value.trim().startsWith("#")) { descriptionValue = value.trim().replace(/^#+/, "").trim(); metadataDone = true; }
     };

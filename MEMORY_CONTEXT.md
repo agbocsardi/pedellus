@@ -146,11 +146,14 @@ configured memory files, matching Python's order.
 
 ## Safety and limitations
 
-Scope is accidental damage, not adversarial confinement. Reads use normal
-filesystem calls with bounds and `O_NOFOLLOW`; observed symlinks are skipped or
-rejected, additional hard links (`nlink != 1`) are rejected, and metadata is
-compared before and after the read. There is no `/proc/self/fd` pinning, so a
-swap between check and open or read is not detected. A `memory/` symlink is
+Scope is accidental damage, not adversarial confinement. Reads share the
+workspace loader's pinned primitives (`src/context/fs-safe.ts`, Linux-only):
+below the explicit root, every directory is opened through `/proc/self/fd` with
+`O_DIRECTORY | O_NOFOLLOW` and every file with `O_NOFOLLOW`; observed symlinks
+are skipped or rejected, additional hard links (`nlink != 1`) are rejected,
+metadata is compared before and after the read, and the name must still resolve
+to the read inode afterwards. There is no whole-tree recheck after all reads, so
+a swap after a file's own checks is not detected. A `memory/` symlink is
 refused; a symlinked workspace root is accepted because the host named it.
 
 The helper deliberately does not duplicate the native tools:

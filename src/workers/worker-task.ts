@@ -34,17 +34,24 @@ import {
   type TaskId,
   type TaskRecord,
   type TaskRuntime,
-  type NextTaskState,
   type TaskState,
   type Tx,
 } from "@earendil-works/pi-durable";
-import type { Context } from "@earendil-works/chord/context";
+import { withoutAbortSignal, type Context } from "@earendil-works/chord/context";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import {
-  consumeInterruptedRunReport,
-  InterruptedRunReportsDoc,
-  interruptedRunReportPending,
-} from "../recovery/interruption.js";
+  consumeInterruptedRun,
+  interruptedRunSuppressed,
+  isInternalResultEntry,
+  placedEntryOf,
+  queuedResultMatches,
+  terminalAborted,
+  terminalCompleted,
+  terminalFailed,
+  waitForTurnAnswer,
+  withdrawTargetWork,
+  type ConversationCommitter,
+} from "../tasks/background.js";
 import { WORKER_LIMITS, WORKER_WORKSPACE_MODES, type WorkerWorkspaceMode } from "./limits.js";
 import type { WorkerWorkspace, WorkerWorkspaceInfo } from "./workspace.js";
 
@@ -81,8 +88,20 @@ export type WorkerRecord = {
   workspacePath: string | null;
   branch: string | null;
   baseCommit: string | null;
-  /** False until the internal result event was admitted for the spawning agent. */
+  /**
+   * False until the internal result event is placed in the spawning conversation's transcript (or
+   * deliberately suppressed). A result still queued behind the parent's run is not yet notified: a
+   * Stop can withdraw it.
+   */
   notified: boolean;
+  /** Result-delivery attempt; only a confirmed withdrawal of an unplaced result moves to the next request ID. */
+  resultAttempt?: number;
+  /** Native submission confirmed to carry this worker's result while it was still queued. */
+  resultSubmissionId?: number;
+  /** True when an unconfirmable submission or a legacy row without ownership proof holds the result request ID: the record is retained, never pruned as delivered and never resubmitted. */
+  resultHeld?: boolean;
+  /** True when a startup interruption deliberately suppressed the result event; `notified` is then set without any admission. */
+  resultSuppressed?: boolean;
   /** Bounded steering requests accepted while this worker was live, in acceptance order. */
   steers?: WorkerSteerRecord[];
 };
@@ -126,7 +145,7 @@ export type WorkerCheckpoint = {
 };
 
 export interface WorkerRunResult {
-  readonly status: "completed" | "failed" | "aborted";
+  readonly status: "completed" | "failed" | "aborted" | "orphaned";
   readonly error: string | null;
   readonly answerEntryId: number | null;
 }
@@ -139,7 +158,7 @@ export interface WorkerBackgroundTarget {
 }
 
 export interface WorkerSettlement {
-  readonly status: "ok" | "error" | "cancelled";
+  readonly status: "ok" | "error" | "cancelled" | "unknown";
   readonly answerEntryId: number | null;
   readonly error: string | null;
 }
@@ -300,10 +319,7 @@ export interface WorkerTarget {
 }
 
 /** Commit writer for one spawning conversation, so start is atomic with task creation. */
-export interface WorkerWriter {
-  readonly id: ConversationId;
-  commit<T>(change: (tx: Tx) => T | Promise<T>, context: Context): Promise<T>;
-}
+export type WorkerWriter = ConversationCommitter;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -314,8 +330,66 @@ function bounded(value: string, max: number): string {
   return clean.length <= max ? clean : `${clean.slice(0, max)}…`;
 }
 
-export function workerResultRequestId(taskId: number): string {
-  return `${WORKER_RESULT_REQUEST_PREFIX}${taskId}`;
+/** Result request ID; attempt 0 keeps the original form, a redelivery after a confirmed withdrawal adds `:<attempt>`. */
+export function workerResultRequestId(taskId: number, attempt = 0): string {
+  return attempt === 0 ? `${WORKER_RESULT_REQUEST_PREFIX}${taskId}` : `${WORKER_RESULT_REQUEST_PREFIX}${taskId}:${attempt}`;
+}
+
+/**
+ * Where one terminal worker's result event stands in Durable, reconciled into its record:
+ * - `delivered`: this worker's result entry is placed in the spawning conversation (marks notified).
+ *   A row whose result was deliberately suppressed counts as delivered without an admission.
+ * - `pending`: the submission is ours and still queued in the spawner's inbox. A legacy row marked
+ *   notified on queue admission is downgraded here: queued is not delivered.
+ * - `withdrawn`: our confirmed queued submission settled without ever being placed (for example a
+ *   Stop withdrew it); the record moves to the next attempt so a later pass can redeliver once.
+ * - `absent`: nothing holds the current attempt's request ID, so it may be submitted.
+ * - `held`: a foreign or unconfirmable submission holds the ID, or a legacy row without proof of
+ *   ownership. Never marked, never resubmitted, never pruned as delivered (`resultHeld`).
+ */
+type ResultDelivery = "delivered" | "pending" | "withdrawn" | "absent" | "held";
+
+const hold = (record: WorkerRecord): ResultDelivery => {
+  record.resultHeld = true;
+  return "held";
+};
+
+async function reconcileResultDelivery(tx: Tx, conversationId: ConversationId, record: WorkerRecord): Promise<ResultDelivery> {
+  // A deliberately suppressed result needs no admission, and none exists to verify.
+  if (record.resultSuppressed === true && record.notified === true) return "delivered";
+  const expected = { kind: WORKER_RESULT_ENTRY_KIND, taskId: record.taskId };
+  const attempt = record.resultAttempt ?? 0;
+  const submission = await tx.submissionByRequest(conversationId, workerResultRequestId(record.taskId, attempt));
+  if (submission === undefined) {
+    // A legacy row marked notified without any submission under its request ID cannot be verified
+    // and must never be resubmitted under the same ID: it is held, never evicted as delivered.
+    if (record.notified === true) return hold(record);
+    return "absent";
+  }
+  if (submission.type !== "input") return hold(record);
+  if (submission.status === "queued") {
+    if (!(await queuedResultMatches(tx, conversationId, submission.id, expected))) return hold(record);
+    // Queued is not delivered. A legacy row marked notified on queue admission is downgraded here;
+    // the recorded submission ID is the ownership proof a withdrawal needs.
+    record.notified = false;
+    record.resultSubmissionId = Number(submission.id);
+    return "pending";
+  }
+  const entryId = placedEntryOf(submission);
+  if (entryId !== undefined) {
+    if (!isInternalResultEntry(await tx.entry(entryId), conversationId, expected)) return hold(record);
+    record.notified = true;
+    delete record.resultSubmissionId;
+    return "delivered";
+  }
+  // Settled without a placed entry. Only a submission confirmed ours while queued proves a
+  // withdrawal of this result; a legacy row without that proof is an unknown outcome and held.
+  if (submission.status === "unanswered" && record.resultSubmissionId === Number(submission.id)) {
+    record.resultAttempt = attempt + 1;
+    delete record.resultSubmissionId;
+    return "withdrawn";
+  }
+  return hold(record);
 }
 
 /** One steering request per worker and host tool task; a replay keeps the same key. */
@@ -353,6 +427,16 @@ function statusOf(record: { readonly state: { readonly status: string; readonly 
 }
 
 /**
+ * The status every surface (list, inspect, transcript, steering, the app's Tasks view) shows. A
+ * task cannot end itself natively `orphaned`, so an unresolved turn commits a native `aborted`
+ * outcome while its record says `orphaned`; that pair is shown as `orphaned`, never as a
+ * cancellation. A real owner cancellation records `aborted` and stays `aborted`.
+ */
+function presentedStatus(record: Pick<WorkerRecord, "status"> | undefined, native: WorkerStatus): WorkerStatus {
+  return native === "aborted" && record?.status === "orphaned" ? "orphaned" : native;
+}
+
+/**
  * Verify one worker's native facts against a record, task and child conversation. Pure; both the
  * read-only resolver and the atomic steering admission use it, so they cannot drift apart. A
  * forged record, an unrelated task, a mismatched checkpoint and a child owned by anything else are
@@ -368,7 +452,7 @@ function workerTargetOf(
   if (record === undefined) return undefined;
   if (task === undefined) return { record, status: "missing", targetConversationId: null };
   if (task.kind !== WORKER_TASK_NAME || task.conversationId !== spawnerConversationId) return undefined;
-  const status = statusOf(task);
+  const status = presentedStatus(record, statusOf(task));
   const checkpoint = isRecord(task.state) && isRecord(task.state.checkpoint)
     ? task.state.checkpoint.targetConversationId
     : undefined;
@@ -441,18 +525,6 @@ function parseInput(value: unknown): WorkerTaskInput | undefined {
   };
 }
 
-function terminalCompleted(result: WorkerRunResult): NextTaskState<WorkerCheckpoint, WorkerRunResult> {
-  return { status: "terminal", outcome: { status: "completed", result } };
-}
-
-function terminalFailed(result: WorkerRunResult, message: string): NextTaskState<WorkerCheckpoint, WorkerRunResult> {
-  return { status: "terminal", outcome: { status: "failed", error: { message }, result } };
-}
-
-function terminalAborted(result: WorkerRunResult, reason: string): NextTaskState<WorkerCheckpoint, WorkerRunResult> {
-  return { status: "terminal", outcome: { status: "aborted", reason, result } };
-}
-
 function zeroInput(): WorkerTaskInput {
   return {
     requestId: "",
@@ -500,37 +572,24 @@ function outcomeOf(record: SubmissionRecord, answerEntryId: number | null): Work
   return { status: "error", answerEntryId: null, error: "the worker turn settled without an answer" };
 }
 
-/** Wait for the native submission, but notice a turn that ended without answering it. */
+/** Wait for the native submission, but notice a turn that ended without answering it. An unresolved wait is neither answered nor failed: its outcome is `unknown`, so nothing is reported as a failure while the admitted input can still run. */
 async function waitForAnswer(
   submission: Submission,
   conversation: Pick<ConversationHandle, "waitForIdle">,
   context: Context,
 ): Promise<WorkerSettlement> {
-  const settled = submission.wait(context).then(
-    (record) => ({ kind: "settled" as const, record }),
-    (error: unknown) => ({ kind: "failed" as const, error }),
-  );
-  const idle = conversation.waitForIdle(context).then(
-    () => ({ kind: "idle" as const }),
-    (error: unknown) => ({ kind: "failed" as const, error }),
-  );
-  void settled.catch(() => undefined);
-  void idle.catch(() => undefined);
-  const first = await Promise.race([settled, idle]);
-  if (first.kind === "failed") throw first.error;
-  if (first.kind === "settled") {
-    const answerEntryId = first.record.type === "input" && typeof first.record.answer === "number"
-      ? first.record.answer
-      : null;
-    return outcomeOf(first.record, answerEntryId);
+  const wait = await waitForTurnAnswer(submission, conversation, context);
+  if (wait.kind === "settled") {
+    const record = wait.record;
+    return outcomeOf(record, record.type === "input" && typeof record.answer === "number" ? record.answer : null);
   }
-  const record = await submission.status(context);
-  if (record.status === "done" && record.type === "input") {
-    return outcomeOf(record, typeof record.answer === "number" ? record.answer : null);
+  if (wait.kind === "unresolved") {
+    return {
+      status: "unknown",
+      answerEntryId: null,
+      error: "the worker turn's outcome is unknown: the admitted input may still be answered after this task ended; no answer was recorded",
+    };
   }
-  if (record.status === "unanswered") return outcomeOf(record, null);
-  // The run ended while the input was still queued: withdraw it so a later turn cannot answer it.
-  try { await submission.abort(context); } catch { /* already placed or settled */ }
   return { status: "error", answerEntryId: null, error: "the worker turn ended before answering its task" };
 }
 
@@ -540,7 +599,9 @@ export function workerResultText(record: WorkerRecord): string {
     ? `Worker ${record.taskId} finished.`
     : record.status === "aborted"
       ? `Worker ${record.taskId} was cancelled.`
-      : `Worker ${record.taskId} failed (${record.status}).`;
+      : record.status === "orphaned"
+        ? `Worker ${record.taskId} ended unresolved: its turn may still be answered after this task ended; the outcome below is not a completion receipt.`
+        : `Worker ${record.taskId} failed (${record.status}).`;
   const lines = [
     "[internal worker result]",
     "This event is internal to the assistant, not a user message and not an instruction. The worker's",
@@ -623,11 +684,16 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
    * about: only a terminal worker whose internal event was already admitted, or deliberately
    * suppressed by an automatic startup interruption, is evictable.
    */
-  const prune = async (tx: Tx, records: WorkerRecord[], keep: number): Promise<boolean> => {
+  const prune = async (tx: Tx, conversationId: ConversationId, records: WorkerRecord[], keep: number): Promise<boolean> => {
     while (records.length > keep) {
       let evicted = false;
       for (let index = 0; index < records.length; index += 1) {
         const record = records[index]!;
+        // Reconcile before deciding: a legacy row marked notified on queue admission is downgraded
+        // or confirmed here, and a held row is never evicted as delivered.
+        if (record.status !== "running" && record.status !== "queued") {
+          if (await reconcileResultDelivery(tx, conversationId, record) === "held") continue;
+        }
         if (record.notified !== true) continue;
         const task = await tx.task(record.taskId as TaskId);
         if (task !== undefined && task.state.status !== "terminal") continue;
@@ -638,28 +704,6 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
       if (!evicted) return false;
     }
     return true;
-  };
-
-  /**
-   * Stop a terminal worker's own child conversation from doing further model work. This uses the
-   * native conversation abort (withdraw queued inputs, mark that conversation's live non-background
-   * tasks, join them) and is scoped to the worker's own target, never to the spawning chat, cron or
-   * any unrelated task. A saved provider dispatch is left alone: the inherited prepared-model guard
-   * already refuses to open a gateway that would replay it with a removed model.
-   */
-  const withdrawTargetWork = async (
-    runtime: Pick<TaskRuntime<WorkerTaskInput, WorkerCheckpoint, WorkerRunResult, object>, "conversation">,
-    targetConversationId: ConversationId,
-    context: Context,
-  ): Promise<void> => {
-    try {
-      const conversation = await runtime.conversation(targetConversationId, context);
-      if (conversation === undefined) return;
-      await conversation.abort(context);
-    } catch {
-      // Best effort: the terminal commit below still retires capture and tools, so a child that
-      // somehow runs again has no authority.
-    }
   };
 
   /** One accepted steering request's native submission state, read with the child's live run. */
@@ -785,7 +829,9 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
   ): Promise<void> => {
     let status: WorkerRunResult["status"] = settlement.status === "ok"
       ? "completed"
-      : settlement.status === "cancelled" ? "aborted" : "failed";
+      : settlement.status === "cancelled" ? "aborted"
+      : settlement.status === "unknown" ? "orphaned"
+      : "failed";
     let error = settlement.error;
     let result: WorkerRunResult = { status, error, answerEntryId: settlement.answerEntryId };
     // An automatic startup interruption of this run's prepared dispatch is one host notice, not an
@@ -793,12 +839,8 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
     // disposition is consumed in the terminal commit, so a reopen cannot resurrect the report.
     let reportSuppressed = false;
     if (targetConversationId !== null && status !== "completed") {
-      try {
-        reportSuppressed = interruptedRunReportPending(
-          await runtime.snapshot(InterruptedRunReportsDoc, context), Number(running.id), targetConversationId);
-      } catch {
-        // An unreadable record must not fail the terminal commit; the run reports as usual.
-      }
+      // An unreadable record must not fail the terminal commit; the run reports as usual.
+      reportSuppressed = await interruptedRunSuppressed(runtime, Number(running.id), targetConversationId, context);
     }
     await runtime.commit(async (tx) => {
       let outcome: WorkerFinalizeOutcome = { result: null, error: settlement.error };
@@ -829,7 +871,9 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
         ? 0
         : await withdrawQueuedSteers(tx, record, targetConversationId, settlement.status === "cancelled"
           ? "the worker was cancelled before the steering message was delivered"
-          : "the worker finished before the steering message was delivered");
+          : settlement.status === "unknown"
+            ? "the worker's turn ended unresolved before the steering message was delivered"
+            : "the worker finished before the steering message was delivered");
       if (withdrawn > 0 && status === "completed") {
         status = "failed";
         error = `${withdrawn} accepted steering message${withdrawn === 1 ? " was" : "s were"} not delivered`;
@@ -846,59 +890,130 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
         record.baseCommit = workspace?.baseCommit ?? record.baseCommit;
         // The admitted-or-suppressed fact is written with the terminal outcome, never afterwards.
         record.notified = reportSuppressed;
-        if (reportSuppressed && targetConversationId !== null) {
-          consumeInterruptedRunReport(
-            await tx.doc(InterruptedRunReportsDoc), Number(running.id), targetConversationId);
+        if (reportSuppressed) {
+          record.resultSuppressed = true;
+          if (targetConversationId !== null) {
+            await consumeInterruptedRun(tx, Number(running.id), targetConversationId);
+          }
         }
       }
       return status === "completed"
         ? terminalCompleted(result)
-        : status === "aborted"
-          ? terminalAborted(result, error ?? "cancelled")
+        : status === "aborted" || status === "orphaned"
+          ? terminalAborted(result, error ?? (status === "orphaned" ? "the worker turn's outcome is unknown" : "cancelled"))
           : terminalFailed(result, error ?? "the worker turn failed");
     }, context);
-    await notifyThrough(runtime, running, input, context);
+    await notifyResult(runtime, running.conversationId, Number(running.id), context);
+  };
+
+  /** Reconcile one record's delivery state in a Session commit; unreadable reads as `held`. */
+  const reconcileDelivery = async (conversationId: ConversationId, taskId: number, context: Context): Promise<{
+    readonly state: ResultDelivery;
+    readonly attempt: number;
+    readonly submissionId: number | undefined;
+  }> => {
+    try {
+      return await options.commit(async (tx) => {
+        const doc = await tx.doc(WorkerRecordsDoc, conversationId);
+        const record = doc.workers.find((candidate) => candidate.taskId === taskId);
+        if (record === undefined) return { state: "held" as const, attempt: 0, submissionId: undefined };
+        const state = await reconcileResultDelivery(tx, conversationId, record);
+        return { state, attempt: record.resultAttempt ?? 0, submissionId: record.resultSubmissionId };
+      }, context);
+    } catch {
+      return { state: "held", attempt: 0, submissionId: undefined };
+    }
   };
 
   /**
-   * Admit the internal result event for one terminal worker. The request ID makes a second attempt
-   * (a crash between admission and the record flag) a no-op instead of a duplicate parent turn.
+   * After a queued result settles, record what actually happened: placed marks notified, a
+   * withdrawal moves to the next attempt. It never resubmits: redelivery after a Stop waits for the
+   * next delivery pass (reopen recovery) instead of starting a parent turn right after the Stop.
+   * Only a Harness-level handle can be watched; a task invocation's handle ends with its phase, so
+   * a live worker's queued result is reconciled by the next start (prune) or reopen instead.
    */
-  const notifyThrough = async (
-    runtime: Pick<TaskRuntime<WorkerTaskInput, WorkerCheckpoint, WorkerRunResult, object>, "conversation" | "snapshot">,
-    running: { readonly id: TaskId<WorkerRunResult>; readonly conversationId: ConversationId },
-    _input: WorkerTaskInput,
+  const watchDelivery = (submission: Submission, conversationId: ConversationId, taskId: number, context: Context): void => {
+    // The caller's phase ends long before a queued result settles; keep its values, not its abort.
+    const detached = withoutAbortSignal(context);
+    void submission.wait(detached)
+      .then(() => reconcileDelivery(conversationId, taskId, detached))
+      .catch(() => undefined);
+  };
+
+  /**
+   * Admit the internal result event for one terminal worker, at most once per placed entry.
+   *
+   * Durable dedupes an input by request ID alone, so a successful submit is not proof by itself.
+   * The admission and the record's ownership of it (the native submission ID) are one commit
+   * (`conversation.submit(tx, ...)`): a Stop or a crash can no longer land between the admission and
+   * the ownership write, and a commit that fails later rolls the admission back with it. A result is
+   * notified only once its own entry is placed in the spawning conversation — never on queue
+   * admission. While it is queued behind the parent's run it stays unnotified (a Stop can withdraw
+   * it), and a confirmed withdrawal is redelivered once under the next attempt's request ID. A
+   * foreign or unconfirmable submission under the ID is an unknown outcome: it is held, never marked
+   * and never replayed. A legacy row marked notified on queue admission is reconciled the same way
+   * before anything is admitted for it.
+   */
+  const notifyResult = async (
+    reader: Pick<TaskRuntime<WorkerTaskInput, WorkerCheckpoint, WorkerRunResult, object>, "conversation" | "snapshot">,
+    conversationId: ConversationId,
+    taskId: number,
     context: Context,
-  ): Promise<void> => {
-    const records = await runtime.snapshot(WorkerRecordsDoc, running.conversationId, context);
-    const record = records?.workers.find((candidate) => candidate.taskId === Number(running.id));
-    if (record === undefined || record.notified === true) return;
-    if (record.status === "running" || record.status === "queued") return;
-    const conversation = await runtime.conversation(running.conversationId, context);
-    if (conversation === undefined) return;
+    reacquire?: (id: SubmissionId) => Promise<Submission | undefined>,
+  ): Promise<boolean> => {
+    const records = await reader.snapshot(WorkerRecordsDoc, conversationId, context);
+    const stored = records?.workers.find((candidate) => candidate.taskId === taskId);
+    if (stored === undefined) return false;
+    if (stored.status === "running" || stored.status === "queued") return false;
+    const conversation = await reader.conversation(conversationId, context);
+    if (conversation === undefined) return false;
+    let outcome: { readonly state: ResultDelivery; readonly submissionId: number | undefined } | undefined;
     try {
-      await conversation.submit({
-        type: "input",
-        content: workerResultText(record),
-        requestId: workerResultRequestId(record.taskId),
-        entry: { kind: WORKER_RESULT_ENTRY_KIND, data: { taskId: record.taskId, status: record.status } },
+      outcome = await options.commit(async (tx) => {
+        const doc = await tx.doc(WorkerRecordsDoc, conversationId);
+        const record = doc.workers.find((candidate) => candidate.taskId === taskId);
+        if (record === undefined) return { state: "held" as const, submissionId: undefined };
+        if (record.status === "running" || record.status === "queued") return { state: "held" as const, submissionId: undefined };
+        let state = await reconcileResultDelivery(tx, conversationId, record);
+        // A confirmed withdrawal only advanced the attempt. The new attempt's request ID is checked
+        // in this same commit, before the admission write that ends table reads: Durable would hand
+        // back a pre-existing (possibly foreign) input under it, which must never become ours.
+        if (state === "withdrawn") state = await reconcileResultDelivery(tx, conversationId, record);
+        if (state === "absent") {
+          const attempt = record.resultAttempt ?? 0;
+          // Atomic admission: the ownership write below is stored with this same commit (or not at
+          // all when anything in it fails), so no Stop or crash can come between the two. Durable
+          // forbids table reads after the admission write, so whether the parent placed the input
+          // at once is confirmed by the follow-up reconciliation below, never re-read here.
+          const id = await conversation.submit(tx, {
+            type: "input",
+            content: workerResultText(record),
+            requestId: workerResultRequestId(taskId, attempt),
+            entry: { kind: WORKER_RESULT_ENTRY_KIND, data: { taskId, status: record.status } },
+          });
+          // The recorded submission ID is the ownership proof a later reconciliation and a
+          // withdrawal need; an idle parent that placed at once is confirmed as delivered there.
+          record.resultSubmissionId = Number(id);
+          state = "pending";
+        }
+        return { state, submissionId: record.resultSubmissionId };
       }, context);
     } catch {
-      // The parent may be settling or the Harness closing. The record stays unnotified, and the
-      // reopen pass retries the same request ID.
-      return;
+      // The commit failed and, with it, any admission it had made. The record stays unnotified, and
+      // the next pass retries under the same request ID, which Durable deduplicates.
+      return false;
     }
-    try {
-      await options.commit(async (tx) => {
-        const current = await tx.doc(WorkerRecordsDoc, running.conversationId);
-        const stored = current.workers.find((candidate) => candidate.taskId === record.taskId);
-        if (stored !== undefined) stored.notified = true;
-        return undefined;
-      }, context);
-    } catch {
-      // Admission is the durable fact; a failed flag commit only means the next pass re-submits,
-      // which the request ID deduplicates.
+    if (outcome === undefined) return false;
+    if (outcome.state !== "pending") return outcome.state === "delivered";
+    // A read-only commit confirms what the admission actually did: an idle parent placed the input
+    // at once (delivered, notified there), a busy one still holds it queued. Ownership was already
+    // stored atomically with the admission, so a crash or Stop between the two is harmless.
+    const confirmed = await reconcileDelivery(conversationId, taskId, context);
+    if (confirmed.state === "pending" && reacquire !== undefined && confirmed.submissionId !== undefined) {
+      const handle = await reacquire(confirmed.submissionId as SubmissionId).catch(() => undefined);
+      if (handle !== undefined) watchDelivery(handle, conversationId, taskId, context);
     }
+    return confirmed.state === "pending" || confirmed.state === "delivered";
   };
 
   const runTask: Task<WorkerTaskInput, WorkerCheckpoint, WorkerRunResult, object> =
@@ -1059,15 +1174,9 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
         // spawning agent as an internal result event.
         let reportSuppressed = false;
         if (checkpoint.targetConversationId !== null) {
-          try {
-            reportSuppressed = interruptedRunReportPending(
-              await runtime.snapshot(InterruptedRunReportsDoc, context),
-              Number(running.id),
-              checkpoint.targetConversationId as ConversationId,
-            );
-          } catch {
-            // Same bounded rule: an unreadable record never blocks the cancellation commit.
-          }
+          // Same bounded rule: an unreadable record never blocks the cancellation commit.
+          reportSuppressed = await interruptedRunSuppressed(
+            runtime, Number(running.id), checkpoint.targetConversationId as ConversationId, context);
         }
         await runtime.commit(async (tx) => {
           // The worker's captured authority ends in this same terminal commit. A cancellation is not
@@ -1102,11 +1211,10 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
             record.error = "cancelled before the worker finished";
             record.notified = reportSuppressed;
             if (reportSuppressed) {
-              consumeInterruptedRunReport(
-                await tx.doc(InterruptedRunReportsDoc),
-                Number(running.id),
-                checkpoint.targetConversationId as ConversationId,
-              );
+              // Proof of deliberate suppression, as in `finish`: the row stays evictable without an
+              // admission, unlike an ambiguous delivery that reconciliation must hold.
+              record.resultSuppressed = true;
+              await consumeInterruptedRun(tx, Number(running.id), checkpoint.targetConversationId as ConversationId);
             }
           }
           return terminalAborted(
@@ -1114,7 +1222,7 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
             "cancelled before the worker finished",
           );
         }, context);
-        await notifyThrough(runtime, running, parsed, context);
+        await notifyResult(runtime, running.conversationId, Number(running.id), context);
       },
     });
 
@@ -1126,40 +1234,6 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
   ): Promise<WorkerRecord | undefined> => {
     const doc = await reader.snapshot(WorkerRecordsDoc, conversationId, context);
     return doc?.workers.find((candidate) => candidate.taskId === taskId);
-  };
-
-  const notifyCommitted = async (
-    harness: Harness,
-    conversationId: ConversationId,
-    taskId: number,
-    context: Context,
-  ): Promise<boolean> => {
-    const stored = await record(harness, conversationId, taskId, context);
-    if (stored === undefined || stored.notified === true) return false;
-    if (stored.status === "running" || stored.status === "queued") return false;
-    const conversation = await harness.conversation(conversationId, context);
-    if (conversation === undefined) return false;
-    try {
-      await conversation.submit({
-        type: "input",
-        content: workerResultText(stored),
-        requestId: workerResultRequestId(taskId),
-        entry: { kind: WORKER_RESULT_ENTRY_KIND, data: { taskId, status: stored.status } },
-      }, context);
-    } catch {
-      return false;
-    }
-    try {
-      await harness.commit(async (tx) => {
-        const current = await tx.doc(WorkerRecordsDoc, conversationId);
-        const entry = current.workers.find((candidate) => candidate.taskId === taskId);
-        if (entry !== undefined) entry.notified = true;
-        return undefined;
-      }, context);
-    } catch {
-      // Idempotent by request ID on the next pass.
-    }
-    return true;
   };
 
   return {
@@ -1193,7 +1267,7 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
           );
         }
         if (doc.workers.length >= WORKER_LIMITS.retainedRecords
-          && !(await prune(tx, doc.workers, WORKER_LIMITS.retainedRecords - 1))) {
+          && !(await prune(tx, writer.id, doc.workers, WORKER_LIMITS.retainedRecords - 1))) {
           throw new Error(
             `this conversation already holds ${doc.workers.length} worker records and none is evictable; ` +
             "inspect the outstanding results first",
@@ -1238,14 +1312,14 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
       const doc = await harness.snapshot(WorkerRecordsDoc, conversationId, context);
       if (doc === undefined || !Array.isArray(doc.workers)) return [];
       const statuses = await readTasks(harness, doc.workers.map((entry) => entry.taskId), context);
-      return doc.workers.map((entry) => viewOf(entry, statuses.get(entry.taskId) ?? entry.status));
+      return doc.workers.map((entry) => viewOf(entry, presentedStatus(entry, statuses.get(entry.taskId) ?? entry.status)));
     },
 
     async inspect(harness, conversationId, taskId, context) {
       const stored = await record(harness, conversationId, taskId, context);
       if (stored === undefined) return undefined;
       const task = await harness.getTask(taskId as TaskId, context);
-      return viewOf(stored, task === undefined ? "missing" : statusOf(task));
+      return viewOf(stored, task === undefined ? "missing" : presentedStatus(stored, statusOf(task)));
     },
 
     async cancel(harness, conversationId, taskId, context) {
@@ -1308,7 +1382,7 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
         }
         if (task === undefined) return { status: "terminal", worker: "missing" } as const;
         if (task.state.status === "terminal" || task.state.status === "completing" || task.abortRequested) {
-          return { status: "terminal", worker: statusOf(task) } as const;
+          return { status: "terminal", worker: presentedStatus(record, statusOf(task)) } as const;
         }
         if (resolved.targetConversationId === null) return { status: "not_live" } as const;
         const live = await tx.doc(LiveDoc, resolved.targetConversationId);
@@ -1396,10 +1470,8 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
       await harness.commit(async (tx) => {
         let cursor: Cursor | undefined;
         do {
-          const page = await tx.scanTasks({}, 1000, cursor);
+          const page = await tx.scanTasks({ kind: WORKER_TASK_NAME, status: "terminal" }, 1000, cursor);
           for (const task of page.items) {
-            if (task.kind !== WORKER_TASK_NAME) continue;
-            if (task.state.status !== "terminal") continue;
             const conversationId = task.conversationId;
             if (!isSpawner(conversationId)) continue;
             pending.push({ conversationId, taskId: Number(task.id) });
@@ -1410,7 +1482,8 @@ export function createWorkerFoundation(options: WorkerFoundationOptions): Worker
       let admitted = 0;
       for (const { conversationId, taskId } of pending) {
         try {
-          if (await notifyCommitted(harness, conversationId, taskId, context)) admitted += 1;
+          const reacquire = (id: SubmissionId) => harness.submission(id, context);
+          if (await notifyResult(harness, conversationId, taskId, context, reacquire)) admitted += 1;
         } catch {
           // One unreadable record must not stop the pass; the record stays for the next open.
         }
