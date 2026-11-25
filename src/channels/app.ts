@@ -225,6 +225,12 @@ export type AppChannelState = {
    * owns it, and a thread's map is rebuilt only by that thread's own reconcile.
    */
   questionMarks?: AppQuestionMarksByThread;
+  /**
+   * Terminal (`unconfirmed`/`refused`) control keys whose report was already delivered. Their
+   * records are kept, bounded, so a replayed request id is answered from the record instead of
+   * looking new and running the command again.
+   */
+  reportedControls?: string[];
 };
 
 export const AppState = defineDoc<AppChannelState>({
@@ -252,9 +258,12 @@ export const AppState = defineDoc<AppChannelState>({
  * The app channel's host surface: the shared channel gateway plus the thread, task, preset and
  * registry operations only this channel uses.
  */
-export interface AppGateway extends ChannelGateway {
-  /** Submission lookup for a recovered input, and the read-only snapshot reader `status` uses. */
-  readonly harness?: Pick<Harness, "submission"> & StatusDocumentReader;
+export interface AppGateway extends Omit<ChannelGateway, "harness"> {
+  /**
+   * Submission lookup for a recovered input and, when present, the read-only snapshot reader
+   * `status` uses; a host without `snapshot` gets the read-only watch projection instead.
+   */
+  readonly harness?: Pick<Harness, "submission"> & Partial<StatusDocumentReader>;
   forkAppThread?(
     stateId: ConversationId, thread: string, from: AppThreadOrigin,
     init: (doc: Draft<AppChannelState>) => void, context: Context,
@@ -594,8 +603,27 @@ export function publishQuestionEvents(
 
 /** Keep the control log bounded: a terminal record stays only while its report is still queued. */
 function pruneAppControls(doc: Draft<AppChannelState>): void {
-  const reported = new Set(doc.pending.filter((item) => item.notice === true).map((item) => item.key));
-  doc.controls = pruneControls(doc.controls, (entry) => reported.has(entry.key), APP_LIMITS.maxUnresolvedControls);
+  const max = APP_LIMITS.maxUnresolvedControls;
+  const queued = new Set(doc.pending.filter((item) => item.notice === true).map((item) => item.key));
+  const reported = new Set(doc.reportedControls ?? []);
+  let controls = pruneControls(doc.controls, (entry) => queued.has(entry.key) || reported.has(entry.key), max);
+  // A delivered terminal report is kept only for replay, the newest within the same bound.
+  const delivered = controls.filter((entry) => (entry.status === "unconfirmed" || entry.status === "refused") &&
+    !queued.has(entry.key) && reported.has(entry.key));
+  if (delivered.length > max) {
+    const dropped = new Set(delivered.slice(0, delivered.length - max).map((entry) => entry.key));
+    controls = controls.filter((entry) => !dropped.has(entry.key));
+  }
+  doc.controls = controls;
+  const present = new Set(controls.map((entry) => entry.key));
+  const kept = [...reported].filter((key) => present.has(key));
+  if (kept.length > 0) doc.reportedControls = kept;
+  else delete doc.reportedControls;
+}
+
+/** Whether this thread has a control acknowledgement still held; later notices wait behind it. */
+function heldAcknowledgement(doc: AppChannelState, thread: string): boolean {
+  return doc.pending.some((item) => item.hold === true && threadOf(item) === thread);
 }
 
 /** Queue one host notice in the caller's commit; the sequence stamp makes its event id unique. */
@@ -783,7 +811,19 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
    * Optional host operations, resolved once. A narrow SDK host keeps new, abort/stop and help only;
    * the rest are neither listed in `hello.commands` nor applied.
    */
-  const capabilities = detectHostCapabilities(gateway, options.restart);
+  const capabilities = detectHostCapabilities(gateway as Omit<AppGateway, "harness">, options.restart);
+  /** The `status` host: the snapshot reader only when this host really has one. */
+  const snapshotReader = typeof gateway.harness?.snapshot === "function"
+    ? gateway.harness as StatusDocumentReader
+    : undefined;
+  const statusHost: Parameters<typeof readStatusNotice>[0] = {
+    conversationFor: (sessionKey, ctx) => gateway.conversationFor(sessionKey, ctx),
+    ...(snapshotReader === undefined ? {} : { harness: snapshotReader }),
+    ...(gateway.listModels === undefined ? {} : { listModels: (sessionKey, ctx) => gateway.listModels!(sessionKey, ctx) }),
+    ...(gateway.backgroundStatus === undefined
+      ? {}
+      : { backgroundStatus: (sessionKey, ctx) => gateway.backgroundStatus!(sessionKey, ctx) }),
+  };
   /** The catalogued app commands this host really implements, in catalogue order. */
   const offeredCommands = offeredChannelCommandNames("app", capabilities);
   const commandInfos: AppCommandInfo[] = offeredConversationCommands("app", offeredCommands).map((command) => ({
@@ -1324,7 +1364,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     sendOk: (body?: Record<string, unknown>) => void,
     sendError: (error: AppErrorCode) => void,
   ): Promise<void> {
-    const noticeId = `notice:callback:${key}`;
+    const noticeKey = `callback:${key}`;
     let duplicate = true;
     let blocked: AppErrorCode | undefined;
     try {
@@ -1334,7 +1374,8 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         // A key whose echo or notice is still in the log is a duplicate even if its window entry
         // was pruned.
         if (doc.sendKeys.some((entry) => entry.key === key) || hasEventId(doc, `send:${key}`) ||
-            hasEventId(doc, noticeId)) return;
+            hasEventId(doc, `notice:${noticeKey}`) || doc.pending.some((entry) => entry.key === noticeKey) ||
+            doc.events.some((event) => event.event === "message" && event.id.startsWith(`notice:${noticeKey}#`))) return;
         duplicate = false;
         doc.sendKeys = pruneKeys([...doc.sendKeys, { key, atMs: now() }], now());
       });
@@ -1357,24 +1398,15 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       text,
       { scope: "thread" },
     )).text;
-    let appended = false;
     try {
-      await mutateState((doc) => {
-        if (hasEventId(doc, noticeId)) return;
-        appendMessage(doc, {
-          event: "message", thread, id: noticeId, role: "notice", text: reply,
-          at: new Date(now()).toISOString(),
-        });
-        appended = true;
-      });
+      // Through the thread's notice queue, so the receipt never overtakes a held acknowledgement.
+      await admitNotice(thread, noticeKey, reply);
     } catch (error) {
       if (stopping || signal?.aborted) return;
       journalEvent("app.send.failed", {}, error);
-      sendError("internal");
+      sendError(error instanceof Error && error.message === QUEUE_FULL ? "not_ready" : "internal");
       return;
     }
-    pushEventsToSockets();
-    if (appended) notifyPush(thread);
     sendOk({ duplicate: false });
   }
 
@@ -1926,8 +1958,13 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     earlySubmissions.delete(key);
     await mutateState((doc) => {
       doc.pending = doc.pending.filter((entry) => entry.key !== key);
-      doc.controls = doc.controls.filter((entry) =>
-        !(entry.key === key && (entry.status === "unconfirmed" || entry.status === "refused")));
+      // A delivered terminal report keeps its record (bounded) so a replayed request id is answered
+      // from it and never runs the command again.
+      const entry = doc.controls.find((item) => item.key === key);
+      if (entry !== undefined && (entry.status === "unconfirmed" || entry.status === "refused")) {
+        doc.reportedControls = [...(doc.reportedControls ?? []).filter((item) => item !== key), key];
+      }
+      pruneAppControls(doc);
     }, cleanupContext);
   };
 
@@ -1942,7 +1979,8 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
     if (thread === undefined || !openThread(state, thread)) return sendError("bad_request");
     if (threads.archiving(thread)) return sendError("not_ready");
     const command = frame.command;
-    const rawArgs = frame.args ?? "";
+    // Only an absent `args` means none; `null` or any other non-string is malformed.
+    const rawArgs = frame.args === undefined ? "" : frame.args;
     if (typeof command !== "string" || typeof rawArgs !== "string" ||
         rawArgs.length > APP_LIMITS.controlArgsChars) {
       sendError("bad_request");
@@ -1984,7 +2022,7 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       }
       case "status":
         if (args !== "") return notice(usageNotice("status"));
-        return notice(await readStatusNotice(gateway, sessionKey, "thread", adapterContext));
+        return notice(await readStatusNotice(statusHost, sessionKey, "thread", adapterContext));
       case "mcp": {
         const admin = gateway.mcpAdmin;
         if (!capabilities.mcp || admin === undefined) return notice(MCP_UNAVAILABLE_HOST);
@@ -2086,7 +2124,12 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
   /** The shared coordinator's durable commits, each one commit of the app state document. */
   const ledger: ControlLedger<string, string, AppControl> = {
     status: (key) => state.controls.find((entry) => entry.key === key)?.status,
-    unresolved: () => state.controls.filter((entry) => entry.status === "admitted" || entry.status === "unconfirmed").length,
+    unresolved: () => {
+      // A delivered interruption report resolved its record for the owner; it is kept only for replay.
+      const reported = new Set(state.reportedControls ?? []);
+      return state.controls.filter((entry) => entry.status === "admitted" ||
+        (entry.status === "unconfirmed" && !reported.has(entry.key))).length;
+    },
     async admit(record, ackText) {
       await mutateState((doc) => {
         // The owner inputs already queued in this thread are placed before the control's effect.
@@ -2176,6 +2219,12 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
         // Withdrawn or delivered meanwhile, or the thread is closing: nothing to place.
         if (!state.pending.some((item) => item.key === earlier.key) ||
             threads.archiving(record.scope) || !openThread(state, record.scope)) return undefined;
+        // Already admitted natively (a live turn stays pending until it settles): it is placed, so it
+        // is neither prepared again (no second download or transcription) nor resubmitted.
+        const conversation = await gateway.conversationFor(sessionForThread(record.scope), adapterContext);
+        const placed = await conversation.commit((tx) =>
+          tx.submissionByRequest(conversation.id, requestIdFor(earlier.key)), adapterContext);
+        if (placed !== undefined) return undefined;
         // The same full content a normal delivery submits: text plus every stored attachment.
         return files.prepare(earlier.attachments, earlier.text, signal);
       },
@@ -2312,7 +2361,9 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       // A capacity-blocked archived origin consumes no dispatch slot — neither for the open-thread
       // cap nor for the snapshot cap: its result waits in the outbox until room exists, and every
       // other thread (main included) keeps flowing.
-      if (isTurnInterruptionNotice(record) || threadInfo(state, thread)?.archived !== true) return true;
+      // A host interruption notice waits behind a held control acknowledgement in its thread.
+      if (isTurnInterruptionNotice(record)) return !heldAcknowledgement(state, thread);
+      if (threadInfo(state, thread)?.archived !== true) return true;
       if (!canOpenSideThread(state)) return false;
       if (snapshotBlocked === undefined) {
         const room = gateway.appSnapshotRoom;
@@ -2337,8 +2388,11 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       const doc = await tx.doc(AppState, stateConversation.id);
       const info = threadInfo(doc, thread);
       if (info === undefined) return;
+      const interruption = isTurnInterruptionNotice(entry);
+      // Rechecked in the commit: the notice is left pending for the next scan while a held
+      // acknowledgement in this thread is still waiting for its control.
+      if (interruption && heldAcknowledgement(doc, thread)) return;
       if (!hasEventId(doc, id)) {
-        const interruption = isTurnInterruptionNotice(entry);
         if (!interruption && info.archived) {
           if (!canOpenSideThread(doc) || await gateway.appSnapshotRoom?.(tx) === false) return;
           setArchived(doc, info, new Date(now()).toISOString());

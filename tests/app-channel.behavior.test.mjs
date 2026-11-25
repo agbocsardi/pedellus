@@ -854,10 +854,11 @@ test('a reopen reports interrupted controls, releases held acknowledgements and 
     assert.match(store.captured.at(-1).messages.at(-1).content, /answer me after the restart/u);
 
     const state = await appState(store.gateway);
-    // The interrupted command's report was delivered, so its unconfirmed record is pruned — the
-    // same terminal-report rule the Telegram controls log keeps. The applied record stays.
+    // The interrupted command's report was delivered; its unconfirmed record is kept (bounded) so a
+    // replayed request id is answered from it, and it no longer counts as unresolved.
     assert.deepEqual(state.controls.map((entry) => [entry.key, entry.status]),
-      [['c:applied', 'applied']]);
+      [['c:interrupted', 'unconfirmed'], ['c:applied', 'applied']]);
+    assert.deepEqual(state.reportedControls, ['c:interrupted']);
     assert.equal(state.pending.length, 0, 'nothing is left queued after recovery');
     await device.close();
   } finally {
@@ -2518,6 +2519,7 @@ test('parseDurableEvent keeps well-formed events and refuses malformed ones befo
 /**
  * The real gateway with the main chat's conversation wrapped: `submit` and `abort` pass through
  * the given hooks, so a check can fail a delivery or hold a native effect deterministically.
+ * `cronOutbox` and `harness` hooks replace those host members.
  */
 function wrapMainChat(gateway, hooks) {
   const bind = (target, prop) => {
@@ -2535,6 +2537,8 @@ function wrapMainChat(gateway, hooks) {
   });
   return new Proxy(gateway, {
     get(target, prop) {
+      if (prop === 'cronOutbox' && hooks.cronOutbox !== undefined) return hooks.cronOutbox(target.cronOutbox);
+      if (prop === 'harness' && hooks.harness !== undefined) return hooks.harness(target.harness);
       if (prop !== 'conversationFor') return bind(target, prop);
       return async (key, ctx) => {
         const conversation = await target.conversationFor(key, ctx);
@@ -2694,6 +2698,167 @@ test('an interrupted or unplaceable restart reports the restart wording and is n
       event.text === 'Restart interrupted; outcome unknown. Not retried.'), 'the abandoned restart report', 20_000);
     assert.equal(device.events('message').some((event) => /^Command interrupted/u.test(event.text)), false);
     assert.deepEqual(requests, [], 'an unplaceable restart is never requested');
+    await device.close();
+  } finally {
+    await app.stop();
+    await store.close();
+  }
+});
+
+test('a replayed request id of a recovered /restart is answered from its record, never run', { timeout: 30_000 }, async () => {
+  const store = await openAppStore('restart-replay', {});
+  const { AppState } = await import(new URL('../dist/channels/app.js', import.meta.url).href);
+  const stateConversation = await store.gateway.conversationFor('app:channel-state', context);
+  await stateConversation.commit(async (tx) => {
+    const doc = await tx.doc(AppState, stateConversation.id);
+    doc.controls = [{ key: 'c:r1', command: 'restart', status: 'admitted' }];
+    doc.nextNoticeSeq = 2;
+    doc.pending = [{ key: 'c:r1', text: 'Restart requested; checking active work.', admittedAtMs: 1, notice: true, noticeSeq: 1, hold: true }];
+  }, context);
+  const requests = [];
+  const app = startApp(store, { restart: { supported: true, request: async () => { requests.push('restart'); } } });
+  try {
+    const base = `http://127.0.0.1:${await app.port}`;
+    const device = await openDevice(base, await pairedDevice(store, base));
+    await device.wait(() => device.events('message').some((event) =>
+      event.text === 'Restart interrupted; outcome unknown. Not retried.'), 'the interruption report');
+    await untilAsync(async () => (await appState(store.gateway)).pending.length === 0, 'the report delivered');
+    assert.deepEqual((await appState(store.gateway)).controls.map((entry) => [entry.key, entry.status]),
+      [['c:r1', 'unconfirmed']], 'the delivered report keeps its record for replay');
+
+    device.send({ type: 'req', id: 'r1', op: 'control', command: 'restart' });
+    await device.wait(() => device.events('message').some((event) =>
+      /^That \/restart was interrupted before it was confirmed/u.test(event.text)), 'the replay report');
+    assert.equal(device.response('r1').ok, true);
+    assert.deepEqual(requests, [], 'the replayed id never requested a restart');
+    assert.equal(device.events('message').some((event) => event.text === 'Restart requested; checking active work.'), false);
+    await device.close();
+  } finally {
+    await app.stop();
+    await store.close();
+  }
+});
+
+test('a control does not prepare or resubmit an earlier input that is already placed', { timeout: 30_000 }, async () => {
+  const store = await openAppStore('control-flush-placed', {});
+  let submits = 0;
+  const gateway = wrapMainChat(store.gateway, {
+    async submit(draft, run) {
+      if (draft.requestId === 'app:send:k-live') submits += 1;
+      return run();
+    },
+  });
+  const requests = [];
+  const app = startApp(store, { gateway, restart: { supported: true, request: async () => { requests.push('restart'); } } });
+  try {
+    const base = `http://127.0.0.1:${await app.port}`;
+    const device = await openDevice(base, await pairedDevice(store, base));
+    const entered = store.gate.hold();
+    device.send({ type: 'req', id: 's1', op: 'send', key: 'k-live', text: 'a live turn' });
+    await entered;
+    // The turn is native and generating, but its pending record stays until it settles.
+    assert.ok((await appState(store.gateway)).pending.some((item) => item.key === 'k-live'));
+    // `restart` flushes the thread's earlier inputs and has no conversation effect of its own.
+    device.send({ type: 'req', id: 'c1', op: 'control', command: 'restart' });
+    await device.wait(() => device.events('message').some((event) =>
+      event.role === 'notice' && event.text === 'Restart requested; checking active work.'), 'restart acknowledgement');
+    assert.equal(submits, 1, 'the placed input was not submitted again');
+    assert.deepEqual(requests, ['restart']);
+    store.gate.release();
+    await device.wait(() => device.events('settled').some((event) =>
+      event.key === 'k-live' && event.outcome === 'answered'), 'the live turn answered once');
+    assert.equal(device.events('message').filter((event) => event.role === 'assistant').length, 1);
+    await device.close();
+  } finally {
+    store.gate.release();
+    await app.stop();
+    await store.close();
+  }
+});
+
+test('callback receipts and interruption notices wait behind a held control acknowledgement', { timeout: 30_000 }, async () => {
+  const store = await openAppStore('held-other-notices', {});
+  const { AppState } = await import(new URL('../dist/channels/app.js', import.meta.url).href);
+  const { CronDeliveriesDoc } = await import(new URL('../dist/automation/cron-delivery.js', import.meta.url).href);
+  const stateConversation = await store.gateway.conversationFor('app:channel-state', context);
+  await stateConversation.commit(async (tx) => {
+    (await tx.doc(AppState, stateConversation.id)).origin = { admittedAtMs: 1 };
+  }, context);
+  let entered;
+  const abortEntered = new Promise((resolve) => { entered = resolve; });
+  let release;
+  const abortReleased = new Promise((resolve) => { release = resolve; });
+  let lists = 0;
+  const gateway = wrapMainChat(store.gateway, {
+    async abort(run) {
+      entered();
+      await abortReleased;
+      return run();
+    },
+    cronOutbox: (outbox) => ({
+      sessions: (ctx) => outbox.sessions(ctx),
+      list: (key, ctx) => { lists += 1; return outbox.list(key, ctx); },
+      update: (key, id, change, ctx) => outbox.update(key, id, change, ctx),
+      recordFault: (key, message, ctx) => outbox.recordFault(key, message, ctx),
+    }),
+  });
+  const app = startApp(store, { gateway, scanIntervalMs: 50 });
+  try {
+    const base = `http://127.0.0.1:${await app.port}`;
+    const device = await openDevice(base, await pairedDevice(store, base));
+    device.send({ type: 'req', id: 'c1', op: 'control', command: 'abort' });
+    await abortEntered;
+
+    device.send({ type: 'req', id: 's1', op: 'send', key: 'cb', text: 'http://127.0.0.1:1/callback?code=c&state=s' });
+    await device.wait(() => device.response('s1') !== undefined, 'callback reply');
+    assert.deepEqual(device.response('s1'), { type: 'res', id: 's1', ok: true, duplicate: false });
+    const chat = await store.gateway.conversationFor(APP_CHAT_SESSION_KEY, context);
+    await chat.commit(async (tx) => {
+      (await tx.doc(CronDeliveriesDoc, chat.id)).deliveries.push({
+        id: 'host:turn-interrupted:1', sessionKey: APP_CHAT_SESSION_KEY, text: 'SYNTHETIC-INTERRUPTION',
+        createdAtMs: Date.now(), status: 'pending', nextChunkIndex: 0,
+      });
+    }, context);
+    // Several outbox scans pass while the acknowledgement is held: nothing may be appended ahead of it.
+    const seen = lists;
+    await until(() => lists >= seen + 3, 'outbox scans while held');
+    assert.equal(device.events('message').length, 0, 'nothing overtook the held acknowledgement');
+
+    release();
+    await device.wait(() => device.events('message').length === 3, 'all three notices');
+    const texts = device.events('message').map((event) => event.text);
+    assert.equal(texts[0], 'Idle. Queue cleared.');
+    assert.deepEqual(new Set(texts.slice(1).map((text) => text === 'SYNTHETIC-INTERRUPTION' ? 'interruption' : 'callback')),
+      new Set(['interruption', 'callback']));
+    assert.match(texts.find((text) => text !== 'SYNTHETIC-INTERRUPTION' && text !== texts[0]), /callback was not stored/u);
+    assert.ok(device.events('message').some((event) => event.id.startsWith('notice:callback:cb#')));
+    // The key stays claimed: a re-sent callback key is a duplicate and appends nothing.
+    device.send({ type: 'req', id: 's2', op: 'send', key: 'cb', text: 'http://127.0.0.1:1/callback?code=c&state=s' });
+    await device.wait(() => device.response('s2') !== undefined, 'duplicate callback reply');
+    assert.equal(device.response('s2').duplicate, true);
+    await device.close();
+  } finally {
+    release();
+    await app.stop();
+    await store.close();
+  }
+});
+
+test('/status works on a host whose harness has no snapshot reader', { timeout: 30_000 }, async () => {
+  const store = await openAppStore('status-no-snapshot', {});
+  const gateway = wrapMainChat(store.gateway, {
+    harness: (harness) => ({ submission: (id, ctx) => harness.submission(id, ctx) }),
+  });
+  const app = startApp(store, { gateway });
+  try {
+    const base = `http://127.0.0.1:${await app.port}`;
+    const device = await openDevice(base, await pairedDevice(store, base));
+    device.send({ type: 'req', id: 'c1', op: 'control', command: 'status' });
+    await device.wait(() => device.events('message').some((event) => event.role === 'notice'), 'status notice');
+    const text = device.events('message').find((event) => event.role === 'notice').text;
+    assert.match(text, /^Status for this thread/u);
+    assert.match(text, /^Model: fixture\/alpha/mu);
+    assert.doesNotMatch(text, /unavailable/u);
     await device.close();
   } finally {
     await app.stop();

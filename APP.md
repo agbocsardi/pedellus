@@ -374,7 +374,12 @@ event, with the same acknowledgement texts (`Context reset.`, `Idle. Queue clear
 held acknowledgement until the native call returns, the same 30-second still-pending wording, and
 the same at-most-once control records with replay reporting. Owner inputs queued in the thread
 before a mutating control are placed ahead of its effect with their full content, attachments
-included; a later notice in that thread never overtakes the held acknowledgement. A `restart`
+included, unless one is already admitted natively (it is then neither prepared again nor
+resubmitted). A later notice in that thread — another control's reply, an OAuth callback receipt
+(queued as a notice) or a host interruption notice from the outbox — never overtakes the held
+acknowledgement. An interrupted or refused control keeps its record (bounded, like the applied
+ones) after its report is delivered, so a replayed request id is answered from it and never runs
+the command again; a delivered interruption report no longer counts toward the unresolved bound. A `restart`
 that is interrupted, or abandoned because an earlier input could never be placed, reports
 `Restart interrupted; outcome unknown. Not retried.` and is never requested. A `new` appends its
 divider only on the transition to applied, so it is recorded once. `model <preset>` applies to that
@@ -664,7 +669,9 @@ catalogue with `model`/`help`/`digest`/`restart` arguments, usage notices and `u
 command reported, held acknowledgement released, a pre-restart turn still answered), a control
 placing an earlier undelivered input with its attachment, a later notice held behind a control's
 acknowledgement, one divider per applied `new`, the restart interruption wording on reopen and on
-an unplaceable earlier input, a failed run
+an unplaceable earlier input, a replayed recovered `/restart` id answered without a request, an
+already-placed input neither prepared nor resubmitted, callback and interruption notices behind a
+held acknowledgement, `/status` on a host without a snapshot reader, a failed run
 (`settled{failed}` with the error presence state), revocation, oversize frames and callback
 interception. `tests/app-mcp-login.behavior.test.mjs` covers the login surface with the loopback
 OAuth fixture: the URL reaching every hello'd device as a `login` frame and no durable event,

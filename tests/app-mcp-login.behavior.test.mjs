@@ -240,15 +240,15 @@ test('a pasted app callback completes the login, a replay is refused and nothing
     assert.ok(side);
     device.send({ type: 'req', id: 'x1', op: 'send', key: 'cross', thread: side, text: callback });
     await device.wait(() => device.response('x1') !== undefined, 'cross-thread callback reply');
-    await until(() => device.events('message').some((event) => event.id === 'notice:callback:cross'), 'cross-thread refusal');
-    const cross = device.events('message').find((event) => event.id === 'notice:callback:cross');
+    await until(() => device.events('message').some((event) => event.id.startsWith('notice:callback:cross#')), 'cross-thread refusal');
+    const cross = device.events('message').find((event) => event.id.startsWith('notice:callback:cross#'));
     assert.match(cross.text, /did not match the active login/u);
 
     // A valid callback completes the attempt and answers with the lifecycle's fixed notice.
     device.send({ type: 'req', id: 'c1', op: 'send', key: 'valid', text: callback });
     await device.wait(() => device.response('c1') !== undefined, 'callback reply');
-    await until(() => device.events('message').some((event) => event.id === 'notice:callback:valid'), 'accepted notice');
-    const accepted = device.events('message').find((event) => event.id === 'notice:callback:valid');
+    await until(() => device.events('message').some((event) => event.id.startsWith('notice:callback:valid#')), 'accepted notice');
+    const accepted = device.events('message').find((event) => event.id.startsWith('notice:callback:valid#'));
     assert.match(accepted.text, /Authorization callback received/u);
     assert.equal(accepted.text.includes('code='), false);
     assert.equal(accepted.text.includes('state='), false);
@@ -277,8 +277,8 @@ test('a pasted app callback completes the login, a replay is refused and nothing
     // A callback arriving after the attempt is gone gets the fixed stale text.
     device.send({ type: 'req', id: 'stale1', op: 'send', key: 'stale', text: callback });
     await device.wait(() => device.response('stale1') !== undefined, 'stale callback reply');
-    await until(() => device.events('message').some((event) => event.id === 'notice:callback:stale'), 'stale notice');
-    const stale = device.events('message').find((event) => event.id === 'notice:callback:stale');
+    await until(() => device.events('message').some((event) => event.id.startsWith('notice:callback:stale#')), 'stale notice');
+    const stale = device.events('message').find((event) => event.id.startsWith('notice:callback:stale#'));
     assert.match(stale.text, /No MCP login is waiting for a callback in this chat/u);
   } finally {
     await device?.close();
@@ -303,18 +303,18 @@ test('a foreign or replayed app callback is refused without storing it', { timeo
     foreign.searchParams.set('state', 'foreign-state-value');
     device.send({ type: 'req', id: 'f1', op: 'send', key: 'foreign', text: foreign.href });
     await device.wait(() => device.response('f1') !== undefined, 'foreign callback reply');
-    await until(() => device.events('message').some((event) => event.id === 'notice:callback:foreign'), 'foreign refusal');
-    assert.match(device.events('message').find((event) => event.id === 'notice:callback:foreign').text,
+    await until(() => device.events('message').some((event) => event.id.startsWith('notice:callback:foreign#')), 'foreign refusal');
+    assert.match(device.events('message').find((event) => event.id.startsWith('notice:callback:foreign#')).text,
       /did not match the active login/u);
 
     device.send({ type: 'req', id: 'a1', op: 'send', key: 'good', text: callback });
     await device.wait(() => device.response('a1') !== undefined, 'valid callback reply');
-    await until(() => device.events('message').some((event) => event.id === 'notice:callback:good'), 'accepted notice');
+    await until(() => device.events('message').some((event) => event.id.startsWith('notice:callback:good#')), 'accepted notice');
     // The attempt is claimed; a second, differently-keyed paste of the same callback is a replay.
     device.send({ type: 'req', id: 'a2', op: 'send', key: 'replay', text: callback });
     await device.wait(() => device.response('a2') !== undefined, 'replay reply');
-    await until(() => device.events('message').some((event) => event.id === 'notice:callback:replay'), 'replay refusal');
-    assert.match(device.events('message').find((event) => event.id === 'notice:callback:replay').text,
+    await until(() => device.events('message').some((event) => event.id.startsWith('notice:callback:replay#')), 'replay refusal');
+    assert.match(device.events('message').find((event) => event.id.startsWith('notice:callback:replay#')).text,
       /did not match the active login/u);
 
     const state = JSON.stringify(await appState(channel.gateway));
@@ -349,6 +349,12 @@ test('/mcp on the app lists the configured servers read-only, like Telegram and 
     assert.match(listing, /OAuth logins waiting for a callback: none\./u);
     assert.match(await control('m2', { command: 'mcp', args: 'login' }), /^Usage: \/mcp \(no arguments\)\. Nothing was sent/u);
     assert.match(await control('m3', { command: 'help', args: 'mcp' }), /^Usage: \/mcp\n/u);
+    // Only an absent `args` means none: `null` or any other non-string is malformed, with no effect.
+    for (const [id, args] of [['m4', null], ['m5', 7], ['m6', ['x']]]) {
+      device.send({ type: 'req', id, op: 'control', command: 'mcp', args });
+      await device.wait(() => device.response(id) !== undefined, `${id} reply`);
+      assert.deepEqual(device.response(id), { type: 'res', id, ok: false, error: 'bad_request' });
+    }
     // Read-only: no turn ran and nothing was admitted to the model.
     assert.equal(channel.captured.length, 0);
     assert.equal((await appState(channel.gateway)).controls.length, 0);
