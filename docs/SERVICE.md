@@ -14,8 +14,8 @@ the existing SIGTERM/SIGINT teardown.
 
 | File | Use |
 | --- | --- |
-| [`systemd/pedellus.service`](systemd/pedellus.service) | The primary instance uses the default config `~/.pedellus/config.json`. |
-| [`systemd/pedellus@.service`](systemd/pedellus@.service) | One named secondary instance uses `~/.pedellus/instances/i-<name>/config.json`. |
+| [`systemd/pedellus.service`](../systemd/pedellus.service) | The primary instance uses the default config `~/.pedellus/config.json`. |
+| [`systemd/pedellus@.service`](../systemd/pedellus@.service) | One named secondary instance uses `~/.pedellus/instances/i-<name>/config.json`. |
 
 Both are user units. Copy or symlink them into the user unit directory, for
 example `~/.config/systemd/user/`, after editing the launch paths.

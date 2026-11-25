@@ -410,7 +410,7 @@ admission, and a reattached terminal conservatively queues until it has admitted
 A failed turn reports `Turn ended` once when the terminal observed its membership in the shared run
 (identified by that run's first native input, never by the error text); an input whose run membership
 it never observed reports its own end. See
-[busy owner messages](./README.md#busy-owner-messages).
+[busy owner messages](../README.md#busy-owner-messages).
 
 ## Local controls
 

@@ -30,21 +30,16 @@ raw exceptions/payloads.
 
 ## Layout
 
-- `src/runtime.ts` — `openGateway`: storage, tool policy, context, cron, host API.
+- `src/runtime.ts`, `src/runtime/` — `openGateway`: authority registry, storage, model/context/cron hosts, restore.
 - `src/cli.ts` — `gateway` (sole runtime owner), `agent` (attaches), recovery.
 - `src/local/` — private Unix-socket CLI protocol; no public listener.
-- `src/channels/` — Telegram, Discord, `app` (see TELEGRAM.md, DISCORD.md, APP.md).
-- `src/mcp/`, `src/workers/`, `src/automation/`, `src/history/`, `src/media/`,
-  `src/context/`, `src/execution/`, `src/auth/`, `src/help/`, `src/doctor/` — one subsystem each.
+- `src/channels/` — shared channel core (`contracts`, `controls`, `turn-runtime`, `outbox-drainer`, `markdown`) + Telegram, Discord, `app` (see `docs/TELEGRAM.md`, `docs/DISCORD.md`, `docs/APP.md`).
+- `src/mcp/`, `src/workers/`, `src/automation/`, `src/tasks/`, `src/history/`, `src/media/`,
+  `src/context/`, `src/execution/`, `src/auth/`, `src/help/`, `src/init/`, `src/doctor/` — one subsystem each.
 - `pwa/` — the installable web app for the `app` channel and the shared wire
   protocol (`pwa/protocol/`); its own notes are in `pwa/AGENTS.md`.
+- `docs/` — user onboarding (`docs/GETTING_STARTED.md`, `docs/SETUP_PROMPT.md`) and topic contracts (`docs/MCP.md`, `docs/WORKERS.md`, `docs/CRON.md`, `docs/MEMORY_RECALL.md`, `docs/HISTORY.md`, `docs/MODELS.md`, `docs/PROVIDERS.md`, `docs/CODEMODE.md`, `docs/WEB.md`, `docs/TOOLS.md`, `docs/EXECUTION.md`, …). Read the relevant one before changing a subsystem and keep it in sync.
 - `plan/` — historical evidence, not a work queue.
-
-User onboarding lives in GETTING_STARTED.md and SETUP_PROMPT.md; keep them in
-sync with CLI/config changes. Topic docs (MCP.md, WORKERS.md, CRON.md,
-MEMORY_RECALL.md, HISTORY.md, MODELS.md, PROVIDERS.md, CODEMODE.md, WEB.md,
-TOOLS.md, EXECUTION.md, …) hold the detailed contracts. Read the relevant one before changing a subsystem and
-keep it in sync.
 
 ## Core invariants
 

@@ -10,7 +10,7 @@ New to Pedellus? [Getting started](./GETTING_STARTED.md) is the quicker
 beginner path (including WSL2); this page is the manual, config-first route.
 
 This does not claim live-model success; what you can verify offline is in
-[Current status and checks](./README.md#current-status-and-checks).
+[Current status and checks](../README.md#current-status-and-checks).
 
 ## 1. Install dependencies
 
@@ -78,7 +78,7 @@ transcript and runtime state live in Durable's SQLite database under `dataDir`.
 
 ## 3. Configure
 
-The shipped [`config.example.json`](./config.example.json) is the starting point:
+The shipped [`config.example.json`](../config.example.json) is the starting point:
 
 | Key | Meaning here |
 | --- | --- |
@@ -89,7 +89,7 @@ The shipped [`config.example.json`](./config.example.json) is the starting point
 | `workspaceContext.memoryManifest` | Lists the other `memory/**/*.md` topics recursively for on-demand `read`; their bodies stay out of the prompt. |
 | `workspaceContext.skills` | Its presence opts into workspace skill discovery; `disabledSkills` can hide names. |
 | `toolAllowlist` | Config authority: these coding tools are enabled for authenticated mapped chats. `[]` or absent disables them. |
-| `followUpMode` | Where an owner message goes while that CLI or Telegram conversation is busy. Absent or `"followUp"` queues it for the next run; `"steer"` places it after the current tool round so it joins the running turn. Internal worker, digest and scheduled work always keeps the native default. See [busy owner messages](./README.md#busy-owner-messages). |
+| `followUpMode` | Where an owner message goes while that CLI or Telegram conversation is busy. Absent or `"followUp"` queues it for the next run; `"steer"` places it after the current tool round so it joins the running turn. Internal worker, digest and scheduled work always keeps the native default. See [busy owner messages](../README.md#busy-owner-messages). |
 | `workers` | Default off. `toolAllowlist` grants ordinary subagents tools independently of the foreground coding list; omitted inherits configured chat tools, `[]` gives no tools. Supports native coding/research/skill names, `mcp` for connected MCP tools, or exact MCP registration names. It never grants Telegram, cron or further delegation. Integrations must still be enabled separately; see [worker configuration](WORKERS.md#separate-worker-grants). |
 | `cron` | Installs the model-facing `cron` tool; `timeZone: "UTC"` interprets calendar expressions without an explicit zone. |
 | `episodeSummary` | Closed episodes use the conversation's current model, or a named override such as `"preset": "fast"`. This costs provider calls; set `enabled: false` to turn it off. |

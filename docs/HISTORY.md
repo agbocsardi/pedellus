@@ -953,7 +953,7 @@ its batch or advance the cursor. A later invocation can process the same evidenc
 prompt tells the model to read existing files and check whether a fact is already recorded before
 adding it; create-only writes and exact-text edits remain enforced, but semantic correctness and
 duplicate-free replay are not guaranteed. This partial-write/retry behavior is intentional; rollback
-and staged publication are [not planned](plan/2026-10-31_digest-rollback-design.md).
+and staged publication are [not planned](../plan/2026-10-31_digest-rollback-design.md).
 No shell, network, MCP, Code Mode, history, channel, worker, cron or
 scheduling tool is installed in a digest target, and a run never writes to the origin chat, a channel
 outbox or a schedule. The same curation hook enforces the run's budgets at the native call, from the run's committed

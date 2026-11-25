@@ -5,7 +5,7 @@ gateway, reached over the tailnet with `tailscale serve`. Personal use only,
 one owner.
 
 Status: the app (`app/`) and the gateway's `app` channel
-(`../src/channels/app*.ts`, [../APP.md](../APP.md)) both speak protocol v2, and
+(`../src/channels/app*.ts`, [../APP.md](../docs/APP.md)) both speak protocol v2, and
 the features below are on `main`. Offline-verified only: no check has run
 against a real device or a live `tailscale serve`, and the supervised deployment
 is still pending.
@@ -25,7 +25,7 @@ The gateway also serves `POST /v1/ask` for iOS Shortcuts (APP.md, *Shortcuts*).
   route, storage, security model, known gaps.
 - [app/README.md](./app/README.md) — dev workflow and the mock gateway's
   affordances.
-- [../GETTING_STARTED.md](../GETTING_STARTED.md#installable-web-app-pwa) — build,
+- [../GETTING_STARTED.md](../docs/GETTING_STARTED.md#installable-web-app-pwa) — build,
   serve and pair it on a real gateway.
 - [docs/native-ios/](./docs/native-ios/) — parked native SwiftUI plan, kept for
   a possible later iOS app.

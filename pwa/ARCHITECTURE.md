@@ -21,7 +21,7 @@ come for free.
 ```
 
 The normative wire contract is [protocol/v2.md](./protocol/v2.md); the
-gateway's behavior is [../APP.md](../APP.md). This file is the map between
+gateway's behavior is [../APP.md](../docs/APP.md). This file is the map between
 them.
 
 ## Why a PWA (2026-11-18)

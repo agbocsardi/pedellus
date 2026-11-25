@@ -92,7 +92,7 @@ pedellus init
   introduces itself and asks on your first chat instead.
 
 Prefer to write the config by hand? Follow [SETUP.md](./SETUP.md) from the
-shipped [`config.example.json`](./config.example.json), and store a provider
+shipped [`config.example.json`](../config.example.json), and store a provider
 credential with `pedellus login`.
 
 **3. Check everything**
@@ -219,7 +219,7 @@ deployment, Web Push delivery and kill/reopen replay remain unverified. See
 
 ## Optional add-ons
 
-- **Run it as a service.** [`systemd/pedellus.service`](./systemd/pedellus.service)
+- **Run it as a service.** [`systemd/pedellus.service`](../systemd/pedellus.service)
   keeps the gateway running and restarts it after a crash. Copy it to
   `~/.config/systemd/user/`, replace `/usr/bin/node` with the output of
   `command -v node` and `/opt/pedellus` with your checkout path, then
