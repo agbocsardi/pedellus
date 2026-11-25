@@ -193,3 +193,106 @@ test('callback payloads are opaque, bounded and parsed only for this prefix and 
   assert.equal(parseQuestionCallback('oauth:abcdef1234:c'), undefined);
   assert.equal(parseQuestionCallback(undefined), undefined);
 });
+
+test('ask_user stays authorized after reopen even with agentHistory false, empty toolAllowlist and no integrations', { timeout: 30_000 }, async (t) => {
+  const { mkdir, mkdtemp, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const packageRoot = process.env.PI_NANOBOT_CANDIDATE ?? new URL('../', import.meta.url).pathname;
+  const modules = join(packageRoot, 'node_modules/@earendil-works');
+  const [
+    { parseConfig },
+    { openGateway },
+    { ASK_USER_TOOL_NAME },
+    { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall },
+    { BACKGROUND_CONTEXT },
+    { AgentDoc },
+  ] = await Promise.all([
+    import(new URL('../dist/config.js', import.meta.url).href),
+    import(new URL('../dist/runtime.js', import.meta.url).href),
+    import(new URL('../dist/questions/index.js', import.meta.url).href),
+    import(`${modules}/pi-ai/dist/index.js`),
+    import(`${modules}/chord/dist/context/index.js`),
+    import(`${modules}/pi-durable/dist/index.js`),
+  ]);
+
+  const context = BACKGROUND_CONTEXT;
+  const directory = await mkdtemp(join(tmpdir(), 'nanobot-ask-user-reopen-'));
+  const workspace = join(directory, 'workspace');
+  const dataDir = join(directory, 'state');
+  await mkdir(workspace, { recursive: true });
+  t.after(() => rm(directory, { recursive: true, force: true }));
+
+  const model = { provider: 'ask-reopen-faux', modelId: 'synthetic' };
+  const config = parseConfig({
+    workspace,
+    dataDir,
+    model,
+    allowedModels: [model],
+    toolAllowlist: [],
+    episodeSummary: { enabled: false },
+  }, directory);
+
+  const sessionKey = 'cli:ask-user-reopen';
+  const openWith = (responses) => {
+    const faux = fauxProvider({ provider: model.provider, models: [{ id: model.modelId, name: 'Synthetic' }] });
+    faux.setResponses(responses);
+    const models = createModels();
+    models.setProvider(faux.provider);
+    return openGateway(config, context, { models, agentHistory: false });
+  };
+
+  let chatId;
+  const first = await openWith([() => fauxAssistantMessage('ready')]);
+  try {
+    const chat = await first.conversationFor(sessionKey, context);
+    chatId = chat.id;
+  } finally {
+    await first.close(context);
+  }
+
+  // Reopen without calling conversationFor: startup policy must still restore mapped chat
+  // authority so ask_user stays offered and callable at call time.
+  let delivered = [];
+  let asked = false;
+  const second = await openWith([
+    () => {
+      if (!asked) {
+        asked = true;
+        return fauxAssistantMessage([
+          fauxToolCall(ASK_USER_TOOL_NAME, {
+            questions: [{ question: 'Proceed after reopen?', options: [{ label: 'Yes' }, { label: 'No' }] }],
+          }, { id: 'ask-reopen-call' }),
+        ], { stopReason: 'toolUse' });
+      }
+      return fauxAssistantMessage('Question sent.');
+    },
+    () => fauxAssistantMessage('Question sent.'),
+  ]);
+  try {
+    const reopened = await second.harness.conversation(chatId, context);
+    assert.ok(reopened !== undefined, 'mapped chat exists after reopen');
+    const agent = await second.harness.snapshot(AgentDoc, chatId, context);
+    const toolNames = (agent?.tools ?? []).map((tool) => (typeof tool === 'string' ? tool : tool.name));
+    const modelToolNames = (agent?.modelTools ?? []).map((tool) => (typeof tool === 'string' ? tool : tool.name));
+    assert.ok(toolNames.includes(ASK_USER_TOOL_NAME), `ask_user must remain in tools after reopen: ${toolNames}`);
+    assert.ok(modelToolNames.includes(ASK_USER_TOOL_NAME), `ask_user must remain in modelTools after reopen: ${modelToolNames}`);
+
+    const detach = second.askSurfaces.attach({
+      owns: (key) => key === sessionKey,
+      deliverQuestion: async (_key, question) => {
+        delivered.push(question);
+      },
+    });
+    try {
+      const submission = await reopened.submit({ type: 'input', content: 'ask me after reopen', requestId: 'ask-reopen-1' }, context);
+      assert.equal((await submission.wait(context)).status, 'done');
+      assert.equal(delivered.length, 1, 'ask_user call succeeded on reopened mapped chat');
+      assert.equal(delivered[0].question, 'Proceed after reopen?');
+    } finally {
+      detach();
+    }
+  } finally {
+    await second.close(context);
+  }
+});

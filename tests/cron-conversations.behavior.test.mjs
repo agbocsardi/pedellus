@@ -1799,3 +1799,245 @@ test("a stale scheduled-run recall/MCP capture never survives a reopen", { timeo
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("cronFoundation.finalize strips extensions consistently with vision off and on", { timeout: 30_000 }, async () => {
+  const { openGateway } = await load(`${pkg}/dist/runtime.js`);
+  const { parseConfig } = await load(`${pkg}/dist/config.js`);
+  const extensionNames = (agent) => (agent?.extensions ?? []).map((ext) => (typeof ext === "string" ? ext : ext.name));
+
+  for (const withVision of [false, true]) {
+    const directory = await temp(`nanobot-cron-finalize-ext-${withVision ? "vision" : "plain"}-`);
+    try {
+      const workspace = resolve(directory, "workspace");
+      await mkdir(workspace);
+      const providerId = `cron-finalize-ext-${withVision ? "vision" : "plain"}`;
+      const provider = fauxProvider({
+        provider: providerId,
+        models: [
+          { id: "chat", name: "Chat", input: ["text", "image"] },
+        ],
+      });
+      let addIssued = false;
+      provider.setResponses(Array.from({ length: 8 }, () => (transcript) => {
+        const input = userTexts(transcript.messages)[0];
+        if (input === scheduledContent("extension strip probe")) return fauxAssistantMessage("STRIP-PROBE-ANSWER");
+        if (input === "schedule extension strip probe" && !addIssued) {
+          addIssued = true;
+          return fauxAssistantMessage([
+            fauxToolCall("cron", { action: "add", message: "extension strip probe", after_seconds: 1 }, { id: "ext-strip-add" }),
+          ], { stopReason: "toolUse" });
+        }
+        return fauxAssistantMessage("Scheduled.");
+      }));
+      const models = createModels();
+      models.setProvider(provider.provider);
+
+      const config = parseConfig({
+        workspace,
+        dataDir: resolve(directory, "state"),
+        ...(withVision
+          ? {
+              modelPresets: {
+                chat: { provider: providerId, modelId: "chat" },
+              },
+              modelPreset: "chat",
+              visionHandoff: { describerPreset: "chat" },
+            }
+          : {
+              model: { provider: providerId, modelId: "chat" },
+              allowedModels: [{ provider: providerId, modelId: "chat" }],
+            }),
+        toolAllowlist: ["read"],
+        cron: { enabled: true, timeZone: "UTC" },
+        episodeSummary: { enabled: false },
+      }, directory);
+
+      const gateway = await openGateway(config, context, { models });
+      try {
+        const chat = await gateway.conversationFor("cron-conversations:finalize-ext", context);
+        const settledWatcher = changeWatcher(gateway.harness, (changes) => changes.some((change) => {
+          if (change.type !== "document" || change.record.kind !== CRON_JOBS_KIND
+            || change.conversationId !== chat.id || change.value === null) return false;
+          return Array.isArray(change.value.jobs)
+            && change.value.jobs.some((job) => job.lastOutcome?.status === "ok");
+        }), "extension strip probe run to settle");
+        try {
+          const submission = await chat.submit(
+            { type: "input", content: "schedule extension strip probe", requestId: "ext-strip-req" },
+            context,
+          );
+          assert.equal((await submission.wait(context)).status, "done");
+          const publication = await settledWatcher.promise;
+          const automationId = publication.changes.find((change) =>
+            change.type === "document" && change.record.kind === CRON_JOBS_KIND
+            && change.conversationId === chat.id)?.value?.jobs[0]?.lastOutcome?.conversationId;
+          assert.equal(typeof automationId, "number");
+
+          // Inspect immediately after finalize (no reopen): extensions must be stripped to
+          // `[visionExtension]` when vision is enabled, or `[]` when vision is off.
+          const agent = await gateway.harness.snapshot(AgentDoc, automationId, context);
+          assert.deepEqual(agent?.tools ?? [], [], "finalized cron target keeps no tools");
+          assert.deepEqual(agent?.modelTools ?? [], [], "finalized cron target keeps no modelTools");
+          assert.deepEqual(
+            extensionNames(agent),
+            withVision ? ["nanobot-vision-handoff"] : [],
+            `finalized cron target extensions must be stripped (withVision=${withVision})`,
+          );
+        } finally {
+          settledWatcher.stop();
+        }
+      } finally {
+        await gateway.close(context);
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test("a forged mapping to a marked automation conversation stays denied even when reopened with cron disabled", { timeout: 30_000 }, async () => {
+  const { openGateway } = await load(`${pkg}/dist/runtime.js`);
+  const { parseConfig } = await load(`${pkg}/dist/config.js`);
+  const directory = await temp("nanobot-cron-forged-disabled-");
+  try {
+    const workspace = resolve(directory, "workspace");
+    await mkdir(workspace);
+    const providerId = "cron-forged-disabled-faux";
+    const model = { provider: providerId, modelId: "synthetic" };
+    const baseConfig = {
+      workspace,
+      dataDir: resolve(directory, "state"),
+      model,
+      allowedModels: [model],
+      toolAllowlist: ["read"],
+      episodeSummary: { enabled: false },
+    };
+    const provider = fauxProvider({ provider: providerId, models: [MODEL] });
+    let addIssued = false;
+    provider.setResponses(Array.from({ length: 8 }, () => (transcript) => {
+      const input = userTexts(transcript.messages)[0];
+      if (input === scheduledContent("forged disabled probe")) return fauxAssistantMessage("FORGED-PROBE-ANSWER");
+      if (input === "schedule forged disabled probe" && !addIssued) {
+        addIssued = true;
+        return fauxAssistantMessage([
+          fauxToolCall("cron", { action: "add", message: "forged disabled probe", after_seconds: 1 }, { id: "forged-disabled-add" }),
+        ], { stopReason: "toolUse" });
+      }
+      return fauxAssistantMessage("Scheduled.");
+    }));
+    const models = createModels();
+    models.setProvider(provider.provider);
+
+    let automationId;
+    const first = await openGateway(
+      parseConfig({ ...baseConfig, cron: { enabled: true, timeZone: "UTC" } }, directory),
+      context,
+      { models },
+    );
+    try {
+      const chat = await first.conversationFor("cron-conversations:forged-disabled-origin", context);
+      const settledWatcher = changeWatcher(first.harness, (changes) => changes.some((change) => {
+        if (change.type !== "document" || change.record.kind !== CRON_JOBS_KIND
+          || change.conversationId !== chat.id || change.value === null) return false;
+        return Array.isArray(change.value.jobs)
+          && change.value.jobs.some((job) => job.lastOutcome?.status === "ok");
+      }), "forged disabled probe run to settle");
+      try {
+        const submission = await chat.submit(
+          { type: "input", content: "schedule forged disabled probe", requestId: "forged-disabled-req" },
+          context,
+        );
+        assert.equal((await submission.wait(context)).status, "done");
+        const publication = await settledWatcher.promise;
+        automationId = publication.changes.find((change) =>
+          change.type === "document" && change.record.kind === CRON_JOBS_KIND
+          && change.conversationId === chat.id)?.value?.jobs[0]?.lastOutcome?.conversationId;
+        assert.equal(typeof automationId, "number");
+      } finally {
+        settledWatcher.stop();
+      }
+      // Forge a SessionMap entry pointing a chat key directly at the marked automation conversation.
+      await first.harness.commit(async (tx) => {
+        const map = await tx.doc(SessionMap, ROOT_CONVERSATION_ID);
+        map.sessions[mappedKey("telegram:7:chat:forged-automation")] = automationId;
+      }, context);
+    } finally {
+      await first.close(context);
+    }
+
+    // Reopen with cron disabled: CronConversationDoc denial classification must still be restored,
+    // so the forged mapping never gains ask_user, coding tools, or foreground chat admission.
+    const second = await openGateway(parseConfig(baseConfig, directory), context, { models, agentHistory: false });
+    try {
+      const agent = await second.harness.snapshot(AgentDoc, automationId, context);
+      assert.deepEqual(offeredToolNames(agent), [],
+        "marked automation conversation keeps no tools when reopened with cron disabled");
+      assert.deepEqual(agent?.modelTools ?? [], [],
+        "marked automation conversation keeps no modelTools when reopened with cron disabled");
+      await assert.rejects(
+        () => second.conversationFor("telegram:7:chat:forged-automation", context),
+        /automation/i,
+        "forged chat key naming a marked automation conversation is rejected even when cron is disabled",
+      );
+    } finally {
+      await second.close(context);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("channel state conversations never receive cron ownership or the cron tool, live or after reopen", { timeout: 30_000 }, async () => {
+  const { openGateway } = await load(`${pkg}/dist/runtime.js`);
+  const { parseConfig } = await load(`${pkg}/dist/config.js`);
+  const extensionNames = (agent) => (agent?.extensions ?? []).map((ext) => (typeof ext === "string" ? ext : ext.name));
+  const directory = await temp("nanobot-cron-channel-state-");
+  try {
+    const workspace = resolve(directory, "workspace");
+    await mkdir(workspace);
+    const providerId = "cron-channel-state-faux";
+    const model = { provider: providerId, modelId: "synthetic" };
+    const config = parseConfig({
+      workspace,
+      dataDir: resolve(directory, "state"),
+      model,
+      allowedModels: [model],
+      toolAllowlist: ["read"],
+      cron: { enabled: true, timeZone: "UTC" },
+      episodeSummary: { enabled: false },
+    }, directory);
+    const provider = fauxProvider({ provider: providerId, models: [MODEL] });
+    const models = createModels();
+    models.setProvider(provider.provider);
+
+    let stateId;
+    const first = await openGateway(config, context, { models });
+    try {
+      const chat = await first.conversationFor("telegram:7:chat:501", context);
+      assert.ok(offeredToolNames(await chat.agent(context)).includes("cron"), "ordinary mapped chat gets cron");
+
+      const state = await first.conversationFor("telegram:7:channel-state", context);
+      stateId = state.id;
+      const stateAgent = await first.harness.snapshot(AgentDoc, stateId, context);
+      assert.deepEqual(offeredToolNames(stateAgent), [], "channel state conversation gets no tools (including cron)");
+      assert.deepEqual(stateAgent?.modelTools ?? [], [], "channel state conversation gets no modelTools");
+      const exts = extensionNames(stateAgent);
+      assert.ok(!exts.some((name) => name.includes("cron")), `channel state conversation gets no cron extensions: ${exts}`);
+    } finally {
+      await first.close(context);
+    }
+
+    const second = await openGateway(config, context, { models });
+    try {
+      const reopenedStateAgent = await second.harness.snapshot(AgentDoc, stateId, context);
+      assert.deepEqual(offeredToolNames(reopenedStateAgent), [], "reopened channel state conversation keeps no tools");
+      assert.deepEqual(reopenedStateAgent?.modelTools ?? [], [], "reopened channel state conversation keeps no modelTools");
+      const exts = extensionNames(reopenedStateAgent);
+      assert.ok(!exts.some((name) => name.includes("cron")), `reopened channel state conversation keeps no cron extensions: ${exts}`);
+    } finally {
+      await second.close(context);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

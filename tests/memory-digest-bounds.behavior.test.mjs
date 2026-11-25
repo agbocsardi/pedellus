@@ -903,3 +903,154 @@ test('incremental scope-hook accounting matches a full transcript scan and reads
     /too long to verify its budget/);
   await assert.rejects(full({ id: 'read-3', name: 'read', arguments: { path: 'SOUL.md' } }), /too long to verify its budget/);
 });
+
+test('a live digest target reopened with bash in toolAllowlist stays bounded to curation tools', { timeout: 40_000 }, async (t) => {
+  const { ConfigToolCaptureDoc } = await import(new URL('../dist/tools/index.js', import.meta.url).href);
+  const { AgentDoc } = await import(`${modules}/pi-durable/dist/index.js`);
+  const fixture = await fixtureWorkspace();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  await writeFile(join(fixture.workspace, 'SOUL.md'), 'owner rules\n', 'utf8');
+
+  const entered = deferred();
+  const store = await openStore(fixture, async (_request, options) => {
+    entered.resolve();
+    await new Promise((resolve) => {
+      const signal = options?.signal;
+      if (signal?.aborted) return resolve();
+      signal?.addEventListener('abort', resolve, { once: true });
+    });
+    return fauxAssistantMessage('interrupted');
+  }, { toolAllowlist: ['read', 'write', 'edit', 'bash'] });
+
+  let reopened;
+  t.after(async () => {
+    await reopened?.close(context).catch(() => undefined);
+    await store.gateway.close(context).catch(() => undefined);
+  });
+
+  const origin = await store.gateway.conversationFor(SESSION, context);
+  await closedEpisode(store.gateway.harness, origin.id, [user('Bound check fact.'), assistant('Noted.')]);
+  const started = await startDigest(store.gateway);
+  assert.equal(started.status, 'started');
+  await within(entered.promise, WAIT_MS, 'the live digest target never reached its first request');
+
+  const digestTarget = await targetOf(store.gateway.harness, started.taskId);
+  assert.ok(digestTarget !== undefined, 'live digest target conversation exists');
+  // Simulate a stale/widened durable capture containing `bash` on the live digest target.
+  await store.gateway.harness.commit(async (tx) => {
+    const capture = await tx.doc(ConfigToolCaptureDoc, digestTarget.id);
+    capture.tools = ['read', 'write', 'edit', 'bash'];
+  }, context);
+
+  await store.gateway.close(context);
+
+  const afterReopenEntered = deferred();
+  const releaseAfterReopen = deferred();
+  const reopenedStore = await openStore(fixture, async (request, options) => {
+    const text = transcriptText(request.messages);
+    if (!text.includes('bash-attempt')) {
+      afterReopenEntered.resolve();
+      await new Promise((resolve) => {
+        const signal = options?.signal;
+        if (signal?.aborted) return resolve();
+        signal?.addEventListener('abort', resolve, { once: true });
+        releaseAfterReopen.promise.then(resolve);
+      });
+      return fauxAssistantMessage([fauxToolCall('bash', { command: 'echo WIDENED' }, { id: 'bash-attempt' })], { stopReason: 'toolUse' });
+    }
+    return fauxAssistantMessage('bash was refused.');
+  }, { toolAllowlist: ['read', 'write', 'edit', 'bash'] });
+  reopened = reopenedStore.gateway;
+
+  try {
+    await within(afterReopenEntered.promise, WAIT_MS, 'the reopened digest task never resumed');
+    // Reopen must have pruned `bash` out of both the durable capture and the target's offered tools.
+    const prunedCapture = await reopened.harness.snapshot(ConfigToolCaptureDoc, digestTarget.id, context);
+    assert.deepEqual([...(prunedCapture?.tools ?? [])], ['read', 'write', 'edit'],
+      'reopen must bound a live digest capture to memoryDigestCurationTools(toolAllowlist)');
+    const agent = await reopened.harness.snapshot(AgentDoc, digestTarget.id, context);
+    const offered = (agent?.tools ?? []).map((tool) => (typeof tool === 'string' ? tool : tool.name));
+    assert.ok(!offered.includes('bash'), `reopened digest target must not be offered bash: ${offered}`);
+    assert.deepEqual(offered.filter((name) => ['read', 'write', 'edit', 'bash'].includes(name)), ['read', 'write', 'edit']);
+
+    releaseAfterReopen.resolve();
+    const task = await settleTask(reopened.harness, started.taskId);
+    assert.equal(task.state.outcome.status, 'failed', 'attempting bash on a digest target fails closed');
+    const results = await toolResults(reopened.harness, digestTarget.id);
+    assert.ok(results.some((result) => result.name === 'bash' && result.isError),
+      'bash call on reopened digest target is refused as an error');
+  } finally {
+    releaseAfterReopen.resolve();
+  }
+});
+
+test('a malformed mixed-type capture on a live digest target fails closed on reopen instead of widening', { timeout: 40_000 }, async (t) => {
+  const { ConfigToolCaptureDoc } = await import(new URL('../dist/tools/index.js', import.meta.url).href);
+  const { AgentDoc } = await import(`${modules}/pi-durable/dist/index.js`);
+  const fixture = await fixtureWorkspace();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  await writeFile(join(fixture.workspace, 'SOUL.md'), 'owner rules\n', 'utf8');
+
+  const entered = deferred();
+  const store = await openStore(fixture, async (_request, options) => {
+    entered.resolve();
+    await new Promise((resolve) => {
+      const signal = options?.signal;
+      if (signal?.aborted) return resolve();
+      signal?.addEventListener('abort', resolve, { once: true });
+    });
+    return fauxAssistantMessage('interrupted');
+  });
+
+  let reopened;
+  t.after(async () => {
+    await reopened?.close(context).catch(() => undefined);
+    await store.gateway.close(context).catch(() => undefined);
+  });
+
+  const origin = await store.gateway.conversationFor(SESSION, context);
+  await closedEpisode(store.gateway.harness, origin.id, [user('Malformed capture fact.'), assistant('Noted.')]);
+  const started = await startDigest(store.gateway);
+  assert.equal(started.status, 'started');
+  await within(entered.promise, WAIT_MS, 'the live digest target never reached its first request');
+
+  const digestTarget = await targetOf(store.gateway.harness, started.taskId);
+  assert.ok(digestTarget !== undefined);
+  // Write a malformed mixed-type tools array into the durable capture document.
+  await store.gateway.harness.commit(async (tx) => {
+    const capture = await tx.doc(ConfigToolCaptureDoc, digestTarget.id);
+    capture.tools = ['read', 42];
+  }, context);
+
+  await store.gateway.close(context);
+
+  const afterReopenEntered = deferred();
+  const releaseAfterReopen = deferred();
+  const reopenedStore = await openStore(fixture, async (request, options) => {
+    if (!transcriptText(request.messages).includes('read-malformed')) {
+      afterReopenEntered.resolve();
+      await new Promise((resolve) => {
+        const signal = options?.signal;
+        if (signal?.aborted) return resolve();
+        signal?.addEventListener('abort', resolve, { once: true });
+        releaseAfterReopen.promise.then(resolve);
+      });
+      return toolRead('SOUL.md', 'read-malformed');
+    }
+    return fauxAssistantMessage('read was refused.');
+  });
+  reopened = reopenedStore.gateway;
+
+  try {
+    await within(afterReopenEntered.promise, WAIT_MS, 'reopened digest task never resumed');
+    const agent = await reopened.harness.snapshot(AgentDoc, digestTarget.id, context);
+    assert.deepEqual(agent?.tools ?? [], [], 'malformed mixed-type capture grants no tools after reopen');
+    assert.equal(await reopened.harness.snapshot(ConfigToolCaptureDoc, digestTarget.id, context), undefined,
+      'malformed mixed-type capture is retired on reopen instead of repaired into a grant');
+    releaseAfterReopen.resolve();
+    const task = await settleTask(reopened.harness, started.taskId);
+    assert.equal(task.state.outcome.status, 'failed');
+  } finally {
+    releaseAfterReopen.resolve();
+  }
+});

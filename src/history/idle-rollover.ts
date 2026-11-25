@@ -12,7 +12,19 @@
  */
 import type { Context } from "@earendil-works/chord";
 import type { ImageContent, Message, TextContent } from "@earendil-works/pi-ai";
-import type { ConversationId, EntryId } from "@earendil-works/pi-durable";
+import type { Models } from "@earendil-works/pi-ai/models";
+import {
+  ConversationBusy,
+  LiveDoc,
+  ResetEntry,
+  type ConversationId,
+  type EntryId,
+  type Harness as HarnessType,
+  type Tx,
+} from "@earendil-works/pi-durable";
+import type { ModelReference } from "../config.js";
+import { journalEvent } from "../observability.js";
+import { AskQuestionsDoc, pendingQuestionViews } from "../questions/index.js";
 
 export const IDLE_ROLLOVER_LIMITS = Object.freeze({
   /** How often mapped chats are checked. */
@@ -191,4 +203,104 @@ export function startIdleRollover(options: IdleRolloverOptions): IdleRollover {
       await Promise.all(deciding.values());
     },
   };
+}
+
+/** An idle rollover's guarded reset: the newest entry when the chat went idle. */
+export interface IdleRolloverReset {
+  readonly expectLatest: EntryId;
+}
+
+/** New activity, a run or a waiting question appeared after the chat went idle. */
+export class IdleRolloverStale extends Error {}
+
+/**
+ * Append the rollover's native reset, only while nothing was appended since the chat went idle, no
+ * run is live and no question still waits for an answer; otherwise the chat is not idle.
+ */
+export async function appendIdleRolloverReset(
+  tx: Tx, conversationId: ConversationId, reset: IdleRolloverReset, nowMs: number,
+): Promise<void> {
+  if ((await tx.doc(LiveDoc, conversationId)).run !== undefined) throw new IdleRolloverStale();
+  if (await tx.latestEntryId(conversationId) !== reset.expectLatest) throw new IdleRolloverStale();
+  if (pendingQuestionViews(await tx.doc(AskQuestionsDoc, conversationId), nowMs).views.length > 0) {
+    throw new IdleRolloverStale();
+  }
+  await tx.appendEntry(conversationId, { kind: ResetEntry.kind, head: "self" });
+}
+
+export interface GatewayIdleRolloverOptions {
+  readonly afterMs: number;
+  readonly now: () => number;
+  readonly context: Context;
+  readonly harness: HarnessType;
+  /** The live provider registry; read at each classification so a host reload applies. */
+  readonly models: () => Models;
+  /** The one configured classifier model. */
+  readonly classifier: ModelReference;
+  readonly sessions: IdleRolloverOptions["sessions"];
+  readonly quiet: IdleRolloverOptions["quiet"];
+  /** Commit the guarded reset, with the host's prompt rebuild when it has one. */
+  readonly reset: (session: IdleRolloverSession, reset: IdleRolloverReset, context: Context) => Promise<void>;
+  readonly report: (error: unknown) => void;
+}
+
+/** The gateway's idle rollover: native transcript probes and the one continuation classifier. */
+export function startGatewayIdleRollover(options: GatewayIdleRolloverOptions): IdleRollover {
+  const { harness, context } = options;
+  return startIdleRollover({
+    afterMs: options.afterMs,
+    now: options.now,
+    context,
+    sessions: options.sessions,
+    quiet: options.quiet,
+    probe: async (conversationId, ctx) => {
+      if ((await harness.snapshot(LiveDoc, conversationId, ctx))?.run !== undefined) return undefined;
+      const conversation = await harness.conversation(conversationId, ctx);
+      if (conversation === undefined) return undefined;
+      const [latest] = (await conversation.entries({ order: "descending" }, 1, undefined, ctx)).items;
+      // Nothing since the last reset (a rollover or `/new`): nothing to roll over.
+      if (latest === undefined || latest.kind === ResetEntry.kind) return undefined;
+      return latest.id;
+    },
+    continues: async (conversationId, message, idleMs, signal) => {
+      const models = options.models();
+      const classifier = models.getModelOfType("classifier", options.classifier.provider, options.classifier.modelId);
+      const conversation = await harness.conversation(conversationId, context);
+      if (classifier === undefined || conversation === undefined) return undefined;
+      const previous = renderRolloverSource((await conversation.context(context)).messages);
+      if (previous.trim().length === 0) return undefined;
+      const result = await models.classify(classifier, {
+        state: { previousConversation: previous, idleMinutes: Math.round(idleMs / 60_000), newMessage: message },
+        questions: {
+          continues: {
+            type: "bool",
+            instructions: "previousConversation is the newest part of an owner's conversation with their assistant, which then went idle."
+              + " Decide whether newMessage, the owner's first message after the pause, continues that conversation.",
+            criteria: {
+              true: "newMessage follows up on, answers, or refers back to the previous conversation, or makes sense only with it.",
+              false: "newMessage starts a different topic that does not need the previous conversation.",
+            },
+          },
+        },
+      }, { signal, telemetry: context.telemetry });
+      const answer = result.answers.continues;
+      if (result.stopReason !== "stop" || answer?.type !== "bool") {
+        journalEvent("gateway.idleRollover.unclassified", { stop: String(result.stopReason) });
+        return undefined;
+      }
+      const continues = answer.probability >= 0.5;
+      journalEvent("gateway.idleRollover.classified", { probability: Math.round(answer.probability * 100) / 100, continues });
+      return continues;
+    },
+    rollover: async (session, expectLatest, ctx) => {
+      try {
+        await options.reset(session, { expectLatest }, ctx);
+      } catch (error) {
+        // New activity won the race; the next idle period starts a fresh clock.
+        if (error instanceof IdleRolloverStale || error instanceof ConversationBusy) return;
+        throw error;
+      }
+    },
+    report: options.report,
+  });
 }

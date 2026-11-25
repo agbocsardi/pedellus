@@ -1,193 +1,68 @@
-import { randomUUID } from "node:crypto";
+/**
+ * Gateway composition root: `openGateway` validates configuration, builds every capability, opens
+ * the Durable harness, restores the authority registry and recovers interrupted work before
+ * scheduling resumes. Each subsystem lives in its own module; this file only wires them:
+ *
+ * - `runtime/authority.ts`: the conversation registry and the single extension/tool policy.
+ * - `runtime/model-host.ts`: model validation, the live catalog snapshot, selection and reload.
+ * - `runtime/context-host.ts`: host prompt snapshots and the skill loader.
+ * - `runtime/sessions.ts`: the session map and the shared mapped-chat scope.
+ * - `runtime/restore.ts`: reopen restoration of roles, pins and capture bounds.
+ * - `runtime/cron-host.ts`: scheduled-run preparation, finalization and the result outbox.
+ * - `recovery/startup.ts`, `history/host.ts`, `channels/app-runtime.ts`, `background-status.ts`.
+ */
 import { resolve } from "node:path";
 import { isChordError } from "@earendil-works/chord";
 import { processLock } from "@earendil-works/chord/node";
-import type { Context, Draft } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord";
 import { withoutAbortSignal } from "@earendil-works/chord/context";
-import type { AssistantMessage, ModelThinkingLevel } from "@earendil-works/pi-ai";
-import type { Models } from "@earendil-works/pi-ai/models";
-import { AgentDoc, AssistantEntry, ResetEntry, ToolTask, configure, ConversationBusy, createRegistry, defineDoc, defineExtension, hook, Harness, InboxDoc, LiveDoc, type AgentChange, type AgentState, type CommitObservation, type CommitPublication, type Conversation, type ConversationId, type Cursor, type EntryId, type EntryRecord, type Extension, type Harness as HarnessType, type Report, type Storage, type TaskId, type ToolRegistration, type Tx } from "@earendil-works/pi-durable";
-import { CONTEXT_LIMITS, createContextExtensionBuilder, type ContextExtensionReplacement, type ConversationContextSnapshot } from "./context/index.js";
-import { createSkillTool, SKILL_TOOL_NAME, type SkillTableUpdate } from "./context/skill-tool.js";
-import { CRON_RUN_TASK_NAME, CRON_TIMER_TASK_NAME, CronJobsDoc, createCronFoundation } from "./automation/cron.js";
+import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import {
-  automationConversationOf,
-  classifyAutomationConversation,
-  CronConversationDoc,
-  type CronConversationClass,
-} from "./automation/cron-conversations.js";
-import { createCronTool, CRON_TOOL_NAME } from "./automation/cron-tool.js";
-import { createCronOperator, type CronOperator } from "./automation/operator.js";
-import {
-  CRON_DELIVERY_MAX_TEXT_CHARS,
-  CronDeliveriesDoc,
-  CronDeliveryFaultsDoc,
-  CronDeliveryOutboxError,
-  admitCronDelivery,
-  copyCronDelivery,
-  cronOutcomeNotice,
-  recordCronDeliveryFault,
-  type CronDeliveryOutbox,
-  type CronDeliveryRecord,
-} from "./automation/cron-delivery.js";
-import {
-  HISTORY_INDEX_LIMITS,
-  createHistoryIndex,
-  historyIndexPath,
-  type HistoryIndex,
-  type HistoryPage,
-  type HistoryQuery,
-  type HistorySession,
-  type HistorySummaryPage,
-  type HistorySummaryQuery,
-} from "./history/index.js";
-import {
-  normalizeReadySummary,
-  readEpisodeDocument,
-  type HistorySummaryView,
-} from "./history/summary-view.js";
+  AgentDoc,
+  AssistantEntry,
+  configure,
+  createRegistry,
+  Harness,
+  type AgentChange,
+  type Conversation,
+  type ConversationId,
+  type EntryId,
+  type Extension,
+  type Harness as HarnessType,
+  type Report,
+  type Storage,
+  type ToolRegistration,
+} from "@earendil-works/pi-durable";
+import { CONTEXT_LIMITS } from "./context/index.js";
+import { SKILL_TOOL_NAME } from "./context/skill-tool.js";
+import { CRON_TOOL_NAME } from "./automation/cron-tool.js";
 import { createMemoryTools } from "./memory/tools.js";
-import { createMemoryService } from "./memory/service.js";
-import { createNotesBackend } from "./memory/notes.js";
-import { createHistoryBackend } from "./memory/history.js";
 import { MEMORY_TOOL_NAMES, type MemoryService } from "./memory/contracts.js";
+import { TELEGRAM_TOOL_NAME, createTelegramActionRegistry, createTelegramTool } from "./channels/telegram-tool.js";
+import { DISCORD_HISTORY_TOOL_NAME, createDiscordHistoryRegistry, createDiscordHistoryTool } from "./channels/discord-history.js";
+import { APP_TOOL_NAME, createAppActionRegistry, createAppTool } from "./channels/app-tool.js";
 import {
-  TELEGRAM_TOOL_NAME,
-  createTelegramActionRegistry,
-  createTelegramTool,
-  type TelegramActionRegistry,
-} from "./channels/telegram-tool.js";
-import {
-  DISCORD_HISTORY_TOOL_NAME,
-  createDiscordHistoryRegistry,
-  createDiscordHistoryTool,
-  type DiscordHistoryRegistry,
-} from "./channels/discord-history.js";
-import {
-  APP_TOOL_NAME,
-  createAppActionRegistry,
-  createAppTool,
-  type AppActionRegistry,
-} from "./channels/app-tool.js";
-import {
-  APP_CHAT_SESSION_KEY, APP_STATE_SESSION_KEY, AppState, AppThreadCapacityError, appForkEntry,
-  createAppConsoleRegistry, sessionForThread, threadInfo,
-  type AppConsoleRegistry, type AppGateway,
-} from "./channels/app.js";
-import { APP_MAIN_THREAD, parseThreadId } from "./channels/app-protocol.js";
-import {
-  cronTask,
-  cronTaskId,
-  selectTasks,
-  workerTask,
-  workerTaskId,
-  type AppTaskCancelResult,
-  type AppTaskList,
-} from "./channels/app-tasks.js";
-import type { CronFoundation, CronOwner } from "./automation/cron.js";
-import {
-  ASK_USER_TOOL_NAME,
-  AskQuestionsDoc,
-  cancelPendingQuestions,
-  pendingQuestionViews,
-  createAskSurfaceRegistry,
-  createAskUserTool,
-  type AskSurfaceRegistry,
-} from "./questions/index.js";
-import {
-  EpisodeDoc,
-  createEpisodeCatalog,
-  type EpisodeCatalog,
-  type EpisodeReconcileReport,
-  type HistoryEpisode,
-  type HistoryEpisodePage,
-  type HistoryEpisodeQuery,
-} from "./history/episodes.js";
-import {
-  createEpisodeSummaries,
-  type EpisodeSummaries,
-  type EpisodeSummaryBackfill,
-  type EpisodeSummaryDrain,
-  type EpisodeSummaryQueueView,
-  type EpisodeSummaryRetry,
-} from "./history/summary-task.js";
-import {
-  EPISODE_SUMMARY_QUEUE_LIMITS,
-  EpisodeSummaryDoc,
-  episodeSummaryKey,
-} from "./history/summary-queue.js";
-import type { EpisodeSummaryRecord } from "./history/summary-queue.js";
-import {
-  chatScopeMessage,
-  encodedSessionKey,
-  isChatSessionKey,
-  partitionChatScope,
-  readChatScope,
-  readChatSessions,
-  readMappedSessions,
-  type ChatScopeExclusion,
-  type HistoryChatSession,
-  type MappedSession,
-} from "./history/scope.js";
-import { ensureStoreIdentity, type StoreIdentity } from "./history/store-identity.js";
-import { modelKey, parseToolTimeoutSeconds, type ModelReference, type PortConfig } from "./config.js";
+  AppThreadCapacityError,
+  appForkAdmissible,
+  archivedAppSessionKeys,
+  createAppConsoleRegistry,
+  createAppTaskRuntime,
+  createAppThreadRuntime,
+  snapshotSlotsUsed,
+} from "./channels/app-runtime.js";
+import { ASK_USER_TOOL_NAME, createAskSurfaceRegistry, createAskUserTool } from "./questions/index.js";
+import { encodedSessionKey, chatScopeMessage, isChatSessionKey } from "./history/scope.js";
+import { parseToolTimeoutSeconds, type PortConfig } from "./config.js";
 import { createVisionHandoffExtension } from "./media/vision-hook.js";
-import { VisionHandoff, type VisionHandoffStats } from "./media/vision.js";
-import {
-  renderRolloverSource,
-  startIdleRollover,
-  type IdleRollover,
-  type OwnerInputContent,
-} from "./history/idle-rollover.js";
-import { hasPersistedNanobotContext, preparedContextReplay, preparedTaskModel } from "./recovery/prepared.js";
-import {
-  addInterruptedRunReport,
-  addTurnInterruptionMark,
-  INTERRUPTED_RUN_REPORT_MAX,
-  INTERRUPTION_RECORD_DAMAGED_FAULT,
-  InterruptedRunReportsDoc,
-  interruptionOrigin,
-  parseInterruptedRunReports,
-  parseTurnInterruptionMarks,
-  removeTurnInterruptionMarks,
-  TurnInterruptionMarksDoc,
-  TURN_INTERRUPTION_MAX_MARKS,
-  turnInterruptionDelivery,
-  type InterruptedPreparedKind,
-  type InterruptionSurface,
-  type TurnInterruptionMark,
-  type TurnInterruptionOrigin,
-} from "./recovery/interruption.js";
-import { canonicalFuturePath, prepareDataDirectory, inside } from "./store.js";
+import type { ModelReference } from "./config.js";
+import { startGatewayIdleRollover, appendIdleRolloverReset, type IdleRollover } from "./history/idle-rollover.js";
+import { recoverStartupInterruptions } from "./recovery/startup.js";
+import { prepareDataDirectory, inside } from "./store.js";
 import { openFullSyncNodeSqliteStorage } from "./storage/sqlite.js";
-import {
-  assertConfiguredModelAuth,
-  createProviderModels,
-  nativeModelReference,
-  resolveClassifierModel,
-  type ResolvedModelChoice,
-} from "./providers.js";
-import { resolveModelConfiguration, type ResolvedModelConfiguration } from "./model-config.js";
-import {
-  modelReloadCompatibility,
-  type ModelReloadResult,
-} from "./model-reload.js";
-import { authStorePath, FileCredentialStore } from "./auth/store.js";
 import { StartupDiagnosticError } from "./startup-diagnostics.js";
 import { reportFailure } from "./failure-diagnostics.js";
-import { journalEvent, journalTelemetry } from "./observability.js";
-import { loadModelCatalog } from "./model-catalog.js";
-import {
-  BACKGROUND_STATUS_LIMITS,
-  backgroundLabel,
-  emptyBackgroundStatus,
-  type BackgroundActiveWork,
-  type BackgroundCronRun,
-  type BackgroundDigest,
-  type BackgroundStatus,
-  type BackgroundTaskState,
-  type BackgroundWorker,
-} from "./background-status.js";
+import { journalTelemetry } from "./observability.js";
+import { emptyBackgroundStatus, readActiveWork, readBackgroundStatus } from "./background-status.js";
 import {
   createMcpAdmin,
   createMcpIntegration,
@@ -195,11 +70,8 @@ import {
   mcpHasEnabledServers,
   MCP_ADMIN_TOOL_NAME,
   type McpAdmin,
-  type McpAdminListing,
   type McpConfig,
   type McpIntegration,
-  type McpServerStatus,
-  type McpSurfaceRegistry,
 } from "./mcp/index.js";
 import {
   CLASSIFIER_MODEL_TOOL_NAME,
@@ -208,33 +80,16 @@ import {
   TOOL_SEARCH_TOOL_NAME,
   type CodeModeIntegration,
 } from "./extensions/codemode.js";
-import {
-  WORKER_TASK_NAME,
-  createWorkerFoundation,
-  workerBackgroundTarget,
-  workerChildPolicy,
-  type WorkerFoundation,
-} from "./workers/worker-task.js";
+import { WORKER_TASK_NAME, createWorkerFoundation, type WorkerFoundation } from "./workers/worker-task.js";
 import { createWorkerTool, WORKER_TOOL_NAME } from "./workers/tool.js";
 import { WORKER_LIMITS } from "./workers/limits.js";
 import { createWorkerWorkspace, type WorkerWorkspace } from "./workers/workspace.js";
-import { createDigestSource, type DigestSource } from "./history/digestion.js";
+import type { DigestSource } from "./history/digestion.js";
 import { DIGEST_RUN_LIMITS_DEFAULT, type DigestRunLimits } from "./history/digest-limits.js";
+import { createMemoryDigest, createMemoryDigestScopeExtension, memoryDigestCurationTools, type MemoryDigest } from "./history/memory-digest.js";
+import { createEpisodeSummaryPass, openHistoryHost, type HistoryHost, type HistoryHostParts } from "./history/host.js";
+import { extractAssistantText } from "./tasks/background.js";
 import {
-  MEMORY_DIGEST_TASK_NAME,
-  createMemoryDigest,
-  createMemoryDigestScopeExtension,
-  hasMemoryDigestTools,
-  memoryDigestCurationTools,
-  memoryDigestTaskPolicy,
-  memoryDigestTaskTarget,
-  type MemoryDigest,
-  type MemoryDigestStartResult,
-  type MemoryDigestStatus,
-  type MemoryDigestWriter,
-} from "./history/memory-digest.js";
-import {
-  boundedCapturedTools,
   CODING_TOOL_NAMES,
   ConfigToolCaptureDoc,
   createCodingToolExtension,
@@ -242,578 +97,33 @@ import {
   type CodingToolName,
   type ToolEnvironments,
 } from "./tools/index.js";
-import {
-  BraveSearchClient,
-  PublicWebFetcher,
-  WEB_TOOL_NAMES,
-  createWebToolExtension,
-  type WebRuntimeOptions,
-} from "./web/index.js";
+import { BraveSearchClient, PublicWebFetcher, WEB_TOOL_NAMES, createWebToolExtension } from "./web/index.js";
+import { ConversationRegistry, createAuthorityPolicy, createCommitEffects } from "./runtime/authority.js";
+import { createContextHost } from "./runtime/context-host.js";
+import { createCronHost, createCronOutbox } from "./runtime/cron-host.js";
+import { createModelHost, resolveBackgroundModels, resolveStartupModels } from "./runtime/model-host.js";
+import { restoreAuthority } from "./runtime/restore.js";
+import { createSessionScope, SessionMap } from "./runtime/sessions.js";
+import { createWorkerEnvironmentPool } from "./runtime/worker-environments.js";
+import type { Gateway, OpenGatewayOptions } from "./runtime/types.js";
 
-const SessionMap = defineDoc<{ sessions: Record<string, number> }>({
-  kind: "nanobot.session-map", version: 1, scope: "conversation", history: "latest", fork: "initial",
-  initial: () => ({ sessions: {} }), checkpointWhen: () => true,
-});
-
-/**
- * Durable identity of the last committed foreground policy revision.
- *
- * A live model reload writes one random revision here in the same commit as every conversation
- * policy it updates. The in-memory provider registry is published only when `observeCommits()`
- * reports that exact revision in a stored commit, so a candidate is never visible before its commit
- * is durable, and a failed or refused commit never publishes one.
- */
-const ModelPolicyRevisionDoc = defineDoc<{ revision: string }>({
-  kind: "nanobot.model-policy-revision", version: 1, scope: "session",
-  initial: () => ({ revision: "" }), checkpointWhen: () => true,
-});
-
-/** An idle rollover's guarded reset: the newest entry when the chat went idle. */
-interface IdleRolloverReset {
-  readonly expectLatest: EntryId;
-}
-
-/** New activity, a run or a waiting question appeared after the chat went idle. */
-class IdleRolloverStale extends Error {}
-
-/** Whether one stored commit carried a specific model-policy revision document. */
-function publicationCarriesRevision(publication: CommitPublication, revision: string): boolean {
-  return publication.changes.some((change) => change.type === "document" && change.kind === "change"
-    && change.record.scope.kind === "session"
-    && change.record.kind === ModelPolicyRevisionDoc.definition.kind
-    && (change.value as { readonly revision?: unknown }).revision === revision);
-}
-
-export interface GatewayModelChoice {
-  provider: string;
-  modelId: string;
-  name: string;
-  thinkingLevels: readonly ModelThinkingLevel[];
-}
-
-export interface GatewayModelSelectionRequest extends ModelReference {
-  thinkingLevel?: ModelThinkingLevel;
-}
-
-export interface GatewayModelSelection extends ModelReference {
-  thinkingLevel: ModelThinkingLevel;
-}
-
-/** Configured vision handoff and its process-lifetime, bounded accounting. */
-export interface GatewayVisionHandoffState {
-  readonly enabled: boolean;
-  readonly describer?: ModelReference;
-  readonly stats: VisionHandoffStats;
-}
-
-/** One named preset from config, using the provider spelling accepted by Gateway selection. */
-export interface GatewayModelPreset {
-  readonly name: string;
-  readonly provider: string;
-  readonly modelId: string;
-  readonly thinkingLevel?: ModelThinkingLevel;
-}
-
-export interface GatewayModelPresets {
-  readonly presets: readonly GatewayModelPreset[];
-  readonly defaultPreset: string;
-}
-
-export interface GatewayModelList {
-  models: readonly GatewayModelChoice[];
-  selected: GatewayModelSelection;
-  /** Named presets; absent in legacy direct-model mode. Omitting thinking means `off` when selected. */
-  presets?: readonly GatewayModelPreset[];
-  /** Configured default preset in named-preset mode. */
-  defaultPreset?: string;
-}
-
-export type GatewayContextSnapshotProvider = (
-  sessionKey: string,
-  conversationId: ConversationId,
-  context: Context,
-) =>
-  | Omit<ConversationContextSnapshot, "conversationId">
-  | undefined
-  | Promise<Omit<ConversationContextSnapshot, "conversationId"> | undefined>;
-
-/** Result of an explicit, per-session context refresh. */
-export interface GatewayContextRefresh {
-  /** Skills in the refreshed snapshot; 0 removes this conversation's on-demand skill table. */
-  readonly skills: number;
-}
-
-export interface OpenGatewayOptions {
-  readonly models?: Models;
-  /**
-   * Host-owned candidate loader for an explicit live model/credential reload. It must re-read the
-   * same configuration file the gateway opened from and return a fully parsed result; the runtime
-   * never accepts a path from a model, chat or tool. Absent, no `/reload` host method is exposed.
-   */
-  readonly reloadConfig?: () => Promise<PortConfig>;
-  /** Explicit host-owned context snapshots; absent means no context extension is installed. */
-  readonly contextSnapshotProvider?: GatewayContextSnapshotProvider;
-  /**
-   * Host switch for model-facing approved memory recall. It is on by default for mapped
-   * chats; pass `false` to disable recall too. It reads only approved workspace notes and
-   * already-mapped chat history, creates no conversation, writes no transcript and grants
-   * no filesystem or shell authority.
-   */
-  readonly agentHistory?: boolean;
-  /**
-   * Optional host override for the durable episode-summary pass. Without an override, summaries
-   * use the current conversation model; `episodeSummary.enabled: false` in config disables them.
-   */
-  readonly episodeSummary?: {
-    readonly provider: string;
-    readonly modelId: string;
-    readonly thinkingLevel?: ModelThinkingLevel;
-    /**
-     * How episodes that closed before opt-in enter the queue. Default `"none"`: a durable watermark
-     * records the newest entry at opt-in and nothing older is queued automatically, so enabling the
-     * pass cannot spend on existing history. `"pending"` is the deliberate opt-in to summarize every
-     * closed episode without a ready summary, through a bounded resumable scan.
-     */
-    readonly backfill?: "none" | "pending";
-  };
-  /**
-   * Native web-tool seams for tests: environment snapshot, controlled resolver and
-   * transports, and a fixed clock. No config field selects these, and an absent
-   * value uses Node DNS and HTTPS. The ordinary runtime makes no external call at
-   * startup, so these cannot silently widen shipped behavior.
-   */
-  readonly web?: WebRuntimeOptions;
-  /**
-   * Host seam for bounded memory digestion: the one-turn deadline used only when `digest` config
-   * leaves `runTimeoutSeconds` absent. A configured product deadline always wins over this seam; a
-   * digest run that exceeds its deadline is cancelled and fails without advancing the cursor. No
-   * config field selects this seam, and starting a run stays an explicit host call.
-   */
-  readonly memoryDigest?: {
-    readonly turnTimeoutMs?: number;
-  };
-}
-
-/** MCP servers configured for this open, with their connection state at the last read. */
-export interface GatewayMcpStatus {
-  readonly servers: readonly McpServerStatus[];
-}
-
-/**
- * Authenticated host surface for MCP management. The model tool performs configuration and login
- * actions directly; this interface lets each foreground adapter consume a callback-shaped line
- * before it becomes model input.
- */
-export interface GatewayMcpAdmin {
-  list(context: Context): Promise<McpAdminListing>;
-  submitCallback(sessionKey: string, text: string, context: Context): Promise<import("./mcp/index.js").McpCallbackResult>;
-}
-
-/** Read-only query for a bounded page of one mapped chat session's raw transcript entries. */
-export interface HistoryEntryQuery {
-  readonly minEntryId?: EntryId;
-  readonly maxEntryId?: EntryId;
-  readonly order?: "ascending" | "descending";
-}
-
-/** Read-only page of raw entries; the caller is responsible for filtering internal content. */
-export interface HistoryEntryPage {
-  readonly conversationId: ConversationId;
-  readonly sessionKey: string;
-  readonly items: readonly EntryRecord[];
-  readonly next?: Cursor;
-}
-
-export interface Gateway {
-  readonly harness: HarnessType;
-  /** Approved read-only recall over notes and mapped chat history. */
-  memorySearch(caller: ConversationId, query: unknown, context: Context): ReturnType<MemoryService["search"]>;
-  memoryBrowse(caller: ConversationId, query: unknown, context: Context): ReturnType<MemoryService["browse"]>;
-  memoryRead(caller: ConversationId, query: unknown, context: Context): ReturnType<MemoryService["read"]>;
-  /**
-   * Whole-episode conversation-to-memory digestion. `start` selects a closed episode from the
-   * mapped chat sessions and creates one continuing Durable task, or reports `idle`, `busy` or `refused`
-   * without starting anything. It is inert until a host calls it: no command, tool, schedule or
-   * provider call exists here, and nothing is sent to a user or channel. A run's cursor advance is
-   * durable and only happens after a settled, answered turn. The owner command (`/digest`, also
-   * offered to the authenticated Telegram owner) and an explicit ordinary cron job with
-   * `intent: "digest"` are the only callers; a failed or cancelled terminal run admits one bounded
-   * internal issue report to the origin agent's own conversation, and a successful run is silent.
-   */
-  readonly memoryDigest: GatewayMemoryDigest;
-  /**
-   * Channel-neutral durable outbox of completed background cron results. Host/channel code uses it
-   * after its own authentication; it creates no conversation, starts no run and adds no authority.
-   */
-  readonly cronOutbox: CronDeliveryOutbox;
-  /**
-   * Owner scheduling controls: create, list, show and cancel over the existing cron foundation.
-   * Present only when cron is enabled. Every origin is resolved through the host's current mapped
-   * ordinary chat sessions, and the owner is derived from that validated key, so a caller can name
-   * a chat but never supply a conversation ID or an owner record. It exposes no schedule editing,
-   * re-arm, bulk operation or run-now path, and it is not a model tool.
-   */
-  readonly cronOperator?: CronOperator;
-  /**
-   * Model-action host registry for the configured Telegram channel. The running adapter attaches
-   * here; when absent, a mapped Telegram chat still sees the tool but every call is denied because
-   * no live channel can send. Present only when `config.telegram` is configured.
-   */
-  readonly telegramActions?: TelegramActionRegistry;
-  /**
-   * Live host registry for the read-only Discord history capability. Present only when `config.discord`
-   * is configured; the running adapter attaches its call-time-checked host, and the runtime offers the
-   * tool only in a scope-checked mapped Discord chat conversation.
-   */
-  readonly discordHistory?: DiscordHistoryRegistry;
-  /**
-   * Live host registry for the app channel's operator console. Present only when `config.app` is
-   * configured; the running adapter attaches its pairing host, and the local terminal's
-   * `app pair|devices|revoke` commands reach it over the private socket.
-   */
-  readonly appConsole?: AppConsoleRegistry;
-  /**
-   * Called by every owner-input path just before it submits to a mapped chat: decides a prepared idle
-   * rollover for that chat (see `src/history/idle-rollover.ts`). Never throws; a no-op without one.
-   */
-  beforeOwnerInput(sessionKey: string, conversationId: ConversationId, content: OwnerInputContent, context: Context): Promise<void>;
-  /**
-   * Model-action host registry for the app channel's `app` file capability (`send`/`artifact`).
-   * Present only when `config.app` is configured; the running adapter attaches here, and the
-   * runtime offers the tool only in a scope-checked mapped app chat conversation.
-   */
-  readonly appActions?: AppActionRegistry;
-  readonly forkAppThread?: NonNullable<AppGateway["forkAppThread"]>;
-  readonly appThreadBusy?: NonNullable<AppGateway["appThreadBusy"]>;
-  /** Present only when `config.app` is configured: snapshot-slot room and eager thread reservation. */
-  readonly appSnapshotRoom?: NonNullable<AppGateway["appSnapshotRoom"]>;
-  readonly createAppThread?: NonNullable<AppGateway["createAppThread"]>;
-  readonly reserveAppThread?: NonNullable<AppGateway["reserveAppThread"]>;
-  /**
-   * The app channel's bounded Tasks view for one already-mapped thread. Read-only: it lists that
-   * thread's own workers and scheduled jobs through the same owner-scoped readers the model tools
-   * use, bounds the result to `LIMITS.maxListedTasks`, and maps it display-only. Nothing else is
-   * read, started, retried or cancelled; an unmapped session key reads nothing.
-   */
-  readonly appTasks?: NonNullable<AppGateway["appTasks"]>;
-  /**
-   * Cancels or removes one task of that thread, and only one it owns: an id from another thread
-   * reports `unknown` and changes nothing. A worker uses the existing durable worker cancel; a
-   * scheduled job uses the existing owner-scoped cron cancel, including its already-terminal case.
-   */
-  readonly appTaskCancel?: NonNullable<AppGateway["appTaskCancel"]>;
-  /**
-   * MCP server connection state; absent when MCP is not configured and enabled. A failed server has
-   * no tools; its status carries a fixed failure code, never a transport message or configured value.
-   */
-  readonly mcp: GatewayMcpStatus | undefined;
-  /**
-   * MCP management host surface. Present only when this gateway loaded an on-disk configuration
-   * file. The model tool performs direct management for authenticated mapped chats; this object
-   * only lists bounded status and consumes callback-shaped ingress before model admission.
-   */
-  readonly mcpAdmin?: GatewayMcpAdmin;
-  /**
-   * Live owner surfaces for direct MCP login delivery. Each foreground adapter attaches the exact
-   * session it authenticated; a URL or completion notice never goes to another chat or attachment.
-   */
-  readonly mcpSurfaces?: McpSurfaceRegistry;
-  /**
-   * Live owner surfaces for model-requested questions. A foreground terminal or channel attaches the
-   * exact session it authenticated; `ask_user` delivers only to the unique surface that owns it, and
-   * never to another chat or a sibling attachment.
-   */
-  readonly askSurfaces?: AskSurfaceRegistry;
-  conversationFor(sessionKey: string, context: Context): Promise<Conversation>;
-  /**
-   * Bounded, read-only background activity for one already-mapped conversation: its own live
-   * workers and scheduled jobs, plus whether the single workspace-global memory-digestion run is
-   * live and whether it belongs to this conversation, plus an anonymous gateway-wide active-work
-   * count for restart safety. It starts, retries and cancels nothing, calls
-   * no model, reads no transcript, prompt, tool argument, host path or other chat, and reports no
-   * other conversation ID. A conversation that is not an authenticated mapped chat reads nothing.
-   */
-  backgroundStatus(sessionKey: string, context: Context): Promise<BackgroundStatus>;
-  /**
-   * Bounded, read-only count of live work a whole-gateway restart would interrupt: executing tasks,
-   * work queued to execute, work waiting for it, and work still finishing. A sleeping native timer is
-   * an armed schedule and a blocked task cannot run, so neither counts, and an armed cron schedule
-   * never keeps the gateway permanently busy. It starts, changes, cancels and calls nothing, and
-   * reports no task, conversation or transcript detail.
-   */
-  activeWork(context: Context): Promise<BackgroundActiveWork>;
-  /** Lists the explicit allowlist and persisted selection for an already-known session key. */
-  listModels(sessionKey: string, context: Context): Promise<GatewayModelList>;
-  /**
-   * Read-only host catalog of named presets and the configured default: no conversation, mapping or
-   * commit is involved. `undefined` in legacy direct-model mode. Reflects the last `/reload`.
-   */
-  modelPresets(): GatewayModelPresets | undefined;
-  /**
-   * Read-only selected model of an already-mapped session key, resolved like `listModels` but
-   * without creating, committing or applying policy. `undefined` when the key has no mapping yet;
-   * it rejects when the stored state cannot be read.
-   */
-  selectedModel(sessionKey: string, context: Context): Promise<GatewayModelSelection | undefined>;
-  /** Persists a native pi.agent choice; rejects ConversationBusy atomically without changing it. */
-  selectModel(sessionKey: string, selection: GatewayModelSelectionRequest, context: Context): Promise<GatewayModelSelection>;
-  /**
-   * Explicit host-only reload of foreground model presets, model selection and credential
-   * references. It re-reads and fully validates the host-owned configuration file, then applies
-   * only those fields; tools, channels, workspace context, MCP and background model captures need
-   * `/restart`. Present only when the host supplied a configuration-file loader.
-   */
-  readonly reloadModels?: (context: Context) => Promise<ModelReloadResult>;
-  /**
-   * Temporarily selects a configured named preset in this conversation, using its provider/model
-   * and its thinking level (or `off`). `default` returns to the configured preset. Named-preset
-   * conversations also reset to the configured preset on the next gateway open. Rejects with
-   * ConversationBusy atomically and fails for unknown names or in legacy direct-model mode.
-   */
-  selectModelPreset(sessionKey: string, name: string, context: Context): Promise<GatewayModelSelection>;
-  /**
-   * Configured vision handoff and bounded counters for auxiliary describer calls. The counters are
-   * process lifetime, not per conversation; they expose spend that the main model request hides.
-   */
-  visionHandoffStats(): GatewayVisionHandoffState;
-  /**
-   * Immutable identity of this SQLite store. A derived index persists `storeId` and refuses
-   * its own rows when it changes, so a rebuilt or replaced store cannot mix two histories.
-   * It carries no access: the host still authenticates the reader.
-   */
-  historyIdentity(context: Context): Promise<StoreIdentity>;
-  /**
-   * Episodes of one mapped chat session: discussions bounded by committed reset entries,
-   * newest first. Read-only over Durable's transcript; nothing is summarized or indexed and
-   * no model runs. A state-only channel conversation is not history and is rejected.
-   *
-   * `next.before` is a durable entry ID, so a continuation stays stable across appends and
-   * reopen. `summary.status` reports `open`, `pending`, `ready`, `failed`, or `unknown` when
-   * reconciliation has not reached that boundary yet; the original entries are always the
-   * authority and remain readable through the conversation handle. Boundaries and counts are
-   * the same before and after reconciliation. Empty episodes are omitted: an episode whose
-   * only entry is its own reset marker is not a discussion. A reset handoff is synthetic
-   * context, so `messages` counts ordinary user and assistant entries only.
-   */
-  listHistoryEpisodes(
-    sessionKey: string,
-    query: HistoryEpisodeQuery,
-    context: Context,
-  ): Promise<HistoryEpisodePage>;
-  /** One episode by its start entry ID, or undefined when it is not a known boundary. */
-  historyEpisode(sessionKey: string, startEntryId: number, context: Context): Promise<HistoryEpisode | undefined>;
-  /**
-   * Bounded read-only page of one existing mapped chat session's raw entries. This never creates
-   * a conversation, writes a transcript, starts a model or accepts a conversation ID. State-only
-   * channel conversations are rejected. Callers must filter internal kinds themselves before
-   * displaying anything; this is a trusted host surface, not an untrusted-channel API.
-   */
-  historyEntries(
-    sessionKey: string,
-    query: HistoryEntryQuery,
-    limit: number,
-    cursor: Cursor | undefined,
-    context: Context,
-  ): Promise<HistoryEntryPage>;
-  /**
-   * Catch this session's episode catalog up now. Idempotent, bounded, and never schedules a
-   * summary; the same work also runs in the background after resets and on reopen.
-   */
-  reconcileHistoryEpisodes(sessionKey: string, context: Context): Promise<EpisodeReconcileReport>;
-  /**
-   * One closed episode's derived summary record (status, coverage, usage, text), or undefined when
-   * no pass finished for it. Requires summaries to be enabled; when disabled this fails
-   * closed. The record is derived data: the original entries stay the authority, and the text is
-   * model output over untrusted transcript content.
-   */
-  historyEpisodeSummary(sessionKey: string, startEntryId: number, context: Context): Promise<EpisodeSummaryRecord | undefined>;
-  /** Durable summary queue counters and the configured summary model; fails closed without one. */
-  historySummaryQueue(sessionKey: string, context: Context): Promise<EpisodeSummaryQueueView>;
-  /**
-   * Start a summary worker for queued work when none is live. Idempotent; it never creates a queue
-   * entry by itself. Reports the live worker and, when Durable blocks the chain's task because no
-   * installed definition can take it, that task and reason. Nothing revives a blocked chain.
-   */
-  drainEpisodeSummaries(sessionKey: string, context: Context): Promise<EpisodeSummaryDrain>;
-  /**
-   * Bounded, resumable scan that queues already-closed episodes without a ready summary. This is the
-   * explicit opt-in to historical spend, whether those episodes were catalogued before summaries were
-   * enabled or were omitted by the queue cap.
-   */
-  backfillEpisodeSummaries(sessionKey: string, context: Context): Promise<EpisodeSummaryBackfill>;
-  /**
-   * Queue one episode by start entry ID, recreating its job from the closed episode document when the
-   * queue entry is gone (failed retention, cap omission, or the opt-in watermark). Reports
-   * `queued`, `already_queued`, `already_ready`, `queue_full`, `missing`, or `version_incompatible`
-   * when the episode record names a newer summarizer version than this build can produce.
-   */
-  retryEpisodeSummary(
-    sessionKey: string,
-    startEntryId: number,
-    context: Context,
-  ): Promise<EpisodeSummaryRetry>;
-  /**
-   * Search the rebuildable SQLite index over Durable-retained entries.
-   *
-   * The index is bound to this store's immutable `nanobot.store-identity` document, minted on the
-   * first open and only read afterwards, so a replaced store file never sees another store's rows.
-   * Durable is the canonical transcript. This method never mutates it, accepts no conversation ID,
-   * and reads only the mapped
-   * chat sessions supplied by the host. The host is the authorization boundary:
-   * call it only from trusted host code after its own channel authentication, and do not expose the
-   * results (which include session keys) directly to an untrusted model or channel.
-   *
-   * Default scope is user/assistant message text, optionally filtered by role. `tools` searches tool
-   * names, arguments and result text only; `all` combines both. Thinking, system prompts, reset
-   * handoffs and compaction summaries are never in these scopes. State-only conversations and
-   * task-owned background runs are excluded. Tool hits expose records, never execution authority.
-   *
-   * Each call reconciles a bounded slice of new Durable entries before querying. `coverage` reports
-   * index lag rather than silently omitting it: a large backlog is visible and continues on the next
-   * call. Long message/tool text is chunked and remains searchable up to the documented per-entry
-   * cap; omitted chunks are counted. Pages are ordered newest-first by Durable entry ID and resume
-   * with a query-, mapping-, generation- and source-bound cursor; entries appended after the first
-   * page stay out of that continuation, and a rebuilt index or changed store identity rejects the
-   * cursor. The derived index may be deleted at any time and is rebuilt from Durable.
-   */
-  historySearch(query: HistoryQuery, context: Context): Promise<HistoryPage>;
-  /**
-   * Discover ready derived episode summaries across mapped chat conversations.
-   *
-   * This is navigation over already-generated summaries: it never plans, queues, retries or backfills
-   * a summary, never calls a model, and never writes Durable. The same bounded episode reconciliation
-   * as `historySearch` runs first, then a bounded slice of stored summary records is re-read. Only a
-   * `ready` record whose episode boundary, summarizer version and text agree is searchable; a missing,
-   * failed or corrupt summary removes at most its own derived row and cannot block raw search.
-   *
-   * Summary text is model output over untrusted stored conversation. Treat it as derived, quoted
-   * navigation; original Durable entries remain the authority and are reached with `historyEpisode`
-   * or `historyEntries`. Pages are newest-first by episode start entry ID with a query-, mapping-,
-   * generation- and snapshot-bound cursor; summaries written after a page are excluded from that
-   * continuation.
-   */
-  historySummarySearch(query: HistorySummaryQuery, context: Context): Promise<HistorySummaryPage>;
-  /**
-   * Read one episode's stored summary by its exact start entry ID through the same validated mapped-chat
-   * session scope as every other history read.
-   *
-   * Unlike `historyEpisodeSummary`, this read does not require the summary pass to be enabled for this
-   * open: it reads the derived catalog/summary documents directly and never calls a model. It returns a
-   * classified view (`ready`, `not-ready`, `missing`, `malformed`, `unreadable`) instead of throwing for
-   * stored state, so a corrupt summary never blocks transcript retrieval. Ready text is model output over
-   * untrusted stored conversation: quote it and treat the original entries as the authority.
-   */
-  historySummary(sessionKey: string, startEntryId: number, context: Context): Promise<HistorySummaryView>;
-  /**
-   * Re-runs the configured context snapshot provider for one existing session and applies it to the
-   * next turn. Rejects an unknown session, a live run, or a gateway opened without a provider.
-   * Prompt content stays metadata-only and no tool authority is added or widened.
-   */
-  refreshContext(sessionKey: string, context: Context): Promise<GatewayContextRefresh>;
-  /**
-   * Start a new context for one mapped chat session and rebuild its host prompt snapshot from
-   * the current workspace files, so the next request of the new session sees them. Both halves are one
-   * operation: a live run is reported as `busy` before either happens, because a rebuilt snapshot
-   * installed mid-run would change the running turn's later provider request, while a reset alone would
-   * leave the new context with the old prompt. Requests already prepared are untouched.
-   */
-  resetSession(sessionKey: string, context: Context): Promise<GatewaySessionReset>;
-  close(context: Context): Promise<void>;
-}
-
-/**
- * The host entry point for memory digestion. `start` is the whole interface: the caller supplies the
- * authenticated origin conversation and decides when to run; nothing is scheduled, exposed or sent.
- * Call it outside a Session commit: it performs its own commits (a live-task check, the batch read and
- * the task creation) and a nested commit would wait on the line the caller already holds.
- */
-export interface GatewayMemoryDigest {
-  start(writer: MemoryDigestWriter, context: Context): Promise<MemoryDigestStartResult>;
-  /** Bounded read-only status: the live run and this conversation's newest run. No scan, no model. */
-  status(writer: MemoryDigestWriter, context: Context): Promise<MemoryDigestStatus>;
-}
-
-/** Outcome of {@link Gateway.resetSession}; `busy` means nothing was reset and nothing was rebuilt. */
-export type GatewaySessionReset =
-  | { readonly status: "reset"; readonly skills: number; readonly promptRebuilt: boolean }
-  | { readonly status: "busy" };
-
-function bindContextSnapshot(
-  value: object | undefined,
-  conversationId: ConversationId,
-): ConversationContextSnapshot {
-  const snapshot: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
-  if (value !== undefined) {
-    for (const key of ["identity", "agents", "soul", "user", "memory", "skills", "skillSummary"]) {
-      const descriptor = Object.getOwnPropertyDescriptor(value, key);
-      if (descriptor && Object.hasOwn(descriptor, "value")) snapshot[key] = descriptor.value;
-    }
-  }
-  snapshot.conversationId = conversationId;
-  return snapshot as unknown as ConversationContextSnapshot;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-/** A native task state that is executing work right now; pending, waiting and sleeping are not. */
-function executingState(value: string | undefined): BackgroundTaskState | undefined {
-  return value === "running" || value === "completing" ? value : undefined;
-}
-
-/** A live background target (scheduled run or worker), recovered from its durable checkpoint. */
-interface BackgroundRunTarget {
-  readonly originConversationId: ConversationId;
-  readonly targetConversationId: ConversationId;
-}
-
-/**
- * The target of one non-terminal cron run whose checkpoint already chose it. A background run's
- * target is task-owned and deliberately absent from the SessionMap, so it is restored from the run
- * task itself. An origin-mode run's target is the origin, which the map already restores.
- */
-function cronBackgroundTarget(task: unknown): BackgroundRunTarget | undefined {
-  if (!isRecord(task) || task.kind !== CRON_RUN_TASK_NAME) return undefined;
-  const { conversationId, state } = task;
-  if (!Number.isSafeInteger(conversationId) || (conversationId as number) < 1) return undefined;
-  if (!isRecord(state) || state.status === "terminal" || state.status === "completing") return undefined;
-  if (!isRecord(state.checkpoint)) return undefined;
-  const targetConversationId = state.checkpoint.targetConversationId;
-  if (!Number.isSafeInteger(targetConversationId) || (targetConversationId as number) < 1) return undefined;
-  if (targetConversationId === conversationId) return undefined;
-  return {
-    originConversationId: conversationId as ConversationId,
-    targetConversationId: targetConversationId as ConversationId,
-  };
-}
-
-function isModelSelection(value: unknown): value is GatewayModelSelectionRequest {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
-  const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) return false;
-  if (!Object.hasOwn(value, "provider") || !Object.hasOwn(value, "modelId")) return false;
-  const candidate = value as Record<string, unknown>;
-  return typeof candidate.provider === "string" && candidate.provider.length > 0 &&
-    typeof candidate.modelId === "string" && candidate.modelId.length > 0;
-}
+export type * from "./runtime/types.js";
 
 export async function openGateway(config: PortConfig, context: Context, options: OpenGatewayOptions = {}): Promise<Gateway> {
   // A config name is not a Durable registration identity or an authorization grant. Only the four
   // native coding tools have reviewed registrations; anything else fails closed before setup.
   const toolAllowlist = config.toolAllowlist ?? [];
-  const unavailableTools = toolAllowlist.filter(
-    (name) => !(CODING_TOOL_NAMES as readonly string[]).includes(name),
-  );
+  const unavailableTools = toolAllowlist.filter((name) => !(CODING_TOOL_NAMES as readonly string[]).includes(name));
   if (unavailableTools.length > 0) {
     throw new StartupDiagnosticError("configInvalid", {
-      detail: `toolAllowlist names unsupported tools: ${unavailableTools.join(", ")} ` +
-        "(no approved registered tools)",
+      detail: `toolAllowlist names unsupported tools: ${unavailableTools.join(", ")} (no approved registered tools)`,
     });
   }
-  const workerCodingTools = config.workers?.enabled === true
-    ? (config.workers.toolAllowlist ?? toolAllowlist).filter((name) =>
-        (CODING_TOOL_NAMES as readonly string[]).includes(name)) : [];
+  const workersConfig = config.workers;
+  const workersEnabled = workersConfig?.enabled === true;
+  const workerCodingTools = workersEnabled
+    ? (workersConfig.toolAllowlist ?? toolAllowlist).filter((name) => (CODING_TOOL_NAMES as readonly string[]).includes(name))
+    : [];
   const registeredCodingTools = [...new Set([...toolAllowlist, ...workerCodingTools])];
   const toolsEnabled = registeredCodingTools.length > 0;
   // MCP is a separate, explicit connection authority. Connecting starts external clients, so the
@@ -830,27 +140,18 @@ export async function openGateway(config: PortConfig, context: Context, options:
   // still ties it to configured MCP, and an explicit `false` disables it either way.
   const codeModeConfig = config.codemode;
   const codeModeEnabled = codeModeConfig === undefined ? mcpConfigured : codeModeConfig.enabled;
-  // Late-bound so the coding ceiling hook can delegate MCP/Code Mode names to the hook installed
-  // later. Absent integrations mean the ceiling blocks those names instead.
+  // Late-bound integrations: the policy delegates to hooks installed later or replaced live, and an
+  // absent integration means its names are blocked instead.
   const mcpRef: { current: McpIntegration | undefined } = { current: undefined };
   const codeModeRef: { current: CodeModeIntegration | undefined } = { current: undefined };
-  // Direct MCP management: the `mcp` model tool acts for an authenticated mapped chat and needs an
-  // on-disk configuration file to write. An SDK host that supplies an object keeps the read-only
-  // `gateway.mcp` status and no write surface.
+  // Direct MCP management needs an on-disk configuration file to write; an SDK host that supplies
+  // an object keeps the read-only `gateway.mcp` status and no write surface.
   const mcpAdminRef: { current: McpAdmin | undefined } = { current: undefined };
-  // Late-bound live activation: the registry and conversation policy exist only after the harness opens.
   const mcpActivationRef: { current: ((next: McpConfig) => Promise<void>) | undefined } = { current: undefined };
-  // Internal agent scheduling: opt-in, and independent of the coding-tool ceiling so a reminder job
-  // needs no filesystem authority.
-  const cronConfig = config.cron;
-  const cronEnabled = cronConfig?.enabled === true;
-  // Bounded ordinary background workers: opt-in, native Durable tasks, and independent of the coding
-  // tool ceiling so a research worker with no filesystem authority is still possible.
-  const workersConfig = config.workers;
-  const workersEnabled = workersConfig?.enabled === true;
-  // A completed background result is queued only for an origin session that belongs to a channel
-  // enabled in this configuration. A disabled channel creates no record, so no later enable can
-  // deliver a stale result through a channel the host had switched off.
+  // Internal scheduling is opt-in and independent of the coding-tool ceiling.
+  const cronEnabled = config.cron?.enabled === true;
+  // A completed background result is queued only for an origin session of a channel enabled in this
+  // configuration, so no later enable can deliver a stale result through a channel switched off.
   const cronDeliveryPrefixes: readonly string[] = [
     ...(config.telegram === undefined ? [] : ["telegram:"]),
     ...(config.discord === undefined ? [] : ["discord:"]),
@@ -858,240 +159,17 @@ export async function openGateway(config: PortConfig, context: Context, options:
   ];
   // Fail at startup, not at the first tool call, when the default cannot be represented by the host shell.
   const toolTimeoutSeconds = parseToolTimeoutSeconds(config.toolTimeoutSeconds);
-  // The gateway and the terminal login/logout command must resolve one private store
-  // file. Resolve the future canonical data directory without creating it: a failed
-  // startup keeps its existing side-effect-free behavior, and startup below re-checks
-  // that the validated, chmodded canonical directory is exactly this one.
-  let credentialStoreDir: string | undefined;
-  let prepared: { models: Models; model: ModelReference; classifier: ModelReference | undefined };
-  if (options.models !== undefined) {
-    prepared = { models: options.models, model: nativeModelReference(config.model), classifier: undefined };
-  } else {
-    try {
-      credentialStoreDir = await canonicalFuturePath(config.dataDir);
-    } catch (cause) {
-      throw new StartupDiagnosticError("workspace", { cause });
-    }
-    // Offline last-good catalog from an explicit `models refresh`; an unusable file is the bundled catalog.
-    const catalog = await loadModelCatalog(credentialStoreDir);
-    if (catalog.issue !== undefined) journalEvent("model_catalog.ignored", { reason: catalog.issue });
-    prepared = createProviderModels(
-      config,
-      process.env,
-      new FileCredentialStore(authStorePath(credentialStoreDir)),
-      catalog.overlay,
-    );
-  }
-  let models = prepared.models;
-  const resolvedModels = resolveModelConfiguration(config, models);
-  let { choices, choicesByConfigured, choicesByNative, configuredPresetName, presetCatalog, defaultChoice } = resolvedModels;
-  let defaultThinkingLevel = resolvedModels.defaultThinkingLevel;
-  // One live model/credential configuration, replaced only by the explicit host reload below.
-  let liveModelConfig = config;
-  // The one configured classifier model, resolved against the very catalog Code Mode uses.
-  const classifierGrant = options.models === undefined
-    ? prepared.classifier
-    : resolveClassifierModel(models, config.classifierModel);
-  const classifierGrantKey = classifierGrant === undefined ? undefined : modelKey(classifierGrant);
-  if (options.models === undefined) {
-    // Fail before storage opens when a configured chat provider has no usable
-    // native credential. Stored OAuth is checked for presence, not refreshed.
-    await assertConfiguredModelAuth(models, choices, context.abortSignal);
-  }
+  const startupModels = await resolveStartupModels(config, options, context);
+  const classifierGrant = startupModels.classifierGrant;
+  const classifierGrantKey = classifierGrant === undefined ? undefined : JSON.stringify([classifierGrant.provider, classifierGrant.modelId]);
   if (options.contextSnapshotProvider !== undefined && typeof options.contextSnapshotProvider !== "function") {
     throw new TypeError("contextSnapshotProvider must be a function");
   }
   if (options.agentHistory !== undefined && typeof options.agentHistory !== "boolean") {
     throw new TypeError("agentHistory must be a boolean");
   }
-  /**
-   * Explicit background model for memory digestion. It is resolved from `digest.preset` or
-   * `digest.model` only: the origin conversation's current model and thinking level are never
-   * inherited, and absent both, a start is refused. A preset keeps its configured thinking level;
-   * a direct model runs at the lowest level it supports (never the foreground default).
-   */
-  let digestChoice: { readonly model: { readonly provider: string; readonly modelId: string }; readonly thinkingLevel: ModelThinkingLevel } | undefined;
-  if (config.digest?.preset !== undefined) {
-    const preset = presetCatalog.get(config.digest.preset);
-    if (preset === undefined) {
-      throw new StartupDiagnosticError("configInvalid", { detail: "digest.preset must name a configured model preset" });
-    }
-    const level = preset.thinkingLevel ?? "off";
-    digestChoice = {
-      model: { provider: preset.choice.native.provider, modelId: preset.choice.native.modelId },
-      thinkingLevel: preset.choice.thinkingLevels.includes(level) ? level : preset.choice.thinkingLevels[0]!,
-    };
-  } else if (config.digest?.model !== undefined) {
-    const choice = choicesByConfigured.get(modelKey(config.digest.model));
-    if (choice === undefined) {
-      throw new StartupDiagnosticError("configInvalid", { detail: "digest.model must be included in allowedModels" });
-    }
-    digestChoice = {
-      model: { provider: choice.native.provider, modelId: choice.native.modelId },
-      thinkingLevel: choice.thinkingLevels.includes("off") ? "off" : choice.thinkingLevels[0]!,
-    };
-  }
-  // Idle rollover classifies the owner's next message with the one configured classifier.
-  if (config.idleRollover !== undefined && classifierGrant === undefined) {
-    throw new StartupDiagnosticError("configInvalid", { detail: "idleRollover requires classifierModel" });
-  }
-  // A worker's model comes from the spawning conversation's current selection at launch, unless config
-  // names one finite preset. Either way it is a native pair inside the configured model catalog.
-  let workerPreset: { readonly model: ModelReference; readonly thinkingLevel: ModelThinkingLevel } | undefined;
-  if (workersConfig?.preset !== undefined) {
-    const selected = presetCatalog.get(workersConfig.preset);
-    if (selected === undefined) {
-      throw new StartupDiagnosticError("model", { detail: "workers.preset must name a configured model preset" });
-    }
-    workerPreset = { model: selected.choice.native, thinkingLevel: selected.thinkingLevel ?? "off" };
-  }
-  // Vision handoff: one configured describer preset replaces or bounds image attachments in the
-  // model-bound request. It is a native generation hook, never a second agent loop, and it leaves
-  // the persisted transcript and prepared checkpoints untouched. The map records the model pinned
-  // by a live prepared dispatch so recovery cannot silently apply the reset configured preset.
-  const preparedGenerationModels = new Map<number, ModelReference>();
-  let visionHandoff: VisionHandoff | undefined;
-  let visionExtension: Extension | undefined;
-  if (config.visionHandoff !== undefined) {
-    const describerPreset = presetCatalog.get(config.visionHandoff.describerPreset);
-    if (describerPreset === undefined) {
-      throw new StartupDiagnosticError("model", {
-        detail: "visionHandoff.describerPreset must name a configured model preset",
-      });
-    }
-    if (!describerPreset.choice.model.input.includes("image")) {
-      throw new StartupDiagnosticError("model", {
-        detail: "visionHandoff.describerPreset must name a model that accepts image input",
-      });
-    }
-    const flaggedModels = new Set<string>();
-    const flagsByNativePair = new Map<string, { readonly name: string; readonly flag: boolean }>();
-    for (const [name, preset] of Object.entries(config.modelPresets ?? {})) {
-      const choice = presetCatalog.get(name);
-      if (choice === undefined) {
-        throw new StartupDiagnosticError("model", {
-          detail: `Model preset ${name} is outside the configured model catalog`,
-        });
-      }
-      const flag = preset.needsVisionHandoff === true;
-      // Requests carry the native provider/model pair, never the config alias. Compare and key
-      // flags by that native pair, so aliasing cannot silently disable a text-only flag.
-      const key = modelKey(choice.choice.native);
-      const previous = flagsByNativePair.get(key);
-      if (previous !== undefined && previous.flag !== flag) {
-        throw new StartupDiagnosticError("model", {
-          detail: `Model presets ${previous.name} and ${name} disagree on needsVisionHandoff for the same native model`,
-        });
-      }
-      flagsByNativePair.set(key, { name, flag });
-      if (!flag) continue;
-      if (name === config.visionHandoff.describerPreset) {
-        throw new StartupDiagnosticError("model", {
-          detail: "visionHandoff.describerPreset must not itself need vision handoff",
-        });
-      }
-      flaggedModels.add(key);
-    }
-    visionHandoff = new VisionHandoff({
-      describer: describerPreset.choice.native,
-      flaggedModels,
-      maxRawImages: config.visionHandoff.maxRawImages,
-      maxDescriptionTokens: config.visionHandoff.maxDescriptionTokens,
-      ...(config.visionHandoff.prompt === undefined ? {} : { prompt: config.visionHandoff.prompt }),
-    });
-    visionExtension = createVisionHandoffExtension({
-      handoff: visionHandoff,
-      // Read at each request so a host model reload updates the fallback without rebuilding the hook.
-      defaultModel: () => defaultChoice.native,
-      preparedModel: (taskId) => {
-        // Consume the pin for exactly the saved dispatch that startup found. A later retry
-        // re-prepares from the reset AgentDoc model, so a stale task-lifetime pin would apply
-        // the old image policy to a different model.
-        const key = Number(taskId);
-        const model = preparedGenerationModels.get(key);
-        if (model !== undefined) preparedGenerationModels.delete(key);
-        return model;
-      },
-    });
-  }
-  // A configured summary override must be allowed. `preset` resolves through the named catalog and
-  // supplies its thinking level to real summary jobs; `model` keeps the legacy direct form.
-  // Otherwise each job captures the conversation's current model when it starts; old history is not
-  // backfilled automatically.
-  let configuredSummary: { readonly model: ModelReference; readonly thinkingLevel?: ModelThinkingLevel } | undefined;
-  if (config.episodeSummary?.preset !== undefined) {
-    const summaryPreset = presetCatalog.get(config.episodeSummary.preset);
-    if (summaryPreset === undefined) {
-      throw new StartupDiagnosticError("model", {
-        detail: "episodeSummary.preset must name a configured model preset",
-      });
-    }
-    configuredSummary = {
-      model: summaryPreset.choice.native,
-      ...(summaryPreset.thinkingLevel === undefined ? {} : { thinkingLevel: summaryPreset.thinkingLevel }),
-    };
-  } else if (config.episodeSummary?.model !== undefined) {
-    const summaryChoice = choicesByConfigured.get(modelKey(config.episodeSummary.model));
-    if (summaryChoice === undefined) {
-      throw new StartupDiagnosticError("model", { detail: "episodeSummary.model must be included in allowedModels" });
-    }
-    configuredSummary = { model: summaryChoice.native };
-  }
-  if (options.episodeSummary === null) throw new StartupDiagnosticError("model", { detail: "episodeSummary must be an object" });
-  const episodeSummaryModel: OpenGatewayOptions["episodeSummary"] = options.episodeSummary ?? (config.episodeSummary?.enabled === false
-    ? undefined
-    : configuredSummary === undefined
-      ? defaultChoice.native
-      : {
-          ...configuredSummary.model,
-          ...(configuredSummary.thinkingLevel === undefined
-            ? {}
-            : { thinkingLevel: configuredSummary.thinkingLevel }),
-        });
-  const useConversationSummaryModel = options.episodeSummary === undefined && configuredSummary === undefined;
-  if (episodeSummaryModel !== undefined) {
-    if (episodeSummaryModel === null || typeof episodeSummaryModel !== "object"
-      || Array.isArray(episodeSummaryModel)) {
-      throw new StartupDiagnosticError("model", { detail: "episodeSummary must be an object" });
-    }
-    if (typeof episodeSummaryModel.provider !== "string" || episodeSummaryModel.provider.length === 0
-      || typeof episodeSummaryModel.modelId !== "string" || episodeSummaryModel.modelId.length === 0) {
-      throw new StartupDiagnosticError("model", {
-        detail: "episodeSummary requires a provider and modelId",
-      });
-    }
-    const approved = choices.some((choice) =>
-      choice.native.provider === episodeSummaryModel.provider
-      && choice.native.modelId === episodeSummaryModel.modelId);
-    if (!approved) {
-      throw new StartupDiagnosticError("model", {
-        detail: "episodeSummary provider/model must be included in allowedModels",
-      });
-    }
-    if (models.getModel(episodeSummaryModel.provider, episodeSummaryModel.modelId) === undefined) {
-      throw new StartupDiagnosticError("model", {
-        detail: "episodeSummary model is not in the provider catalog",
-      });
-    }
-    if (episodeSummaryModel.backfill !== undefined
-      && episodeSummaryModel.backfill !== "none" && episodeSummaryModel.backfill !== "pending") {
-      throw new StartupDiagnosticError("model", {
-        detail: 'episodeSummary backfill must be "none" or "pending"',
-      });
-    }
-    if (episodeSummaryModel.thinkingLevel !== undefined) {
-      // The level must be supported by the selected summary model, not merely a known string: a
-      // provider rejects an unsupported level at request time, which would burn an episode attempt.
-      const choice = choices.find((candidate) =>
-        candidate.native.provider === episodeSummaryModel.provider
-        && candidate.native.modelId === episodeSummaryModel.modelId);
-      if (choice === undefined || !choice.thinkingLevels.includes(episodeSummaryModel.thinkingLevel)) {
-        throw new StartupDiagnosticError("model", {
-          detail: "episodeSummary thinkingLevel is not supported by the summary model",
-        });
-      }
-    }
-  }
+  const background = resolveBackgroundModels(config, options, startupModels);
+  const { digestChoice, workerPreset, visionHandoff, configuredSummary, episodeSummaryModel } = background;
   let preparedDataDirectory: Awaited<ReturnType<typeof prepareDataDirectory>>;
   try {
     preparedDataDirectory = await prepareDataDirectory(config);
@@ -1099,9 +177,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
     throw new StartupDiagnosticError("workspace", { cause });
   }
   const { workspace, extraRoots, canonicalDataDir, dbPath } = preparedDataDirectory;
-  if (credentialStoreDir !== undefined && credentialStoreDir !== canonicalDataDir) {
-    // The configured dataDir changed between credential resolution and validation (for
-    // example a symlink appeared). Refuse instead of reading a different store file.
+  if (startupModels.credentialStoreDir !== undefined && startupModels.credentialStoreDir !== canonicalDataDir) {
+    // The configured dataDir changed between credential resolution and validation (for example a
+    // symlink appeared). Refuse instead of reading a different store file.
     throw new StartupDiagnosticError("credential", {
       detail: "The configured dataDir changed while startup prepared the credential store",
     });
@@ -1112,9 +190,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
   if (workersEnabled) {
     const worktreesRoot = resolve(canonicalDataDir, "worker-worktrees");
     if (inside(worktreesRoot, dbPath) || inside(dbPath, worktreesRoot)) {
-      throw new StartupDiagnosticError("workspace", {
-        detail: "worker worktrees must not overlap the SQLite store",
-      });
+      throw new StartupDiagnosticError("workspace", { detail: "worker worktrees must not overlap the SQLite store" });
     }
     try {
       workerWorkspace = createWorkerWorkspace({ repositoryRoot: workspace, worktreesRoot });
@@ -1123,86 +199,79 @@ export async function openGateway(config: PortConfig, context: Context, options:
     }
   }
   const hostPolicy: AgentChange = { cwd: workspace };
-  let defaultAgentPolicy: AgentChange = {
-    ...hostPolicy,
-    model: defaultChoice.native,
-    thinkingLevel: defaultThinkingLevel,
-    tools: [],
-    modelTools: [],
-  };
   const now = () => Date.now();
   // Mirrors the shared policy's config-level default so a host-default timeout reports its duration.
   const defaultTimeoutSeconds = toolTimeoutSeconds ?? 60;
   // Recall is enabled by default for mapped chats and shares the existing explicit history opt-out.
   const historyEnabled = options.agentHistory !== false;
-  // Telegram interaction is a separate channel capability, not a coding-tool name. It exists only
-  // when the channel is configured; the running adapter attaches its host, and the runtime offers
-  // the tool only in a mapped Telegram chat conversation. Root, channel-state, fork, raw and
-  // task-owned cron targets are never in that set.
-  const telegramActions: TelegramActionRegistry | undefined =
-    config.telegram === undefined ? undefined : createTelegramActionRegistry();
-  // Discord history is the same shape of capability: a channel-only read surface with a late-bound
-  // live host. It is independent of `toolAllowlist`, so no configuration entry can hand it to a
-  // worker, a fork, a root conversation or a scheduled/digest target.
-  const discordHistory: DiscordHistoryRegistry | undefined =
-    config.discord === undefined ? undefined : createDiscordHistoryRegistry();
-  // The app channel's operator console (pairing, devices, revoke) is a late-bound live host: the
-  // local terminal reaches it over the private socket, and the running adapter attaches here.
-  const appConsole: AppConsoleRegistry | undefined =
-    config.app === undefined ? undefined : createAppConsoleRegistry();
-  const sessionKeyForConversation = new Map<ConversationId, string>();
-  const telegramChatConversations = new Set<ConversationId>();
-  const discordChatConversations = new Set<ConversationId>();
-  const appChatConversations = new Set<ConversationId>();
-  const telegramTool = telegramActions === undefined
-    ? undefined
-    : createTelegramTool({
-        registry: telegramActions,
-        sessionKeyFor: (conversationId) => sessionKeyForConversation.get(conversationId),
-        // Outbound workspace files need two explicit operator decisions: the `media` opt-in (which
-        // also supplies the channel's workspace) and the configured `read` coding tool, so the agent
-        // can already open what it sends. Neither is implied by configuring Telegram alone.
-        fileSend: config.media !== undefined && toolAllowlist.includes("read"),
-      });
-  const telegramToolRegistration = telegramTool?.extension.tools?.[0];
-  // Agent file delivery is the app channel's own capability, offered in mapped app chat threads
-  // only while that channel is configured, with its own file storage and a live adapter host.
-  const appActions: AppActionRegistry | undefined =
-    config.app === undefined ? undefined : createAppActionRegistry();
-  const appTool = appActions === undefined || config.media === undefined
-    ? undefined
-    : createAppTool({
-        registry: appActions,
-        sessionKeyFor: (conversationId) => sessionKeyForConversation.get(conversationId),
-      });
-  const appToolRegistration = appTool?.extension.tools?.[0];
-  const discordHistoryTool = discordHistory === undefined
-    ? undefined
-    : createDiscordHistoryTool({
-        registry: discordHistory,
-        sessionKeyFor: (conversationId) => sessionKeyForConversation.get(conversationId),
-      });
-  const discordHistoryToolRegistration = discordHistoryTool?.extension.tools?.[0];
-  // Config authorization names only mapped ordinary chat conversations (loaded map + scope checked).
-  // The call-time hook consults this set; the policy filter reads the same rule from committed state.
-  const authorizedChatConversations = new Set<ConversationId>();
-  const askUserTool = createAskUserTool({
-    surfaces: askSurfaces,
-    sessionKeyFor: (conversationId) => sessionKeyForConversation.get(conversationId),
-    isAuthorizedChat: (conversationId) => authorizedChatConversations.has(conversationId),
+  const modelHost = createModelHost({
+    config, startup: startupModels, options, hostPolicy,
+    // Models resolved at open for work the configuration file cannot rebuild.
+    pinned: () => [
+      ...(digestChoice === undefined ? [] : [digestChoice.model]),
+      ...(workerPreset === undefined ? [] : [workerPreset.model]),
+      ...(configuredSummary === undefined ? [] : [configuredSummary.model]),
+      ...(options.episodeSummary === undefined ? [] : [options.episodeSummary]),
+    ],
   });
-  // Native public web tools carry network authority only: they are not coding tools, are never named by
-  // `toolAllowlist`, and are offered solely in mapped ordinary chat conversations whose scope this host
-  // validated. The search key is resolved once here; an absent value fails startup instead of quietly
-  // answering with zero results.
+  // Vision handoff is a native generation hook, never a second agent loop; it leaves the transcript
+  // and prepared checkpoints untouched. The map pins the model of a live prepared dispatch so
+  // recovery cannot silently apply the reset configured preset.
+  const preparedGenerationModels = new Map<number, ModelReference>();
+  const visionExtension: Extension | undefined = visionHandoff === undefined ? undefined : createVisionHandoffExtension({
+    handoff: visionHandoff,
+    // Read at each request so a host model reload updates the fallback without rebuilding the hook.
+    defaultModel: () => modelHost.state().resolved.defaultChoice.native,
+    preparedModel: (taskId) => {
+      // Consume the pin for exactly the saved dispatch startup found: a later retry re-prepares from
+      // the reset AgentDoc model, so a stale task-lifetime pin would apply the old image policy.
+      const key = Number(taskId);
+      const model = preparedGenerationModels.get(key);
+      if (model !== undefined) preparedGenerationModels.delete(key);
+      return model;
+    },
+  });
+
+  // One registry for every classified conversation; role changes a foundation commit decides are
+  // applied only once that commit is stored.
+  const registry = new ConversationRegistry();
+  const effects = createCommitEffects((error) => reportFailure(error, "gateway.observe"));
+  const harnessRef: { current?: HarnessType } = {};
+  const openHarness = (): HarnessType => {
+    if (harnessRef.current === undefined) throw new Error("The runtime is not open");
+    return harnessRef.current;
+  };
+  const sessionKeyFor = (id: ConversationId) => registry.sessionKeyFor(id);
+
+  // Channel capabilities exist only while their channel is configured; each running adapter attaches
+  // its live host, and the policy offers each tool only in a mapped chat of that channel.
+  const telegramActions = config.telegram === undefined ? undefined : createTelegramActionRegistry();
+  const discordHistory = config.discord === undefined ? undefined : createDiscordHistoryRegistry();
+  const appConsole = config.app === undefined ? undefined : createAppConsoleRegistry();
+  const appActions = config.app === undefined ? undefined : createAppActionRegistry();
+  const telegramTool = telegramActions === undefined ? undefined : createTelegramTool({
+    registry: telegramActions,
+    sessionKeyFor,
+    // Outbound workspace files need two explicit operator decisions: the `media` opt-in and the
+    // configured `read` coding tool. Neither is implied by configuring Telegram alone.
+    fileSend: config.media !== undefined && toolAllowlist.includes("read"),
+  });
+  const appTool = appActions === undefined || config.media === undefined
+    ? undefined : createAppTool({ registry: appActions, sessionKeyFor });
+  const discordHistoryTool = discordHistory === undefined
+    ? undefined : createDiscordHistoryTool({ registry: discordHistory, sessionKeyFor });
+  const askUserTool = createAskUserTool({
+    surfaces: askSurfaces, sessionKeyFor, isAuthorizedChat: (id) => registry.isChat(id),
+  });
+  // Native public web tools carry network authority only: never named by `toolAllowlist`, offered
+  // solely in mapped chats (and captured by workers). An absent search key fails startup.
   let webTool: { readonly extension: Extension } | undefined;
   const webConfig = config.web;
   if (webConfig !== undefined && (webConfig.search !== undefined || webConfig.fetch === true)) {
-    const searchConfig = webConfig.search;
     let search: BraveSearchClient | undefined;
-    if (searchConfig !== undefined) {
+    if (webConfig.search !== undefined) {
       const env = options.web?.env ?? process.env;
-      const key = Object.hasOwn(env, searchConfig.keyEnv) ? env[searchConfig.keyEnv] : undefined;
+      const key = Object.hasOwn(env, webConfig.search.keyEnv) ? env[webConfig.search.keyEnv] : undefined;
       if (typeof key !== "string" || key.trim() === "") {
         throw new StartupDiagnosticError("webCredential", {
           detail: "Missing credential: set the environment variable named by web.search.keyEnv",
@@ -1210,9 +279,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
       }
       search = new BraveSearchClient({
         apiKey: key.trim(),
-        ...(options.web?.searchTransport === undefined
-          ? {}
-          : { transport: options.web.searchTransport }),
+        ...(options.web?.searchTransport === undefined ? {} : { transport: options.web.searchTransport }),
       });
     }
     const fetcher = webConfig.fetch === true
@@ -1225,163 +292,76 @@ export async function openGateway(config: PortConfig, context: Context, options:
     webTool = createWebToolExtension({
       ...(search === undefined ? {} : { search }),
       ...(fetcher === undefined ? {} : { fetcher }),
-      isAuthorizedChat: (conversationId) => authorizedChatConversations.has(conversationId)
-        || workerChildConversations.has(conversationId),
+      isAuthorizedChat: (id) => registry.isChat(id) || registry.isWorker(id),
     });
   }
-  const webToolRegistrations = webTool?.extension.tools ?? [];
-  const webConversations = new Set<ConversationId>();
+  const contextHost = createContextHost({
+    provider: options.contextSnapshotProvider, now, isMapped: (id) => registry.isMapped(id), effects,
+  });
+  const skillTool = contextHost.skillTool;
   const toolExtension: Extension | undefined = toolsEnabled
     ? createCodingToolExtension({
         tools: registeredCodingTools as readonly CodingToolName[],
         ceiling: toolAllowlist,
-        capturedCeiling: (conversationId) => workerChildConversations.has(conversationId)
-          ? workerCodingTools : toolAllowlist,
+        capturedCeiling: (id) =>
+          registry.isWorker(id) ? workerCodingTools
+            : registry.isScheduledRun(id) ? toolAllowlist
+              : registry.isDigest(id) ? memoryDigestCurationTools(toolAllowlist)
+                : [],
+        // Capabilities with their own call-time scope hooks are exempt from the coding ceiling, each
+        // only while its gated extension is actually installed.
         contextTools: [
-          ...(options.contextSnapshotProvider === undefined ? [] : [SKILL_TOOL_NAME]),
+          ...(skillTool === undefined ? [] : [SKILL_TOOL_NAME]),
           ...(cronEnabled ? [CRON_TOOL_NAME] : []),
           ...(workersEnabled ? [WORKER_TOOL_NAME] : []),
           ...(telegramTool === undefined ? [] : [TELEGRAM_TOOL_NAME]),
           ...(appTool === undefined ? [] : [APP_TOOL_NAME]),
-          // The read-only Discord history capability is a scoped channel integration, not a coding
-          // tool: its own call-time hook decides every scope, so the ceiling must not suppress it.
           ...(discordHistoryTool === undefined ? [] : [DISCORD_HISTORY_TOOL_NAME]),
-          // MCP management is a separate host capability, not a coding-tool grant: it can
-          // write server configuration and launch stdio processes. Its own hook limits it to
-          // authenticated mapped chats; login also requires a unique live owner surface.
-          // It exists only when the host can write configuration.
           ...(config.configFile === undefined ? [] : [MCP_ADMIN_TOOL_NAME]),
-          // Owner questions are an interactive capability scoped by their own hook, not coding
-          // authority, so the ceiling must not suppress them.
           ASK_USER_TOOL_NAME,
-          // History retrieval is read-only over mapped chats and has its own scope checks, so the
-          // ceiling must not suppress it when coding tools are enabled.
           ...(historyEnabled ? [...MEMORY_TOOL_NAMES] : []),
-          // Web tools are a separate config capability with their own call-time scope hook. They are
-          // exempt from the coding ceiling only while that gated extension is actually installed.
           ...(webTool === undefined ? [] : WEB_TOOL_NAMES),
         ],
         defaultTimeoutSeconds,
-        authenticatedChat: (conversationId: ConversationId) => authorizedChatConversations.has(conversationId),
-        // Code Mode/tool-search authority comes from their own installed scope hook, independent of
-        // MCP connection state. MCP registrations remain gated by the MCP hook. Each predicate is
-        // false unless that hook is actually installed, so a stale persisted selection cannot turn
-        // this exemption into authority.
+        authenticatedChat: (id: ConversationId) => registry.isChat(id),
+        // Code Mode/tool-search and MCP names are delegated to their own installed hooks; each
+        // predicate is false unless that hook is installed, so a stale selection is no authority.
         delegatedTools: (name: string) =>
           (codeModeRef.current !== undefined
-            && (name === CODEMODE_TOOL_NAME || name === TOOL_SEARCH_TOOL_NAME
-              || name === CLASSIFIER_MODEL_TOOL_NAME))
+            && (name === CODEMODE_TOOL_NAME || name === TOOL_SEARCH_TOOL_NAME || name === CLASSIFIER_MODEL_TOOL_NAME))
           || (mcpRef.current !== undefined && mcpRef.current.ownsTool(name)),
       })
     : undefined;
+  const environmentOptions = {
+    sandbox: config.toolSandbox ?? "host",
+    ...(config.bwrapPath === undefined ? {} : { bwrapPath: config.bwrapPath }),
+    ...(toolTimeoutSeconds === undefined ? {} : { timeoutSeconds: toolTimeoutSeconds }),
+  } as const;
   const toolEnvironments: ToolEnvironments | undefined = toolsEnabled
     ? createToolEnvironments({
         workspaceRoot: workspace,
         allowedRoots: extraRoots,
         restrictToWorkspace: config.restrictToWorkspace !== false,
         protectedRoots: [canonicalDataDir],
-        sandbox: config.toolSandbox ?? "host",
-        ...(config.bwrapPath === undefined ? {} : { bwrapPath: config.bwrapPath }),
-        ...(toolTimeoutSeconds === undefined ? {} : { timeoutSeconds: toolTimeoutSeconds }),
+        ...environmentOptions,
       })
     : undefined;
-  // A worker in worktree mode is an ordinary conversation whose declared cwd and filesystem guard are
-  // its own checkout instead of the configured workspace. The root is per task and is never added to
-  // the configured roots, so the two workspaces cannot read through each other.
-  const workerWorkspaceRoots = new Map<ConversationId, string>();
-  // Workers are not mapped chats. Separate scope plus a durable per-tool capture grants research
-  // capabilities without Telegram, scheduling or recursive delegation.
-  const workerChildConversations = new Set<ConversationId>();
-  const workerToolNames = (): string[] => {
-    if (config.workers?.enabled !== true) return [];
-    const configured = config.workers?.toolAllowlist;
-    // Classifier authority is part of the Code Mode grant, never a separately named
-    // worker tool. Removing Code Mode from worker config removes it permanently.
-    const codeModeGranted = codeModeRef.current !== undefined
-      && (configured === undefined || configured.includes(CODEMODE_TOOL_NAME));
-    // The classifier nested tool exists only with an explicit configured model grant.
-    const classifierGranted = codeModeGranted && classifierGrantKey !== undefined;
-    return [
-      ...workerCodingTools,
-      ...(skillToolRegistration === undefined ? [] : [SKILL_TOOL_NAME]),
-      ...webToolRegistrations.map((tool) => tool.name),
-      ...(historyEnabled ? [...MEMORY_TOOL_NAMES] : []),
-      ...(codeModeGranted
-        ? [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME]
-        : []),
-      ...(classifierGranted ? [CLASSIFIER_MODEL_TOOL_NAME] : []),
-      ...(mcpRef.current?.toolNames ?? []),
-    ].filter((name) => name === CLASSIFIER_MODEL_TOOL_NAME || configured === undefined || configured.includes(name)
-      || (configured.includes("mcp") && mcpRef.current?.ownsTool(name)));
+  // A worktree worker's declared cwd and filesystem guard are its own checkout; that root is never
+  // added to the configured roots, so the two workspaces cannot read through each other.
+  const cleanupContext = withoutAbortSignal(context);
+  const workerEnvironments = createWorkerEnvironmentPool((root) => createToolEnvironments({
+    workspaceRoot: root,
+    allowedRoots: [],
+    // Shared workers inherit host access; explicit worktree workers remain checkout-scoped.
+    restrictToWorkspace: root !== workspace || config.restrictToWorkspace !== false,
+    // Worktrees are already confined to their own checkout; do not deny that checkout itself.
+    protectedRoots: root === workspace ? [canonicalDataDir] : [],
+    ...environmentOptions,
+  }), (error) => reportFailure(error, "gateway.close.runtime"));
+  const environmentFor = (id: ConversationId, ctx: Context) => {
+    const root = registry.workerRoot(id);
+    return root === undefined ? toolEnvironments!.forConversation(id, ctx) : workerEnvironments.forConversation(root, id, ctx);
   };
-  const workerCapabilityExtension = defineExtension({
-    name: "nanobot-worker-capabilities",
-    hooks: [hook(ToolTask, {
-      async beforeTool(call, api, ctx) {
-        if (!workerToolNames().includes(call.name)) {
-          return { block: `Tool ${call.name} is outside the configured worker grants` };
-        }
-        if (!workerChildConversations.has(api.conversationId)) {
-          return { block: "Worker capability is no longer active" };
-        }
-        const capture = await api.snapshot(ConfigToolCaptureDoc, api.conversationId, ctx);
-        if (capture === undefined || !authorizedChatConversations.has(capture.originConversationId as ConversationId)
-          || !capture.tools.includes(call.name)) {
-          return { block: `Tool ${call.name} is outside this worker's captured authority` };
-        }
-        if (call.name === CLASSIFIER_MODEL_TOOL_NAME) {
-          // The durable capture, not the current config, decides which classifier model this
-          // worker may still call. A pruned or retired identity never returns.
-          const model = call.arguments.model;
-          const provider = typeof model === "object" && model !== null ? (model as Record<string, unknown>).provider : undefined;
-          const id = typeof model === "object" && model !== null ? (model as Record<string, unknown>).id : undefined;
-          if (typeof provider !== "string" || typeof id !== "string"
-            || capture.classifierModel !== modelKey({ provider, modelId: id })) {
-            return { block: "Classifier model is outside this worker's captured authority" };
-          }
-        }
-        return undefined;
-      },
-    })],
-  });
-  /**
-   * Call-time authority for a live scheduled run's non-coding capture. The coding-tool hook exempts
-   * memory recall (a context tool) and MCP names (delegated to their own hook), so their exact grants
-   * are rechecked here: the durable capture must name the tool, its recorded origin must still be an
-   * authenticated mapped chat holding that capability now, and the conversation must still be a live
-   * run target. A revoked name, a narrowed config, a closed server or a retired capture fails closed.
-   */
-  const scheduledRunCapabilityExtension = defineExtension({
-    name: "nanobot-scheduled-run-capabilities",
-    hooks: [hook(ToolTask, {
-      async beforeTool(call, api, ctx) {
-        const recall = (MEMORY_TOOL_NAMES as readonly string[]).includes(call.name);
-        const mcp = mcpRef.current?.ownsTool(call.name) === true;
-        if (!recall && !mcp) return undefined;
-        if (!scheduledRunTargets.has(api.conversationId)) {
-          return { block: "Scheduled run capability is no longer active" };
-        }
-        const capture = await api.snapshot(ConfigToolCaptureDoc, api.conversationId, ctx);
-        const origin = capture?.originConversationId;
-        if (capture === undefined || typeof origin !== "number" || !Number.isSafeInteger(origin) || origin < 1
-          || !authorizedChatConversations.has(origin as ConversationId)
-          || !Array.isArray(capture.tools) || !capture.tools.includes(call.name)) {
-          return { block: `Tool ${call.name} is outside this scheduled run's captured authority` };
-        }
-        if (!scheduledRunCapabilityNames(origin as ConversationId).includes(call.name)) {
-          return { block: `Tool ${call.name} is outside the current scheduled-run grants` };
-        }
-        return undefined;
-      },
-    })],
-  });
-  // Live memory-digestion targets. They are task-owned like a worker child, but deliberately get
-  // no Code Mode, no MCP/web/channel/history tool and no shell: only the curation-scope hook and the
-  // captured Markdown tools. The set is rebuilt from live digest tasks on reopen.
-  const digestTargetConversations = new Set<ConversationId>();
-  // Accepted bounds of each live target, restored from its task input on reopen. The scope hook reads
-  // them at call time, so config changes in a later open cannot widen an already-started run.
-  const digestTargetLimits = new Map<ConversationId, DigestRunLimits>();
   const digestLimits: DigestRunLimits = Object.freeze({
     ...DIGEST_RUN_LIMITS_DEFAULT,
     ...(config.digest?.entriesPerBatch === undefined ? {} : { entriesPerBatch: config.digest.entriesPerBatch }),
@@ -1391,586 +371,144 @@ export async function openGateway(config: PortConfig, context: Context, options:
     ...(config.digest?.maxInputTokens === undefined ? {} : { maxInputTokens: config.digest.maxInputTokens }),
     ...(config.digest?.maxChangedFiles === undefined ? {} : { maxChangedFiles: config.digest.maxChangedFiles }),
     ...(config.digest?.maxDiffChars === undefined ? {} : { maxDiffChars: config.digest.maxDiffChars }),
-    // A product-configured run deadline wins over the host test seam; the seam only fills the gap
-    // when config leaves `runTimeoutSeconds` absent.
+    // A product-configured run deadline wins over the host test seam.
     runTimeoutMs: config.digest?.runTimeoutSeconds !== undefined
       ? config.digest.runTimeoutSeconds * 1000
       : options.memoryDigest?.turnTimeoutMs ?? DIGEST_RUN_LIMITS_DEFAULT.runTimeoutMs,
   });
+  // The digest scope hook reads each live target's accepted bounds at call time, so a later open's
+  // config cannot widen an already-started run.
   const digestScopeExtension = createMemoryDigestScopeExtension(workspace, {
-    harness: () => {
-      if (harnessRef.current === undefined) throw new Error("The runtime is not open");
-      return harnessRef.current;
-    },
-    limitsFor: (conversationId) => digestTargetLimits.get(conversationId),
+    harness: openHarness,
+    limitsFor: (id) => registry.digestLimits(id),
   });
   const digestSourceRef: { current: DigestSource | undefined } = { current: undefined };
-  const workerEnvironments = new Map<string, ToolEnvironments>();
-  const environmentFor = (conversationId: ConversationId, ctx: Context) => {
-    const root = workerWorkspaceRoots.get(conversationId);
-    if (root === undefined) return toolEnvironments!.forConversation(conversationId, ctx);
-    let environments = workerEnvironments.get(root);
-    if (environments === undefined) {
-      environments = createToolEnvironments({
-        workspaceRoot: root,
-        allowedRoots: [],
-        // Shared workers inherit host access; explicit worktree workers remain checkout-scoped.
-        restrictToWorkspace: root !== workspace || config.restrictToWorkspace !== false,
-        // Worktrees live under dataDir but are already confined to their own checkout,
-        // which cannot reach the store or its siblings. Do not deny that checkout itself.
-        protectedRoots: root === workspace ? [canonicalDataDir] : [],
-        sandbox: config.toolSandbox ?? "host",
-        ...(config.bwrapPath === undefined ? {} : { bwrapPath: config.bwrapPath }),
-        ...(toolTimeoutSeconds === undefined ? {} : { timeoutSeconds: toolTimeoutSeconds }),
-      });
-      workerEnvironments.set(root, environments);
-    }
-    return environments.forConversation(conversationId, ctx);
-  };
-  const fallbackThinkingLevel = (
-    choice: ResolvedModelChoice,
-    preferred: ModelThinkingLevel = defaultThinkingLevel,
-  ): ModelThinkingLevel => choice.thinkingLevels.includes(preferred) ? preferred : "off";
-  const choiceFromState = (state: Readonly<AgentState> | undefined): ResolvedModelChoice | undefined =>
-    state?.model === undefined ? undefined : choicesByNative.get(modelKey(state.model));
-  /** The live catalog exactly as the open path or the last published reload left it. */
-  const liveResolvedModels = (): ResolvedModelConfiguration => ({
-    choices, choicesByConfigured, choicesByNative, configuredPresetName, presetCatalog, defaultChoice, defaultThinkingLevel,
-  });
-  /**
-   * Reapply host policy to a persisted conversation, computed only from one resolved catalog so a
-   * reload can evaluate a candidate without touching the live bindings first. Named-preset mode
-   * additionally resets a selection left by a previous run to the configured preset on startup, so
-   * a temporary CLI switch never survives a restart or a configuration reload.
-   */
-  const policyAgainst = (
-    resolved: ResolvedModelConfiguration,
-    state: Readonly<AgentState> | undefined,
-    resetToConfiguredPreset = false,
-  ): AgentChange => {
-    const existing = resetToConfiguredPreset
-      ? undefined
-      : state?.model === undefined ? undefined : resolved.choicesByNative.get(modelKey(state.model));
-    const choice = existing ?? resolved.defaultChoice;
-    const modelWasRevoked = existing === undefined;
-    const thinkingLevel = !modelWasRevoked && state?.thinkingLevel !== undefined && choice.thinkingLevels.includes(state.thinkingLevel)
-      ? state.thinkingLevel
-      : fallbackThinkingLevel(choice, resolved.defaultThinkingLevel);
-    return { ...hostPolicy, model: choice.native, thinkingLevel };
-  };
-  const policyForState = (
-    state: Readonly<AgentState> | undefined,
-    resetToConfiguredPreset = false,
-  ): AgentChange => policyAgainst(liveResolvedModels(), state, resetToConfiguredPreset);
-  let contextExtension: Extension | undefined;
-  const contextExtensionBuilder = createContextExtensionBuilder();
-  const contextConversations = new Set<ConversationId>();
-  // A read-only progressive skill loader: it serves bodies from the host snapshot only, so a
-  // builtin skill outside the workspace is reachable without widening the workspace or the shell.
-  const skillTool = options.contextSnapshotProvider === undefined ? undefined : createSkillTool();
-  const skillToolRegistration = skillTool?.extension.tools?.[0];
-  const skillConversations = new Set<ConversationId>();
   // Approved recall tools are registered before open and late-bind to the gateway-owned service.
   const memoryServiceRef: { current: MemoryService | undefined } = { current: undefined };
   const memoryTools = historyEnabled ? createMemoryTools({
     service: () => memoryServiceRef.current,
-    caller: (conversationId) => historyConversations.has(conversationId)
-      || workerChildConversations.has(conversationId)
-      || scheduledRunTargets.has(conversationId),
+    caller: (id) => registry.isChat(id) || registry.isWorker(id) || registry.isScheduledRun(id),
   }) : undefined;
-  const memoryToolRegistrations = memoryTools?.extension.tools ?? [];
-  const historyConversations = new Set<ConversationId>();
-  // A live scheduled run's automation target, and only until its terminal commit. It selects the
-  // capture's call-time checks and the read-only recall scope for that one run; an idle automation
-  // conversation, a chat, a worker, a digest target, a fork or the root is never in it.
-  const scheduledRunTargets = new Set<ConversationId>();
-  /**
-   * The non-coding capabilities a scheduled run may capture from its authenticated origin right now:
-   * the read-only memory recall that origin holds and the exact tools of its connected MCP servers.
-   * Scheduling, worker delegation, MCP management/login, channel actions, classifiers and Code Mode
-   * are deliberately absent, as is anything the origin does not currently hold. Every call is
-   * rechecked against the durable capture and this function, so a narrowed config denies.
-   */
-  const scheduledRunCapabilityNames = (originConversationId: ConversationId): string[] => [
-    ...(historyEnabled && historyConversations.has(originConversationId) ? [...MEMORY_TOOL_NAMES] : []),
-    ...(mcpRef.current?.toolNames ?? []),
-  ];
-  // Mapped session keys own their snapshot. A scheduled run's target is tracked separately in
-  // insertion order so the cap can drop an idle target instead of failing the run, and never a
-  // mapped session's snapshot.
-  const sessionConversations = new Set<ConversationId>();
-  const backgroundTargets: ConversationId[] = [];
-  // Always an explicit selection, never an add/remove edit: Durable's edit form resolves against the
-  // extensions installed at read time, so a later dynamic install (a new conversation's context
-  // extension) would otherwise be selected by unrelated conversations.
-  const extensionsPolicy = (conversationId: ConversationId): AgentChange => {
-    const selected: Extension[] = [];
-    // The vision hook carries no tool or workspace authority; selecting it everywhere keeps
-    // image bounding independent of tool allowlists and channel scope.
-    if (visionExtension) selected.push(visionExtension);
-    if (toolExtension) selected.push(toolExtension);
-    // MCP tools and Code Mode/tool-search exist only in an authenticated mapped chat conversation.
-    // Code Mode is selected independently of MCP connection state; each bundle is selected only
-    // while it is live for this open.
-    if (authorizedChatConversations.has(conversationId)) {
-      // Owner questions are an interactive capability for this validated chat only, never a worker,
-      // fork, root or scheduled/digest target.
-      selected.push(askUserTool.extension);
-      if (mcpRef.current !== undefined) selected.push(mcpRef.current.extension);
-      if (codeModeRef.current !== undefined) selected.push(...codeModeRef.current.extensions);
-      // MCP management is a mapped-chat capability only: a worker, fork, root or scheduled run
-      // never proposes configuration or account authority.
-      if (mcpAdminRef.current !== undefined) selected.push(mcpAdminRef.current.extension);
-    } else if (workerChildConversations.has(conversationId)) {
-      selected.push(workerCapabilityExtension);
-      if (mcpRef.current !== undefined) selected.push(mcpRef.current.extension);
-      if (codeModeRef.current !== undefined) selected.push(...codeModeRef.current.extensions);
-      if (memoryTools !== undefined) selected.push(memoryTools.extension);
-      if (webTool !== undefined) selected.push(webTool.extension);
-    } else if (scheduledRunTargets.has(conversationId)) {
-      // A live scheduled run's capture is prepared per run and retired with it. These extensions are
-      // that capture's call-time checks, not authority: the hook rechecks the durable capture and the
-      // current grants, and the MCP hook rechecks the server's live state on every call. Code Mode,
-      // tool search and MCP management are deliberately absent.
-      selected.push(scheduledRunCapabilityExtension);
-      if (mcpRef.current !== undefined) selected.push(mcpRef.current.extension);
-      if (memoryTools !== undefined) selected.push(memoryTools.extension);
-    }
-    // A live digest target keeps its narrowing path hook across a reopen. The hook grants nothing;
-    // it only refuses paths outside the curation scope and makes write create-only.
-    if (digestTargetConversations.has(conversationId)) selected.push(digestScopeExtension);
-    if (options.contextSnapshotProvider && contextExtension && contextConversations.has(conversationId)) {
-      selected.push(contextExtension);
-    }
-    if (skillTool && contextConversations.has(conversationId) && skillConversations.has(conversationId)) {
-      selected.push(skillTool.extension);
-    }
-    if (memoryTools && historyConversations.has(conversationId)) selected.push(memoryTools.extension);
-    if (webTool && webConversations.has(conversationId)) selected.push(webTool.extension);
-    if (telegramTool && telegramChatConversations.has(conversationId)) selected.push(telegramTool.extension);
-    if (appTool && appChatConversations.has(conversationId)) selected.push(appTool.extension);
-    if (discordHistoryTool && discordChatConversations.has(conversationId)) selected.push(discordHistoryTool.extension);
-    if (cronFoundation && cronTool && cronOwners.has(conversationId)) {
-      selected.push(cronFoundation.extension, cronTool.extension);
-    }
-    if (workerTool && workerSpawners.has(conversationId)) selected.push(workerTool.extension);
-    return { extensions: selected };
-  };
   const toolRegistrations = new Map<string, ToolRegistration>(
-    [...(toolExtension?.tools ?? []), ...webToolRegistrations, ...memoryToolRegistrations,
-      ...(skillToolRegistration === undefined ? [] : [skillToolRegistration])]
-      .map((tool) => [tool.name, tool]),
+    [...(toolExtension?.tools ?? []), ...(webTool?.extension.tools ?? []), ...(memoryTools?.extension.tools ?? []),
+      ...(skillTool?.extension.tools ?? [])].map((tool) => [tool.name, tool]),
   );
-  // Origin sessions only: a scheduled run's automation conversation is not an origin session, so it
-  // cannot schedule further jobs. Owners are keyed by the mapped session key.
-  const cronOwners = new Map<ConversationId, CronOwner>();
-  // Scheduled runs' automation conversations, by the durable class this host recorded for them. They
-  // are ownerless so they outlive every run task, which means the class has to be carried explicitly:
-  // it keeps them out of chat scope, it denies them every capability set below, and it is how a
-  // reopened gateway finds a live run's target. Rebuilt from committed cron documents at open and
-  // extended by `prepare`, so a conversation created by this process is classified too.
-  const automationConversations = new Map<ConversationId, {
-    readonly originConversationId: ConversationId;
-    readonly conversationClass: CronConversationClass;
-    readonly jobId: string | null;
-  }>();
-  /** This host's scope record for one conversation: its class, never inferred from absence. */
-  const scopeRecordFor = async (tx: Tx, conversationId: ConversationId) => {
-    const record = await tx.conversation(conversationId);
-    if (record === undefined) return undefined;
-    return automationConversations.has(conversationId) ? { ...record, automation: true } : record;
-  };
-  /** Automation conversations in episode-catalog shape; never chat, so no session key is implied. */
-  const automationSessions = (): HistoryChatSession[] => [...automationConversations.keys()]
-    .map((conversationId) => ({ sessionKey: `cron-automation:${conversationId}`, conversationId }));
-  // Worker spawning is the same rule, and deliberately not inherited: only a validated mapped chat
-  // conversation may start a worker, so a worker's own task-owned conversation can never recurse.
-  const workerSpawners = new Set<ConversationId>();
-  const harnessRef: { current?: HarnessType } = {};
-  // The snapshot-install path, late-bound because cron's `prepare` can only call it once
-  // Harness.open() has run. It reports whether skills were installed for that conversation, and it
-  // rebuilds a background target's snapshot instead of reusing the one an earlier run installed.
-  const contextInstallerRef: {
-    current?: (sessionKey: string, conversationId: ConversationId, ctx: Context, tx: Tx, background: boolean) => Promise<boolean>;
-  } = {};
-  const cronFoundation = cronEnabled
-    ? createCronFoundation({
-        now,
-        // Only a host that steers owner messages needs the idle-only origin admission, because only then can
-        // an owner steer share a final boundary with a queued occurrence.
-        ownerSteering: config.followUpMode === "steer",
-        // A `digest` occurrence is the same bounded native entry a manual command uses. It is
-        // invoked with the authenticated origin conversation (the job's own document conversation),
-        // never a task-owned target; `start` re-checks that origin and the current curation
-        // allowlist, so a narrowed config refuses instead of widening. The digest task reports its
-        // own completion internally, so no cron outbox delivery is queued for this intent.
-        digest: async ({ originConversationId }, ctx) => {
-          const harness = harnessRef.current;
-          if (harness === undefined) return { status: "error", error: "the runtime is not open" };
-          const conversation = await harness.conversation(originConversationId, ctx);
-          if (conversation === undefined) {
-            return { status: "error", error: "the digest origin conversation is missing" };
-          }
-          try {
-            const result = await memoryDigest.start({
-              id: conversation.id,
-              commit: (change, inner) => conversation.commit(change, inner),
-            }, ctx);
-            if (result.status === "started") return { status: "ok", error: null };
-            if (result.status === "busy") {
-              return { status: "ok", error: `run ${result.taskId} is still active; nothing new was started` };
-            }
-            if (result.status === "idle") {
-              return {
-                status: "ok",
-                error: result.idle.caughtUp ? null : "no bounded batch was ready; completed history remains for a later run",
-              };
-            }
-            return { status: "error", error: result.reason };
-          } catch (error) {
-            return { status: "error", error: error instanceof Error ? error.message : String(error) };
-          }
-        },
-        // Each run starts a new episode in its automation conversation: the foundation asks for the
-        // same native reset `/new` places, so earlier entries stay stored and searchable while this
-        // run's model context starts empty. It is admitted before the run's own input, and no stored
-        // entry is ever trimmed or rewritten.
-        reset: async (targetConversationId, ctx) => {
-          const harness = harnessRef.current;
-          if (harness === undefined) return;
-          const conversation = await harness.conversation(targetConversationId, ctx);
-          if (conversation === undefined) return;
-          await conversation.reset(undefined, ctx);
-        },
-        // A background run is an automation conversation whose authority is prepared per run. It
-        // captures the ceiling its authenticated origin currently has; the call-time hook still
-        // requires that origin and the current config, so the capture is a subset, never new
-        // authority. An origin-mode run answers inside the conversation that already has the
-        // configured authority, so it needs no capture.
-        prepare: async ({ tx, originConversationId, targetConversationId, background }, ctx) => {
-          if (!background) {
-            const owner = cronOwners.get(originConversationId);
-            if (owner?.sessionKey.startsWith(`${APP_CHAT_SESSION_KEY}:`) && !contextConversations.has(originConversationId)) {
-              await contextInstallerRef.current?.(owner.sessionKey, originConversationId, ctx, tx, false);
-              await configure(tx, originConversationId, {
-                ...extensionsPolicy(originConversationId), ...await toolFilterFor(tx, originConversationId),
-              });
-            }
-            return;
-          }
-          // Classify the conversation first, from the durable marker the foundation wrote in the same
-          // commit: a forged or stale mapping can never be mistaken for chat via this host, and a
-          // failure later in this preparation cannot leave the conversation chat-like in memory.
-          const classified = automationConversationOf(
-            await tx.doc(CronConversationDoc, targetConversationId),
-          );
-          if (classified !== undefined) {
-            automationConversations.set(targetConversationId, {
-              originConversationId,
-              conversationClass: classified.conversationClass,
-              jobId: classified.jobId,
-            });
-          }
-          // Fail closed on a run whose origin cannot be attributed to a known owner: it gets no
-          // captured authority, so every effectful call stays denied.
-          const owner = cronOwners.get(originConversationId);
-          const captured: string[] = [];
-          if (owner !== undefined) {
-            const capture = await tx.doc(ConfigToolCaptureDoc, targetConversationId);
-            capture.originConversationId = originConversationId;
-            // The captured ceiling is the origin's current authority: its configured coding tools
-            // plus the read-only recall and exact MCP tools it holds right now. Scheduling, worker
-            // delegation, MCP management/login, channel actions, classifiers and Code Mode are never
-            // captured, and every call still passes the durable-capture and current-config checks.
-            capture.tools = authorizedChatConversations.has(originConversationId)
-              ? [...toolAllowlist, ...scheduledRunCapabilityNames(originConversationId)]
-              : [];
-            capture.classifierModel = null;
-            captured.push(...capture.tools);
-          } else {
-            await tx.retireDoc(ConfigToolCaptureDoc, targetConversationId);
-          }
-          // The automation conversation is default-deny between runs, so it also receives the
-          // origin's workspace context through the same snapshot path: bootstrap/AGENTS, the memory
-          // manifest, the skill summary and the read-only `skill` tool. That snapshot is rebuilt in
-          // this same preparation, so a later episode renders the workspace as it is now. An origin
-          // with no known owner skips this and keeps the run default-deny. The cron tool and
-          // foundation are never offered here.
-          const skillsInstalled = owner !== undefined && contextInstallerRef.current !== undefined
-            ? await contextInstallerRef.current(owner.sessionKey, targetConversationId, ctx, tx, true)
-            : false;
-          const tools = [
-            ...captured.flatMap((name) => {
-              const tool = toolRegistrations.get(name);
-              return tool === undefined ? [] : [tool];
-            }),
-            ...(skillsInstalled && skillToolRegistration !== undefined ? [skillToolRegistration] : []),
-          ];
-          const extensions: Extension[] = [];
-          // The vision hook carries no tool authority. A scheduled background run is an automation
-          // conversation with only captured tools, so it needs this non-authoritative extension
-          // explicitly; otherwise a read-tool image would bypass the flagged-preset handoff.
-          if (visionExtension !== undefined) extensions.push(visionExtension);
-          if (toolExtension !== undefined) extensions.push(toolExtension);
-          // The captured recall and MCP names carry their own call-time hooks: an automation
-          // conversation gets no chat policy pass, so these have to be selected here explicitly.
-          extensions.push(scheduledRunCapabilityExtension);
-          if (mcpRef.current !== undefined) extensions.push(mcpRef.current.extension);
-          if (memoryTools !== undefined) extensions.push(memoryTools.extension);
-          if (contextConversations.has(targetConversationId) && contextExtension !== undefined) {
-            extensions.push(contextExtension);
-          }
-          if (skillsInstalled && skillTool !== undefined) extensions.push(skillTool.extension);
-          // An automation conversation is ownerless, so Durable copies no agent state into it: the
-          // workspace, model and thinking level this run uses are prepared here, per run, instead of
-          // being inherited once at creation. History keeps no authority either way.
-          const originAgent = await tx.doc(AgentDoc, originConversationId);
-          await configure(tx, targetConversationId, {
-            tools,
-            // An explicit list offers deferred MCP tools directly: this run has no Code Mode or tool
-            // search to load them, and the capture is the grant.
-            modelTools: tools,
-            extensions,
-            cwd: workspace,
-            ...(originAgent.model === undefined ? {} : { model: { ...originAgent.model } }),
-            ...(originAgent.thinkingLevel === undefined ? {} : { thinkingLevel: originAgent.thinkingLevel }),
-          });
-          // The capture's call-time checks are live only while this run is the target's live run.
-          scheduledRunTargets.add(targetConversationId);
-        },
-        // A separate run target's captured authority ends with the run: retire its capture document
-        // and stop offering its tools in the same commit that records the terminal outcome, so a
-        // finished or cancelled run cannot be used for a later admission. The automation
-        // conversation itself stays: its history is the job's ongoing activity, and the next run
-        // prepares its own authority again. An origin-mode run answers in the origin conversation
-        // itself, so that conversation keeps its configured tools, cron ownership and context, and
-        // none of its documents are retired.
-        finalize: async ({ tx, job, occurrence, originConversationId, targetConversationId, background, delivery }) => {
-          if (background) {
-            scheduledRunTargets.delete(targetConversationId);
-            await tx.retireDoc(ConfigToolCaptureDoc, targetConversationId);
-            await configure(tx, targetConversationId, { tools: [], modelTools: [] });
-          }
-          // Queue one record for the occurrence in the same commit as the terminal run outcome, for
-          // a separate target and for an origin-mode answer alike. A cancelled, superseded, fenced or
-          // missing-job run passes `delivery: null` and stays silent, so abandoned work never sends.
-          // A settled run with an error, or with no committed answer text, queues fixed sanitized
-          // notice text naming the job and occurrence only: raw provider errors, the job's message and
-          // model text never leave the store. A successful answer is queued from the committed entry
-          // the scheduled submission settled with, so no model turn is rerun and no nearby user
-          // answer is substituted for it. Suppression is the job's own persistent `silent` setting
-          // and nothing else: a scheduled run is never offered a way to withhold its own delivery, so
-          // a reminder cannot vanish because the model answered with a marker. An unusable success —
-          // no text, or only the retired `[SILENT]` marker — queues the fixed empty-result notice
-          // instead of being dropped or sent literally, and a failed occurrence always queues its
-          // notice. The origin session key is also the channel locator: a key
-          // outside an enabled delivery prefix is never queued.
-          if (delivery === null) return;
-          if (job === null || !isChatSessionKey(job.owner.sessionKey)) return;
-          if (!cronDeliveryPrefixes.some((prefix) => job.owner.sessionKey.startsWith(prefix))) return;
-          let text: string;
-          let appAnswerEntry: EntryId | undefined;
-          if (delivery.status === "error") {
-            text = cronOutcomeNotice("failed", job.id, occurrence.scheduledAtMs);
-          } else {
-            const answer = delivery.answerEntryId === null
-              ? undefined
-              : await tx.entry(AssistantEntry, delivery.answerEntryId);
-            const message = answer?.model?.[0] as AssistantMessage | undefined;
-            const body = (message?.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("") ?? "").trim();
-            // Suppression stops only this automatic channel delivery: the answer stays in the run's
-            // conversation, and the marker has no meaning in an ordinary chat reply. A `silent` job
-            // suppresses every successful occurrence, including an empty answer. Nothing else can:
-            // without it, a successful run always sends its answer or the fixed empty-result notice,
-            // so a run that produced no usable message is visible rather than silently dropped. A
-            // failed run never reaches this branch and keeps its sanitized notice.
-            if (job.silent === true) return;
-            if (job.owner.sessionKey.startsWith("app:") && answer?.conversationId === originConversationId &&
-                body !== "" && body !== "[SILENT]") appAnswerEntry = answer.id;
-            text = body === "" || body === "[SILENT]"
-              ? cronOutcomeNotice("empty", job.id, occurrence.scheduledAtMs)
-              : body.length > CRON_DELIVERY_MAX_TEXT_CHARS
-                ? `${body.slice(0, CRON_DELIVERY_MAX_TEXT_CHARS - 16)}\n\n[truncated]`
-                : body;
-          }
-          // A corrupt outbox must never fault the run's terminal commit. Invalid data is left as
-          // stored; a full outbox records an actionable fault rather than implying lossless delivery.
-          let admission: "admitted" | "duplicate" | "full" | "invalid" = "invalid";
-          try {
-            const records = await tx.doc(CronDeliveriesDoc, originConversationId);
-            admission = admitCronDelivery(records, {
-              id: `cron:${job.id}:${occurrence.scheduledAtMs}`,
-              sessionKey: job.owner.sessionKey,
-              text,
-              createdAtMs: now(),
-              status: "pending",
-              nextChunkIndex: 0,
-              ...(appAnswerEntry === undefined ? {} : { appAnswerEntry }),
-            });
-          } catch {
-            admission = "invalid";
-          }
-          if (admission === "full" || admission === "invalid") {
-            try {
-              const faults = await tx.doc(CronDeliveryFaultsDoc, originConversationId);
-              recordCronDeliveryFault(faults, {
-                jobId: job.id,
-                scheduledAtMs: occurrence.scheduledAtMs,
-                recordedAtMs: now(),
-                message: admission === "full"
-                  ? "delivery outbox is full; result was not queued"
-                  : "delivery outbox is malformed; result was not queued",
-              });
-            } catch {
-              // This diagnostic is derived state; it must not fault the cron run itself.
-            }
-          }
-        },
-      })
-    : undefined;
-  const cronTool = cronFoundation === undefined
-    ? undefined
-    : createCronTool({
-        foundation: cronFoundation,
-        ownerFor: (conversationId) => cronOwners.get(conversationId),
-        harness: () => {
-          if (harnessRef.current === undefined) throw new Error("The runtime is not open");
-          return harnessRef.current;
-        },
-        ...(cronConfig?.timeZone === undefined ? {} : { timeZone: cronConfig.timeZone }),
-        digestAvailable: (conversationId) => digestChoice !== undefined
-          && authorizedChatConversations.has(conversationId)
-          && hasMemoryDigestTools(toolAllowlist),
-      });
-  const cronToolRegistration = cronTool?.extension.tools?.[0];
+  const authority = createAuthorityPolicy({
+    registry,
+    toolAllowlist,
+    workersEnabled,
+    workerCodingTools,
+    workerToolAllowlist: workersConfig?.toolAllowlist,
+    historyEnabled,
+    classifierGrantKey,
+    toolRegistrations,
+    capabilities: {
+      ...(visionExtension === undefined ? {} : { vision: visionExtension }),
+      ...(toolExtension === undefined ? {} : { coding: toolExtension }),
+      askUser: askUserTool,
+      ...(webTool === undefined ? {} : { web: webTool }),
+      ...(memoryTools === undefined ? {} : { memory: memoryTools }),
+      ...(telegramTool === undefined ? {} : { telegram: telegramTool }),
+      ...(appTool === undefined ? {} : { app: appTool }),
+      ...(discordHistoryTool === undefined ? {} : { discordHistory: discordHistoryTool }),
+      ...(skillTool === undefined ? {} : { skill: skillTool }),
+      digestScope: digestScopeExtension,
+      live: {
+        mcp: () => mcpRef.current,
+        codeMode: () => codeModeRef.current,
+        mcpAdmin: () => mcpAdminRef.current,
+        cron: () => cronHost === undefined ? undefined : { foundation: cronHost.foundation.extension, tool: cronHost.tool },
+        worker: () => workerTool,
+      },
+    },
+    context: {
+      extension: contextHost.extension,
+      extensionRef: contextHost.extensionRef,
+      has: contextHost.has,
+      hasSkills: contextHost.hasSkills,
+    },
+  });
+  const { extensionsPolicy, toolFilterFor } = authority;
+  const memoryDigestRef: { current?: MemoryDigest } = {};
+  const cronHost = cronEnabled ? createCronHost({
+    now,
+    ownerSteering: config.followUpMode === "steer",
+    timeZone: config.cron?.timeZone,
+    workspace,
+    toolAllowlist,
+    digestConfigured: digestChoice !== undefined,
+    deliveryPrefixes: cronDeliveryPrefixes,
+    authority,
+    effects,
+    contextHost,
+    harness: openHarness,
+    memoryDigest: () => memoryDigestRef.current!,
+  }) : undefined;
   // Bounded ordinary background workers. The foundation owns the Durable task, its child conversation
-  // and the internal result event; the runtime supplies only capture, model, workspace and retirement,
-  // exactly as it does for a scheduled run. A worker is never an origin: its target is task-owned and
-  // carries captured tools only.
+  // and the internal result event; the host supplies capture, model, workspace and retirement. A
+  // worker is never an origin: its target is task-owned and carries captured tools only.
   const workerFoundation: WorkerFoundation | undefined = workersEnabled && workerWorkspace !== undefined
     ? createWorkerFoundation({
         now,
         maxConcurrent: workersConfig?.maxConcurrent ?? WORKER_LIMITS.defaultConcurrent,
-        allowModel: (candidate) => choicesByNative.has(modelKey(candidate)),
+        allowModel: modelHost.allowModel,
         spawnModel: async (tx, conversationId) => {
-          const state = await tx.doc(AgentDoc, conversationId);
-          const choice = choiceFromState(state) ?? defaultChoice;
-          const level = state?.thinkingLevel !== undefined && choice.thinkingLevels.includes(state.thinkingLevel)
-            ? state.thinkingLevel
-            : fallbackThinkingLevel(choice);
+          const { choice, level } = modelHost.selectionOf(await tx.doc(AgentDoc, conversationId));
           return { model: choice.native, thinkingLevel: level };
         },
         ...(workerPreset === undefined ? {} : { preset: workerPreset }),
-        workspace: workerWorkspace!,
+        workspace: workerWorkspace,
         prepare: async ({ tx, spawnerConversationId, targetConversationId: target, input, workspace: targetWorkspace, ctx }) => {
-          // The worker starts default-deny. Its capture comes from the independent worker config
-          // (or inherited defaults), and call-time hooks still require an authorized spawning chat.
-          // A worker-only coding grant never widens the foreground or other task targets.
-          const authorized = authorizedChatConversations.has(spawnerConversationId);
-          const capture = await tx.doc(ConfigToolCaptureDoc, target);
-          capture.originConversationId = spawnerConversationId;
-          capture.tools = authorized ? workerToolNames() : [];
-          // Classifier model authority is captured with the tool name, so a config
-          // change narrows it durably instead of re-admitting a stale model later.
-          capture.classifierModel = capture.tools.includes(CLASSIFIER_MODEL_TOOL_NAME)
-            ? classifierGrantKey ?? null
-            : null;
-          // The same snapshot path a scheduled run uses: bootstrap/AGENTS, the memory manifest, the
-          // skill summary and the read-only `skill` tool, only when the host configured a provider and
-          // the spawning session is mapped.
-          const spawnerKey = sessionKeyForConversation.get(spawnerConversationId);
-          const skillsInstalled = spawnerKey !== undefined && contextInstallerRef.current !== undefined
-            ? await contextInstallerRef.current(spawnerKey, target, ctx, tx, true)
-            : false;
-          // Explicit worker grants are independent of the foreground coding ceiling. Snapshot
-          // delivery cannot add a skill tool the worker configuration withheld.
-          if (!skillsInstalled) capture.tools = capture.tools.filter((name) => name !== SKILL_TOOL_NAME);
-          const tools = capture.tools.flatMap((name) => {
-            const tool = toolRegistrations.get(name);
-            return tool === undefined ? [] : [tool];
-          });
-          const extensions: Extension[] = [];
-          // The vision hook carries no tool authority; a fresh captured-tool conversation needs it
-          // explicitly or a read-tool image would bypass the flagged-preset handoff.
-          if (visionExtension !== undefined) extensions.push(visionExtension);
-          if (toolExtension !== undefined) extensions.push(toolExtension);
-          if (contextConversations.has(target) && contextExtension !== undefined) extensions.push(contextExtension);
-          if (skillsInstalled && skillTool !== undefined) extensions.push(skillTool.extension);
-          if (codeModeRef.current !== undefined) extensions.push(...codeModeRef.current.extensions);
-          if (mcpRef.current !== undefined) extensions.push(mcpRef.current.extension);
-          if (webTool !== undefined) extensions.push(webTool.extension);
-          if (memoryTools !== undefined) extensions.push(memoryTools.extension);
-          extensions.push(workerCapabilityExtension);
-          const workerChoice = choicesByNative.get(modelKey(input.model));
-          await configure(tx, target, {
+          // The worker starts default-deny. Its capture is the independent worker ceiling of an
+          // authorized spawning chat, plus the snapshot path a scheduled run uses; snapshot delivery
+          // cannot add a skill tool the worker configuration withheld.
+          const spawnerKey = registry.sessionKeyFor(spawnerConversationId);
+          const contextState = spawnerKey === undefined
+            ? undefined
+            : await contextHost.install(spawnerKey, target, ctx, true, tx);
+          const skillsInstalled = contextState?.hasSkills === true;
+          const captured = await authority.writeCapture(tx, target, spawnerConversationId,
+            authority.captureFor("worker", spawnerConversationId).filter((name) => skillsInstalled || name !== SKILL_TOOL_NAME));
+          await authority.configureCaptured(tx, target, {
+            kind: "worker", workspaceRoot: targetWorkspace.mode === "worktree" ? targetWorkspace.path : undefined,
+          }, {
             cwd: targetWorkspace.path,
             model: input.model,
             // The captured level may predate a provider catalog change; the current catalog wins.
-            thinkingLevel: workerChoice !== undefined && workerChoice.thinkingLevels.includes(input.thinkingLevel)
-              ? input.thinkingLevel
-              : workerChoice === undefined ? "off" : fallbackThinkingLevel(workerChoice),
-            tools,
-            // The classifier nested tool is script-reachable only, never a direct model tool.
-            modelTools: tools.filter((tool) =>
-              !mcpRef.current?.ownsTool(tool.name) && tool.name !== CLASSIFIER_MODEL_TOOL_NAME),
-            extensions,
-          });
+            thinkingLevel: modelHost.pinnedThinkingLevel(input.model, input.thinkingLevel, "default"),
+          }, captured, contextState);
         },
         finalize: async ({ tx, targetConversationId: target, settlement }) => {
-          // A worker's captured authority ends in the same terminal commit that records its outcome.
-          // Code Mode selection goes with it: a terminal or cancelled child has nothing left to
-          // compose, and the retired capture denies any stale nested call at call time.
-          await tx.retireDoc(ConfigToolCaptureDoc, target);
-          await configure(tx, target, {
-            tools: [],
-            modelTools: [],
-            extensions: visionExtension === undefined ? [] : [visionExtension],
+          // A worker's captured authority, Code Mode selection included, ends in the same terminal
+          // commit that records its outcome. Once stored, its checkout's tool environments close
+          // when no other live worker still uses that checkout.
+          await authority.retireCaptured(tx, target);
+          await effects.defer(tx, () => {
+            const root = registry.releaseWorker(target);
+            if (root !== undefined && !registry.workerRootInUse(root)) workerEnvironments.release(root, cleanupContext);
           });
-          workerWorkspaceRoots.delete(target);
-          workerChildConversations.delete(target);
-          if (settlement.status !== "ok" || settlement.answerEntryId === null) {
-            return { result: null, error: settlement.error };
-          }
-          const answer = await tx.entry(AssistantEntry, settlement.answerEntryId as EntryId);
-          const message = answer?.model?.[0] as AssistantMessage | undefined;
-          const body = (message?.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("") ?? "").trim();
+          if (settlement.status !== "ok" || settlement.answerEntryId === null) return { result: null, error: settlement.error };
+          const body = extractAssistantText(await tx.entry(AssistantEntry, settlement.answerEntryId as EntryId)).trim();
           return { result: body === "" ? null : body, error: null };
         },
-        trackWorkspace: (conversationId, workspaceInfo) => {
-          workerChildConversations.add(conversationId);
-          if (workspaceInfo.mode === "worktree") workerWorkspaceRoots.set(conversationId, workspaceInfo.path);
-          else workerWorkspaceRoots.delete(conversationId);
-        },
-        commit: (change, ctx) => {
-          if (harnessRef.current === undefined) throw new Error("The runtime is not open");
-          return harnessRef.current.commit(change, ctx);
-        },
+        // Called by the foundation only after the prepared target is durable.
+        trackWorkspace: (id, info) => registry.trackWorker(id, info.mode === "worktree" ? info.path : undefined),
+        commit: (change, ctx) => openHarness().commit(change, ctx),
       })
     : undefined;
-  const workerTool = workerFoundation === undefined
-    ? undefined
-    : createWorkerTool({
-        foundation: workerFoundation,
-        spawnerFor: (conversationId) => workerSpawners.has(conversationId),
-        harness: () => {
-          if (harnessRef.current === undefined) throw new Error("The runtime is not open");
-          return harnessRef.current;
-        },
-        precheckWorktree: () => workerWorkspace!.precheck(),
-      });
-  const workerToolRegistration = workerTool?.extension.tools?.[0];
+  const workerTool = workerFoundation === undefined ? undefined : createWorkerTool({
+    foundation: workerFoundation,
+    spawnerFor: (id) => registry.isWorkerSpawner(id),
+    harness: openHarness,
+    precheckWorktree: () => workerWorkspace!.precheck(),
+  });
   /**
-   * Bounded conversation-to-memory digestion. It is registered even when no host will start it so a
-   * task persisted by an earlier open can resume, but it is otherwise inert: `start` is the only
-   * entry and nothing schedules, notifies or creates a conversation by itself. Its target is a
-   * task-owned conversation holding only the origin's curated Markdown subset (read/write/edit) and
-   * the curation-scope hook, so it never inherits shell, network, channel, history or worker authority.
+   * Bounded conversation-to-memory digestion. Registered even when no host will start it so a task
+   * persisted by an earlier open can resume, but otherwise inert: `start` is the only entry. Its
+   * target holds only the origin's curated Markdown subset and the curation-scope hook.
    */
   const memoryDigest: MemoryDigest = createMemoryDigest({
-    harness: () => {
-      if (harnessRef.current === undefined) throw new Error("The runtime is not open");
-      return harnessRef.current;
-    },
+    harness: openHarness,
     source: () => {
       if (digestSourceRef.current === undefined) throw new Error("The digest source is not open");
       return digestSourceRef.current;
@@ -1982,267 +520,31 @@ export async function openGateway(config: PortConfig, context: Context, options:
     episodesPerRun: config.digest?.episodesPerRun ?? 1,
     // Explicit background selection only: never the origin conversation's current model or thinking.
     model: async () => digestChoice,
-    allowModel: (candidate) => choicesByNative.has(modelKey(candidate)),
-    modelContext: (candidate) => choicesByNative.get(modelKey(candidate))?.model,
-    curationTools: (conversationId) => authorizedChatConversations.has(conversationId)
-      ? memoryDigestCurationTools(toolAllowlist)
-      : [],
+    allowModel: modelHost.allowModel,
+    modelContext: (candidate) => modelHost.state().resolved.choicesByNative.get(JSON.stringify([candidate.provider, candidate.modelId]))?.model,
+    curationTools: (id) => authority.captureFor("digest", id),
     prepare: async ({ tx, originConversationId, targetConversationId: target, input }) => {
-      // The fresh task-owned target starts default-deny. This capture is the origin's current
-      // curated subset, and the coding-tool hook still requires that origin and the current
-      // allowlist at call time, so a capture is never wider than configured authority.
-      const capture = await tx.doc(ConfigToolCaptureDoc, target);
-      capture.originConversationId = originConversationId;
-      capture.tools = authorizedChatConversations.has(originConversationId)
-        ? memoryDigestCurationTools(toolAllowlist)
-        : [];
-      // A digest run never holds Code Mode or classifier authority.
-      capture.classifierModel = null;
-      const tools = capture.tools.flatMap((name) => {
-        const tool = toolRegistrations.get(name);
-        return tool === undefined ? [] : [tool];
-      });
-      const extensions: Extension[] = [];
-      // The vision hook carries no tool or memory authority; it is selected so a digest target can
-      // never send an unbounded raw image to a flagged text-only model. The curation hook narrows.
-      if (visionExtension !== undefined) extensions.push(visionExtension);
-      if (toolExtension !== undefined) extensions.push(toolExtension);
-      extensions.push(digestScopeExtension);
-      const choice = choicesByNative.get(modelKey(input.model));
-      await configure(tx, target, {
+      const captured = await authority.writeCapture(tx, target, originConversationId, authority.captureFor("digest", originConversationId));
+      await authority.configureCaptured(tx, target, { kind: "digest", limits: input.limits }, {
         cwd: workspace,
         model: input.model,
-        // A pinned level that left the provider catalog falls back inside the pinned model only.
-        thinkingLevel: choice !== undefined && choice.thinkingLevels.includes(input.thinkingLevel as ModelThinkingLevel)
-          ? input.thinkingLevel as ModelThinkingLevel
-          : choice === undefined ? "off" : choice.thinkingLevels.includes("off")
-            ? "off"
-            : choice.thinkingLevels[0]!,
-        tools,
-        modelTools: tools,
-        extensions,
-      });
-      digestTargetConversations.add(target);
-      digestTargetLimits.set(target, { ...input.limits });
+        thinkingLevel: modelHost.pinnedThinkingLevel(input.model, input.thinkingLevel as ModelThinkingLevel, "lowest"),
+      }, captured);
+      await effects.defer(tx, () => registry.beginDigest(target, input.limits));
     },
     finalize: async ({ tx, targetConversationId: target }) => {
-      // A digest target's captured authority ends in the same terminal commit that records the
-      // outcome. The curation hook goes with it: a terminal conversation keeps nothing to write.
-      await tx.retireDoc(ConfigToolCaptureDoc, target);
-      await configure(tx, target, {
-        tools: [],
-        modelTools: [],
-        extensions: visionExtension === undefined ? [] : [visionExtension],
-      });
-      digestTargetConversations.delete(target);
-      digestTargetLimits.delete(target);
+      // The curation hook and the capture end in the same terminal commit that records the outcome.
+      await authority.retireCaptured(tx, target);
+      await effects.defer(tx, () => registry.endDigest(target));
     },
   });
-  const toolFilterFromNames = (
-    names: readonly string[],
-  ): { readonly tools: readonly ToolRegistration[] } => ({
-    tools: names.flatMap((name) => {
-      const tool = toolRegistrations.get(name);
-      return tool === undefined ? [] : [tool];
-    }),
-  });
-  const contextToolsFor = (conversationId: ConversationId): ToolRegistration[] => {
-    // The skill loader is context delivery, not an effectful tool: it stays outside the host
-    // ceiling, and is offered only for captured skill snapshots.
-    // The cron tool is an owner-scoped scheduling capability, not filesystem or shell authority,
-    // and is offered only in an origin session whose owner is known.
-    const skillTools = skillToolRegistration !== undefined && skillConversations.has(conversationId)
-      ? [skillToolRegistration]
-      : [];
-    const cronTools = cronToolRegistration !== undefined && cronOwners.has(conversationId)
-      ? [cronToolRegistration]
-      : [];
-    // Recall is read-only over mapped chats; workers need explicit captures for each tool, and a
-    // live scheduled run holds only the recall tools its own capture names.
-    const memoryToolsForConversation = historyEnabled
-      && (historyConversations.has(conversationId) || workerChildConversations.has(conversationId)
-        || scheduledRunTargets.has(conversationId))
-      ? memoryToolRegistrations
-      : [];
-    // Telegram interaction is a scoped channel capability for one mapped private chat, not a coding
-    // tool. The live adapter rechecks the current allowlist and observed target at call time.
-    const telegramTools = telegramToolRegistration !== undefined && telegramChatConversations.has(conversationId)
-      ? [telegramToolRegistration]
-      : [];
-    // App file delivery is a scoped channel capability for one mapped app chat thread, never a
-    // coding tool: the live adapter re-derives and rechecks the thread at call time.
-    const appTools = appToolRegistration !== undefined && appChatConversations.has(conversationId)
-      ? [appToolRegistration]
-      : [];
-    // Discord history is read-only and host-scoped: the live adapter rechecks the exact session,
-    // sender, channel and Discord permissions at call time, so it is offered only in a mapped
-    // Discord chat and is never inherited by a worker or a task-owned scope.
-    const discordHistoryTools = discordHistoryToolRegistration !== undefined && discordChatConversations.has(conversationId)
-      ? [discordHistoryToolRegistration]
-      : [];
-    const webTools = webConversations.has(conversationId) || workerChildConversations.has(conversationId)
-      ? [...webToolRegistrations] : [];
-    // Worker management is a spawning-conversation capability, not filesystem or shell authority. The
-    // worker's own task-owned conversation is never in this set, so it cannot start another worker.
-    const workerTools = workerToolRegistration !== undefined && workerSpawners.has(conversationId)
-      ? [workerToolRegistration]
-      : [];
-    // MCP management is exempt from the coding ceiling and offered to authenticated mapped chats
-    // alone (never a worker or task-owned scope); its model tool acts directly.
-    const mcpAdminTools = mcpAdminRef.current !== undefined && authorizedChatConversations.has(conversationId)
-      ? [...(mcpAdminRef.current.extension.tools ?? [])]
-      : [];
-    // Owner questions are offered to the same validated chats; the call-time check and the live
-    // surface registry still decide whether this chat can actually reach its owner.
-    const askUserTools = authorizedChatConversations.has(conversationId)
-      ? [...(askUserTool.extension.tools ?? [])]
-      : [];
-    return [...skillTools, ...cronTools, ...memoryToolsForConversation, ...telegramTools,
-      ...appTools, ...discordHistoryTools, ...webTools, ...workerTools, ...mcpAdminTools, ...askUserTools];
-  };
-  /**
-   * The authority-derived tool filter. The host ceiling directly authorizes authenticated mapped
-   * ordinary chats; a scheduled background run must pass its restored capture bound, or it keeps no
-   * coding tool. An empty bound is a genuine deny and retires the capture.
-   */
-  const toolFilterFor = async (
-    tx: Tx,
-    conversationId: ConversationId,
-    backgroundTools?: ReadonlySet<string>,
-  ): Promise<Pick<AgentChange, "tools" | "modelTools">> => {
-    const worker = workerChildConversations.has(conversationId);
-    const scheduledRun = scheduledRunTargets.has(conversationId);
-    const captured = worker || scheduledRun ? backgroundTools ?? new Set<string>() : undefined;
-    const contextTools = contextToolsFor(conversationId).filter((tool) =>
-      captured === undefined || captured.has(tool.name)
-        // A scheduled run's `skill` loader is context delivery for the snapshot installed for that
-        // run, not a captured tool, so its restored snapshot decides and it is never filtered here.
-        || (scheduledRun && tool.name === SKILL_TOOL_NAME));
-    // MCP stays deferred in mapped chats and captured workers.
-    const authorized = authorizedChatConversations.has(conversationId);
-    const codeModeOfferedBase = codeModeRef.current !== undefined
-      && (authorized || captured?.has(CODEMODE_TOOL_NAME));
-    let offered = codeModeOfferedBase ? [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME] : [];
-    // Classifier calls are native nested ToolTasks of Code Mode. They stay out of
-    // `modelTools`, so the model cannot call them directly, and no other scope
-    // receives them without the Code Mode grant and an explicit configured model.
-    const classifierOffered = (): string[] => classifierGrantKey === undefined
-      ? []
-      : [CLASSIFIER_MODEL_TOOL_NAME];
-    let classifierTools = codeModeOfferedBase ? classifierOffered() : [];
-    const deferred = [...(mcpRef.current?.toolNames ?? [])].filter((name) => authorized || captured?.has(name));
-    const withContext = (names: readonly string[]): Pick<AgentChange, "tools" | "modelTools"> => {
-      const tools = [
-        ...toolFilterFromNames(names).tools,
-        ...toolFilterFromNames(offered).tools,
-        ...toolFilterFromNames(classifierTools).tools,
-        ...toolFilterFromNames(deferred).tools,
-        ...contextTools,
-      ];
-      const modelTools = [
-        ...toolFilterFromNames(names).tools,
-        ...toolFilterFromNames(offered).tools,
-        // A scheduled run has no Code Mode or tool search to load a deferred tool, so the MCP tools
-        // its capture names are offered directly: the capture is the explicit grant.
-        ...(scheduledRun ? toolFilterFromNames(deferred).tools : []),
-        ...contextTools,
-      ];
-      return { tools, modelTools };
-    };
-    if (worker) {
-      const capture = await tx.doc(ConfigToolCaptureDoc, conversationId);
-      capture.tools = workerToolNames().filter((name) =>
-        captured!.has(name) && capture.tools.includes(name));
-      // Use the pruned durable capture, not the launch input, so removing Code Mode
-      // from worker config or a reopen cannot resurrect classifiers from a stale grant.
-      const capturedCodeMode = codeModeRef.current !== undefined
-        && workerToolNames().includes(CODEMODE_TOOL_NAME)
-        && capture.tools.includes(CODEMODE_TOOL_NAME);
-      // Classifier authority is captured by model identity, not only by tool name: a
-      // removed or changed configuration is pruned in this same commit, so a later
-      // re-enable cannot resurrect it for an existing worker.
-      capture.classifierModel = capturedCodeMode
-        && capture.tools.includes(CLASSIFIER_MODEL_TOOL_NAME)
-        && classifierGrantKey !== undefined
-        && capture.classifierModel === classifierGrantKey
-        ? classifierGrantKey
-        : null;
-      offered = capturedCodeMode ? [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME] : [];
-      classifierTools = capturedCodeMode && capture.classifierModel !== null
-        ? [CLASSIFIER_MODEL_TOOL_NAME]
-        : [];
-      return withContext(capture.tools.filter((name) => workerCodingTools.includes(name)));
-    }
-    if (!toolExtension && !scheduledRun) {
-      // Retire instead of creating an empty document: a disabled ceiling must durably remove
-      // previously captured tools so re-enabling it cannot resurrect them.
-      await tx.retireDoc(ConfigToolCaptureDoc, conversationId);
-      return withContext([]);
-    }
-    // Only the host's validated mapped-chat set carries configured authority. The root, a
-    // channel-state conversation, a fork, a raw conversation and any other task-owned target
-    // are denied even when agent state still names a tool.
-    if (authorizedChatConversations.has(conversationId)) return withContext(toolAllowlist);
-    if (backgroundTools !== undefined) {
-      const capture = await tx.doc(ConfigToolCaptureDoc, conversationId);
-      const names = toolAllowlist.filter((name) =>
-        backgroundTools.has(name) && capture.tools.includes(name));
-      // A scheduled run's captured recall and MCP names are re-bounded the same way, so a revoke, a
-      // narrowed config or a closed server is pruned from the durable document here and cannot
-      // return when that capability is enabled again later.
-      const origin = capture.originConversationId;
-      const originAuthorized = Number.isSafeInteger(origin) && origin > 0
-        && authorizedChatConversations.has(origin as ConversationId);
-      const capabilities = scheduledRun && originAuthorized
-        ? scheduledRunCapabilityNames(origin as ConversationId).filter((name) =>
-          backgroundTools.has(name) && capture.tools.includes(name))
-        : [];
-      // Persist the prune so a later call-time check cannot revive a name the origin lost.
-      capture.tools = [...names, ...capabilities];
-      return withContext(names);
-    }
-    await tx.retireDoc(ConfigToolCaptureDoc, conversationId);
-    return withContext([]);
-  };
-  const denyNewConversation = async (
-    tx: Tx,
-    conversation: { readonly id: ConversationId },
-  ): Promise<void> => {
-    // Every native creation path, including forks and raw/task-created conversations, starts denied.
-    // Any capture document is retired so a fork's copied agent state can never inherit authority,
-    // and extensions are explicit so a later dynamic install cannot be selected by default.
-    await tx.retireDoc(ConfigToolCaptureDoc, conversation.id);
-    await configure(tx, conversation.id, {
-      tools: [],
-      modelTools: [],
-      // Denied conversations still get the non-authoritative vision hook so a raw, forked or
-      // task-created request cannot send unbounded raw images to a flagged text-only model.
-      extensions: visionExtension === undefined ? [] : [visionExtension],
-    });
-  };
-  const publicChoice = (choice: ResolvedModelChoice): GatewayModelChoice => ({
-    ...choice.configured,
-    name: choice.model.name,
-    thinkingLevels: [...choice.thinkingLevels],
-  });
-  const publicSelection = (choice: ResolvedModelChoice, thinkingLevel: ModelThinkingLevel): GatewayModelSelection => ({
-    ...choice.configured,
-    thinkingLevel,
-  });
-  const publicPresetsFor = (
-    catalog: ReadonlyMap<string, { readonly choice: ResolvedModelChoice; readonly thinkingLevel?: ModelThinkingLevel }>,
-  ): readonly GatewayModelPreset[] => [...catalog].map(([name, preset]) => ({
-    name,
-    ...preset.choice.configured,
-    ...(preset.thinkingLevel === undefined ? {} : { thinkingLevel: preset.thinkingLevel }),
-  }));
-  let publicPresets = publicPresetsFor(presetCatalog);
+  memoryDigestRef.current = memoryDigest;
+
   async function applyConversationPolicy(conversation: Conversation, ctx: Context): Promise<void> {
     await conversation.commit(async (tx) => {
-      const state = await tx.doc(AgentDoc, conversation.id);
       const toolFilter = await toolFilterFor(tx, conversation.id);
       await configure(tx, conversation.id, {
-        ...policyForState(state),
+        ...modelHost.policyForState(await tx.doc(AgentDoc, conversation.id)),
         ...extensionsPolicy(conversation.id),
         ...toolFilter,
       });
@@ -2250,34 +552,28 @@ export async function openGateway(config: PortConfig, context: Context, options:
   }
   /**
    * Reapply tool and extension policy after a live MCP change. Authenticated chats may gain the new
-   * registration; existing workers and scheduled runs are pruned against their durable captures,
-   * never widened by it.
+   * registration; existing workers and scheduled runs keep their pinned model and are pruned against
+   * their durable captures, never widened by it.
    */
   async function refreshMcpConversationPolicy(): Promise<void> {
     const open = harnessRef.current;
     if (open === undefined) return;
     let failure: unknown;
-    for (const conversationId of new Set([
-      ...authorizedChatConversations, ...workerChildConversations, ...scheduledRunTargets,
-    ])) {
+    for (const id of new Set([...registry.chats(), ...registry.workers(), ...registry.scheduledRuns()])) {
       try {
-        const conversation = await open.conversation(conversationId, context);
+        const conversation = await open.conversation(id, context);
         if (conversation === undefined) continue;
-        if (!workerChildConversations.has(conversationId) && !scheduledRunTargets.has(conversationId)) {
+        if (registry.isChat(id)) {
           await applyConversationPolicy(conversation, context);
           continue;
         }
-        // A worker or scheduled run keeps its pinned model, cwd and thinking level. Reapply only its extension
-        // selection and the capture intersection: a newly added MCP tool is never added to an
-        // existing capture, while a removed one is pruned in this same commit.
         await conversation.commit(async (tx) => {
-          const capture = await tx.doc(ConfigToolCaptureDoc, conversationId);
-          const alreadyCaptured = new Set(capture.tools);
-          const toolFilter = await toolFilterFor(tx, conversationId, alreadyCaptured);
-          await configure(tx, conversationId, {
-            ...extensionsPolicy(conversationId),
-            ...toolFilter,
-          });
+          // Read the durable capture first to fence against finalization on this conversation,
+          // then verify the capture is still live and the background role has not retired.
+          const capture = await tx.doc(ConfigToolCaptureDoc, id);
+          if (capture.originConversationId === null || (!registry.isWorker(id) && !registry.isScheduledRun(id))) return;
+          const toolFilter = await toolFilterFor(tx, id, new Set(capture.tools));
+          await configure(tx, id, { ...extensionsPolicy(id), ...toolFilter });
         }, context);
       } catch (error) {
         failure ??= error;
@@ -2285,71 +581,56 @@ export async function openGateway(config: PortConfig, context: Context, options:
     }
     if (failure !== undefined) throw failure;
   }
+
   let releaseLock: Awaited<ReturnType<typeof processLock>>;
   try {
     releaseLock = await processLock(`nanobot:${dbPath}`);
   } catch (cause) {
     // A known live owner is actionable and its raw lock name contains the database path.
-    if (isChordError(cause) && cause.reason === "locked") {
-      throw new StartupDiagnosticError("storeLocked", { cause });
-    }
+    if (isChordError(cause) && cause.reason === "locked") throw new StartupDiagnosticError("storeLocked", { cause });
     reportFailure(cause, "gateway.lock");
     throw cause;
   }
   let harness: HarnessType | undefined;
   let storage: Storage | undefined;
-  let episodeCatalog: EpisodeCatalog | undefined;
   let idleRollover: IdleRollover | undefined;
-  let historyIndex: HistoryIndex | undefined;
-  let episodeSummaries: EpisodeSummaries | undefined;
+  const historyParts: HistoryHostParts = {};
   let closed = false;
   try {
-    // Constructed before the Harness opens so its extension is in the initial registry. The
-    // object holds no harness: every operation receives Durable's own transaction or task surface.
-    episodeSummaries = episodeSummaryModel === undefined
-      ? undefined
-      : createEpisodeSummaries({
-          model: {
-            provider: episodeSummaryModel.provider,
-            modelId: episodeSummaryModel.modelId,
-            ...(episodeSummaryModel.thinkingLevel === undefined
-              ? {}
-              : { thinkingLevel: episodeSummaryModel.thinkingLevel }),
-          },
-          ...(episodeSummaryModel.backfill === undefined ? {} : { backfill: episodeSummaryModel.backfill }),
-          ...(useConversationSummaryModel ? {
-            resolveModel: async (tx: Tx, conversationId: ConversationId) => {
-              const state = await tx.doc(AgentDoc, conversationId);
-              const selected = choiceFromState(state) ?? defaultChoice;
-              return { ...selected.native, thinkingLevel: null };
-            },
-          } : {}),
-          allowModel: (provider: string, modelId: string) => choicesByNative.has(modelKey({ provider, modelId })),
-          includeOpenAtActivation: options.episodeSummary === undefined,
-          // Backstop: a job whose conversation is not chat scope never reaches a provider call. An
-          // automation conversation and a summary task's own target are equally out of scope.
-          scope: (tx: Tx, conversationId: ConversationId): Promise<ChatScopeExclusion | undefined> =>
-            chatScopeById(tx, conversationId),
-          // Resolved lazily: the catalog is created after this object so its extension can be
-          // installed in the initial registry.
-          listEpisodes: (conversationId, query, ctx) =>
-            episodeCatalog!.list(
-              conversationId,
-              query.before === undefined
-                ? { limit: query.limit }
-                : { limit: query.limit, before: query.before as EntryId },
-              ctx,
-            ),
-          now,
-        });
-    // MCP connects before the registry is built so every discovered tool is in the initial
-    // registry. A failed server contributes nothing and is reported through `gateway.mcp`; the
-    // whole open fails only for an internal error, and the catch below tears down whatever started.
-    // OAuth grants live under the same canonical data directory as the private credential store: a
-    // private `0600` file like the provider credential store, on the same trust boundary. Any process
-    // running as this user can read it — including the model's own shell and an MCP stdio server — and
-    // that is the accepted posture; no model-facing surface returns its content (see MCP.md).
-    const mcpDataDir = credentialStoreDir ?? config.dataDir;
+    const sessionScopeRef: { current?: ReturnType<typeof createSessionScope> } = {};
+    const episodeSummaries = createEpisodeSummaryPass({
+      model: episodeSummaryModel,
+      useConversationModel: background.useConversationSummaryModel,
+      includeOpenAtActivation: options.episodeSummary === undefined,
+      now,
+      conversationModel: (agent) => modelHost.selectionOf(agent).choice.native,
+      allowModel: modelHost.allowModel,
+      // Backstop: a job whose conversation is not chat scope never reaches a provider call.
+      scope: (tx, id) => sessionScopeRef.current!.chatScopeById(tx, id),
+      catalog: () => historyParts.episodeCatalog!,
+    });
+    // MCP connects before the registry is built so every discovered tool is in the initial registry.
+    // A failed server contributes nothing and is reported through `gateway.mcp`. OAuth grants live
+    // under the canonical data directory beside the private credential store (see MCP.md).
+    const mcpDataDir = startupModels.credentialStoreDir ?? config.dataDir;
+    const mcpIntegration = (next: McpConfig) => createMcpIntegration({
+      config: next,
+      workspace,
+      dataDir: mcpDataDir,
+      // A live scheduled run's captured MCP tools stay callable for that run; the exact per-tool
+      // grant is checked against its durable capture by the run-capability hook.
+      isAuthorizedChat: (id: ConversationId) => registry.isChat(id) || registry.isWorker(id) || registry.isScheduledRun(id),
+      delegatedToolNames: [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME],
+    });
+    const codeModeIntegration = (namespaces: McpIntegration["namespaces"]) => createCodeModeIntegration({
+      namespaces,
+      // Native `models.*`: only the one configured classifier model plus read-only catalog helpers.
+      models: true,
+      ...(classifierGrant === undefined ? {} : { classifierModel: classifierGrant }),
+      // A live worker child may compose its captured tools; every nested call still passes that
+      // tool's own call-time hook, so retirement or a narrowed ceiling denies stale composition.
+      isAuthorizedChat: (id: ConversationId) => registry.isChat(id) || registry.isWorker(id),
+    });
     let registeredMcpToolNames = new Set<string>();
     const replaceMcpRegistrations = (integration: McpIntegration): void => {
       for (const name of registeredMcpToolNames) toolRegistrations.delete(name);
@@ -2359,20 +640,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
       }
     };
     if (mcpConfigured && mcpConfig !== undefined) {
-      mcpRef.current = await createMcpIntegration({
-        config: mcpConfig,
-        workspace,
-        dataDir: mcpDataDir,
-        // A live scheduled run's captured MCP tools stay callable for that run; the exact per-tool
-        // grant is checked against its durable capture by the run-capability hook below.
-        isAuthorizedChat: (conversationId: ConversationId) => authorizedChatConversations.has(conversationId)
-          || workerChildConversations.has(conversationId)
-          || scheduledRunTargets.has(conversationId),
-        delegatedToolNames: [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME],
-      });
+      mcpRef.current = await mcpIntegration(mcpConfig);
       replaceMcpRegistrations(mcpRef.current);
     }
-    // Direct MCP management is performed by the model tool for authenticated mapped chats. This host
+    // Direct MCP management is performed by the model tool for authenticated mapped chats; this host
     // object only exposes bounded status and consumes callback-shaped ingress before model admission.
     if (config.configFile !== undefined && mcpSurfaces !== undefined) {
       mcpAdminRef.current = createMcpAdmin({
@@ -2390,85 +661,61 @@ export async function openGateway(config: PortConfig, context: Context, options:
           if (integration === undefined) return;
           await integration.reconnect(name);
           replaceMcpRegistrations(integration);
-          registry.install(integration.extension);
+          registry_.install(integration.extension);
           codeModeRef.current?.updateNamespaces(integration.namespaces);
           await refreshMcpConversationPolicy();
         },
         servers: () => mcpRef.current?.status ?? [],
-        sessionKeyFor: (conversationId) => sessionKeyForConversation.get(conversationId),
+        sessionKeyFor,
         surfaces: mcpSurfaces,
-        isAuthorizedChat: (conversationId: ConversationId) => authorizedChatConversations.has(conversationId),
+        isAuthorizedChat: (id: ConversationId) => registry.isChat(id),
       } as Parameters<typeof createMcpAdmin>[0]);
       for (const tool of mcpAdminRef.current.extension.tools ?? []) toolRegistrations.set(tool.name, tool);
     }
-    // Code Mode is an independent compositor, not an MCP wrapper. It gets MCP namespaces only from
-    // an actually connected integration; without MCP it composes the conversation's other tools.
+    // Code Mode is an independent compositor, not an MCP wrapper: it gets MCP namespaces only from a
+    // connected integration, and without MCP it composes the conversation's other tools.
     if (codeModeEnabled) {
-      codeModeRef.current = createCodeModeIntegration({
-        namespaces: mcpRef.current?.namespaces ?? [],
-        // Native `models.*`: only the one configured classifier model plus read-only
-        // catalog helpers. Image generation is not registered by this integration.
-        models: true,
-        ...(classifierGrant === undefined ? {} : { classifierModel: classifierGrant }),
-        // A live worker child may compose its captured tools; every nested call still passes that
-        // tool's own call-time hook, so retirement or a narrowed ceiling denies stale composition.
-        isAuthorizedChat: (conversationId: ConversationId) =>
-          authorizedChatConversations.has(conversationId) || workerChildConversations.has(conversationId),
-      });
+      codeModeRef.current = codeModeIntegration(mcpRef.current?.namespaces ?? []);
       for (const extension of codeModeRef.current.extensions) {
         for (const tool of extension.tools ?? []) toolRegistrations.set(tool.name, tool);
       }
     }
-    const registry = createRegistry();
-    if (episodeSummaries !== undefined) registry.install(episodeSummaries.extension);
-    if (visionExtension) registry.install(visionExtension);
-    if (toolExtension) registry.install(toolExtension);
-    if (mcpRef.current !== undefined) registry.install(mcpRef.current.extension);
-    if (mcpAdminRef.current !== undefined) registry.install(mcpAdminRef.current.extension);
-    if (codeModeRef.current !== undefined) {
-      for (const extension of codeModeRef.current.extensions) registry.install(extension);
+    const registry_ = createRegistry();
+    for (const extension of [
+      episodeSummaries?.extension, visionExtension, toolExtension, mcpRef.current?.extension,
+      mcpAdminRef.current?.extension, ...(codeModeRef.current?.extensions ?? []), skillTool?.extension,
+      memoryTools?.extension, telegramTool?.extension, appTool?.extension, askUserTool.extension,
+      discordHistoryTool?.extension, webTool?.extension, cronHost?.foundation.extension, cronHost?.tool.extension,
+      workerFoundation?.extension, workerTool?.extension, authority.workerCapabilityExtension,
+      authority.scheduledRunCapabilityExtension, memoryDigest.extension, digestScopeExtension,
+    ]) {
+      if (extension !== undefined) registry_.install(extension);
     }
-    if (skillTool) registry.install(skillTool.extension);
-    if (memoryTools) registry.install(memoryTools.extension);
-    if (telegramTool) registry.install(telegramTool.extension);
-    if (appTool) registry.install(appTool.extension);
-    registry.install(askUserTool.extension);
-    if (discordHistoryTool) registry.install(discordHistoryTool.extension);
-    if (webTool) registry.install(webTool.extension);
-    if (cronFoundation) registry.install(cronFoundation.extension);
-    if (cronTool) registry.install(cronTool.extension);
-    if (workerFoundation) registry.install(workerFoundation.extension);
-    if (workerTool) registry.install(workerTool.extension);
-    registry.install(workerCapabilityExtension);
-    registry.install(scheduledRunCapabilityExtension);
-    registry.install(memoryDigest.extension);
-    registry.install(digestScopeExtension);
     storage = await openFullSyncNodeSqliteStorage(dbPath, context);
-    const harnessOptions = {
+    harness = await Harness.open(storage, {
       // Consume the whole pending steering burst at each native boundary, including worker steers.
       settings: { steeringMode: "all" as const },
-      // A host reload swaps this catalog without reopening the Harness; every generation, compaction,
-      // hook and tool resolves the current one at each use.
-      models: () => models,
-      registry,
+      // A host reload swaps this catalog without reopening the Harness; every generation,
+      // compaction, hook and tool resolves the current one at each use.
+      models: () => modelHost.state().models,
+      registry: registry_,
       telemetry: journalTelemetry,
-      // Durable reports asynchronous storage, scheduler, hook and listener failures here even
-      // when no public operation throws. Record the original cause before it is otherwise lost.
+      // Durable reports asynchronous storage, scheduler, hook and listener failures here even when no
+      // public operation throws. Record the original cause before it is otherwise lost.
       onReport: (report: Report) => reportFailure(report.error, `durable.${report.kind}`,
         "task" in report && report.task !== undefined ? Number(report.task.id) : undefined, {
           reason: "reason" in report ? report.reason : undefined,
           restarts: "restarts" in report ? report.restarts : undefined,
         }),
-      conversationCreated: denyNewConversation,
-      ...(toolEnvironments === undefined
-        ? {}
-        : {
-            env: (target: { readonly conversationId: ConversationId }, ctx: Context) =>
-              environmentFor(target.conversationId, ctx),
-          }),
-    };
-    harness = await Harness.open(storage, harnessOptions, context);
+      conversationCreated: authority.denyNewConversation,
+      ...(toolEnvironments === undefined ? {} : {
+        env: (target: { readonly conversationId: ConversationId }, ctx: Context) => environmentFor(target.conversationId, ctx),
+      }),
+    }, context);
     harnessRef.current = harness;
+    const openedHarness = harness;
+    // Deferred registry effects are applied from stored commits; nothing defers before resume.
+    effects.observe(openedHarness);
     mcpActivationRef.current = async (next) => {
       let integration = mcpRef.current;
       if (integration === undefined) {
@@ -2476,36 +723,20 @@ export async function openGateway(config: PortConfig, context: Context, options:
           liveMcpConfig = next;
           return;
         }
-        integration = await createMcpIntegration({
-          config: next,
-          workspace,
-          dataDir: mcpDataDir,
-          isAuthorizedChat: (conversationId: ConversationId) => authorizedChatConversations.has(conversationId)
-            || workerChildConversations.has(conversationId)
-            || scheduledRunTargets.has(conversationId),
-          delegatedToolNames: [CODEMODE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME],
-        });
+        integration = await mcpIntegration(next);
         mcpRef.current = integration;
-        registry.install(integration.extension);
-        replaceMcpRegistrations(integration);
       } else {
         await integration.applyConfig(next);
-        registry.install(integration.extension);
-        replaceMcpRegistrations(integration);
       }
+      registry_.install(integration.extension);
+      replaceMcpRegistrations(integration);
       liveMcpConfig = next;
       // Legacy Code Mode follows MCP when its own block is absent. A live first server therefore
       // installs it without a restart; an explicit `codemode.enabled: false` stays the owner's choice.
       if (codeModeRef.current === undefined && codeModeConfig === undefined && mcpHasEnabledServers(next)) {
-        codeModeRef.current = createCodeModeIntegration({
-          namespaces: integration.namespaces,
-          models: true,
-          ...(classifierGrant === undefined ? {} : { classifierModel: classifierGrant }),
-          isAuthorizedChat: (conversationId: ConversationId) =>
-            authorizedChatConversations.has(conversationId) || workerChildConversations.has(conversationId),
-        });
+        codeModeRef.current = codeModeIntegration(integration.namespaces);
         for (const extension of codeModeRef.current.extensions) {
-          registry.install(extension);
+          registry_.install(extension);
           for (const tool of extension.tools ?? []) toolRegistrations.set(tool.name, tool);
         }
       } else if (codeModeConfig === undefined && !mcpHasEnabledServers(next) && codeModeRef.current !== undefined) {
@@ -2513,1645 +744,131 @@ export async function openGateway(config: PortConfig, context: Context, options:
         codeModeRef.current = undefined;
         retired.stopAdmission();
         for (const extension of retired.extensions) {
-          registry.uninstall(extension);
+          registry_.uninstall(extension);
           for (const tool of extension.tools ?? []) toolRegistrations.delete(tool.name);
         }
-        // Management may itself be nested in this sandbox. Do not wait for our own
-        // execution to exit; admission is closed synchronously and close joins it later.
+        // Management may itself be nested in this sandbox. Do not wait for our own execution to
+        // exit; admission is closed synchronously and close joins it later.
         void retired.close().catch(() => undefined);
       } else {
         codeModeRef.current?.updateNamespaces(integration.namespaces);
       }
       await refreshMcpConversationPolicy();
     };
-    const root = await harness.root(context, { agent: defaultAgentPolicy });
-
-    /**
-     * The one narrow fork exception (AGENTS.md): an app-channel thread fork is admissible as an
-     * ordinary mapped chat only under its own exact registered app session key. Every hop of a
-     * fork-of-fork chain must carry a durable enrollment whose recorded app message resolves, in the
-     * conversation the native parent names, to a committed user or assistant transcript entry equal
-     * to the native fork cutoff; the enrollment is the authority and the thread registry's displayed
-     * `origin` is only metadata. The base of the chain must be the exact app mapping of a validated
-     * app chat (main or an unenrolled side thread). Anything else stays a denied fork.
-     */
-    async function appForkAdmissible(tx: Tx, sessionKey: string, conversationId: ConversationId): Promise<boolean> {
-      if (!sessionKey.startsWith(`${APP_CHAT_SESSION_KEY}:`)) return false;
-      const callerThread = parseThreadId(sessionKey.slice(APP_CHAT_SESSION_KEY.length + 1));
-      if (callerThread === undefined || callerThread === APP_MAIN_THREAD) return false;
-      let child = await tx.conversation(conversationId);
-      if (child === undefined || child.parent === undefined || child.owner !== undefined) return false;
-      const map = await tx.doc(SessionMap, root.id);
-      const stateId = map.sessions[encodedSessionKey(APP_STATE_SESSION_KEY)] as ConversationId | undefined;
-      if (stateId === undefined || stateId === root.id) return false;
-      const stateRecord = await tx.conversation(stateId);
-      if (stateRecord === undefined || stateRecord.owner !== undefined || stateRecord.parent !== undefined) return false;
-      const state = await tx.doc(AppState, stateId);
-      let childThread = callerThread;
-      const seen = new Set<ConversationId>();
-      while (child.parent !== undefined) {
-        if (seen.has(child.id) || child.id === root.id || child.owner !== undefined || automationConversations.has(child.id)) return false;
-        seen.add(child.id);
-        const enrollment = state.forks?.[`c${child.id}`];
-        if (enrollment === undefined || enrollment.thread !== childThread ||
-            map.sessions[encodedSessionKey(sessionForThread(childThread))] !== child.id) return false;
-        if (threadInfo(state, childThread) === undefined || typeof enrollment.messageId !== "string") return false;
-        if (enrollment.at !== child.parent.at) return false;
-        const parentId = child.parent.conversationId;
-        // Older enrollments omitted the source key. Recover it from the native parent and its
-        // unique app mapping, never from the displayed origin, and apply the same entry check.
-        let parentThread = enrollment.parentThread;
-        if (parentThread === undefined) {
-          const matches = state.threads?.filter(({ id }) => parseThreadId(id) === id &&
-            map.sessions[encodedSessionKey(sessionForThread(id))] === parentId);
-          if (matches?.length !== 1) return false;
-          parentThread = matches[0]!.id;
-        }
-        if (parseThreadId(parentThread) !== parentThread ||
-            map.sessions[encodedSessionKey(sessionForThread(parentThread))] !== parentId) return false;
-        const anchor = await appForkEntry(tx, state, parentId, {
-          thread: parentThread, messageId: enrollment.messageId,
-        });
-        if (anchor !== child.parent.at) return false;
-        const parent = await tx.conversation(child.parent.conversationId);
-        if (parent === undefined) return false;
-        child = parent;
-        childThread = parentThread;
-      }
-      if (child.id === root.id || child.id === stateId || child.owner !== undefined || automationConversations.has(child.id) ||
-          automationConversationOf(await tx.doc(CronConversationDoc, child.id)) !== undefined) return false;
-      if (childThread === APP_MAIN_THREAD) {
-        return state.forks?.[`c${child.id}`] === undefined &&
-          map.sessions[encodedSessionKey(APP_CHAT_SESSION_KEY)] === child.id;
-      }
-      const baseInfo = threadInfo(state, childThread);
-      if (baseInfo === undefined || state.forks?.[`c${child.id}`] !== undefined) return false;
-      return map.sessions[encodedSessionKey(sessionForThread(childThread))] === child.id;
-    }
-    /** Structural scope of one session's conversation, with the app fork exception bound to that key. */
-    async function chatScopeForSession(
-      tx: Tx, sessionKey: string, conversationId: ConversationId,
-    ): Promise<ChatScopeExclusion | undefined> {
-      const reason = await readChatScope((id) => scopeRecordFor(tx, id), conversationId, root.id);
-      if (reason !== "forked") return reason;
-      return await appForkAdmissible(tx, sessionKey, conversationId) ? undefined : reason;
-    }
-    /** Conversation-id-only scope for background summary work: the exact mapped key decides forks. */
-    async function chatScopeById(tx: Tx, conversationId: ConversationId): Promise<ChatScopeExclusion | undefined> {
-      const reason = await readChatScope((id) => scopeRecordFor(tx, id), conversationId, root.id);
-      if (reason !== "forked") return reason;
-      const map = await tx.doc(SessionMap, root.id);
-      const sessions = readMappedSessions(map.sessions, root.id);
-      const session = sessions.find((candidate) => candidate.conversationId === conversationId);
-      if (session === undefined) return reason;
-      return await appForkAdmissible(tx, session.sessionKey, conversationId) ? undefined : reason;
-    }
-    /** Encoded session keys of archived side threads: their snapshots are evictable, not pinned. */
-    async function archivedAppSessionKeys(tx: Tx): Promise<Set<string>> {
-      const map = await tx.doc(SessionMap, root.id);
-      const stateId = map.sessions[encodedSessionKey(APP_STATE_SESSION_KEY)] as ConversationId | undefined;
-      const keys = new Set<string>();
-      if (stateId === undefined || stateId === root.id) return keys;
-      const state = await tx.doc(AppState, stateId);
-      for (const info of state.threads ?? []) {
-        if (info.id !== APP_MAIN_THREAD && info.archived) keys.add(encodedSessionKey(sessionForThread(info.id)));
-      }
-      return keys;
-    }
-    /** Mapped conversations that still demand a snapshot slot; archived app threads do not. */
-    async function snapshotSlotsUsed(tx: Tx): Promise<number> {
-      const map = await tx.doc(SessionMap, root.id);
-      const total = Object.keys(map.sessions).length;
-      if (total < CONTEXT_LIMITS.maxConversations) return total;
-      let archived = 0;
-      for (const key of await archivedAppSessionKeys(tx)) if (map.sessions[key] !== undefined) archived += 1;
-      return total - archived;
-    }
-
-    // One immutable identity document per store, minted on first open. A derived index binds
-    // its rows to this value instead of to a file path, which a replaced store can reuse.
-    const storeIdentity = await ensureStoreIdentity(harness!, context, { now });
-
-    // History scope: mapped chat sessions only. A channel's own state conversation, a scheduled run's
-    // automation conversation and the root are not chat history, and the host has already
-    // authenticated the session key before naming it. Search, episode reads and summary work share
-    // the same checked scope, including the narrow exception for registered app thread forks.
-    const assertMappedChatConversations = async (
-      sessions: readonly { readonly sessionKey: string; readonly conversationId: ConversationId }[],
-      ctx: Context,
-    ): Promise<void> => {
-      await root.commit(async (tx) => {
-        for (const { sessionKey, conversationId } of sessions) {
-          const reason = await chatScopeForSession(tx, sessionKey, conversationId);
-          if (reason !== undefined) throw new Error(chatScopeMessage(reason));
-        }
-      }, ctx);
-    };
-    // Background scope is decided by the conversation record and this host's automation
-    // classification, never by the session key alone. An out-of-scope mapping is skipped instead of
-    // failing the whole pass, so one forged entry cannot stop cataloguing or summarizing the
-    // conversations that really are chat history. The per-session history surface still rejects such
-    // a mapping loudly.
-    const mappedChatSessions = async (ctx: Context): Promise<readonly HistoryChatSession[]> => {
-      const mapping = await harness!.snapshot(SessionMap, root.id, ctx);
-      if (mapping === undefined) return [];
-      const candidates = readChatSessions(mapping.sessions, root.id);
-      return root.commit(async (tx) => {
-        const { chat, excluded } = await partitionChatScope((id) => scopeRecordFor(tx, id), candidates, root.id);
-        const chats = [...chat];
-        for (const entry of excluded) {
-          if (entry.reason !== "forked") continue;
-          if (await appForkAdmissible(tx, entry.sessionKey, entry.conversationId)) chats.push(entry);
-        }
-        return chats;
-      }, ctx);
-    };
-    // Episode cataloguing covers chat and automation conversations alike: a scheduled run's episodes
-    // are exactly the executions a recurring job accumulates, and a one-off job's are its occurrence
-    // in the shared catch-all conversation. Summary queueing is conversation-scoped, so it needs no
-    // session key; the read-only history tool still resolves sources through the mapped-chat rule and
-    // therefore never presents these conversations as chats.
-    const episodeSessions = async (ctx: Context): Promise<readonly HistoryChatSession[]> =>
-      [...(await mappedChatSessions(ctx)), ...automationSessions()];
-    // The imported prefix is already consumed by its atomically seeded cursor. Do not exclude
-    // entire legacy channels: that would also suppress future closed episodes. Recall is unchanged.
-    // Automation conversations remain excluded by the shared mapped ordinary-chat scope.
-    digestSourceRef.current = createDigestSource({
-      harness: harness!,
-      sessions: mappedChatSessions,
-      limits: { entriesPerBatch: digestLimits.entriesPerBatch, charsPerBatch: digestLimits.charsPerBatch },
+    const root = await openedHarness.root(context, { agent: modelHost.state().defaultAgentPolicy });
+    const isAutomation = (id: ConversationId) => registry.isAutomation(id);
+    const sessions = createSessionScope({
+      harness: openedHarness,
+      root,
+      isAutomation,
+      forkAdmissible: (tx, sessionKey, id) => appForkAdmissible(tx, { rootId: root.id, isAutomation }, sessionKey, id),
     });
-    // Bounded, background-only derived state: reset-delimited episode boundaries and their
-    // durable summary status. It reads committed entries only and changes no reset or busy
-    // ordering. A closed episode is recorded as pending; with summaries opted in, the same
-    // commit queues its summary job, and without them nothing schedules or calls a provider.
-    episodeCatalog = createEpisodeCatalog({
-      harness: harness!,
-      sessions: episodeSessions,
+    sessionScopeRef.current = sessions;
+    const { mappedChatSessions, existingConversationFor, mappedConversationId, chatConversationIdFor } = sessions;
+    contextHost.bind({
+      harness: openedHarness,
+      root,
+      install: (extension) => registry_.install(extension),
+      archivedSessionKeys: (tx) => archivedAppSessionKeys(tx, root.id),
+      applyPolicy: async (tx, id, contextOverride) => {
+        const toolFilter = await toolFilterFor(tx, id, undefined, undefined, contextOverride);
+        await configure(tx, id, { ...extensionsPolicy(id, undefined, contextOverride), ...toolFilter });
+      },
+    });
+    modelHost.bind({
+      harness: openedHarness,
+      root,
+      existingConversationFor,
+      mappedConversationId,
+      applyConversationPolicy,
+      toolFilterFor: (tx, id) => toolFilterFor(tx, id),
+      chats: () => registry.chats(),
+      liveMcpConfig: () => liveMcpConfig,
+    });
+    const history: HistoryHost = await openHistoryHost({
+      harness: openedHarness,
+      root,
       context,
-      ...(episodeSummaries === undefined ? {} : { summaryJobs: { enqueue: episodeSummaries.enqueue } }),
+      now,
+      dbPath,
+      workspace,
+      memoryFiles: config.workspaceContext?.memoryFiles ?? [],
+      historyEnabled,
+      sessions,
+      automationSessions: () => registry.automations()
+        .map((id) => ({ sessionKey: `cron-automation:${id}`, conversationId: id })),
+      digestLimits,
+      summaries: episodeSummaries,
+      summaryBackfill: episodeSummaryModel?.backfill === "pending",
+      authority,
+    }, historyParts);
+    digestSourceRef.current = history.digestSource;
+
+    // Restore the registry from the store, refuse unsafe prepared replays, recover interrupted
+    // turns, and only then apply host policy to every conversation before scheduling resumes.
+    const restored = await restoreAuthority({
+      harness: openedHarness,
+      root,
+      context,
+      authority,
+      models: modelHost,
+      contextHost,
+      cronEnabled,
+      workspace,
+      mappedChatSessions,
+      chatScopeForSession: sessions.chatScopeForSession,
+      archivedSessionKeys: (tx) => archivedAppSessionKeys(tx, root.id),
+      ...(visionHandoff === undefined ? {} : {
+        pinPreparedGeneration: (taskId: number, model: ModelReference) => preparedGenerationModels.set(taskId, model),
+      }),
     });
+    await recoverStartupInterruptions({
+      harness: openedHarness,
+      root,
+      context,
+      now,
+      mappedChatSessions,
+      automationOrigin: (id) => registry.automation(id)?.originConversationId,
+      backgroundRun: restored.backgroundRun,
+    }, restored.preparedContextReplays);
+    await restored.applyStartupPolicies();
 
-    // Read-only view of one derived episode summary. The catalog's episode document is the authority
-    // for the closed boundary and the authoritative summarizer version; the version-keyed summary
-    // record supplies the text. Both are read as untrusted JSON through public document snapshots,
-    // and a missing, malformed or unreadable record is classified instead of thrown, so summary
-    // discovery can never block raw transcript search. This reads derived docs only: no model call,
-    // no summary job, no Durable write.
-    async function readEpisodeSummary(
-      conversationId: ConversationId,
-      startEntryId: EntryId,
-      ctx: Context,
-      fullText = false,
-    ): Promise<HistorySummaryView> {
-      let episode: unknown;
-      try {
-        episode = await harness!.snapshot(EpisodeDoc, conversationId, String(startEntryId), ctx);
-      } catch {
-        return { state: "unreadable" };
-      }
-      const classified = readEpisodeDocument(episode, startEntryId);
-      if (classified.kind !== "ready") {
-        return classified.kind === "not-ready"
-          ? { state: "not-ready", status: classified.status }
-          : { state: classified.kind };
-      }
-      let record: unknown;
-      try {
-        record = await harness!.snapshot(
-          EpisodeSummaryDoc,
-          conversationId,
-          episodeSummaryKey(startEntryId, classified.version),
-          ctx,
-        );
-      } catch {
-        return { state: "unreadable" };
-      }
-      return normalizeReadySummary(classified.body, record, classified.version, { fullText });
-    }
-
-    // Derived, rebuildable search index. Its file is separate from Durable's store, and every Durable
-    // read goes through `root.commit` without a write. A missing index is rebuilt from retained entries.
-    // It is bound to this store's committed identity, so a replaced store file clears every derived row.
-    const historySessions = async (ctx: Context): Promise<readonly HistorySession[]> => {
-      const mapping = await harnessRef.current!.snapshot(SessionMap, root.id, ctx);
-      if (mapping === undefined) return [];
-      const mappedSessions = readChatSessions(mapping.sessions, root.id);
-      if (mappedSessions.length > HISTORY_INDEX_LIMITS.maxMappedSessions) {
-        throw new Error(
-          `History search supports at most ${HISTORY_INDEX_LIMITS.maxMappedSessions} mapped chat sessions; ` +
-          `${mappedSessions.length} are present`,
-        );
-      }
-      // Fail loudly rather than silently indexing a task-owned transcript or inherited fork.
-      await assertMappedChatConversations(mappedSessions, ctx);
-      return mappedSessions;
-    };
-    historyIndex = createHistoryIndex({
-      indexPath: historyIndexPath(dbPath),
-      sourcePath: dbPath,
-      storeId: storeIdentity.storeId,
-      sessions: historySessions,
-      scan: (ctx, read) => root.commit(read, ctx),
-      readSummary: (ctx, conversationId, startEntryId) =>
-        readEpisodeSummary(conversationId, startEntryId, ctx),
+    const appTasks = createAppTaskRuntime({
+      harness: openedHarness,
+      mappedConversationId,
+      isChat: (id) => registry.isChat(id),
+      isWorkerSpawner: (id) => registry.isWorkerSpawner(id),
+      cronOwner: (id) => registry.cronOwner(id),
+      workerFoundation,
+      cronFoundation: cronHost?.foundation,
     });
-    const memoryHost = {
-      async scope(caller: ConversationId, ctx: Context, operation: typeof MEMORY_TOOL_NAMES[number]) {
-        const worker = workerChildConversations.has(caller);
-        const scheduledRun = scheduledRunTargets.has(caller);
-        if (!historyConversations.has(caller) && !worker && !scheduledRun) {
-          throw new Error("Memory recall is unavailable in this conversation");
-        }
-        const mapped = await mappedChatSessions(ctx);
-        let workspaceRoot = workspace;
-        if (worker) {
-          const capture = await harness!.snapshot(ConfigToolCaptureDoc, caller, ctx);
-          const origin = capture?.originConversationId;
-          if (capture === undefined || typeof origin !== "number" || !Number.isSafeInteger(origin) || origin < 1
-            || !Array.isArray(capture.tools) || capture.tools.some((name) => typeof name !== "string")
-            || (capture.classifierModel !== null && typeof capture.classifierModel !== "string")
-            || !authorizedChatConversations.has(origin as ConversationId)
-            || !mapped.some((session) => session.conversationId === origin)
-            || !capture.tools.includes(operation) || !workerToolNames().includes(operation)) {
-            throw new Error("Worker memory recall is outside its live captured authority");
-          }
-          const workerRoot = workerWorkspaceRoots.get(caller);
-          if (workerRoot === undefined) throw new Error("Worker workspace is unavailable; refusing memory access");
-          workspaceRoot = workerRoot;
-        } else if (scheduledRun) {
-          // A scheduled run's recall is the origin's read-only recall as it is now: the durable
-          // capture must name this exact tool, and its origin must still be a mapped chat that holds
-          // recall. Notes stay in the shared workspace this run executes with; nothing about the run
-          // is authority, and a narrowed config denies instead of widening.
-          const capture = await harness!.snapshot(ConfigToolCaptureDoc, caller, ctx);
-          const origin = capture?.originConversationId;
-          if (capture === undefined || typeof origin !== "number" || !Number.isSafeInteger(origin) || origin < 1
-            || !Array.isArray(capture.tools) || capture.tools.some((name) => typeof name !== "string")
-            || (capture.classifierModel !== null && typeof capture.classifierModel !== "string")
-            || !authorizedChatConversations.has(origin as ConversationId)
-            || !mapped.some((session) => session.conversationId === origin)
-            || !capture.tools.includes(operation)
-            || !scheduledRunCapabilityNames(origin as ConversationId).includes(operation)) {
-            throw new Error("Scheduled-run memory recall is outside its live captured authority");
-          }
-        } else if (!mapped.some((session) => session.conversationId === caller)) {
-          throw new Error("Memory recall is unavailable in this conversation");
-        }
-        const sessions = mapped.map((session) => ({
-          sessionKey: session.sessionKey,
-          conversationId: session.conversationId,
-          channel: session.sessionKey.split(":", 1)[0] ?? null,
-        }));
-        return {
-          storeId: storeIdentity.storeId,
-          workspaceRoot,
-          memoryFiles: config.workspaceContext?.memoryFiles ?? [],
-          sessions,
-        };
-      },
-      async entries(session: string, query: HistoryEntryQuery, limit: number, cursor: Cursor | undefined, ctx: Context) {
-        await mappedChatConversationFor(session, ctx);
-        return gateway.historyEntries(session, query, limit, cursor, ctx);
-      },
-      async summary(session: string, episodeStart: number, ctx: Context) {
-        const conversation = await mappedChatConversationFor(session, ctx);
-        return readEpisodeSummary(conversation.id, episodeStart as EntryId, ctx, true);
-      },
-      search: (query: HistoryQuery, ctx: Context) => gateway.historySearch(query, ctx),
-      searchSummaries: (query: HistorySummaryQuery, ctx: Context) => gateway.historySummarySearch(query, ctx),
-    };
-    const memoryService = historyEnabled ? createMemoryService(memoryHost, {
-      notes: createNotesBackend(),
-      history: createHistoryBackend(memoryHost),
-    }) : undefined;
-
-    // Archived app mappings stay chat owners, but their idle workspace snapshots are evictable.
-    async function makeSnapshotRoom(target: ConversationId, ctx: Context, commit?: Tx): Promise<void> {
-      if (contextConversations.size < CONTEXT_LIMITS.maxConversations) return;
-      async function evict(tx: Tx): Promise<void> {
-        if (contextConversations.size < CONTEXT_LIMITS.maxConversations) return;
-        const map = await tx.doc(SessionMap, root.id);
-        const candidates = backgroundTargets.filter((id) => !sessionConversations.has(id));
-        for (const key of await archivedAppSessionKeys(tx)) {
-          const id = map.sessions[key] as ConversationId | undefined;
-          if (id !== undefined) candidates.push(id);
-        }
-        for (const candidate of candidates) {
-          if (candidate === target || !contextConversations.has(candidate) || contextSnapshotLoads.has(candidate)) continue;
-          if ((await tx.doc(LiveDoc, candidate)).run !== undefined ||
-              (await tx.doc(InboxDoc, candidate)).items.length > 0) continue;
-          const index = backgroundTargets.indexOf(candidate);
-          if (index >= 0) backgroundTargets.splice(index, 1);
-          contextConversations.delete(candidate);
-          skillConversations.delete(candidate);
-          skillTool?.removeConversation(candidate);
-          contextExtension = contextExtensionBuilder.remove(candidate);
-          registry.install(contextExtension);
-          return;
-        }
-      }
-      if (commit === undefined) await root.commit(evict, ctx);
-      else await evict(commit);
-    }
-    const contextSnapshotLoads = new Map<ConversationId, Promise<unknown>>();
-    /**
-     * Install one conversation's workspace snapshot. A mapped chat is installed once per process; a
-     * background target is rebuilt on every call, because each scheduled run is a new episode that
-     * must render the workspace as it is now rather than as the first run of this process found it.
-     * Both paths reuse the one `nanobot-context` extension name, so a rebuild replaces this
-     * conversation's sections instead of adding a second extension.
-     */
-    const installContextSnapshot = async (
-      sessionKey: string,
-      conversationId: ConversationId,
-      ctx: Context,
-      backgroundTarget: boolean,
-      tx?: Tx,
-    ): Promise<boolean> => {
-      if (!options.contextSnapshotProvider) return false;
-      const loading = contextSnapshotLoads.get(conversationId);
-      if (loading !== undefined && tx === undefined) {
-        await loading;
-        return skillConversations.has(conversationId);
-      }
-      const installed = contextConversations.has(conversationId);
-      if (installed && !backgroundTarget) return skillConversations.has(conversationId);
-      if (backgroundTarget && !installed && !backgroundTargets.includes(conversationId)) {
-        backgroundTargets.push(conversationId);
-      }
-      const pending = Promise.resolve()
-        .then(() => options.contextSnapshotProvider!(sessionKey, conversationId, ctx))
-        .then(async (supplied) => {
-          if (supplied !== undefined && !isRecord(supplied)) {
-            throw new TypeError("Context snapshot provider must return an object or undefined");
-          }
-          const snapshot = bindContextSnapshot(supplied, conversationId);
-          if (!contextConversations.has(conversationId) && contextConversations.size >= CONTEXT_LIMITS.maxConversations) {
-            await makeSnapshotRoom(conversationId, ctx, tx);
-          }
-          const replacement = contextConversations.has(conversationId)
-            ? contextExtensionBuilder.replace(snapshot)
-            : { extension: contextExtensionBuilder.add(snapshot) };
-          contextConversations.add(conversationId);
-          let skillsPresent = false;
-          if (skillTool !== undefined) {
-            if (skillTool.setConversation(conversationId, snapshot).skills > 0) {
-              skillConversations.add(conversationId);
-              skillsPresent = true;
-            } else {
-              skillConversations.delete(conversationId);
-            }
-          }
-          contextExtension = replacement.extension;
-          registry.install(replacement.extension);
-          return skillsPresent;
-        })
-        .finally(() => {
-          if (contextSnapshotLoads.get(conversationId) === pending) contextSnapshotLoads.delete(conversationId);
-        });
-      contextSnapshotLoads.set(conversationId, pending);
-      return pending;
-    };
-    const ensureContextSnapshot = async (
-      sessionKey: string,
-      conversationId: ConversationId,
-      ctx: Context,
-    ): Promise<void> => {
-      await installContextSnapshot(sessionKey, conversationId, ctx, false);
-    };
-    contextInstallerRef.current = (sessionKey, conversationId, ctx, tx, background) =>
-      installContextSnapshot(sessionKey, conversationId, ctx, background, tx);
-
-    // Explicit same-conversation refresh: re-run the host provider and apply the new snapshot to the
-    // next turn. It is opt-in, per session key, and refuses a live run. Provider or loader failure
-    // leaves the captured snapshot untouched. Refresh changes no tool authority: it re-renders the
-    // skills summary and replaces the on-demand skill table, while the normal policy pass reapplies
-    // the configured tool filter. Background cron targets are not reachable here because they have no
-    // session key.
-    // The refresh registers in contextSnapshotLoads so an install for the same conversation cannot
-    // build a competing snapshot; any failed commit restores the prior in-memory extension/table.
-    // The rollover reset applies only while nothing was appended since the chat went idle and no
-    // question still waits for an answer; otherwise the chat is not idle.
-    const appendIdleRollover = async (tx: Tx, conversationId: ConversationId, reset: IdleRolloverReset): Promise<void> => {
-      if ((await tx.doc(LiveDoc, conversationId)).run !== undefined) throw new IdleRolloverStale();
-      if (await tx.latestEntryId(conversationId) !== reset.expectLatest) throw new IdleRolloverStale();
-      if (pendingQuestionViews(await tx.doc(AskQuestionsDoc, conversationId), now()).views.length > 0) {
-        throw new IdleRolloverStale();
-      }
-      await tx.appendEntry(conversationId, { kind: ResetEntry.kind, head: "self" });
-    };
-    const refreshContextSnapshot = async (
-      sessionKey: string,
-      conversationId: ConversationId,
-      ctx: Context,
-      reset: boolean | IdleRolloverReset = false,
-    ): Promise<number> => {
-      // Serialize with an in-flight install or a previous refresh for this conversation.
-      for (;;) {
-        const loading = contextSnapshotLoads.get(conversationId);
-        if (loading === undefined) break;
-        await loading;
-      }
-      const pending = (async () => {
-        const conversation = await harnessRef.current!.conversation(conversationId, ctx);
-        if (!conversation) throw new Error("Stored conversation mapping points to a missing conversation");
-        // Refuse an obvious live run before re-reading skill files; the commit below rechecks atomically.
-        if ((await harnessRef.current!.snapshot(LiveDoc, conversationId, ctx))?.run !== undefined) {
-          throw new ConversationBusy(conversationId);
-        }
-        const supplied = await options.contextSnapshotProvider!(sessionKey, conversationId, ctx);
-        if (supplied !== undefined && !isRecord(supplied)) {
-          throw new TypeError("Context snapshot provider must return an object or undefined");
-        }
-        const snapshot = bindContextSnapshot(supplied, conversationId);
-        const hadContext = contextConversations.has(conversationId);
-        const hadSkills = skillConversations.has(conversationId);
-        const previousExtension = contextExtension;
-        let replacement: ContextExtensionReplacement | undefined;
-        let table: SkillTableUpdate | undefined;
-        try {
-          return await conversation.commit(async (tx) => {
-            const live = await tx.doc(LiveDoc, conversationId);
-            if (live.run !== undefined) throw new ConversationBusy(conversationId);
-            replacement ??= contextExtensionBuilder.replace(snapshot);
-            table ??= skillTool?.setConversation(conversationId, snapshot);
-            const count = table?.skills ?? 0;
-            contextExtension = replacement.extension;
-            contextConversations.add(conversationId);
-            if (count > 0) skillConversations.add(conversationId);
-            else skillConversations.delete(conversationId);
-            // Publish synchronously inside the commit: a deferred install could race a builder change
-            // from another conversation and publish an older superset under the same extension name.
-            registry.install(replacement.extension);
-            const toolFilter = await toolFilterFor(tx, conversationId);
-            await configure(tx, conversationId, { ...extensionsPolicy(conversationId), ...toolFilter });
-            // Idle-only reset and prompt replacement share one commit, including across multiple
-            // CLI attachments. No submission can begin between the two effects.
-            if (reset === true) await tx.appendEntry(conversationId, { kind: ResetEntry.kind, head: "self" });
-            else if (reset !== false) await appendIdleRollover(tx, conversationId, reset);
-            return count;
-          }, ctx);
-        } catch (error) {
-          table?.restore();
-          if (hadContext) contextConversations.add(conversationId);
-          else contextConversations.delete(conversationId);
-          if (hadSkills) skillConversations.add(conversationId);
-          else skillConversations.delete(conversationId);
-          if (replacement !== undefined) {
-            const restoredExtension = replacement.restore();
-            contextExtension = restoredExtension;
-            registry.install(restoredExtension);
-          } else {
-            contextExtension = previousExtension;
-          }
-          throw error;
-        }
-      })();
-      contextSnapshotLoads.set(conversationId, pending);
-      try {
-        return await pending;
-      } finally {
-        if (contextSnapshotLoads.get(conversationId) === pending) contextSnapshotLoads.delete(conversationId);
-      }
-    };
-
-    // Restore the persisted session mapping before resume can schedule work. Cron owners come from
-    // the same mapping and are restored even without a context snapshot provider: the policy pass
-    // below would otherwise strip the cron tool from every persisted origin session on reopen.
-    const mappedSessionKeys = new Map<ConversationId, string>();
-    // The stored mapping is read once here, before any scope decision: a scheduled run's automation
-    // conversation has to be classified before a mapped key naming it can be admitted as chat, and a
-    // class applied after that admission could never be withdrawn again.
-    let storedMappedSessions: readonly MappedSession[] | undefined;
-    if (options.contextSnapshotProvider || cronEnabled) {
-      await root.commit(async (tx) => { await tx.doc(SessionMap, root.id); }, context);
-      const mapping = await harness.snapshot(SessionMap, root.id, context);
-      storedMappedSessions = readMappedSessions(mapping?.sessions, root.id);
-      if (options.contextSnapshotProvider) {
-        // Archived app threads hold no snapshot, so they do not count against the slot cap here.
-        const active = await root.commit(async (tx) => {
-          const archived = await archivedAppSessionKeys(tx);
-          return storedMappedSessions!.filter(({ sessionKey }) => !archived.has(encodedSessionKey(sessionKey))).length;
-        }, context);
-        if (active > CONTEXT_LIMITS.maxConversations) {
-          throw new Error(`Context snapshots support at most ${CONTEXT_LIMITS.maxConversations} mapped conversations`);
-        }
-      }
-    }
-    // Restore the class of every automation conversation this store names, before the mapped-chat
-    // authority pass below can see a key that names one. Origins are the stored mapping itself, not
-    // the owner sets that pass builds: a guard drawn from those sets would veto the classification of
-    // exactly the mapping it has to refuse. The conversation's own durable marker decides, and it
-    // names its own origin and job, so a mapped conversation is classified whether or not its
-    // origin's document still records it — including one whose pointer was damaged away — for the
-    // price of one snapshot per mapped conversation. Committed cron documents are read as an index as
-    // well, because a live run's target is ownerless and unmapped: nothing else names it for the task
-    // scan below. Documents never decide the class, so a damaged pointer can only fail to enumerate a
-    // conversation, never promote a chat or hide an automation conversation a key names. Only a
-    // conversation that is still ownerless and unforked and whose marker names another conversation
-    // is classified (`classifyAutomationConversation`, the same rule a run applies to a recorded
-    // pointer). This host writes that marker only on an automation conversation, so a store this host
-    // wrote never loses a chat to it; a marker written onto a chat by hand buys denial of that chat's
-    // surfaces and of store-wide history search, never authority. A missing, foreign or damaged marker
-    // leaves the ID unclassified and the job's next run records a fresh conversation in its place.
-    // This is a read: it creates no document and starts nothing.
-    if (cronEnabled && storedMappedSessions !== undefined) {
-      const candidates = new Set<ConversationId>();
-      for (const { conversationId } of storedMappedSessions) candidates.add(conversationId);
-      for (const { conversationId: originConversationId } of storedMappedSessions) {
-        let doc: { readonly jobs: readonly { readonly conversationId?: number | null }[]; readonly oneOffConversationId?: number | null } | undefined;
-        try {
-          doc = await harness.snapshot(CronJobsDoc, originConversationId, context);
-        } catch {
-          continue;
-        }
-        if (doc === undefined) continue;
-        for (const job of doc.jobs) {
-          if (Number.isSafeInteger(job.conversationId) && (job.conversationId as number) > 0) {
-            candidates.add(job.conversationId as ConversationId);
-          }
-        }
-        if (Number.isSafeInteger(doc.oneOffConversationId) && (doc.oneOffConversationId as number) > 0) {
-          candidates.add(doc.oneOffConversationId as ConversationId);
-        }
-      }
-      for (const conversationId of candidates) {
-        // The root is never an automation conversation, whatever a marker or a document says.
-        if (conversationId === root.id) continue;
-        let record: { readonly owner?: unknown; readonly parent?: unknown } | undefined;
-        let marker: unknown;
-        try {
-          record = await root.commit((tx) => tx.conversation(conversationId), context);
-        } catch {
-          record = undefined;
-        }
-        try {
-          marker = await harness.snapshot(CronConversationDoc, conversationId, context);
-        } catch {
-          marker = undefined;
-        }
-        const own = automationConversationOf(marker);
-        // A marker that names its own conversation is damaged: a run records its origin as the
-        // origin, never as the target, so it may not take that conversation out of chat scope.
-        if (own === undefined) continue;
-        const originConversationId = own.originConversationId as ConversationId;
-        if (originConversationId === conversationId) continue;
-        const classified = classifyAutomationConversation(
-          record, marker, { originConversationId, jobId: own.jobId },
-        );
-        if (classified === undefined) continue;
-        automationConversations.set(conversationId, {
-          originConversationId,
-          conversationClass: classified.conversationClass,
-          jobId: classified.jobId,
-        });
-      }
-    }
-    // History retrieval is independent of the context snapshot opt-in: every mapped chat
-    // conversation can read history, while state-only bookkeeping conversations cannot. Config tool
-    // authority is derived from the same validated mapping, so it is loaded whenever either needs it.
-    const initialMapping = memoryTools === undefined && !toolsEnabled && telegramTool === undefined
-      && appTool === undefined && discordHistoryTool === undefined && !workersEnabled
-      && webTool === undefined && !mcpConfigured && !codeModeEnabled && mcpAdminRef.current === undefined
-      ? undefined
-      : await harness.snapshot(SessionMap, root.id, context);
-    if (initialMapping !== undefined) {
-      for (const { sessionKey, conversationId } of await mappedChatSessions(context)) {
-        if (memoryTools !== undefined) historyConversations.add(conversationId);
-        authorizedChatConversations.add(conversationId);
-        if (webTool !== undefined) webConversations.add(conversationId);
-        sessionKeyForConversation.set(conversationId, sessionKey);
-        // A worker may be spawned only from this scope-checked set; a task-owned target, the root,
-        // a fork or a channel-state conversation is never in it.
-        if (workersEnabled) workerSpawners.add(conversationId);
-        if (telegramTool !== undefined && sessionKey.startsWith("telegram:")) {
-          telegramChatConversations.add(conversationId);
-        }
-        if (appTool !== undefined && sessionKey.startsWith("app:")) {
-          appChatConversations.add(conversationId);
-        }
-        if (discordHistoryTool !== undefined && sessionKey.startsWith("discord:")) {
-          discordChatConversations.add(conversationId);
-        }
-      }
-    }
-    if (storedMappedSessions !== undefined) {
-      const sessions = storedMappedSessions;
-      // A stored key names a mapped session only while its conversation is still ordinary chat: the
-      // class pass above removed this host's automation conversations, and the shared scope rule
-      // removes the root, task-owned conversations and unregistered forks, as channel ingress refuses
-      // that same key. Such a key therefore gains no cron owner, no unevictable snapshot slot and no
-      // resume target here, and a forked id leaves this set so its snapshot stays evictable. A missing
-      // conversation keeps its explicit failure below.
-      const outOfScope = new Set<ConversationId>();
-      let archivedAppKeys = new Set<string>();
-      await root.commit(async (tx) => {
-        archivedAppKeys = await archivedAppSessionKeys(tx);
-        for (const { sessionKey, conversationId } of sessions) {
-          const reason = await chatScopeForSession(tx, sessionKey, conversationId);
-          if (reason === "automation" || reason === "root" || reason === "task-owned" || reason === "forked") {
-            outOfScope.add(conversationId);
-          }
-        }
-      }, context);
-      for (const { sessionKey, conversationId } of sessions) {
-        if (outOfScope.has(conversationId)) continue;
-        if (options.contextSnapshotProvider) {
-          if (!(await harness.conversation(conversationId, context))) {
-            throw new Error("Stored session mapping points to a missing conversation");
-          }
-          // An archived app thread stays a mapped chat (cron owner, resume target), but its
-          // snapshot is evictable and is rebuilt by the restore that makes it usable again.
-          if (!archivedAppKeys.has(encodedSessionKey(sessionKey))) {
-            await ensureContextSnapshot(sessionKey, conversationId, context);
-          }
-        }
-        cronOwners.set(conversationId, { ownerId: sessionKey, sessionKey });
-        sessionConversations.add(conversationId);
-        mappedSessionKeys.set(conversationId, sessionKey);
-      }
-    }
-
-    // Refuse unsafe prepared replays before resume; checkpoints pin historical context cutoffs.
-    const preparedContextReplays: NonNullable<ReturnType<typeof preparedContextReplay>>[] = [];
-    const backgroundRunTargets: BackgroundRunTarget[] = [];
-    // Live worker targets keep the model, thinking level and workspace chosen at launch. A reopen must
-    // not silently replace them with the configured default, and a worktree child keeps its own root.
-    const workerChildPolicies = new Map<ConversationId, NonNullable<ReturnType<typeof workerChildPolicy>>>();
-    // Live digest targets keep the model pinned at start too. They are not run targets with a host
-    // context snapshot: a digest turn's prompt is its own bounded input, identical before and after
-    // a reopen, so only its pinned model and curation hook are restored.
-    const digestTargetPolicies = new Map<ConversationId, NonNullable<ReturnType<typeof memoryDigestTaskPolicy>>>();
-    // Live children whose captured model left the current catalog. They are denied before
-    // scheduling resumes, never silently moved to the configured default.
-    const pinnedModelRemoved = new Set<ConversationId>();
-    const runTasksById = new Map<number, { readonly originConversationId: ConversationId; readonly targetConversationId: ConversationId | null }>();
-    // A background run's target conversation is task-owned, never a chat. Interruption recovery
-    // resolves its legitimate owning surface and class back through the run task that created it.
-    const backgroundTargetRuns = new Map<ConversationId, {
-      readonly originConversationId: ConversationId;
-      readonly surface: "worker" | "digest" | "scheduled";
-    }>();
-    await root.commit(async (tx) => {
-      let taskCursor: Cursor | undefined;
-      do {
-        const page = await tx.scanTasks({}, 1000, taskCursor);
-        for (const task of page.items) {
-          const snapshotTarget = cronBackgroundTarget(task) ?? workerBackgroundTarget(task);
-          const digestTarget = memoryDigestTaskTarget(task);
-          const backgroundTarget = snapshotTarget ?? digestTarget;
-          if (task.kind === CRON_RUN_TASK_NAME || task.kind === WORKER_TASK_NAME
-            || task.kind === MEMORY_DIGEST_TASK_NAME) {
-            runTasksById.set(Number(task.id), {
-              originConversationId: task.conversationId as ConversationId,
-              targetConversationId: backgroundTarget?.targetConversationId ?? null,
-            });
-          }
-          if (backgroundTarget !== undefined) {
-            // A scheduled run's target is an automation conversation that this origin's committed cron
-            // documents record; a worker or digest target is still the conversation its task owns. A
-            // mismatched record is not a run target and gets no bound or snapshot restore.
-            const target = await tx.conversation(backgroundTarget.targetConversationId);
-            const ownsTarget = target?.owner?.taskId === Number(task.id)
-              && target.owner.conversationId === backgroundTarget.originConversationId;
-            const automationTarget = target !== undefined
-              && automationConversations.get(target.id)?.originConversationId
-                === backgroundTarget.originConversationId;
-            if (ownsTarget || automationTarget) {
-              backgroundTargetRuns.set(backgroundTarget.targetConversationId, {
-                originConversationId: task.conversationId as ConversationId,
-                surface: task.kind === WORKER_TASK_NAME
-                  ? "worker"
-                  : task.kind === MEMORY_DIGEST_TASK_NAME ? "digest" : "scheduled",
-              });
-              // A digest target deliberately gets no origin context snapshot: its model input is
-              // its own bounded batch, so a reopened attempt renders the same framing again.
-              if (snapshotTarget !== undefined) backgroundRunTargets.push(snapshotTarget);
-              const policy = workerChildPolicy(task);
-              if (policy !== undefined && policy.targetConversationId === target.id) {
-                workerChildPolicies.set(target.id, policy);
-                // A live child keeps the compositor across a reopen; its enabled tools are restored
-                // from the capture, so a narrowed ceiling also narrows what a script can compose.
-                workerChildConversations.add(target.id);
-                if (!choicesByNative.has(modelKey(policy.model))) pinnedModelRemoved.add(target.id);
-                if (policy.workspace.mode === "worktree") {
-                  workerWorkspaceRoots.set(target.id, policy.workspace.path);
-                }
-              }
-              const digestPolicy = memoryDigestTaskPolicy(task);
-              if (digestPolicy !== undefined && digestPolicy.targetConversationId === target.id) {
-                digestTargetPolicies.set(target.id, digestPolicy);
-                // A live digest target keeps its curation hook and pinned model; its captured
-                // Markdown tools are restored and narrowed from the capture below.
-                digestTargetConversations.add(target.id);
-                digestTargetLimits.set(target.id, { ...digestPolicy.limits });
-                if (!choicesByNative.has(modelKey(digestPolicy.model))) pinnedModelRemoved.add(target.id);
-              }
-            }
-          }
-          const preparedModel = preparedTaskModel(task);
-          if (preparedModel !== undefined && !choicesByNative.has(modelKey(preparedModel))) {
-            throw new Error(`Cannot resume ${task.kind} task ${task.id}: prepared model ${modelKey(preparedModel)} is outside allowedModels`);
-          }
-          const contextReplay = preparedContextReplay(task);
-          if (visionHandoff !== undefined && preparedModel !== undefined
-            && contextReplay?.kind === "pi.generation" && contextReplay.phase === "request") {
-            // Only a saved request still owes its model-bound dispatch. A poll resumes an
-            // already-sent request without beforeRequest, and a later retry re-prepares from
-            // the reset AgentDoc, so pinning those would apply a stale image policy.
-            preparedGenerationModels.set(Number(task.id), preparedModel);
-          }
-          if (contextReplay !== undefined) preparedContextReplays.push(contextReplay);
-        }
-        taskCursor = page.next;
-      } while (taskCursor !== undefined);
-    }, context);
-
-    // A pinned child (worker or digest target) whose captured model was removed must not reach a
-    // provider with it, or with a silently substituted default. Before scheduling resumes, stop its
-    // own conversation's pending work through native ownership: queued inputs, and live tasks that
-    // hold no saved provider dispatch.
-    // A saved dispatch is deliberately left alone; the inherited prepared-model guard refuses to open
-    // the gateway in that case instead of cancelling it to "repair" startup.
-    if (pinnedModelRemoved.size > 0) {
-      let inspection: Awaited<ReturnType<HarnessType["inspect"]>> | undefined;
-      try {
-        inspection = await harness.inspect(context);
-      } catch {
-        inspection = undefined;
-      }
-      if (inspection !== undefined) {
-        for (const submission of inspection.submissions) {
-          if (submission.status !== "queued" || !pinnedModelRemoved.has(submission.conversationId)) continue;
-          try {
-            await harness.abortSubmission(submission.id, context, submission.conversationId);
-          } catch {
-            // The task's terminal commit still retires authority; a re-run child has none.
-          }
-        }
-        for (const inspectionTask of inspection.tasks) {
-          const record = inspectionTask.record;
-          if (record.state.status === "terminal" || record.state.status === "completing") continue;
-          if (record.kind === WORKER_TASK_NAME || record.kind === MEMORY_DIGEST_TASK_NAME) continue;
-          if (!pinnedModelRemoved.has(record.conversationId)) continue;
-          if (preparedTaskModel(record) !== undefined) continue;
-          try {
-            await harness.abortTask(record.id, context);
-          } catch {
-            // Same bounded fallback: capture and tools are retired below.
-          }
-        }
-      }
-    }
-
-    // A background run's target deliberately has no SessionMap entry. Restore its snapshot from the
-    // run task's checkpoint before the pre-resume policy pass, so the pass keeps the context and
-    // `skill` selections instead of stripping them. Unknown origins and missing conversations skip.
-    if (options.contextSnapshotProvider) {
-      for (const { originConversationId, targetConversationId } of backgroundRunTargets) {
-        const sessionKey = mappedSessionKeys.get(originConversationId);
-        if (sessionKey === undefined) continue;
-        if (!(await harness.conversation(targetConversationId, context))) continue;
-        await installContextSnapshot(sessionKey, targetConversationId, context, true);
-      }
-    }
-
-    // Every conversation a live run task currently targets is that run's target. A scheduled run's
-    // automation conversation is ownerless, so it is found through the class this open restored;
-    // a worker or digest target is found through the task that still owns it. A target whose run
-    // already ended keeps no prepared authority and is left out.
-    const runTargetCandidates: { conversationId: ConversationId; originConversationId: ConversationId }[] = [];
-    await root.commit(async (tx) => {
-      for (const [taskId, task] of runTasksById) {
-        const targetConversationId = task.targetConversationId;
-        if (targetConversationId === null) continue;
-        const conversation = await tx.conversation(targetConversationId);
-        if (conversation === undefined) continue;
-        const automation = automationConversations.get(conversation.id);
-        const owned = conversation.owner?.taskId === taskId
-          && conversation.owner.conversationId === task.originConversationId;
-        if (automation === undefined || automation.originConversationId !== task.originConversationId) {
-          if (!owned) continue;
-        }
-        runTargetCandidates.push({
-          conversationId: conversation.id,
-          originConversationId: task.originConversationId,
-        });
-      }
-    }, context);
-
-    // A background run's captured authority is only as good as the current host config and its
-    // origin. Durable's tool hooks run in the call phase only, so a committed execute intent
-    // resolves without them and a resumed turn could otherwise admit a call the config or origin no
-    // longer supports. Intersect every live run's capture with the current ceiling and its
-    // authenticated origin before resume; a mismatched origin, an unknown origin owner, an already
-    // finished run or a missing capture is a deny rather than authority.
-    const backgroundToolBounds = new Map<ConversationId, ReadonlySet<string>>();
-    for (const { conversationId: targetConversationId, originConversationId } of runTargetCandidates) {
-      const tools = new Set<string>();
-      const capture = await harness.snapshot(ConfigToolCaptureDoc, targetConversationId, context);
-      // A live scheduled run's target is classified from the run task that still targets it, never
-      // from its capture: losing the capture makes it deny, not stop being a run target.
-      const scheduledRun = backgroundTargetRuns.get(targetConversationId)?.surface === "scheduled";
-      if (scheduledRun) scheduledRunTargets.add(targetConversationId);
-      if (capture !== undefined && capture.originConversationId === originConversationId
-        && authorizedChatConversations.has(originConversationId)) {
-        // A live scheduled run may also hold the non-coding capabilities its origin currently has;
-        // the bound is still the stored capture intersected with that, so a revoke or a new server
-        // can only narrow it, never widen what the run actually captured.
-        const ceiling = workerChildPolicies.has(targetConversationId)
-          ? workerToolNames()
-          : scheduledRun
-            ? [...toolAllowlist, ...scheduledRunCapabilityNames(originConversationId)]
-            : toolAllowlist;
-        for (const name of boundedCapturedTools(capture.tools, ceiling, true)) tools.add(name);
-      }
-      backgroundToolBounds.set(targetConversationId, tools);
-    }
-
-    /**
-     * Retire a record this build cannot read. Native `retireDoc` preserves the unreadable incarnation
-     * in the store's document history without materializing, repairing or overwriting its value, so
-     * availability does not depend on a manual repair step for optional notice bookkeeping.
-     */
-    const retireUnreadableRecord = async (retire: (tx: Tx) => Promise<void>): Promise<void> => {
-      try {
-        await harness!.commit(retire, context);
-      } catch (cause) {
-        throw new StartupDiagnosticError("preparedContext", {
-          cause,
-          detail: "Cannot retire an unreadable interruption recovery record; run the context recovery interface " +
-            "before gateway recovery",
-        });
-      }
-    };
-
-    /**
-     * Read the pending interruption facts. A record this build cannot read is retired rather than
-     * repaired: the notices it held are lost (the one thing those transient marks were for), a fixed
-     * delivery fault is recorded where an origin is known, and the authoritative task scan below still
-     * cancels the startup-blocking prepared dispatch.
-     */
-    const readInterruptionMarks = async (): Promise<{ marks: TurnInterruptionMark[]; damaged: boolean }> => {
-      let stored;
-      try {
-        stored = await harness!.snapshot(TurnInterruptionMarksDoc, context);
-      } catch {
-        await retireUnreadableRecord((tx) => tx.retireDoc(TurnInterruptionMarksDoc));
-        return { marks: [], damaged: true };
-      }
-      if (stored === undefined) return { marks: [], damaged: false };
-      try {
-        return { marks: parseTurnInterruptionMarks(stored), damaged: false };
-      } catch {
-        await retireUnreadableRecord((tx) => tx.retireDoc(TurnInterruptionMarksDoc));
-        return { marks: [], damaged: true };
-      }
-    };
-
-    /** The same availability rule for the interrupted-run record: retire, never repair in place. */
-    const ensureInterruptedRunReportsReadable = async (): Promise<void> => {
-      let stored;
-      try {
-        stored = await harness!.snapshot(InterruptedRunReportsDoc, context);
-      } catch {
-        await retireUnreadableRecord((tx) => tx.retireDoc(InterruptedRunReportsDoc));
-        return;
-      }
-      if (stored === undefined) return;
-      try {
-        parseInterruptedRunReports(stored);
-      } catch {
-        await retireUnreadableRecord((tx) => tx.retireDoc(InterruptedRunReportsDoc));
-      }
-    };
-
-    // The origin of a prepared dispatch is the mapped chat that owns it, never the worker, digest or
-    // scheduled-run target conversation. A target is resolved through the class the open restored or
-    // the run task that still owns it; no session key is inferred from a conversation id.
-    const interruptionOriginFor = (
-      conversationId: ConversationId,
-      sessions: ReadonlyMap<ConversationId, string>,
-    ) => interruptionOrigin(conversationId, {
-      chatSessionKey: (id) => sessions.get(id),
-      automationOrigin: (id) => automationConversations.get(id)?.originConversationId,
-      backgroundOrigin: (id) => {
-        const run = backgroundTargetRuns.get(id);
-        if (run === undefined || run.surface === "scheduled") return undefined;
-        return { originConversationId: run.originConversationId, surface: run.surface };
-      },
-    });
-
-    /**
-     * The class a cancelled prepared dispatch belonged to, for wording that stays true. A target
-     * conversation's owning run task names its class even after that run is terminal, so a notice
-     * admitted after a crash window still says what was interrupted.
-     */
-    const interruptionSurfaceIn = async (tx: Tx, conversationId: ConversationId): Promise<InterruptionSurface> => {
-      const ownerTaskId = (await tx.conversation(conversationId))?.owner?.taskId;
-      if (ownerTaskId === undefined) return automationConversations.has(conversationId) ? "scheduled" : "chat";
-      const owner = await tx.task(ownerTaskId as TaskId);
-      if (owner?.kind === WORKER_TASK_NAME) return "worker";
-      if (owner?.kind === MEMORY_DIGEST_TASK_NAME) return "digest";
-      if (owner?.kind === CRON_RUN_TASK_NAME) return "scheduled";
-      return "chat";
-    };
-
-    /**
-     * Admit one notice per marked task into its origin's existing bounded channel outbox, then clear
-     * the mark in the same commit. A settled non-abort outcome (or a completed turn that won the race)
-     * is not reported as an interruption; a mark whose origin is no longer this mapped chat is dropped
-     * instead of rerouted. An unreadable/full outbox keeps gateway availability and records a bounded
-     * delivery fault; the notice is not retried and no unknown-outcome record is evicted.
-     */
-    const admitInterruptionNotices = async (
-      sessions: ReadonlyMap<ConversationId, string>,
-      marks: readonly TurnInterruptionMark[],
-      damaged: boolean,
-      origins: ReadonlyMap<number, TurnInterruptionOrigin>,
-    ): Promise<void> => {
-      if (marks.length === 0 && !damaged) return;
-      const deliverable: TurnInterruptionMark[] = [];
-      const clear = new Set<number>();
-      for (const mark of marks) {
-        const task = await harness!.getTask(mark.taskId as TaskId, context);
-        if (task === undefined) {
-          clear.add(mark.taskId);
-          continue;
-        }
-        const interrupted = task.state.status === "terminal"
-          ? task.state.outcome.status !== "completed"
-          : task.abortRequested === true;
-        if (!interrupted) {
-          clear.add(mark.taskId);
-          continue;
-        }
-        if (sessions.get(mark.originConversationId) !== mark.sessionKey) {
-          clear.add(mark.taskId);
-          continue;
-        }
-        deliverable.push(mark);
-      }
-      if (deliverable.length === 0 && clear.size === 0 && !damaged) return;
-      await root.commit(async (tx) => {
-        const markDoc = await tx.doc(TurnInterruptionMarksDoc);
-        // Fail closed on damaged state instead of overwriting a mark this build does not understand.
-        parseTurnInterruptionMarks(markDoc);
-        for (const mark of deliverable) {
-          if ((await tx.conversation(mark.originConversationId)) === undefined) {
-            clear.add(mark.taskId);
-            continue;
-          }
-          let admission: "admitted" | "duplicate" | "full" | "invalid" = "invalid";
-          try {
-            const deliveries = await tx.doc(CronDeliveriesDoc, mark.originConversationId);
-            const interrupted = await tx.task(mark.taskId as TaskId);
-            admission = admitCronDelivery(
-              deliveries,
-              turnInterruptionDelivery(
-                mark.sessionKey,
-                mark.taskId,
-                now(),
-                mark.kind,
-                await interruptionSurfaceIn(tx, interrupted?.conversationId ?? mark.originConversationId),
-              ),
-            );
-          } catch {
-            admission = "invalid";
-          }
-          if (admission === "full" || admission === "invalid") {
-            try {
-              const faults = await tx.doc(CronDeliveryFaultsDoc, mark.originConversationId);
-              recordCronDeliveryFault(faults, {
-                jobId: null,
-                scheduledAtMs: null,
-                recordedAtMs: now(),
-                message: admission === "full"
-                  ? "interruption notice was not queued: delivery outbox is full"
-                  : "interruption notice was not queued: delivery outbox is malformed",
-              });
-            } catch {
-              // This diagnostic is derived state; it must not stop the gateway from recovering.
-            }
-          }
-          clear.add(mark.taskId);
-        }
-        if (damaged) {
-          // The retired record's own notices are gone; record the fixed loss once per origin this open
-          // can still name. The fault list is bounded and this text is value-free.
-          for (const originConversationId of new Set([...origins.values()].map((origin) => origin.conversationId))) {
-            try {
-              const faults = await tx.doc(CronDeliveryFaultsDoc, originConversationId);
-              recordCronDeliveryFault(faults, {
-                jobId: null,
-                scheduledAtMs: null,
-                recordedAtMs: now(),
-                message: INTERRUPTION_RECORD_DAMAGED_FAULT,
-              });
-            } catch {
-              // Same bounded diagnostic rule: never stop the gateway for derived state.
-            }
-          }
-        }
-        if (clear.size > 0) removeTurnInterruptionMarks(markDoc, clear);
-      }, context);
-    };
-
-    /**
-     * Cancel every prepared dispatch whose pinned context still contains Nanobot sections. The
-     * detailed error is for SDK callers; the CLI prints one fixed recovery diagnostic. A mark is
-     * written first for every dispatch with a mapped origin, so a crash between that write, the
-     * native abort and the notice admission is reconciled on the next open. A dispatch whose
-     * prepared model left `allowedModels` never reaches here: the scan above fails closed first.
-     */
-    const recoverInterruptedPreparedTurns = async (blocked: readonly NonNullable<ReturnType<typeof preparedContextReplay>>[]): Promise<void> => {
-      const stored = await readInterruptionMarks();
-      if (blocked.length === 0 && stored.marks.length === 0) return;
-      const sessions = new Map((await mappedChatSessions(context))
-        .map(({ conversationId, sessionKey }) => [conversationId, sessionKey] as const));
-      const origins = new Map<number, TurnInterruptionOrigin>();
-      for (const replay of blocked) {
-        const origin = interruptionOriginFor(replay.conversationId, sessions);
-        if (origin !== undefined) origins.set(replay.id, origin);
-      }
-      // Admit notices already pending from an earlier open first, so a bounded mark list is drained
-      // of settled entries before it can refuse a new one and force a manual recovery.
-      try {
-        await admitInterruptionNotices(sessions, stored.marks, stored.damaged, origins);
-      } catch {
-        // The marks stay durable; the next open retries. Notice admission is bookkeeping, not startup
-        // authority, so it must not turn a damaged outbox into a dead end.
-      }
-      if (blocked.length === 0) return;
-      const additions: TurnInterruptionMark[] = [];
-      // Only a dispatch whose cancellation fails the owning run can leave an internal report to
-      // suppress: the conversation's own generation, or a blocking compaction a generation waits on.
-      // A background or manual compaction is cancelled without failing the run, so it records nothing.
-      const candidates: {
-        readonly replayId: number;
-        readonly kind: InterruptedPreparedKind;
-        readonly targetConversationId: ConversationId;
-      }[] = [];
-      for (const replay of blocked) {
-        if (!stored.marks.some((mark) => mark.taskId === replay.id)) {
-          const origin = origins.get(replay.id);
-          if (origin !== undefined) {
-            additions.push({
-              taskId: replay.id,
-              kind: replay.kind,
-              originConversationId: origin.conversationId,
-              sessionKey: origin.sessionKey,
-              createdAtMs: now(),
-            });
-          }
-        }
-        candidates.push({ replayId: replay.id, kind: replay.kind, targetConversationId: replay.conversationId });
-      }
-      if (additions.length > 0 || candidates.length > 0) {
-        if (candidates.length > 0) await ensureInterruptedRunReportsReadable();
-        await harness!.commit(async (tx) => {
-          const doc = await tx.doc(TurnInterruptionMarksDoc);
-          for (const mark of additions) {
-            const result = addTurnInterruptionMark(doc, mark);
-            if (result === "full") {
-              throw new StartupDiagnosticError("preparedContext", {
-                detail: `Cannot automatically recover interrupted turns: the bounded interruption record holds ` +
-                  `${TURN_INTERRUPTION_MAX_MARKS} pending notices; cancel the blocked prepared dispatch with the ` +
-                  "context recovery interface before gateway recovery",
-              });
-            }
-          }
-          if (candidates.length === 0) return;
-          const reportDoc = await tx.doc(InterruptedRunReportsDoc);
-          // Reuse slots a crashed earlier open left behind: only a live run can consume one.
-          const live: typeof reportDoc.runs = [];
-          for (const entry of parseInterruptedRunReports(reportDoc)) {
-            const task = await tx.task(entry.runTaskId as TaskId);
-            if (task === undefined || task.state.status === "terminal") continue;
-            live.push(entry);
-          }
-          reportDoc.runs = live;
-          const runByTarget = new Map<ConversationId, number | undefined>();
-          for (const candidate of candidates) {
-            if (candidate.kind === "pi.compaction") {
-              const compaction = await tx.task(candidate.replayId as TaskId);
-              if (compaction?.owner === undefined) continue;
-            }
-            if (!runByTarget.has(candidate.targetConversationId)) {
-              // The target's owning run task is the one whose internal report must stay silent. It is
-              // read here, so a failed or finished run is never guessed from a target id.
-              const ownerTaskId = (await tx.conversation(candidate.targetConversationId))?.owner?.taskId;
-              const run = ownerTaskId === undefined ? undefined : await tx.task(ownerTaskId as TaskId);
-              runByTarget.set(candidate.targetConversationId,
-                run === undefined || run.state.status === "terminal"
-                  || (run.kind !== WORKER_TASK_NAME && run.kind !== MEMORY_DIGEST_TASK_NAME)
-                  ? undefined
-                  : ownerTaskId);
-            }
-            const runTaskId = runByTarget.get(candidate.targetConversationId);
-            if (runTaskId === undefined) continue;
-            const result = addInterruptedRunReport(reportDoc, {
-              runTaskId,
-              targetConversationId: candidate.targetConversationId,
-              recordedAtMs: now(),
-            });
-            if (result === "full") {
-              throw new StartupDiagnosticError("preparedContext", {
-                detail: `Cannot automatically recover interrupted turns: the bounded interrupted-run record holds ` +
-                  `${INTERRUPTED_RUN_REPORT_MAX} live runs; cancel the blocked prepared dispatch with the context ` +
-                  "recovery interface before gateway recovery",
-              });
-            }
-          }
-        }, context);
-      }
-      for (const replay of blocked) {
-        // A cascade from an earlier abort can already have settled this task; never abort a terminal
-        // task or repeat an existing mark.
-        const current = await harness!.getTask(replay.id as TaskId, context);
-        if (current === undefined || current.state.status === "terminal" || current.abortRequested === true) continue;
-        try {
-          await harness!.abortTask(replay.id as TaskId, context);
-        } catch (cause) {
-          throw new StartupDiagnosticError("preparedContext", {
-            cause,
-            detail: `Cannot automatically cancel ${replay.kind} task ${replay.id} (${replay.phase}): the native ` +
-              "abort failed; cancel that prepared dispatch with the context recovery interface before gateway recovery",
-          });
-        }
-      }
-      for (const replay of blocked) {
-        const task = await harness!.getTask(replay.id as TaskId, context);
-        if (task === undefined || task.state.status === "terminal" || task.abortRequested === true) continue;
-        throw new StartupDiagnosticError("preparedContext", {
-          detail: `Cannot safely recover ${replay.kind} task ${replay.id} (${replay.phase}): the native abort mark ` +
-            "did not persist; cancel that prepared dispatch with the context recovery interface before gateway recovery",
-        });
-      }
-      const admitted = await readInterruptionMarks();
-      try {
-        await admitInterruptionNotices(sessions, admitted.marks, admitted.damaged, origins);
-      } catch {
-        // The marks stay durable; the next open retries and the gateway stays available.
-      }
-    };
-
-    const blockedPreparedTurns: NonNullable<ReturnType<typeof preparedContextReplay>>[] = [];
-    for (const replay of preparedContextReplays) {
-      try {
-        const conversation = await harness.conversation(replay.conversationId, context);
-        if (!conversation) throw new Error("conversation is missing");
-        const view = await conversation.context(context, { at: replay.at as EntryId });
-        if (hasPersistedNanobotContext(view.messages)) blockedPreparedTurns.push(replay);
-      } catch (cause) {
-        throw new StartupDiagnosticError("preparedContext", {
-          cause,
-          detail: `Cannot inspect the pinned context of ${replay.kind} task ${replay.id} (${replay.phase}); ` +
-            "cancel that prepared dispatch with the context recovery interface before gateway recovery",
-        });
-      }
-    }
-    await recoverInterruptedPreparedTurns(blockedPreparedTurns);
-
-    // Apply host security, configured tool authority and context selection only after every prepared
-    // dispatch passes the replay guard. A narrowed configuration is what keeps a removed tool from replaying.
-    await root.commit(async (tx) => {
-      let cursor: Cursor | undefined;
-      do {
-        const page = await tx.scanConversations({}, 1000, cursor);
-        for (const conversation of page.items) {
-          const state = await tx.doc(AgentDoc, conversation.id);
-          const toolFilter = await toolFilterFor(tx, conversation.id, backgroundToolBounds.get(conversation.id));
-          const workerPolicy = workerChildPolicies.get(conversation.id);
-          const digestPolicy = digestTargetPolicies.get(conversation.id);
-          // A live worker keeps the model, thinking level and workspace chosen at launch, even when
-          // that model has since left the catalog: the pin stays honest instead of silently becoming
-          // the configured default. The worker task then fails closed in its own terminal commit.
-          const workerChoice = workerPolicy === undefined ? undefined : choicesByNative.get(modelKey(workerPolicy.model));
-          const digestChoice = digestPolicy === undefined ? undefined : choicesByNative.get(modelKey(digestPolicy.model));
-          await configure(tx, conversation.id, {
-            ...(workerPolicy !== undefined
-              ? {
-                  cwd: workerPolicy.workspace.path,
-                  model: workerPolicy.model,
-                  thinkingLevel: workerChoice !== undefined && workerChoice.thinkingLevels.includes(workerPolicy.thinkingLevel)
-                    ? workerPolicy.thinkingLevel
-                    : workerChoice !== undefined ? fallbackThinkingLevel(workerChoice) : workerPolicy.thinkingLevel,
-                }
-              : digestPolicy !== undefined
-                ? {
-                    cwd: workspace,
-                    model: digestPolicy.model,
-                    // Deterministic lowest supported level if the pinned one left the catalog: the
-                    // foreground thinking level is never inherited by a background digest run.
-                    thinkingLevel: digestChoice !== undefined && digestChoice.thinkingLevels.includes(digestPolicy.thinkingLevel)
-                      ? digestPolicy.thinkingLevel
-                      : digestChoice !== undefined
-                        ? digestChoice.thinkingLevels.includes("off") ? "off" : digestChoice.thinkingLevels[0]!
-                        : digestPolicy.thinkingLevel,
-                  }
-                // Named-preset mode owns the startup default; direct mode preserves its persisted choice.
-                : policyForState(state, configuredPresetName !== undefined)),
-            ...extensionsPolicy(conversation.id),
-            ...toolFilter,
-          });
-          if ((workerPolicy !== undefined && workerChoice === undefined)
-            || (digestPolicy !== undefined && digestChoice === undefined)) {
-            // Removed model: no fallback dispatch and no captured authority. The target's own pending
-            // work was withdrawn above; the task commits the terminal error on resume. Code Mode
-            // selection goes too, so no stale script can compose a retired worker capture.
-            await tx.retireDoc(ConfigToolCaptureDoc, conversation.id);
-            await configure(tx, conversation.id, {
-              tools: [],
-              modelTools: [],
-              extensions: visionExtension === undefined ? [] : [visionExtension],
-            });
-          }
-        }
-        cursor = page.next;
-      } while (cursor !== undefined);
-    }, context);
-
-    // Host/channel view of the durable cron result outbox. Every access resolves an existing
-    // mapped chat session; no conversation is created and no transcript is exposed.
-    const cronOutbox: CronDeliveryOutbox = {
-      sessions: (ctx) => mappedChatSessions(ctx),
-      async list(sessionKey, ctx) {
-        const conversationId = await chatConversationIdFor(sessionKey, ctx);
-        const doc = await harness!.snapshot(CronDeliveriesDoc, conversationId, ctx);
-        if (doc === undefined) return [];
-        const value: unknown = doc.deliveries;
-        if (!Array.isArray(value)) throw new CronDeliveryOutboxError("delivery outbox is malformed");
-        return value as readonly CronDeliveryRecord[];
-      },
-      async update(sessionKey, id, change, ctx) {
-        const conversationId = await chatConversationIdFor(sessionKey, ctx);
-        return root.commit(async (tx) => {
-          const doc = await tx.doc(CronDeliveriesDoc, conversationId);
-          const value: unknown = doc.deliveries;
-          if (!Array.isArray(value)) throw new CronDeliveryOutboxError("delivery outbox is malformed");
-          const record = value.find((entry) =>
-            entry !== null && typeof entry === "object" && (entry as { id?: unknown }).id === id);
-          if (record === undefined) return undefined;
-          await change(record as Draft<CronDeliveryRecord>, tx);
-          return copyCronDelivery(record as Draft<CronDeliveryRecord>);
-        }, ctx);
-      },
-      async recordFault(sessionKey, message, ctx) {
-        const conversationId = await chatConversationIdFor(sessionKey, ctx);
-        try {
-          await root.commit(async (tx) => {
-            const doc = await tx.doc(CronDeliveryFaultsDoc, conversationId);
-            recordCronDeliveryFault(doc, {
-              jobId: null,
-              scheduledAtMs: null,
-              recordedAtMs: now(),
-              message,
-            });
-          }, ctx);
-        } catch {
-          // A best-effort diagnostic must not make the channel scan fail repeatedly.
-        }
-      },
-    };
-    /** Shared atomic selection path for direct choices and named presets. */
-    const selectConversationModel = async (
-      sessionKey: string,
-      selection: GatewayModelSelectionRequest,
-      ctx: Context,
-    ): Promise<GatewayModelSelection> => {
-      if (!isModelSelection(selection)) throw new Error("Model selection requires provider and modelId strings");
-      const target = choicesByConfigured.get(modelKey(selection));
-      if (!target) throw new Error("Model is not in the configured allowlist");
-      const requestedLevel = Object.hasOwn(selection, "thinkingLevel") ? selection.thinkingLevel : undefined;
-      if (requestedLevel !== undefined && !target.thinkingLevels.includes(requestedLevel)) {
-        throw new Error(`Unsupported thinkingLevel ${requestedLevel} for ${selection.provider}/${selection.modelId}`);
-      }
-      const conversation = await existingConversationFor(sessionKey, ctx);
-      const level = await conversation.commit(async (tx) => {
-        const state = await tx.doc(AgentDoc, conversation.id);
-        const current = choiceFromState(state);
-        const live = await tx.doc(LiveDoc, conversation.id);
-        if (live.run !== undefined) throw new ConversationBusy(conversation.id);
-        const changed = current === undefined || modelKey(current.native) !== modelKey(target.native);
-        const currentLevel = current !== undefined && state.thinkingLevel !== undefined && current.thinkingLevels.includes(state.thinkingLevel)
-          ? state.thinkingLevel
-          : fallbackThinkingLevel(current ?? defaultChoice);
-        const nextLevel = requestedLevel ?? (changed
-          ? fallbackThinkingLevel(target)
-          : target.thinkingLevels.includes(currentLevel) ? currentLevel : fallbackThinkingLevel(target));
-        const toolFilter = await toolFilterFor(tx, conversation.id);
-        await configure(tx, conversation.id, {
-          ...hostPolicy,
-          model: target.native,
-          thinkingLevel: nextLevel,
-          ...toolFilter,
-        });
-        return nextLevel;
-      }, ctx);
-      return publicSelection(target, level);
-    };
-    /**
-     * Explicit host reload of the foreground model catalog and credential references.
-     *
-     * The contract is deliberately narrow. Everything is validated before the first in-memory
-     * change, the candidate may differ from the live file only in foreground model fields, and the
-     * registry is published only with the exact commit Storage stored (a revision document in that
-     * commit identifies it). Any live work other than an armed native cron timer refuses the reload:
-     * a sleeping or blocked capture can resume later, and rotating a credential or catalog under it
-     * would silently change the authority of work admitted under the previous policy. Work admitted
-     * after the commit uses the newly published registry and credentials.
-     */
-    let reloadInProgress = false;
-    /** The live configuration a candidate is classified against, including a managed MCP edit. */
-    const effectiveLiveConfig = (): PortConfig => {
-      if (liveMcpConfig === liveModelConfig.mcp) return liveModelConfig;
-      const { mcp: _startupMcp, ...rest } = liveModelConfig;
-      return liveMcpConfig === undefined ? rest : { ...rest, mcp: liveMcpConfig };
-    };
-    /** An armed native cron timer sleeps until its slot and holds no model capture. */
-    const armedCronTimer = (kind: string, status: string): boolean =>
-      kind === CRON_TIMER_TASK_NAME && status === "sleeping";
-    // A queued owner input is work even before its native task exists, so it blocks a reload just as
-    // an executing task does. Every live task blocks except an armed native cron timer, including a
-    // sleeping or blocked task whose captured model and credential would otherwise change.
-    const reloadBlocked = async (ctx: Context): Promise<boolean> => {
-      const inspection = await harnessRef.current!.inspect(ctx);
-      return inspection.submissions.length > 0
-        || inspection.tasks.some((task) => !armedCronTimer(task.record.kind, task.state.kind));
-    };
-    /**
-     * Models resolved at open for work the configuration file cannot rebuild. A candidate that drops
-     * one from the finite allowlist would strand that work at its next resume, so it is refused.
-     */
-    const capturedBackgroundModels = (): readonly { readonly provider: string; readonly modelId: string }[] => [
-      ...(digestChoice === undefined ? [] : [digestChoice.model]),
-      ...(workerPreset === undefined ? [] : [workerPreset.model]),
-      ...(configuredSummary === undefined ? [] : [configuredSummary.model]),
-      ...(options.episodeSummary === undefined ? [] : [options.episodeSummary]),
-    ];
-    const reloadModels = async (ctx: Context): Promise<ModelReloadResult> => {
-      if (options.reloadConfig === undefined || options.models !== undefined || credentialStoreDir === undefined) {
-        return { status: "refused", reason: "unavailable" };
-      }
-      if (reloadInProgress) return { status: "busy" };
-      reloadInProgress = true;
-      let observation: CommitObservation | undefined;
-      let pending: { readonly revision: string; readonly publish: () => void } | undefined;
-      try {
-        if (await reloadBlocked(ctx)) return { status: "busy" };
-        let candidate: PortConfig;
-        try {
-          candidate = await options.reloadConfig();
-        } catch {
-          return { status: "refused", reason: "invalid" };
-        }
-        const compatibility = modelReloadCompatibility(effectiveLiveConfig(), candidate);
-        if (compatibility === "unrelated") return { status: "refused", reason: "unrelated" };
-        if (compatibility === "mode") return { status: "refused", reason: "mode" };
-        if (compatibility === "pinned") return { status: "refused", reason: "pinned" };
-        const counts = (value: PortConfig) => ({
-          models: (value.allowedModels ?? [value.model]).length,
-          presets: value.modelPresets === undefined ? 0 : Object.keys(value.modelPresets).length,
-          ...(value.modelPreset === undefined ? {} : { defaultPreset: value.modelPreset }),
-        });
-        if (compatibility === "unchanged") return { status: "unchanged", ...counts(effectiveLiveConfig()) };
-
-        let nextModels: Models;
-        let nextResolved: ResolvedModelConfiguration;
-        try {
-          nextModels = createProviderModels(
-            candidate,
-            process.env,
-            new FileCredentialStore(authStorePath(credentialStoreDir)),
-            (await loadModelCatalog(credentialStoreDir)).overlay,
-          ).models;
-          nextResolved = resolveModelConfiguration(candidate, nextModels);
-          await assertConfiguredModelAuth(nextModels, nextResolved.choices, ctx.abortSignal);
-        } catch {
-          // Parse, provider, catalog and credential failures are all a candidate this host refuses.
-          // Nothing above this point changed the live catalog or a conversation.
-          return { status: "refused", reason: "invalid" };
-        }
-        // Validation may have awaited environment or credential reads; do not apply over work that
-        // started meanwhile.
-        if (await reloadBlocked(ctx)) return { status: "busy" };
-        for (const model of capturedBackgroundModels()) {
-          if (!nextResolved.choicesByNative.has(modelKey(model))) return { status: "refused", reason: "pinned" };
-        }
-
-        // The candidate values are computed completely before anything is published: no temporary
-        // assignment to the live bindings can leak into a concurrent read while an await is pending.
-        const nextPublicPresets = publicPresetsFor(nextResolved.presetCatalog);
-        const nextDefaultAgentPolicy: AgentChange = {
-          ...hostPolicy,
-          model: nextResolved.defaultChoice.native,
-          thinkingLevel: nextResolved.defaultThinkingLevel,
-          tools: [],
-          modelTools: [],
-        };
-        const revision = randomUUID();
-        let published = false;
-        const publish = (): void => {
-          if (published) return;
-          published = true;
-          models = nextModels;
-          choices = nextResolved.choices;
-          choicesByConfigured = nextResolved.choicesByConfigured;
-          choicesByNative = nextResolved.choicesByNative;
-          configuredPresetName = nextResolved.configuredPresetName;
-          presetCatalog = nextResolved.presetCatalog;
-          defaultChoice = nextResolved.defaultChoice;
-          defaultThinkingLevel = nextResolved.defaultThinkingLevel;
-          publicPresets = nextPublicPresets;
-          defaultAgentPolicy = nextDefaultAgentPolicy;
-          liveModelConfig = candidate;
-        };
-        pending = { revision, publish };
-        observation = harness!.observeCommits({
-          // Synchronous assignments only: publishes the candidate exactly when Storage stored the
-          // commit carrying this revision document. It never awaits, throws or calls the Session.
-          advance: (publication: CommitPublication) => {
-            const awaiting = pending;
-            if (awaiting === undefined || !publicationCarriesRevision(publication, awaiting.revision)) return;
-            pending = undefined;
-            awaiting.publish();
-          },
-          end: () => {},
-        });
-        const outcome = await (async () => {
-          try {
-            return await root.commit(async (tx) => {
-              // Definitive gate on the Session line: no submission, task creation or configuration
-              // commit can interleave with these reads and writes. Native nonterminal states are
-              // scanned one status at a time so a long terminal history costs no full scan.
-              for (const status of ["pending", "running", "waiting", "sleeping", "completing"] as const) {
-                let taskCursor: Cursor | undefined;
-                do {
-                  const page = await tx.scanTasks({ status }, 1000, taskCursor);
-                  for (const record of page.items) {
-                    if (!armedCronTimer(record.kind, record.state.status)) return { kind: "busy" } as const;
-                  }
-                  taskCursor = page.next;
-                } while (taskCursor !== undefined);
-              }
-              // A managed MCP edit rewrites the same file and updates the live block; any other MCP
-              // change that landed while the candidate was validated stays a startup-only refusal.
-              if (modelReloadCompatibility(effectiveLiveConfig(), candidate) !== "reloadable") {
-                return { kind: "unrelated" } as const;
-              }
-              for (const model of capturedBackgroundModels()) {
-                if (!nextResolved.choicesByNative.has(modelKey(model))) return { kind: "pinned" } as const;
-              }
-              // A queued or placed owner input is refused in the same commit that would repolicy the
-              // conversation, so no admitted turn can begin under a policy this reload replaced.
-              for (const conversationId of authorizedChatConversations) {
-                const live = await tx.doc(LiveDoc, conversationId);
-                if (live.run !== undefined) return { kind: "busy" } as const;
-                const inbox = await tx.doc(InboxDoc, conversationId);
-                if (inbox.items.length > 0) return { kind: "busy" } as const;
-              }
-              // Auth validation and the preceding reads may have awaited while an outside editor
-              // changed the file. Compare a fresh parsed snapshot before the first policy write;
-              // checking only effectiveLiveConfig would miss unapplied edits on disk.
-              let latest: PortConfig;
-              try { latest = await options.reloadConfig!(); }
-              catch { return { kind: "invalid" } as const; }
-              if (modelReloadCompatibility(candidate, latest) !== "unchanged") {
-                return { kind: "unrelated" } as const;
-              }
-              // Only foreground mapped chats are repolicied. An automation, worker or digest target
-              // keeps the exact model, thinking level and per-run authority prepared for its run.
-              for (const conversationId of authorizedChatConversations) {
-                if (automationConversations.has(conversationId) || workerChildConversations.has(conversationId)
-                  || digestTargetConversations.has(conversationId) || scheduledRunTargets.has(conversationId)) {
-                  continue;
-                }
-                const state = await tx.doc(AgentDoc, conversationId);
-                const change = policyAgainst(nextResolved, state, nextResolved.configuredPresetName !== undefined);
-                await configure(tx, conversationId, {
-                  model: change.model ?? null,
-                  thinkingLevel: change.thinkingLevel ?? null,
-                });
-              }
-              const doc = await tx.doc(ModelPolicyRevisionDoc);
-              doc.revision = revision;
-              return { kind: "applied" } as const;
-            }, ctx);
-          } finally {
-            // The commit either published (the observer runs before its wait resolves) or stored
-            // nothing; the pending candidate is dropped either way.
-            observation?.detach();
-            observation = undefined;
-            pending = undefined;
-          }
-        })();
-        if (outcome.kind === "busy") return { status: "busy" };
-        if (outcome.kind === "unrelated") return { status: "refused", reason: "unrelated" };
-        if (outcome.kind === "invalid") return { status: "refused", reason: "invalid" };
-        if (outcome.kind === "pinned") return { status: "refused", reason: "pinned" };
-        // Durable publishes a stored commit to `observeCommits()` observers before the commit's wait
-        // resolves. This fallback is a no-op unless that ever changed, and keeps the in-memory
-        // catalog consistent with the commit that really landed.
-        publish();
-        return { status: "reloaded", ...counts(candidate) };
-      } finally {
-        observation?.detach();
-        pending = undefined;
-        reloadInProgress = false;
-      }
+    const recall = (): MemoryService => {
+      const service = memoryServiceRef.current;
+      if (!service) throw new Error("Memory recall is unavailable");
+      return service;
     };
     const gateway: Gateway = {
-      harness,
-      ...(config.app === undefined ? {} : {
-        async forkAppThread(stateId, thread, from, register, ctx) {
-          if (parseThreadId(thread) !== thread || thread === APP_MAIN_THREAD || parseThreadId(from.thread) !== from.thread) return false;
-          const stateKey = encodedSessionKey(APP_STATE_SESSION_KEY);
-          const sourceKey = encodedSessionKey(sessionForThread(from.thread));
-          const targetKey = encodedSessionKey(sessionForThread(thread));
-          const anchor = await root.commit(async (tx) => {
-            const map = await tx.doc(SessionMap, root.id);
-            const id = map.sessions[sourceKey] as ConversationId | undefined;
-            if (map.sessions[stateKey] !== stateId || id === undefined ||
-                id === stateId || await chatScopeForSession(tx, sessionForThread(from.thread), id) !== undefined ||
-                automationConversationOf(await tx.doc(CronConversationDoc, id)) !== undefined) return undefined;
-            const state = await tx.doc(AppState, stateId);
-            if (threadInfo(state, from.thread)?.archived !== false) return undefined;
-            const at = await appForkEntry(tx, state, id, from);
-            if (at === undefined) return undefined;
-            if (options.contextSnapshotProvider && await snapshotSlotsUsed(tx) >= CONTEXT_LIMITS.maxConversations) {
-              throw new AppThreadCapacityError();
-            }
-            return { id, at, policy: policyForState(await tx.doc(AgentDoc, id)) };
-          }, ctx);
-          if (anchor === undefined) return false;
-          const source = await harness!.conversation(anchor.id, ctx);
-          if (source === undefined) return false;
-          const fork = await source.fork(anchor.at, {
-            ownership: { kind: "ownerless" },
-            agent: anchor.policy,
-            async init(tx, child) {
-              const map = await tx.doc(SessionMap, root.id);
-              if (map.sessions[stateKey] !== stateId || map.sessions[sourceKey] !== anchor.id ||
-                  Object.hasOwn(map.sessions, targetKey)) throw new Error("App thread mapping changed");
-              if (options.contextSnapshotProvider && await snapshotSlotsUsed(tx) >= CONTEXT_LIMITS.maxConversations) {
-                throw new AppThreadCapacityError();
-              }
-              const state = await tx.doc(AppState, stateId);
-              register(state);
-              const origin = threadInfo(state, thread)?.origin;
-              if (origin?.thread !== from.thread || origin.messageId !== from.messageId) throw new Error("App fork registration is missing provenance");
-              const enrollment = { thread, parentThread: from.thread, at: anchor.at, messageId: from.messageId };
-              if (state.forks === undefined) state.forks = { [`c${child}`]: enrollment };
-              else state.forks[`c${child}`] = enrollment;
-              map.sessions[targetKey] = child;
-            },
-          }, ctx);
-          // Apply ordinary mapped-chat policy; native forks always start with denied tools.
-          await gateway.conversationFor(sessionForThread(thread), ctx);
-          await episodeSummaries?.initialize(harness!, fork.id, ctx).catch(() => undefined);
-          return true;
-        },
-        async appThreadBusy(tx, thread) {
-          const map = await tx.doc(SessionMap, root.id);
-          const id = map.sessions[encodedSessionKey(sessionForThread(thread))] as ConversationId | undefined;
-          if (id === undefined) return false;
-          return (await tx.doc(LiveDoc, id)).run !== undefined || (await tx.doc(InboxDoc, id)).items.length > 0;
-        },
-      }),
-      memorySearch: (caller, query, ctx) => {
-        const service = memoryServiceRef.current;
-        if (!service) throw new Error("Memory recall is unavailable");
-        return service.search(caller, query, ctx);
-      },
-      memoryBrowse: (caller, query, ctx) => {
-        const service = memoryServiceRef.current;
-        if (!service) throw new Error("Memory recall is unavailable");
-        return service.browse(caller, query, ctx);
-      },
-      memoryRead: (caller, query, ctx) => {
-        const service = memoryServiceRef.current;
-        if (!service) throw new Error("Memory recall is unavailable");
-        return service.read(caller, query, ctx);
-      },
+      harness: openedHarness,
+      ...(config.app === undefined ? {} : createAppThreadRuntime({
+        harness: openedHarness,
+        root,
+        snapshots: contextHost.enabled,
+        chatScopeForSession: sessions.chatScopeForSession,
+        policyForState: (agent) => modelHost.policyForState(agent),
+        conversationFor: (sessionKey, ctx) => gateway.conversationFor(sessionKey, ctx),
+        ...(episodeSummaries === undefined ? {} : {
+          initializeSummaries: (id: ConversationId, ctx: Context) => episodeSummaries.initialize(openedHarness, id, ctx),
+        }),
+      })),
+      memorySearch: (caller, query, ctx) => recall().search(caller, query, ctx),
+      memoryBrowse: (caller, query, ctx) => recall().browse(caller, query, ctx),
+      memoryRead: (caller, query, ctx) => recall().read(caller, query, ctx),
       memoryDigest: {
         start: (writer, ctx) => memoryDigest.start(writer, ctx),
         status: (writer, ctx) => memoryDigest.status(writer, ctx),
       },
-      cronOutbox,
-      ...(cronFoundation === undefined ? {} : {
-        cronOperator: createCronOperator({
-          foundation: cronFoundation,
-          harness: () => {
-            if (harnessRef.current === undefined) throw new Error("The runtime is not open");
-            return harnessRef.current;
-          },
-          // The same validated reader every other derived consumer uses: a state-only, automation,
-          // task-owned, forked or root conversation is never a scheduling origin.
-          origins: (ctx) => mappedChatSessions(ctx),
-        }),
-      }),
+      cronOutbox: createCronOutbox({ harness: openedHarness, root, now, sessions: mappedChatSessions, chatConversationIdFor }),
+      ...(cronHost === undefined ? {} : { cronOperator: cronHost.operator(mappedChatSessions) }),
       ...(telegramActions === undefined ? {} : { telegramActions }),
       ...(discordHistory === undefined ? {} : { discordHistory }),
       ...(appConsole === undefined ? {} : { appConsole }),
@@ -4165,9 +882,8 @@ export async function openGateway(config: PortConfig, context: Context, options:
       },
       ...(mcpAdminRef.current === undefined ? {} : {
         mcpAdmin: {
-          list: (ctx: Context): Promise<McpAdminListing> => mcpAdminRef.current!.list(ctx),
-          submitCallback: (sessionKey: string, text: string, ctx: Context) =>
-            mcpAdminRef.current!.submitCallback(sessionKey, text, ctx),
+          list: (ctx: Context) => mcpAdminRef.current!.list(ctx),
+          submitCallback: (sessionKey: string, text: string, ctx: Context) => mcpAdminRef.current!.submitCallback(sessionKey, text, ctx),
         },
       }),
       ...(mcpSurfaces === undefined ? {} : { mcpSurfaces }),
@@ -4181,173 +897,73 @@ export async function openGateway(config: PortConfig, context: Context, options:
             conversationId = map.sessions[key] as ConversationId;
             return;
           }
-          if (options.contextSnapshotProvider && await snapshotSlotsUsed(tx) >= CONTEXT_LIMITS.maxConversations) {
+          if (contextHost.enabled && await snapshotSlotsUsed(tx, root.id) >= CONTEXT_LIMITS.maxConversations) {
             throw new AppThreadCapacityError(`Context snapshots support at most ${CONTEXT_LIMITS.maxConversations} mapped conversations`);
           }
           const created = await tx.createConversation({ ownership: { kind: "ownerless" } });
-          createdNow = created.id as ConversationId;
+          createdNow = created.id;
           const toolFilter = await toolFilterFor(tx, created.id);
           await configure(tx, created.id, {
-            ...defaultAgentPolicy,
-            ...extensionsPolicy(created.id),
-            ...toolFilter,
+            ...modelHost.state().defaultAgentPolicy, ...extensionsPolicy(created.id), ...toolFilter,
           });
           map.sessions[key] = created.id as number;
           conversationId = created.id;
         }, ctx);
         if (!Number.isSafeInteger(conversationId)) throw new Error("Stored conversation mapping has an invalid ID");
-        // The stored map is host data, not authority: it can be forged, imported or left behind by an
-        // older layout. A mapped session key may therefore name only an ordinary chat conversation —
-        // or, under its own exact key, a registered app thread fork — before it can become a cron
-        // owner or receive chat policy.
-        const scopeReason = await root.commit(
-          (tx) => chatScopeForSession(tx, sessionKey, conversationId!), ctx,
-        );
+        const id = conversationId!;
+        // The stored map is host data, not authority: a mapped key may name only an ordinary chat
+        // conversation — or, under its own exact key, a registered app thread fork — before it can
+        // become a cron owner or receive chat policy.
+        const scopeReason = await root.commit((tx) => sessions.chatScopeForSession(tx, sessionKey, id), ctx);
         if (scopeReason !== undefined) throw new Error(chatScopeMessage(scopeReason));
-        // A mapped session key is the cron owner; unmapped conversations (such as a scheduled run's
-        // own background conversation) have no owner and therefore never receive the cron tool.
-        let mappedChat = false;
-        if (isChatSessionKey(sessionKey)) {
-          historyConversations.add(conversationId!);
-          authorizedChatConversations.add(conversationId!);
-          if (webTool !== undefined) webConversations.add(conversationId!);
-          mappedChat = true;
-        }
-        // The exact host-owned session key for this conversation is what a channel action host
-        // revalidates; it is never supplied by the model. Only a scope-checked mapped Telegram chat
-        // conversation is offered the Telegram action tool.
-        sessionKeyForConversation.set(conversationId!, sessionKey);
-        if (workersEnabled) {
-          // Only a scope-checked mapped chat may spawn workers; the task-owned worker conversation is
-          // never mapped, so a worker can never start another worker.
-          if (mappedChat) workerSpawners.add(conversationId!);
-          else workerSpawners.delete(conversationId!);
-        }
-        if (mappedChat && sessionKey.startsWith("telegram:")) {
-          telegramChatConversations.add(conversationId!);
-        } else {
-          telegramChatConversations.delete(conversationId!);
-        }
-        if (mappedChat && sessionKey.startsWith("app:")) {
-          appChatConversations.add(conversationId!);
-        } else {
-          appChatConversations.delete(conversationId!);
-        }
-        // The same rule for Discord: a scope-checked mapped chat key is the only conversation class
-        // offered the read-only history capability.
-        if (mappedChat && sessionKey.startsWith("discord:")) {
-          discordChatConversations.add(conversationId!);
-        } else {
-          discordChatConversations.delete(conversationId!);
-        }
+        // The exact host-owned session key is what a channel action host revalidates; it is never
+        // supplied by the model. Only a chat key becomes a chat; a state key carries no authority.
+        if (isChatSessionKey(sessionKey)) registry.admitChat(id, sessionKey);
+        else registry.recordSessionKey(id, sessionKey);
         if (createdNow !== undefined && episodeSummaries !== undefined) {
           try {
-            await episodeSummaries.initialize(harness!, createdNow, ctx);
+            await episodeSummaries.initialize(openedHarness, createdNow, ctx);
           } catch {
             // The startup policy pass and the defensive enqueue path both record a missing watermark.
           }
         }
-        cronOwners.set(conversationId!, { ownerId: sessionKey, sessionKey });
-        sessionConversations.add(conversationId!);
-        const conversation = await harness!.conversation(conversationId!, ctx);
+        registry.recordMapped(id, sessionKey);
+        const conversation = await openedHarness.conversation(id, ctx);
         if (!conversation) throw new Error("Stored conversation mapping points to a missing conversation");
-        await ensureContextSnapshot(sessionKey, conversationId!, ctx);
+        await contextHost.ensure(sessionKey, id, ctx);
         // Read and reapply host policy atomically so concurrent selection cannot be overwritten.
         await applyConversationPolicy(conversation, ctx);
         return conversation;
       },
-      backgroundStatus: (sessionKey, ctx) => backgroundStatusFor(sessionKey, ctx),
-      activeWork: (ctx) => activeWorkFor(ctx),
-      appTasks: (sessionKey, ctx) => appTasksFor(sessionKey, ctx),
-      appTaskCancel: (sessionKey, task, ctx) => appTaskCancelFor(sessionKey, task, ctx),
-      ...(config.app === undefined ? {} : {
-        async createAppThread(stateId, thread, register, ctx) {
-          await root.commit(async (tx) => {
-            const map = await tx.doc(SessionMap, root.id);
-            const key = encodedSessionKey(sessionForThread(thread));
-            if (parseThreadId(thread) !== thread || thread === APP_MAIN_THREAD ||
-                map.sessions[encodedSessionKey(APP_STATE_SESSION_KEY)] !== stateId || Object.hasOwn(map.sessions, key)) {
-              throw new Error("Invalid app thread mapping");
-            }
-            if (options.contextSnapshotProvider && await snapshotSlotsUsed(tx) >= CONTEXT_LIMITS.maxConversations) {
-              throw new AppThreadCapacityError();
-            }
-            register(await tx.doc(AppState, stateId));
-            const chat = await tx.createConversation({ ownership: { kind: "ownerless" } });
-            map.sessions[key] = chat.id;
-          }, ctx);
-        },
-        async appSnapshotRoom(tx) {
-          return !options.contextSnapshotProvider || await snapshotSlotsUsed(tx) < CONTEXT_LIMITS.maxConversations;
-        },
-        /** Create the thread's mapping and snapshot now; `full` reports the snapshot-slot cap. */
-        reserveAppThread: async (thread: string, ctx) => {
-          try {
-            await gateway.conversationFor(sessionForThread(thread), ctx);
-            return "ok" as const;
-          } catch (error) {
-            if (error instanceof AppThreadCapacityError || (error instanceof RangeError &&
-                /conversation snapshots are accepted/u.test(error.message))) {
-              return "full" as const;
-            }
-            throw error;
-          }
-        },
-      }),
-      async listModels(sessionKey, ctx) {
+      async backgroundStatus(sessionKey, ctx) {
         const conversation = await existingConversationFor(sessionKey, ctx);
-        await applyConversationPolicy(conversation, ctx);
-        const state = await harness!.snapshot(AgentDoc, conversation.id, ctx);
-        const choice = choiceFromState(state) ?? defaultChoice;
-        const level = state?.thinkingLevel !== undefined && choice.thinkingLevels.includes(state.thinkingLevel)
-          ? state.thinkingLevel
-          : fallbackThinkingLevel(choice);
-        return {
-          models: choices.map(publicChoice),
-          selected: publicSelection(choice, level),
-          ...(configuredPresetName === undefined
-            ? {}
-            : { presets: publicPresets, defaultPreset: configuredPresetName }),
-        };
-      },
-      modelPresets() {
-        return configuredPresetName === undefined
-          ? undefined
-          : { presets: publicPresets, defaultPreset: configuredPresetName };
-      },
-      async selectedModel(sessionKey, ctx) {
-        const id = await mappedConversationId(sessionKey, ctx);
-        if (id === undefined) return undefined;
-        const state = await harness!.snapshot(AgentDoc, id, ctx);
-        // Mapped but unreadable is unknown, never the default.
-        if (state === undefined) throw new Error("missing conversation state");
-        const choice = choiceFromState(state) ?? defaultChoice;
-        const level = state?.thinkingLevel !== undefined && choice.thinkingLevels.includes(state.thinkingLevel)
-          ? state.thinkingLevel
-          : fallbackThinkingLevel(choice);
-        return publicSelection(choice, level);
-      },
-      async selectModel(sessionKey, selection, ctx) {
-        return selectConversationModel(sessionKey, selection, ctx);
-      },
-      async selectModelPreset(sessionKey, name, ctx) {
-        if (configuredPresetName === undefined) {
-          throw new Error("Named model presets are not configured; use the direct model selection");
-        }
-        if (typeof name !== "string" || name.length === 0) {
-          throw new Error("Model preset name must be a non-empty string");
-        }
-        const resolvedName = name === "default" ? configuredPresetName : name;
-        const preset = presetCatalog.get(resolvedName);
-        if (preset === undefined) throw new Error("Unknown model preset");
-        // A preset always supplies a concrete thinking level, so selecting it is deterministic even
-        // when two names share the same provider/model pair.
-        return selectConversationModel(sessionKey, {
-          ...preset.choice.configured,
-          thinkingLevel: preset.thinkingLevel ?? "off",
+        const id = conversation.id;
+        // A conversation that is not an authenticated mapped chat learns nothing and causes no read.
+        if (!registry.isChat(id)) return emptyBackgroundStatus();
+        const cronOwner = registry.cronOwner(id);
+        return readBackgroundStatus({
+          harness: openedHarness,
+          conversationId: id,
+          ...(workerFoundation === undefined || !registry.isWorkerSpawner(id) ? {} : {
+            workers: { list: () => workerFoundation.list(openedHarness, id, ctx), taskKind: WORKER_TASK_NAME },
+          }),
+          ...(cronHost === undefined || cronOwner === undefined ? {} : {
+            cron: { list: () => cronHost.foundation.list(openedHarness, id, { owner: cronOwner }, ctx) },
+          }),
+          digest: {
+            status: () => memoryDigest.status({ id, commit: (change, inner) => conversation.commit(change, inner) }, ctx),
+          },
         }, ctx);
       },
-      ...(options.reloadConfig === undefined || options.models !== undefined ? {} : { reloadModels }),
+      activeWork: (ctx) => readActiveWork(openedHarness, ctx),
+      appTasks: appTasks.appTasks,
+      appTaskCancel: appTasks.appTaskCancel,
+      listModels: modelHost.listModels,
+      modelPresets: modelHost.modelPresets,
+      selectedModel: modelHost.selectedModel,
+      selectModel: modelHost.selectModel,
+      selectModelPreset: modelHost.selectModelPreset,
+      ...(modelHost.reloadModels === undefined ? {} : { reloadModels: modelHost.reloadModels }),
       visionHandoffStats() {
         return visionHandoff === undefined
           ? {
@@ -4359,149 +975,16 @@ export async function openGateway(config: PortConfig, context: Context, options:
             }
           : { enabled: true, describer: visionHandoff.describer, stats: visionHandoff.stats() };
       },
-      historyIdentity() {
-        return Promise.resolve(storeIdentity);
-      },
-      async listHistoryEpisodes(sessionKey, query, ctx) {
-        const conversationId = await chatConversationIdFor(sessionKey, ctx);
-        const page = await episodeCatalog!.list(conversationId, query, ctx);
-        return { ...page, episodes: await Promise.all(page.episodes.map((episode) => digestEpisodeView(episode, ctx))) };
-      },
-      async historyEpisode(sessionKey, startEntryId, ctx) {
-        const conversationId = await chatConversationIdFor(sessionKey, ctx);
-        const episode = await episodeCatalog!.episode(conversationId, startEntryId as EntryId, ctx);
-        return episode === undefined ? undefined : digestEpisodeView(episode, ctx);
-      },
-      async reconcileHistoryEpisodes(sessionKey, ctx) {
-        const conversationId = await chatConversationIdFor(sessionKey, ctx);
-        return episodeCatalog!.reconcile(conversationId, ctx);
-      },
-      async historyEpisodeSummary(sessionKey, startEntryId, ctx) {
-        if (episodeSummaries === undefined) {
-          throw new Error("Episode summaries require an explicit provider/model choice");
-        }
-        if (!Number.isSafeInteger(startEntryId) || startEntryId < 1) {
-          throw new TypeError("Episode start must be a positive entry ID");
-        }
-        const conversationId = await chatConversationIdFor(sessionKey, ctx);
-        return episodeSummaries.record(harness!, conversationId, startEntryId, ctx);
-      },
-      async historySummaryQueue(sessionKey, ctx) {
-        if (episodeSummaries === undefined) {
-          throw new Error("Episode summaries require an explicit provider/model choice");
-        }
-        const conversationId = await chatConversationIdFor(sessionKey, ctx);
-        return episodeSummaries.queue(harness!, conversationId, ctx);
-      },
-      async drainEpisodeSummaries(sessionKey, ctx) {
-        if (episodeSummaries === undefined) {
-          throw new Error("Episode summaries require an explicit provider/model choice");
-        }
-        const conversationId = await chatConversationIdFor(sessionKey, ctx);
-        return episodeSummaries.drain(harness!, conversationId, ctx);
-      },
-      async backfillEpisodeSummaries(sessionKey, ctx) {
-        if (episodeSummaries === undefined) {
-          throw new Error("Episode summaries require an explicit provider/model choice");
-        }
-        const conversationId = await chatConversationIdFor(sessionKey, ctx);
-        return episodeSummaries.backfill(harness!, conversationId, ctx);
-      },
-      async retryEpisodeSummary(sessionKey, startEntryId, ctx) {
-        if (episodeSummaries === undefined) {
-          throw new Error("Episode summaries require an explicit provider/model choice");
-        }
-        if (!Number.isSafeInteger(startEntryId) || startEntryId < 1) {
-          throw new TypeError("Episode start must be a positive entry ID");
-        }
-        const conversationId = await chatConversationIdFor(sessionKey, ctx);
-        return episodeSummaries.retry(harness!, conversationId, startEntryId, ctx);
-      },
-      async historySearch(query, ctx) {
-        return historyIndex!.search(query, ctx);
-      },
-      async historySummarySearch(query, ctx) {
-        return historyIndex!.searchSummaries(query, ctx);
-      },
-      async historySummary(sessionKey, startEntryId, ctx) {
-        if (!Number.isSafeInteger(startEntryId) || startEntryId < 1) {
-          throw new TypeError("Episode start must be a positive entry ID");
-        }
-        const conversationId = await chatConversationIdFor(sessionKey, ctx);
-        return readEpisodeSummary(conversationId, startEntryId as EntryId, ctx);
-      },
-      async historyEntries(sessionKey, query, limit, cursor, ctx) {
-        if (typeof sessionKey !== "string" || sessionKey.length === 0) {
-          throw new TypeError("History entry session key must be a non-empty string");
-        }
-        if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
-          throw new TypeError("History entry page limit must be an integer from 1 to 200");
-        }
-        if (query === null || typeof query !== "object" || Array.isArray(query)) {
-          throw new TypeError("History entry query must be an object");
-        }
-        const allowed = new Set(["minEntryId", "maxEntryId", "order"]);
-        for (const key of Object.keys(query)) {
-          if (!allowed.has(key)) throw new TypeError(`History entry query has an unsupported field: ${key}`);
-        }
-        const minEntryId = query.minEntryId;
-        const maxEntryId = query.maxEntryId;
-        for (const [name, value] of [["minEntryId", minEntryId], ["maxEntryId", maxEntryId]] as const) {
-          if (value !== undefined && (!Number.isSafeInteger(value) || value < 1)) {
-            throw new TypeError(`History entry ${name} must be a positive entry ID`);
-          }
-        }
-        const order = query.order;
-        if (order !== undefined && order !== "ascending" && order !== "descending") {
-          throw new TypeError("History entry order must be ascending or descending");
-        }
-        const conversation = await mappedChatConversationFor(sessionKey, ctx);
-        const page = await conversation.entries({
-          ...(minEntryId === undefined ? {} : { minEntryId }),
-          ...(maxEntryId === undefined ? {} : { maxEntryId }),
-          ...(order === undefined ? {} : { order }),
-        }, limit, cursor, ctx);
-        return {
-          conversationId: conversation.id,
-          sessionKey,
-          items: page.items,
-          ...(page.next === undefined ? {} : { next: page.next }),
-        };
-      },
+      ...history.methods,
       async refreshContext(sessionKey, ctx) {
-        if (!options.contextSnapshotProvider) {
-          throw new Error("Context refresh requires a configured contextSnapshotProvider");
-        }
+        if (!contextHost.enabled) throw new Error("Context refresh requires a configured contextSnapshotProvider");
         const conversation = await existingConversationFor(sessionKey, ctx);
-        return { skills: await refreshContextSnapshot(sessionKey, conversation.id, ctx) };
+        return { skills: await contextHost.refresh(sessionKey, conversation.id, ctx) };
       },
       async resetSession(sessionKey, ctx) {
         // `/new` may be the first message in a chat, so its own mapped conversation is resolved the
-        // same way `conversationFor` resolves it (creating only that host-supplied key). No other
-        // session selector exists here.
-        const conversation = await gateway.conversationFor(sessionKey, ctx);
-        // A new context retires questions the owner can no longer meaningfully answer: an answer
-        // would start a fresh turn that no longer sees the question in its context. Existing buttons
-        // remain, and a later tap is refused with fixed text.
-        const cancelQuestions = () => conversation.commit(async (tx) => {
-          cancelPendingQuestions(await tx.doc(AskQuestionsDoc, conversation.id));
-        }, ctx);
-        // Without a host prompt snapshot there is nothing to rebuild: the native reset is the whole effect.
-        if (!options.contextSnapshotProvider) {
-          await conversation.reset(undefined, ctx);
-          await cancelQuestions();
-          return { status: "reset", skills: 0, promptRebuilt: false };
-        }
-        let skills: number;
-        try {
-          // Rebuild and reset atomically: a live run refuses before either effect is published.
-          skills = await refreshContextSnapshot(sessionKey, conversation.id, ctx, true);
-        } catch (error) {
-          if (error instanceof ConversationBusy) return { status: "busy" };
-          throw error;
-        }
-        await cancelQuestions();
-        return { status: "reset", skills, promptRebuilt: true };
+        // same way `conversationFor` resolves it (creating only that host-supplied key).
+        return contextHost.resetSession(sessionKey, await gateway.conversationFor(sessionKey, ctx), ctx);
       },
       async close(ctx) {
         if (closed) return;
@@ -4520,402 +1003,60 @@ export async function openGateway(config: PortConfig, context: Context, options:
         await close(() => mcpAdminRef.current?.close());
         await close(() => idleRollover?.close());
         // Stop derived background work before the session stops accepting commits.
-        await close(() => episodeCatalog?.close());
-        await close(() => harness!.close(cleanup));
+        await close(() => historyParts.episodeCatalog?.close());
+        await close(() => openedHarness.close(cleanup));
         // Code Mode first: it owns sandbox workers that may be calling MCP tools. Then the MCP
         // clients, whose native transports tear down their server process groups.
         await close(() => codeModeRef.current?.close());
         await close(() => mcpRef.current?.close());
         await close(() => memoryServiceRef.current?.close());
-        await close(() => historyIndex?.close());
-        for (const environments of workerEnvironments.values()) await close(() => environments.close(cleanup));
-        workerEnvironments.clear();
+        await close(() => historyParts.historyIndex?.close());
+        await workerEnvironments.closeAll(close, cleanup);
         await close(() => toolEnvironments?.close(cleanup));
         await close(() => releaseLock());
         if (failure !== undefined) throw failure.error;
       },
     };
-    async function digestEpisodeView(episode: HistoryEpisode, ctx: Context): Promise<HistoryEpisode> {
-      let status: NonNullable<HistoryEpisode["digestion"]>["status"] = "unknown";
-      let nextEntryId: number | null = null;
-      let nextItemIndex: number | null = null;
-      let nextTextStart: number | null = null;
-      try {
-        const cursor = await digestSourceRef.current!.cursor(episode.conversationId, ctx);
-        nextEntryId = cursor.nextEntryId;
-        nextItemIndex = cursor.nextItemIndex;
-        nextTextStart = cursor.nextTextStart;
-        if (episode.endEntryId !== null) {
-          if (nextEntryId !== null && nextEntryId > episode.endEntryId) {
-            status = "digested";
-            // The importer's reset provenance identifies the baseline, not a name suffix or a
-            // fake successful digest task. Future episodes in the same chat are not legacy units.
-            const conversation = await harness!.conversation(episode.conversationId, ctx);
-            const first = (await conversation?.entries({ order: "ascending", minEntryId: episode.startEntryId,
-              maxEntryId: episode.startEntryId }, 1, undefined, ctx))?.items[0];
-            if (first?.data && typeof first.data === "object" && "legacy" in first.data) status = "imported-baseline";
-          } else status = nextEntryId !== null && (nextEntryId > episode.startEntryId
-            || (nextEntryId === episode.startEntryId && (cursor.nextItemIndex > 0 || cursor.nextTextStart > 0)))
-            ? "partial" : "not-started";
-        }
-      } catch { /* An unreadable frontier is unknown, never guessed as pending or consumed. */ }
-      if (episode.status === "open") status = "open-ineligible";
-      return { ...episode, digestion: { status, nextEntryId, nextItemIndex, nextTextStart } };
-    }
-    async function chatConversationIdFor(sessionKey: string, ctx: Context): Promise<ConversationId> {
-      return (await mappedChatConversationFor(sessionKey, ctx)).id;
-    }
-    async function mappedChatConversationFor(sessionKey: string, ctx: Context): Promise<Conversation> {
-      // State-only conversations hold channel bookkeeping, not discussion: they are not history.
-      if (!isChatSessionKey(sessionKey)) throw new Error("State-only conversations are not chat history");
-      const conversation = await existingConversationFor(sessionKey, ctx);
-      await assertMappedChatConversations([{ sessionKey, conversationId: conversation.id }], ctx);
-      return conversation;
-    }
-    async function mappedConversationId(sessionKey: string, ctx: Context): Promise<ConversationId | undefined> {
-      const key = encodedSessionKey(sessionKey);
-      const map = await harness!.snapshot(SessionMap, root.id, ctx);
-      const id = map && Object.hasOwn(map.sessions, key) ? map.sessions[key] : undefined;
-      return Number.isSafeInteger(id) ? id as ConversationId : undefined;
-    }
-    async function existingConversationFor(sessionKey: string, ctx: Context): Promise<Conversation> {
-      const id = await mappedConversationId(sessionKey, ctx);
-      if (id === undefined) throw new Error("Unknown session key");
-      const conversation = await harness!.conversation(id, ctx);
-      if (!conversation) throw new Error("Stored conversation mapping points to a missing conversation");
-      return conversation;
-    }
-    /**
-     * One bounded snapshot per read, never a claim of atomicity across the parts: each foundation is
-     * read once, in order, and nothing is written. `emptyBackgroundStatus()` is returned for a
-     * conversation that is not an authenticated mapped chat, so a root, state, fork or task-owned
-     * conversation learns nothing and causes no read at all.
-     */
-    async function backgroundStatusFor(sessionKey: string, ctx: Context): Promise<BackgroundStatus> {
-      const conversation = await existingConversationFor(sessionKey, ctx);
-      const conversationId = conversation.id;
-      if (!authorizedChatConversations.has(conversationId)) return emptyBackgroundStatus();
-      // Restart is process-wide, so its count is read for the whole store, not for this chat alone.
-      const active = await activeWorkFor(ctx);
-      // A native task record keeps its last state when Durable parks it, so "unfinished" is not the
-      // same as "will run": only the live-work inspection reports blocked tasks. It is read lazily,
-      // once, and only when something unfinished actually needs classifying.
-      let blockedTasks: Map<number, string> | undefined;
-      const blockedNow = async (): Promise<Map<number, string>> => {
-        if (blockedTasks !== undefined) return blockedTasks;
-        const blocked = new Map<number, string>();
-        for (const task of (await harness!.inspect(ctx)).tasks) {
-          // A blocked task has no installed definition that can run it, so it is reported parked.
-          if (task.state.kind === "blocked") blocked.set(Number(task.record.id), task.state.reason);
-        }
-        blockedTasks = blocked;
-        return blocked;
-      };
-      // Workers: this conversation's retained records, re-checked against the native task record so a
-      // stale pointer or a record naming someone else's task is never reported as live work.
-      const workerItems: BackgroundWorker[] = [];
-      let liveWorkers = 0;
-      let parkedWorkers = 0;
-      let runningWorkers = 0;
-      let waitingWorkers = 0;
-      let queuedWorkers = 0;
-      if (workerFoundation !== undefined && workerSpawners.has(conversationId)) {
-        for (const view of await workerFoundation.list(harness!, conversationId, ctx)) {
-          if (view.status !== "queued" && view.status !== "running") continue;
-          const task = await harness!.getTask(view.taskId as TaskId, ctx);
-          if (task === undefined || task.kind !== WORKER_TASK_NAME || task.conversationId !== conversationId) continue;
-          const state = task.state.status;
-          if (state === "terminal") continue;
-          const blockReason = (await blockedNow()).get(view.taskId);
-          if (blockReason === undefined) {
-            liveWorkers += 1;
-            // Count only what the native state establishes: a waiting worker is not generating, and
-            // a queued one has not started. A parked worker is reported separately below.
-            if (state === "running" || state === "completing") runningWorkers += 1;
-            else if (state === "waiting") waitingWorkers += 1;
-            else if (state === "pending" || state === "sleeping") queuedWorkers += 1;
-          } else parkedWorkers += 1;
-          if (workerItems.length >= BACKGROUND_STATUS_LIMITS.rows) continue;
-          workerItems.push({
-            taskId: view.taskId,
-            status: blockReason === undefined ? state : "parked",
-            task: backgroundLabel(view.prompt),
-            workspace: view.workspaceMode,
-          });
-        }
-      }
-      // Cron: this conversation's own jobs, read through the same derived view the cron tool uses, so
-      // the native timer/run/target states decide what is executing, queued, parked or merely armed.
-      const cronOwner = cronOwners.get(conversationId);
-      const runningItems: BackgroundCronRun[] = [];
-      let runningTotal = 0;
-      let scheduled = 0;
-      let nextAtMs: number | null = null;
-      let pendingCron = 0;
-      let parked = 0;
-      if (cronFoundation !== undefined && cronOwner !== undefined) {
-        for (const view of await cronFoundation.list(harness!, conversationId, { owner: cronOwner }, ctx)) {
-          // `parked` is a task no installed definition can take and `missing` is an absent record.
-          // Either way the job cannot execute, so it is never folded into the healthy count.
-          if (view.status === "parked" || view.status === "missing") parked += 1;
-          if (view.nextAtMs !== null) {
-            scheduled += 1;
-            nextAtMs = nextAtMs === null ? view.nextAtMs : Math.min(nextAtMs, view.nextAtMs);
-          }
-          const execution = view.execution?.status;
-          const executing = executingState(execution) ?? executingState(view.target?.status);
-          if (executing !== undefined) {
-            runningTotal += 1;
-            if (runningItems.length < BACKGROUND_STATUS_LIMITS.rows) {
-              runningItems.push({ name: backgroundLabel(view.job.name), status: executing });
-            }
-            continue;
-          }
-          if (execution === "pending" || execution === "waiting" || execution === "sleeping") pendingCron += 1;
-        }
-      }
-      // One workspace-global digest run at a time: its origin decides whether this chat owns it.
-      const digestStatus = await memoryDigest.status({
-        id: conversationId,
-        commit: (change, inner) => conversation.commit(change, inner),
-      }, ctx);
-      const digestLive: BackgroundDigest["live"] = digestStatus.liveTaskId === null
-        ? "none"
-        : digestStatus.liveConversationId === conversationId ? "own" : "shared";
-      const digestParked = digestStatus.liveTaskId !== null
-        && (await blockedNow()).has(digestStatus.liveTaskId);
-      return {
-        workers: {
-          live: liveWorkers,
-          parked: parkedWorkers,
-          running: runningWorkers,
-          waiting: waitingWorkers,
-          queued: queuedWorkers,
-          items: workerItems,
-        },
-        cron: {
-          scheduled,
-          nextAtMs,
-          running: { total: runningTotal, items: runningItems },
-          pending: pendingCron,
-          parked,
-        },
-        digest: { live: digestLive, parked: digestParked },
-        active,
-      };
-    }
-    /**
-     * The Tasks view of one mapped thread. The owner-scoped list functions decide what exists; this
-     * function only reads them, once each, and never creates, retries or changes anything. An
-     * unmapped session key has no conversation to read, so it answers an empty list rather than
-     * mapping (and thereby creating) one.
-     */
-    async function appTasksFor(sessionKey: string, ctx: Context): Promise<AppTaskList> {
-      const conversationId = await mappedConversationId(sessionKey, ctx);
-      if (conversationId === undefined) return { tasks: [] };
-      // Only an authenticated mapped chat has tasks to show or cancel (as backgroundStatusFor checks).
-      if (!authorizedChatConversations.has(conversationId)) return { tasks: [] };
-      const workers = workerFoundation !== undefined && workerSpawners.has(conversationId)
-        ? await workerFoundation.list(harness!, conversationId, ctx)
-        : [];
-      const cronOwner = cronOwners.get(conversationId);
-      const jobs = cronFoundation !== undefined && cronOwner !== undefined
-        ? await cronFoundation.list(harness!, conversationId, { owner: cronOwner }, ctx)
-        : [];
-      return { tasks: selectTasks(workers, jobs) };
-    }
-    /**
-     * Cancels one task of one mapped thread. The task is resolved through this thread's own owner-
-     * scoped list first, so an id from another conversation is never passed to either foundation:
-     * it reports `unknown` and nothing is touched. A worker uses the ordinary durable cancel; a job
-     * uses the cron cancel, where a recorded cancellation whose cleanup threw is still `cancelled`,
-     * exactly as the model-facing tool reports it.
-     */
-    async function appTaskCancelFor(
-      sessionKey: string, task: string, ctx: Context,
-    ): Promise<AppTaskCancelResult> {
-      const conversationId = await mappedConversationId(sessionKey, ctx);
-      if (conversationId === undefined) return { outcome: "unknown" };
-      // Only an authenticated mapped chat has tasks to show or cancel (as backgroundStatusFor checks).
-      if (!authorizedChatConversations.has(conversationId)) return { outcome: "unknown" };
-      if (workerFoundation !== undefined && workerSpawners.has(conversationId)) {
-        const worker = (await workerFoundation.list(harness!, conversationId, ctx))
-          .find((view) => workerTaskId(view.taskId) === task);
-        if (worker !== undefined) {
-          const title = workerTask(worker).title;
-          // A thrown cancel is reported as a failure, like the worker tool: the abort either
-          // committed or it did not, and claiming an outcome here would be a guess.
-          const result = await workerFoundation.cancel(harness!, conversationId, worker.taskId, ctx);
-          const outcome = result === "marked" ? "cancelled" : result === "terminal" ? "finished" : "unknown";
-          return { outcome, title };
-        }
-      }
-      const cronOwner = cronOwners.get(conversationId);
-      if (cronFoundation !== undefined && cronOwner !== undefined) {
-        const job = (await cronFoundation.list(harness!, conversationId, { owner: cronOwner }, ctx))
-          .find((view) => cronTaskId(view.job.id) === task);
-        if (job !== undefined) {
-          const title = cronTask(job).title;
-          let result: Awaited<ReturnType<CronFoundation["cancel"]>>;
-          try {
-            result = await cronFoundation.cancel(harness!, conversationId, job.job.id, { owner: cronOwner }, ctx);
-          } catch (error) {
-            // A throw may still have committed the cancellation before cleanup failed; re-read the
-            // job and report the recorded truth instead of inviting a retry.
-            let after: Awaited<ReturnType<CronFoundation["inspect"]>>;
-            try {
-              after = await cronFoundation.inspect(harness!, conversationId, job.job.id, { owner: cronOwner }, ctx);
-            } catch {
-              after = undefined;
-            }
-            if (after === undefined || after.job.cancelledAtMs === null) throw error;
-            return { outcome: "cancelled", title };
-          }
-          if (result.status === "cancelled") return { outcome: "cancelled", title };
-          if (result.status === "already_terminal") return { outcome: "finished", title };
-          return { outcome: "unknown" };
-        }
-      }
-      return { outcome: "unknown" };
-    }
-    /**
-     * One read of the native task inspection. Sleeping is an armed timer and blocked is parked work,
-     * so neither is work a replacement could interrupt; everything else is unfinished work it would
-     * cut into. Nothing is written, aborted or retried here.
-     */
-    async function activeWorkFor(ctx: Context): Promise<BackgroundActiveWork> {
-      let interrupting = 0;
-      for (const task of (await harness!.inspect(ctx)).tasks) {
-        if (task.state.kind === "sleeping" || task.state.kind === "blocked") continue;
-        interrupting += 1;
-      }
-      return { interrupting };
-    }
-    // Summary policy and cut-chain repair. The opt-in watermark is recorded before any catalog pass
-    // can enqueue history, so enabling summaries never spends on episodes that already existed. A
-    // queue with no live task means the chain was cut by an abort, a fault or a crash before the
-    // terminal commit; repairing it is deterministic, at most one task per mapped session.
-    if (episodeSummaries !== undefined) {
-      const backfillEnabled = episodeSummaryModel?.backfill === "pending";
-      // A backfill scan lists episode documents, so the catalog must record those boundaries first:
-      // an unrecorded boundary is not work and must not be skipped or called complete.
-      const settleCatalog = async (conversationId: ConversationId, passes: number): Promise<boolean> => {
-        for (let pass = 0; pass < passes; pass += 1) {
-          const report = await episodeCatalog!.reconcile(conversationId, context);
-          if (report.caughtUp) return true;
-        }
-        return false;
-      };
-      // Summary policy stays chat-only: an automation conversation's episodes are catalogued, but a
-      // summary of one has no reader (the history tool is mapped-chat scoped), so it is not
-      // initialized here and the catalog's enqueue defers instead of spending on it.
-      for (const session of await mappedChatSessions(context)) {
-        try {
-          await episodeSummaries.initialize(harness, session.conversationId, context);
-          await settleCatalog(session.conversationId, EPISODE_SUMMARY_QUEUE_LIMITS.startupCatalogPasses);
-          if (backfillEnabled) {
-            for (let pass = 0; pass < EPISODE_SUMMARY_QUEUE_LIMITS.backfillPassesPerRun; pass += 1) {
-              const report = await episodeSummaries.backfill(harness, session.conversationId, context);
-              if (report.complete) break;
-              if (report.reason !== "catalog-behind") break;
-              // More history to record before its boundaries can be queued; one bounded round.
-              await settleCatalog(session.conversationId, 2);
-            }
-          }
-          await episodeSummaries.drain(harness, session.conversationId, context);
-        } catch {
-          // A policy/repair failure is derived work; the durable queue keeps the jobs for a later drain.
-        }
-      }
-    }
-    // Scheduling begins only after registry and all persisted conversation policies are ready.
-    memoryServiceRef.current = memoryService;
-    harness.resume();
+    await history.settleSummaries(context);
+    // Scheduling begins only after the registry and all persisted conversation policies are ready.
+    memoryServiceRef.current = history.memoryService;
+    openedHarness.resume();
     if (config.idleRollover !== undefined) {
-      idleRollover = startIdleRollover({
-        afterMs: config.idleRollover!.afterMinutes * 60_000,
+      idleRollover = startGatewayIdleRollover({
+        afterMs: config.idleRollover.afterMinutes * 60_000,
         now,
         context,
-        sessions: async (ctx) => (await mappedChatSessions(ctx))
-          .filter((session) => authorizedChatConversations.has(session.conversationId)),
-        quiet: async (ctx) => (await activeWorkFor(ctx)).interrupting === 0,
-        probe: async (conversationId, ctx) => {
-          if ((await harness!.snapshot(LiveDoc, conversationId, ctx))?.run !== undefined) return undefined;
-          const conversation = await harness!.conversation(conversationId, ctx);
-          if (conversation === undefined) return undefined;
-          const [latest] = (await conversation.entries({ order: "descending" }, 1, undefined, ctx)).items;
-          // Nothing since the last reset (a rollover or `/new`): nothing to roll over.
-          if (latest === undefined || latest.kind === ResetEntry.kind) return undefined;
-          return latest.id;
-        },
-        continues: async (conversationId, message, idleMs, signal) => {
-          const classifier = models.getModelOfType("classifier", classifierGrant!.provider, classifierGrant!.modelId);
-          const conversation = await harness!.conversation(conversationId, context);
-          if (classifier === undefined || conversation === undefined) return undefined;
-          const previous = renderRolloverSource((await conversation.context(context)).messages);
-          if (previous.trim().length === 0) return undefined;
-          const result = await models.classify(classifier, {
-            state: { previousConversation: previous, idleMinutes: Math.round(idleMs / 60_000), newMessage: message },
-            questions: {
-              continues: {
-                type: "bool",
-                instructions: "previousConversation is the newest part of an owner's conversation with their assistant, which then went idle."
-                  + " Decide whether newMessage, the owner's first message after the pause, continues that conversation.",
-                criteria: {
-                  true: "newMessage follows up on, answers, or refers back to the previous conversation, or makes sense only with it.",
-                  false: "newMessage starts a different topic that does not need the previous conversation.",
-                },
-              },
-            },
-          }, { signal, telemetry: context.telemetry });
-          const answer = result.answers.continues;
-          if (result.stopReason !== "stop" || answer?.type !== "bool") {
-            journalEvent("gateway.idleRollover.unclassified", { stop: String(result.stopReason) });
-            return undefined;
+        harness: openedHarness,
+        models: () => modelHost.state().models,
+        classifier: classifierGrant!,
+        sessions: async (ctx) => (await mappedChatSessions(ctx)).filter((session) => registry.isChat(session.conversationId)),
+        quiet: async (ctx) => (await readActiveWork(openedHarness, ctx)).interrupting === 0,
+        reset: async (session, reset, ctx) => {
+          if (contextHost.enabled) {
+            await contextHost.refresh(session.sessionKey, session.conversationId, ctx, reset);
+            return;
           }
-          const continues = answer.probability >= 0.5;
-          journalEvent("gateway.idleRollover.classified", { probability: Math.round(answer.probability * 100) / 100, continues });
-          return continues;
-        },
-        rollover: async (session, expectLatest, ctx) => {
-          const reset: IdleRolloverReset = { expectLatest };
-          try {
-            if (options.contextSnapshotProvider) {
-              await refreshContextSnapshot(session.sessionKey, session.conversationId, ctx, reset);
-            } else {
-              const conversation = await harness!.conversation(session.conversationId, ctx);
-              if (conversation === undefined) return;
-              await conversation.commit((tx) => appendIdleRollover(tx, session.conversationId, reset), ctx);
-            }
-          } catch (error) {
-            // New activity won the race; the next idle period starts a fresh clock.
-            if (error instanceof IdleRolloverStale || error instanceof ConversationBusy) return;
-            throw error;
-          }
+          const conversation = await openedHarness.conversation(session.conversationId, ctx);
+          if (conversation === undefined) return;
+          await conversation.commit((tx) => appendIdleRolloverReset(tx, session.conversationId, reset, now()), ctx);
         },
         report: (error) => reportFailure(error, "gateway.idleRollover"),
       });
     }
     // A worker that finished while the process was gone already committed its outcome and retired its
-    // authority, but may not have admitted the internal result event. Re-admitting is idempotent by the
-    // conversation-scoped request ID, so a crash cannot lose a result or duplicate the parent's turn.
+    // authority, but may not have admitted the internal result event. Re-admitting is idempotent by
+    // the conversation-scoped request ID, so a crash cannot lose a result or duplicate the turn.
     if (workerFoundation !== undefined) {
       try {
-        await workerFoundation.recover(harness, (conversationId) => workerSpawners.has(conversationId), context);
+        await workerFoundation.recover(openedHarness, (id) => registry.isWorkerSpawner(id), context);
       } catch {
         // The records stay unnotified; the next open retries the same admission.
       }
     }
-    // The same admission guarantee for a terminal failed or cancelled digest run: its internal issue
-    // report may have been lost between the terminal commit and the submit. Only currently mapped
-    // chat origins are notified, and the request ID keeps a retry from duplicating the origin
-    // agent's turn. A successful run is never admitted at all.
+    // The same admission guarantee for a terminal failed or cancelled digest run; only currently
+    // mapped chat origins are notified, and a successful run is never admitted at all.
     try {
-      await memoryDigest.recover(
-        harness,
-        (conversationId) => authorizedChatConversations.has(conversationId),
-        context,
-      );
+      await memoryDigest.recover(openedHarness, (id) => registry.isChat(id), context);
     } catch {
       // Notices stay open; the next open retries.
     }
@@ -4924,21 +1065,21 @@ export async function openGateway(config: PortConfig, context: Context, options:
     // Keep the primary Durable/open failure even if cleanup itself throws afterwards.
     reportFailure(error, "gateway.open");
     const cleanup = withoutAbortSignal(context);
-    // A failed open must not leave deferred cataloguing attached to a closed session, nor a
-    // derived index handle open behind a failed gateway.
+    // A failed open must not leave a login, deferred cataloguing or a derived index handle behind.
     const close = async (operation: () => unknown): Promise<void> => {
       try { await operation(); }
       catch (cleanupError) { reportFailure(cleanupError, "gateway.close.runtime"); }
     };
+    await close(() => mcpAdminRef.current?.close());
     await close(() => idleRollover?.close());
-    await close(() => episodeCatalog?.close());
-    await close(() => memoryServiceRef.current?.close());
+    await close(() => historyParts.episodeCatalog?.close());
+    await close(() => historyParts.memoryService?.close());
     memoryServiceRef.current = undefined;
     await close(() => harness ? harness.close(cleanup) : storage?.close(cleanup));
     await close(() => codeModeRef.current?.close());
     await close(() => mcpRef.current?.close());
-    await close(() => historyIndex?.close());
-    for (const environments of workerEnvironments.values()) await close(() => environments.close(cleanup));
+    await close(() => historyParts.historyIndex?.close());
+    await workerEnvironments.closeAll(close, cleanup);
     await close(() => toolEnvironments?.close(cleanup));
     await close(() => releaseLock());
     throw error;

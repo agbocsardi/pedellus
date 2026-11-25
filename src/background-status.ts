@@ -12,6 +12,12 @@
  * recovery interface.
  */
 
+import type { Context } from "@earendil-works/chord";
+import type { ConversationId, Harness, TaskId } from "@earendil-works/pi-durable";
+import type { CronJobView } from "./automation/cron.js";
+import type { MemoryDigestStatus } from "./history/memory-digest.js";
+import type { WorkerView } from "./workers/worker-task.js";
+
 export const BACKGROUND_STATUS_LIMITS = Object.freeze({
   /** Rows of live workers and of executing cron runs rendered; every read is bounded separately. */
   rows: 4,
@@ -203,4 +209,157 @@ export function renderBackgroundStatus(status: BackgroundStatus | undefined): st
 function isoTime(ms: number | null): string | undefined {
   if (ms === null || !Number.isSafeInteger(ms) || Math.abs(ms) > 8.64e15) return undefined;
   return new Date(ms).toISOString();
+}
+
+/* ------------------------------------------------------------------------ */
+/* Host readers                                                              */
+/* ------------------------------------------------------------------------ */
+
+/** A native task state that is executing work right now; pending, waiting and sleeping are not. */
+function executingState(value: string | undefined): BackgroundTaskState | undefined {
+  return value === "running" || value === "completing" ? value : undefined;
+}
+
+/** The one native read both readers use: live task records and their scheduler state. */
+export interface BackgroundInspector {
+  inspect(context: Context): Promise<{
+    readonly tasks: readonly { readonly record: { readonly id: unknown }; readonly state: { readonly kind: string; readonly reason?: string } }[];
+  }>;
+}
+
+/**
+ * One read of the native task inspection. Sleeping is an armed timer and blocked is parked work,
+ * so neither is work a replacement could interrupt; everything else is unfinished work it would
+ * cut into. Nothing is written, aborted or retried here.
+ */
+export async function readActiveWork(harness: BackgroundInspector, context: Context): Promise<BackgroundActiveWork> {
+  let interrupting = 0;
+  for (const task of (await harness.inspect(context)).tasks) {
+    if (task.state.kind === "sleeping" || task.state.kind === "blocked") continue;
+    interrupting += 1;
+  }
+  return { interrupting };
+}
+
+/** What the status reader needs for one already-authorized mapped chat conversation. */
+export interface BackgroundStatusSources {
+  readonly harness: BackgroundInspector & Pick<Harness, "getTask">;
+  readonly conversationId: ConversationId;
+  /** Present only when workers are enabled and this conversation may spawn them. */
+  readonly workers?: { list(): Promise<readonly WorkerView[]>; readonly taskKind: string };
+  /** Present only when cron is enabled and this conversation is a cron owner. */
+  readonly cron?: { list(): Promise<readonly CronJobView[]> };
+  readonly digest: { status(): Promise<Pick<MemoryDigestStatus, "liveTaskId" | "liveConversationId">> };
+}
+
+/**
+ * One bounded snapshot per read, never a claim of atomicity across the parts: each foundation is
+ * read once, in order, and nothing is written. The caller decides authorization first: a root,
+ * state, fork or task-owned conversation reads `emptyBackgroundStatus()` instead of calling this.
+ */
+export async function readBackgroundStatus(sources: BackgroundStatusSources, context: Context): Promise<BackgroundStatus> {
+  const { harness, conversationId } = sources;
+  // Restart is process-wide, so its count is read for the whole store, not for this chat alone.
+  const active = await readActiveWork(harness, context);
+  // A native task record keeps its last state when Durable parks it, so "unfinished" is not the
+  // same as "will run": only the live-work inspection reports blocked tasks. It is read lazily,
+  // once, and only when something unfinished actually needs classifying.
+  let blockedTasks: Map<number, string> | undefined;
+  const blockedNow = async (): Promise<Map<number, string>> => {
+    if (blockedTasks !== undefined) return blockedTasks;
+    const blocked = new Map<number, string>();
+    for (const task of (await harness.inspect(context)).tasks) {
+      // A blocked task has no installed definition that can run it, so it is reported parked.
+      if (task.state.kind === "blocked") blocked.set(Number(task.record.id), task.state.reason ?? "");
+    }
+    blockedTasks = blocked;
+    return blocked;
+  };
+  // Workers: this conversation's retained records, re-checked against the native task record so a
+  // stale pointer or a record naming someone else's task is never reported as live work.
+  const workerItems: BackgroundWorker[] = [];
+  let liveWorkers = 0;
+  let parkedWorkers = 0;
+  let runningWorkers = 0;
+  let waitingWorkers = 0;
+  let queuedWorkers = 0;
+  if (sources.workers !== undefined) {
+    for (const view of await sources.workers.list()) {
+      if (view.status !== "queued" && view.status !== "running") continue;
+      const task = await harness.getTask(view.taskId as TaskId, context);
+      if (task === undefined || task.kind !== sources.workers.taskKind || task.conversationId !== conversationId) continue;
+      const state = task.state.status;
+      if (state === "terminal") continue;
+      const blockReason = (await blockedNow()).get(view.taskId);
+      if (blockReason === undefined) {
+        liveWorkers += 1;
+        // Count only what the native state establishes: a waiting worker is not generating, and
+        // a queued one has not started. A parked worker is reported separately below.
+        if (state === "running" || state === "completing") runningWorkers += 1;
+        else if (state === "waiting") waitingWorkers += 1;
+        else if (state === "pending" || state === "sleeping") queuedWorkers += 1;
+      } else parkedWorkers += 1;
+      if (workerItems.length >= BACKGROUND_STATUS_LIMITS.rows) continue;
+      workerItems.push({
+        taskId: view.taskId,
+        status: blockReason === undefined ? state : "parked",
+        task: backgroundLabel(view.prompt),
+        workspace: view.workspaceMode,
+      });
+    }
+  }
+  // Cron: this conversation's own jobs, read through the same derived view the cron tool uses, so
+  // the native timer/run/target states decide what is executing, queued, parked or merely armed.
+  const runningItems: BackgroundCronRun[] = [];
+  let runningTotal = 0;
+  let scheduled = 0;
+  let nextAtMs: number | null = null;
+  let pendingCron = 0;
+  let parked = 0;
+  if (sources.cron !== undefined) {
+    for (const view of await sources.cron.list()) {
+      // `parked` is a task no installed definition can take and `missing` is an absent record.
+      // Either way the job cannot execute, so it is never folded into the healthy count.
+      if (view.status === "parked" || view.status === "missing") parked += 1;
+      if (view.nextAtMs !== null) {
+        scheduled += 1;
+        nextAtMs = nextAtMs === null ? view.nextAtMs : Math.min(nextAtMs, view.nextAtMs);
+      }
+      const execution = view.execution?.status;
+      const executing = executingState(execution) ?? executingState(view.target?.status);
+      if (executing !== undefined) {
+        runningTotal += 1;
+        if (runningItems.length < BACKGROUND_STATUS_LIMITS.rows) {
+          runningItems.push({ name: backgroundLabel(view.job.name), status: executing });
+        }
+        continue;
+      }
+      if (execution === "pending" || execution === "waiting" || execution === "sleeping") pendingCron += 1;
+    }
+  }
+  // One workspace-global digest run at a time: its origin decides whether this chat owns it.
+  const digestStatus = await sources.digest.status();
+  const digestLive: BackgroundDigest["live"] = digestStatus.liveTaskId === null
+    ? "none"
+    : digestStatus.liveConversationId === conversationId ? "own" : "shared";
+  const digestParked = digestStatus.liveTaskId !== null && (await blockedNow()).has(digestStatus.liveTaskId);
+  return {
+    workers: {
+      live: liveWorkers,
+      parked: parkedWorkers,
+      running: runningWorkers,
+      waiting: waitingWorkers,
+      queued: queuedWorkers,
+      items: workerItems,
+    },
+    cron: {
+      scheduled,
+      nextAtMs,
+      running: { total: runningTotal, items: runningItems },
+      pending: pendingCron,
+      parked,
+    },
+    digest: { live: digestLive, parked: digestParked },
+    active,
+  };
 }

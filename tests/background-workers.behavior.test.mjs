@@ -2797,3 +2797,198 @@ test('cancelling a worker with an accepted steer withdraws the queued message in
     await rm(fixture.directory, { recursive: true, force: true });
   }
 });
+
+test('worktree worker environments are closed and evicted on finalize and abort while the gateway stays open', { timeout: 40_000 }, async () => {
+  const fixture = await fixtureWorkspace({ git: true });
+  const abortChildRanExec = deferred();
+  const releaseAbortChild = deferred();
+  let abortChildBlocked = false;
+  const issued = new Set();
+  const childExecIssued = new Set();
+  const store = await syntheticStore(fixture, async (transcript, options) => {
+    const input = lastUserText(transcript.messages);
+    if (input.includes('Background worker task.')) {
+      const transcriptJson = transcriptText(transcript.messages);
+      if (input.includes('WORKTREE-COMPLETE-ENV')) {
+        if (!childExecIssued.has('complete')) {
+          childExecIssued.add('complete');
+          return fauxAssistantMessage([
+            fauxToolCall('bash', { command: 'printf "%s\\n" "$TMPDIR"' }, { id: 'wt-complete-exec' }),
+          ], { stopReason: 'toolUse' });
+        }
+        const match = transcriptJson.match(/\/[^\\"\s]*nanobot-host-exec-[^\\"\s]+/);
+        return fauxAssistantMessage(`COMPLETE-DONE ${match?.[0] ?? ''}`);
+      }
+      if (input.includes('WORKTREE-ABORT-ENV')) {
+        if (!childExecIssued.has('abort')) {
+          childExecIssued.add('abort');
+          return fauxAssistantMessage([
+            fauxToolCall('bash', { command: 'printf "%s\\n" "$TMPDIR"' }, { id: 'wt-abort-exec' }),
+          ], { stopReason: 'toolUse' });
+        }
+        if (!abortChildBlocked) {
+          abortChildBlocked = true;
+          abortChildRanExec.resolve();
+          await new Promise((resolve) => {
+            const signal = options?.signal;
+            if (signal?.aborted) return resolve();
+            signal?.addEventListener('abort', () => resolve(), { once: true });
+            releaseAbortChild.promise.then(() => resolve());
+          });
+        }
+        return fauxAssistantMessage('LATE-ABORT');
+      }
+    }
+    if (input.includes('[internal worker result]')) return fauxAssistantMessage('noted');
+    if (input === 'spawn complete worktree' && !issued.has(input)) {
+      issued.add(input);
+      return fauxAssistantMessage([
+        fauxToolCall(WORKER_TOOL_NAME, {
+          action: 'start',
+          task: 'WORKTREE-COMPLETE-ENV report TMPDIR',
+          workspace_mode: 'worktree',
+        }, { id: 'start-complete-wt' }),
+      ], { stopReason: 'toolUse' });
+    }
+    if (input === 'spawn abort worktree' && !issued.has(input)) {
+      issued.add(input);
+      return fauxAssistantMessage([
+        fauxToolCall(WORKER_TOOL_NAME, {
+          action: 'start',
+          task: 'WORKTREE-ABORT-ENV report TMPDIR then wait',
+          workspace_mode: 'worktree',
+        }, { id: 'start-abort-wt' }),
+      ], { stopReason: 'toolUse' });
+    }
+    return fauxAssistantMessage('ok');
+  }, { toolAllowlist: ['read', 'write', 'bash'] });
+
+  let completeWatcher;
+  let abortWatcher;
+  try {
+    const conversation = await store.gateway.conversationFor(ORIGIN, context);
+
+    // 1. Completed worktree worker: its HostExecutionEnv temp dir is cleaned up on finalize
+    // before gateway.close().
+    completeWatcher = workerResultWatcher(store.gateway.harness, conversation.id, 'completed worktree worker result');
+    const first = await conversation.submit({ type: 'input', content: 'spawn complete worktree', requestId: 'wt-env-1' }, context);
+    assert.equal((await first.wait(context)).status, 'done');
+    const completePub = await within(completeWatcher.promise, WAIT_MS, 'completed worktree worker never reported');
+    const completeBody = messageText(workerResultEntry(completePub, conversation.id)?.model?.[0]);
+    const completeScratchMatch = completeBody.match(/\/[^\s]*nanobot-host-exec-[^\s]+/);
+    assert.ok(completeScratchMatch !== null, `worker must report its HostExecutionEnv TMPDIR: ${completeBody}`);
+    const completeScratch = completeScratchMatch[0];
+    await waitFor(async () => !(await exists(completeScratch)),
+      'completed worktree worker ToolEnvironments scratch dir to be closed and removed while gateway is open');
+
+    // 2. Aborted worktree worker: after it runs bash (allocating its ToolEnvironments), aborting it
+    // also closes and removes its HostExecutionEnv scratch dir while the gateway stays open.
+    abortWatcher = workerResultWatcher(store.gateway.harness, conversation.id, 'aborted worktree worker result');
+    const second = await conversation.submit({ type: 'input', content: 'spawn abort worktree', requestId: 'wt-env-2' }, context);
+    assert.equal((await second.wait(context)).status, 'done');
+    await within(abortChildRanExec.promise, WAIT_MS, 'abort worktree worker never finished exec');
+
+    const workers = (await store.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context)).workers;
+    const abortRecord = workers.find((record) => record.prompt.includes('WORKTREE-ABORT-ENV'));
+    assert.ok(abortRecord?.conversationId != null, 'abort worktree worker has a child conversation');
+    const abortChild = await store.gateway.harness.conversation(abortRecord.conversationId, context);
+    const abortEntries = (await abortChild.entries({ order: 'ascending' }, 100, undefined, context)).items;
+    const abortScratchMatch = JSON.stringify(abortEntries).match(/\/[^\\"\s]*nanobot-host-exec-[^\\"\s]+/);
+    assert.ok(abortScratchMatch !== null, 'abort worktree worker ran bash and recorded TMPDIR');
+    const abortScratch = abortScratchMatch[0];
+    assert.equal(await exists(abortScratch), true, 'worktree scratch dir exists while worker is live');
+
+    await store.gateway.harness.abortTask(abortRecord.taskId, context);
+    await within(abortWatcher.promise, WAIT_MS, 'aborted worktree worker never reported');
+    await waitFor(async () => !(await exists(abortScratch)),
+      'aborted worktree worker ToolEnvironments scratch dir to be closed and removed while gateway is open');
+  } finally {
+    releaseAbortChild.resolve();
+    completeWatcher?.stop();
+    abortWatcher?.stop();
+    await store.gateway.close(context);
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('a live worker whose task policy is damaged on reopen fails closed without foreground tools', { timeout: 30_000 }, async () => {
+  const { DatabaseSync } = await import('node:sqlite');
+  const fixture = await fixtureWorkspace({ git: true });
+  const childStarted = deferred();
+  let blocked = false;
+  const issued = new Set();
+  const store = await syntheticStore(fixture, async (transcript, options) => {
+    const input = lastUserText(transcript.messages);
+    if (input.includes('Background worker task.')) {
+      if (!blocked) {
+        blocked = true;
+        childStarted.resolve();
+        await new Promise((resolve) => {
+          const signal = options?.signal;
+          if (signal?.aborted) return resolve();
+          signal?.addEventListener('abort', () => resolve(), { once: true });
+        });
+      }
+      return fauxAssistantMessage('INTERRUPTED');
+    }
+    if (input.includes('[internal worker result]')) return fauxAssistantMessage('noted');
+    if (input === 'spawn damaged policy worker' && !issued.has(input)) {
+      issued.add(input);
+      return fauxAssistantMessage([
+        fauxToolCall(WORKER_TOOL_NAME, {
+          action: 'start',
+          task: 'DAMAGED-POLICY-WORKER wait across reopen',
+          workspace_mode: 'worktree',
+        }, { id: 'start-damaged-worker' }),
+      ], { stopReason: 'toolUse' });
+    }
+    return fauxAssistantMessage('ok');
+  }, { toolAllowlist: ['read', 'write', 'bash'] });
+
+  let workerTaskId;
+  let targetConversationId;
+  try {
+    const conversation = await store.gateway.conversationFor(ORIGIN, context);
+    const first = await conversation.submit({ type: 'input', content: 'spawn damaged policy worker', requestId: 'damaged-1' }, context);
+    assert.equal((await first.wait(context)).status, 'done');
+    await within(childStarted.promise, WAIT_MS, 'worker never reached its first model request');
+    const record = (await store.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context)).workers[0];
+    workerTaskId = record.taskId;
+    targetConversationId = record.conversationId;
+    assert.ok(typeof targetConversationId === 'number', 'worker target conversation exists');
+  } finally {
+    await store.gateway.close(context);
+  }
+
+  // Corrupt the live worker task's stored input model so workerChildPolicy() returns undefined
+  // while workerBackgroundTarget() and task ownership still identify targetConversationId.
+  const db = new DatabaseSync(join(fixture.dataDir, 'nanobot.sqlite'));
+  try {
+    const row = db.prepare('SELECT record FROM tasks WHERE id = ?').get(workerTaskId);
+    assert.ok(row && typeof row.record === 'string', 'live worker task row exists in sqlite');
+    const parsed = JSON.parse(row.record);
+    parsed.input.model = null;
+    db.prepare('UPDATE tasks SET record = ? WHERE id = ?').run(JSON.stringify(parsed), workerTaskId);
+  } finally {
+    db.close();
+  }
+
+  // Reopen: the damaged worker target must fail closed (no foreground tools, retired capture).
+  const reopened = await syntheticStore(fixture, () => fauxAssistantMessage('SHOULD-NOT-RUN-TOOLS'), {
+    toolAllowlist: ['read', 'write', 'bash'],
+  });
+  try {
+    await waitFor(async () => (await reopened.gateway.harness.getTask(workerTaskId, context))?.state.status === 'terminal',
+      'damaged worker task to settle terminal');
+    const task = await reopened.gateway.harness.getTask(workerTaskId, context);
+    assert.equal(task.state.outcome.status, 'failed');
+    const agent = await reopened.gateway.harness.snapshot(AgentDoc, targetConversationId, context);
+    assert.deepEqual(agent?.tools ?? [], [], 'damaged worker target keeps no coding tools on reopen');
+    assert.deepEqual(agent?.modelTools ?? [], [], 'damaged worker target keeps no modelTools on reopen');
+    assert.equal(await reopened.gateway.harness.snapshot(ConfigToolCaptureDoc, targetConversationId, context), undefined,
+      'damaged worker target capture is retired');
+  } finally {
+    await reopened.gateway.close(context);
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});

@@ -42,19 +42,64 @@ export const ConfigToolCaptureDoc = defineDoc<ConfigToolCaptureDocument>({
   checkpointWhen: () => true,
 });
 
+/** Strict read of a capture's tool list: every entry must be a string; mixed-type arrays are invalid. */
+export function validCapturedToolNames(tools: unknown): readonly string[] | undefined {
+  if (!Array.isArray(tools) || tools.some((name) => typeof name !== "string")) return undefined;
+  return tools as readonly string[];
+}
+
 /**
  * Names a scheduled run may hold right now: captured names the host still configures, in host
  * ceiling order. The origin check is supplied by the host because only it knows which
- * conversations are authenticated chat sessions.
+ * conversations are authenticated chat sessions. A malformed or mixed-type array fails closed.
  */
 export function boundedCapturedTools(
   captured: readonly string[],
   ceiling: readonly string[],
   originAuthorized: boolean,
 ): string[] {
-  if (!originAuthorized || !Array.isArray(captured)) return [];
-  const capturedNames = new Set<string>(captured.filter((name): name is string => typeof name === "string"));
+  if (!originAuthorized) return [];
+  const valid = validCapturedToolNames(captured);
+  if (valid === undefined) return [];
+  const capturedNames = new Set<string>(valid);
   return ceiling.filter((name) => capturedNames.has(name));
+}
+
+/** Why a durable capture does not authorize one tool call; each caller words its own refusal. */
+export type CapturedToolRefusal = "unreadable" | "missing" | "origin" | "unauthorized" | "tool";
+
+export type CapturedToolVerdict =
+  | { readonly ok: true; readonly capture: ConfigToolCaptureDocument; readonly origin: ConversationId }
+  | { readonly ok: false; readonly reason: CapturedToolRefusal };
+
+/**
+ * The one call-time reading of a {@link ConfigToolCaptureDoc}, shared by every hook and host that
+ * honours a captured grant (coding tools, worker and scheduled-run capabilities, memory recall). The
+ * stored value is untrusted JSON: a capture authorizes `tool` only when it is readable, names a
+ * positive origin conversation that `originAuthorized` still accepts, and lists `tool` among string
+ * names. Anything else is a refusal, never a widened default; a read that throws is `unreadable`.
+ */
+export async function verifyCapturedTool(
+  read: () => Promise<unknown>,
+  tool: string,
+  originAuthorized: (origin: ConversationId) => boolean,
+): Promise<CapturedToolVerdict> {
+  let value: unknown;
+  try {
+    value = await read();
+  } catch {
+    return { ok: false, reason: "unreadable" };
+  }
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return { ok: false, reason: "missing" };
+  const capture = value as Partial<Record<keyof ConfigToolCaptureDocument, unknown>>;
+  const origin = capture.originConversationId;
+  if (typeof origin !== "number" || !Number.isSafeInteger(origin) || origin < 1) return { ok: false, reason: "origin" };
+  if (!originAuthorized(origin as ConversationId)) return { ok: false, reason: "unauthorized" };
+  const tools = validCapturedToolNames(capture.tools);
+  if (tools === undefined || !tools.includes(tool)) {
+    return { ok: false, reason: "tool" };
+  }
+  return { ok: true, capture: value as ConfigToolCaptureDocument, origin: origin as ConversationId };
 }
 
 /**
@@ -78,36 +123,33 @@ export function createConfigToolHook(
 ): HookRegistration {
   const allowed = new Set(ceiling);
   const ungated = new Set(contextTools);
+  const refusals: Record<CapturedToolRefusal, (name: string) => string> = {
+    // Durable treats a throwing hook as a block, but a rejected read must never read as allowed.
+    unreadable: (name) => `Tool ${name} authority could not be read; refusing the call`,
+    missing: (name) => `Tool ${name} is not enabled for this conversation`,
+    origin: (name) => `Tool ${name} capture has an invalid origin; refusing the call`,
+    unauthorized: (name) => `Tool ${name} capture origin is not an authenticated chat; refusing the call`,
+    tool: (name) => `Tool ${name} is not in this run's captured config authority`,
+  };
   return hook(ToolTask, {
     async beforeTool(call: ToolHookCall, api, context) {
       if (ungated.has(call.name)) return undefined;
       if (delegatedTools?.(call.name) === true) return undefined;
       const chat = isAuthenticatedChat(api.conversationId);
-      const enabled = chat || capturedCeiling === undefined
-        ? allowed.has(call.name)
-        : capturedCeiling(api.conversationId).includes(call.name);
-      if (!enabled) return { block: `Tool ${call.name} is outside the host tool ceiling` };
-      if (chat) return undefined;
-      try {
-        const capture = await api.snapshot(ConfigToolCaptureDoc, api.conversationId, context);
-        if (capture === undefined) {
-          return { block: `Tool ${call.name} is not enabled for this conversation` };
-        }
-        const originId = capture.originConversationId;
-        if (!Number.isSafeInteger(originId) || originId < 1) {
-          return { block: `Tool ${call.name} capture has an invalid origin; refusing the call` };
-        }
-        if (!isAuthenticatedChat(originId as ConversationId)) {
-          return { block: `Tool ${call.name} capture origin is not an authenticated chat; refusing the call` };
-        }
-        if (!Array.isArray(capture.tools) || !capture.tools.includes(call.name)) {
-          return { block: `Tool ${call.name} is not in this run's captured config authority` };
-        }
+      if (chat) {
+        if (!allowed.has(call.name)) return { block: `Tool ${call.name} is outside the host tool ceiling` };
         return undefined;
-      } catch {
-        // Durable treats a throwing hook as a block, but a rejected hook must never read as allowed.
-        return { block: `Tool ${call.name} authority could not be read; refusing the call` };
       }
+      if (capturedCeiling === undefined) {
+        return { block: `Tool ${call.name} is not enabled for this conversation` };
+      }
+      const targetCeiling = capturedCeiling(api.conversationId);
+      if (targetCeiling.length === 0) return { block: `Tool ${call.name} is not enabled for this conversation` };
+      if (!targetCeiling.includes(call.name)) return { block: `Tool ${call.name} is outside the host tool ceiling` };
+      const verdict = await verifyCapturedTool(
+        () => api.snapshot(ConfigToolCaptureDoc, api.conversationId, context), call.name, isAuthenticatedChat,
+      );
+      return verdict.ok ? undefined : { block: refusals[verdict.reason](call.name) };
     },
   });
 }

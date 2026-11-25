@@ -285,10 +285,10 @@ test("normal SDK shutdown attempts teardown and releases ownership while keeping
         return harness;
       };
       gateway = await openGateway(config, context, { models });
-      assert.equal(observations.length, 1, 'the catalog owns the host commit observer');
+      assert.equal(observations.length, 2, 'commit effects and the catalog own the host commit observers');
       if (catalogFails) {
-        const detach = observations[0].detach;
-        observations[0].detach = () => { detach(); throw catalogFailure; };
+        const detach = observations[1].detach;
+        observations[1].detach = () => { detach(); throw catalogFailure; };
       }
       await assert.rejects(gateway.close(context), (error) => error === (catalogFails ? catalogFailure : harnessFailure));
       assert.equal(harnessCloses, 1, 'an early catalog failure must not skip native teardown');
