@@ -826,3 +826,80 @@ test('native failed attempts are reported but do not consume the successful-resp
   assert.equal(task.state.outcome.result.successfulRequests, 1);
   assert.ok(await cursorDoc(store.gateway.harness, origin.id));
 });
+
+test('incremental scope-hook accounting matches a full transcript scan and reads only new entries', { timeout: 30_000 }, async () => {
+  const { createDigestTranscriptTracker, digestToolUse, digestTranscriptUse } = await import(
+    new URL('../dist/history/digest-verifier.js', import.meta.url).href
+  );
+  const entries = [];
+  const queries = [];
+  let folded = 0;
+  const harness = {
+    async conversation(id) {
+      if (id !== 7) return undefined;
+      return {
+        async entries(query, limit, cursor) {
+          queries.push({ ...query, limit, cursor });
+          const matching = entries.filter((entry) => query.minEntryId === undefined || entry.id >= query.minEntryId);
+          const offset = cursor?.offset ?? 0;
+          const items = matching.slice(offset, offset + limit);
+          folded += items.length;
+          return offset + limit < matching.length ? { items, next: { offset: offset + limit } } : { items };
+        },
+      };
+    },
+  };
+  let nextId = 1;
+  const append = (model) => entries.push({ id: nextId++, kind: 'synthetic', model });
+  const round = (calls, usage = { input: 100, output: 10, cacheRead: 5, cacheWrite: 1 }) => append([{
+    role: 'assistant', stopReason: 'toolUse', usage,
+    content: calls.map(([id, name, args]) => ({ type: 'toolCall', id, name, arguments: args })),
+  }]);
+  const result = (toolCallId, isError = false) => append([{ role: 'toolResult', toolCallId, isError }]);
+  const limits = DIGEST_RUN_LIMITS_DEFAULT;
+  const tracker = createDigestTranscriptTracker();
+  const full = async (current) => digestToolUse(await digestTranscriptUse(harness, 7, limits, context), current);
+  const same = async (current, label) => {
+    const before = folded;
+    const incremental = await tracker.toolUse(harness, 7, current, limits, context);
+    const incrementalFolded = folded - before;
+    assert.deepEqual(incremental, await full(current), label);
+    return incrementalFolded;
+  };
+
+  append([{ role: 'user', content: 'digest input' }]);
+  round([['read-1', 'read', { path: 'SOUL.md' }], ['write-1', 'write', { path: 'memory/a.md', content: '- a\n' }]]);
+  assert.equal(await same({ id: 'read-1', name: 'read', arguments: { path: 'SOUL.md' } }, 'first round'), 2);
+  // A parallel call in the same round folds nothing new.
+  assert.equal(await same({ id: 'write-1', name: 'write', arguments: { path: 'memory/a.md', content: '- a\n' } }, 'same round'), 0);
+
+  result('read-1');
+  result('write-1', true);
+  round([['edit-1', 'edit', { path: 'memory/b.md', edits: [{ oldText: 'x', newText: 'yz' }] }]], { input: 300, output: 20 });
+  append([{ role: 'assistant', stopReason: 'error' }]);
+  const fresh = queries.length;
+  assert.equal(await same({ id: 'edit-1', name: 'edit', arguments: { path: 'memory/b.md', edits: [{ oldText: 'x', newText: 'yz' }] } },
+    'a later round with a failed write and an unaccounted response'), 4);
+  assert.equal(queries[fresh].minEntryId, 3, 'the next scan starts after the last folded entry');
+
+  // Concurrent calls for one round are serialized: each new entry is folded exactly once.
+  result('edit-1');
+  round([['read-2', 'read', { path: 'USER.md' }], ['write-2', 'write', { path: 'memory/c.md', content: 'c' }]]);
+  const before = folded;
+  const [left, right] = await Promise.all([
+    tracker.toolUse(harness, 7, { id: 'read-2', name: 'read', arguments: { path: 'USER.md' } }, limits, context),
+    tracker.toolUse(harness, 7, { id: 'write-2', name: 'write', arguments: { path: 'memory/c.md', content: 'c' } }, limits, context),
+  ]);
+  assert.equal(folded - before, 2, 'a parallel round folds its two new entries once');
+  assert.deepEqual(left, await full({ id: 'read-2', name: 'read', arguments: { path: 'USER.md' } }));
+  assert.deepEqual(right, await full({ id: 'write-2', name: 'write', arguments: { path: 'memory/c.md', content: 'c' } }));
+  assert.equal(right.calls, 5);
+  assert.equal(right.unaccountedResponses, 1);
+  assert.deepEqual([...right.paths].sort(), ['memory/b.md', 'memory/c.md'], 'the failed write reserves nothing');
+
+  // The whole-run entry bound still fails closed once the running total passes it.
+  while (entries.length <= 4_000) append([{ role: 'user', content: 'filler' }]);
+  await assert.rejects(tracker.toolUse(harness, 7, { id: 'read-3', name: 'read', arguments: { path: 'SOUL.md' } }, limits, context),
+    /too long to verify its budget/);
+  await assert.rejects(full({ id: 'read-3', name: 'read', arguments: { path: 'SOUL.md' } }), /too long to verify its budget/);
+});

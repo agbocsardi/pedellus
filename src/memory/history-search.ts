@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Context } from "@earendil-works/chord";
-import { ResetEntry } from "@earendil-works/pi-durable";
+import { ResetEntry, type EntryId, type EntryRecord } from "@earendil-works/pi-durable";
 import type { HistoryHit, HistorySummaryHit } from "../history/index.js";
 import type { MemoryBackend, MemoryHit, MemoryHost, MemoryPage, MemoryQuery, MemoryScope } from "./contracts.js";
 import { episodeFilters, matchesEpisode, matchesPart, partHit, projectEntry, queryKey } from "./history-source.js";
@@ -15,6 +15,8 @@ const MAX_SEEN = 250_000;
 const MAX_CHAINS = 256;
 const MAX_CACHED_PAGES = 64;
 const MAX_CACHED_REPLIES = 2_048;
+/** Widest entry-ID range one batched hit lookup reads; also its page limit (host maximum 200). */
+const MAX_LOOKUP_SPAN = 64;
 type Coverage = Record<string, unknown>;
 type EpisodeJob = { readonly hit: HistorySummaryHit; readonly sessionKey: string; cursor?: unknown; minTime: number | null; maxTime: number | null; undated: number; malformed: number; omitted: number; unreadable: number; missing: number; sourceEntries: number };
 type CachedPage = { readonly page: MemoryPage; readonly nextToken?: string };
@@ -42,6 +44,20 @@ function summaryHit(hit: HistorySummaryHit, scope: MemoryScope, view: Awaited<Re
   const undated = job.undated;
   const provenance = "unknown" as const;
   return { ref, episodeRef, source: { target: "episodes", session: owner.sessionKey, channel: owner.channel, provenance }, time: { from: known.length ? new Date(known[0]!).toISOString() : null, to: known.length ? new Date(known[1]! + 1).toISOString() : null, undated }, excerpt: excerpt(snap.summary), preview: true, coverage: { complete: snap.coverageComplete && job.unreadable === 0 && job.sourceEntries === hit.sourceEntries, unreadable: job.unreadable, undated, malformed: job.malformed, missing: job.missing, omittedNonText: job.omitted, truncatedEntries: snap.sourceTruncatedEntries, originalEntriesCovered: job.sourceEntries, sourceRangeComplete: job.sourceEntries === hit.sourceEntries, provenance: "unknown" }, generatedAt: snap.completedAtMs === null ? null : new Date(snap.completedAtMs).toISOString(), title: snap.title, state: "closed" };
+}
+/**
+ * The entry-ID window, at most `maxSpan` wide, that contains `target` and the most other `wanted`
+ * IDs; a tie keeps the narrower window. One bounded host read of it replaces one read per hit.
+ */
+function lookupWindow(target: number, wanted: readonly number[], maxSpan: number): { min: number; max: number } {
+  let best = { min: target, max: target, count: 1 };
+  for (const low of wanted) {
+    if (low > target || target - low >= maxSpan) continue;
+    const inside = wanted.filter((id) => id >= low && id - low < maxSpan);
+    const window = { min: low, max: Math.max(target, ...inside), count: inside.length };
+    if (window.count > best.count || (window.count === best.count && window.max - window.min < best.max - best.min)) best = window;
+  }
+  return best;
 }
 function validateFilters(query: MemoryQuery, scope: MemoryScope): void {
   episodeFilters(query, scope);
@@ -153,6 +169,27 @@ export function createHistorySearcher(host: MemoryHost): { search: MemoryBackend
       if (page !== undefined && state.pendingHits.length === 0 && !state.pendingDone) reads++;
       state.pendingHits = []; state.pendingDone = false;
       state.indexCursor = page.next; state.coverage = { ...page.coverage }; state.freshness = { index: page.coverage };
+      // Entries this page already read, by `session:entryId`: null when the host had no such entry,
+      // "failed" when its batched read failed. Each hit keeps its own unreadable accounting.
+      const looked = new Map<string, EntryRecord | null | "failed">();
+      const lookup = async (hitIndex: number, hit: HistoryHit): Promise<EntryRecord | null | "failed"> => {
+        const key = `${hit.sessionKey}:${hit.entryId}`;
+        const known = looked.get(key);
+        if (known !== undefined) return known;
+        const wanted = [...new Set(page.hits.slice(hitIndex)
+          .filter((candidate) => candidate.sessionKey === hit.sessionKey && !looked.has(`${candidate.sessionKey}:${candidate.entryId}`))
+          .map((candidate) => Number(candidate.entryId)))];
+        const window = lookupWindow(Number(hit.entryId), wanted, Math.min(MAX_LOOKUP_SPAN, MAX_SOURCE_PER_CALL - sourceEntries));
+        const covered = wanted.filter((id) => id >= window.min && id <= window.max);
+        let recordPage: Awaited<ReturnType<MemoryHost["entries"]>> | undefined;
+        try { recordPage = await host.entries(hit.sessionKey, { minEntryId: window.min as EntryId, maxEntryId: window.max as EntryId, order: "ascending" }, window.max - window.min + 1, undefined, context); }
+        catch { recordPage = undefined; }
+        if (recordPage === undefined) { for (const id of covered) looked.set(`${hit.sessionKey}:${id}`, "failed"); return "failed"; }
+        reads++; sourceEntries += recordPage.items.length;
+        for (const id of covered) looked.set(`${hit.sessionKey}:${id}`, null);
+        for (const entry of recordPage.items) if (covered.includes(Number(entry.id))) looked.set(`${hit.sessionKey}:${entry.id}`, entry);
+        return looked.get(key) ?? null;
+      };
       for (let hitIndex = 0; hitIndex < page.hits.length; hitIndex++) {
         if (sourceEntries >= MAX_SOURCE_PER_CALL) { state.pendingHits = [...page.hits.slice(hitIndex)]; state.pendingDone = page.next === undefined; break; }
         const hit = page.hits[hitIndex]!;
@@ -160,11 +197,8 @@ export function createHistorySearcher(host: MemoryHost): { search: MemoryBackend
         if (state.seen.has(key)) continue;
         state.seen.add(key); if (state.seen.size > MAX_SEEN) throw new Error("history search deduplication bound reached; narrow the query or filters");
         const owner = session(scope, hit.sessionKey); if (!owner) continue;
-        let recordPage: Awaited<ReturnType<MemoryHost["entries"]>>;
-        try { recordPage = await host.entries(hit.sessionKey, { minEntryId: hit.entryId, maxEntryId: hit.entryId }, 1, undefined, context); }
-        catch { state.diagnostics.unreadable++; continue; }
-        reads++; sourceEntries += recordPage.items.length;
-        const entry = recordPage.items[0]; if (!entry) { state.diagnostics.unreadable++; continue; }
+        const entry = await lookup(hitIndex, hit);
+        if (entry === "failed" || entry === null) { state.diagnostics.unreadable++; continue; }
         const projected = projectEntry(entry);
         const diagnosticKey = `${hit.sessionKey}:${hit.entryId}`;
         if (!state.diagnosedEntries.has(diagnosticKey)) { state.diagnosedEntries.add(diagnosticKey); state.diagnostics.unknownProvenance++; state.diagnostics.malformed += projected.malformed; state.diagnostics.omittedNonText += projected.omittedNonText; state.diagnostics.undated += projected.parts.filter((candidate) => candidate.timestamp === null).length; }
