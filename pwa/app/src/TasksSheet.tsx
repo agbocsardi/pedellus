@@ -72,7 +72,7 @@ function parseTasks(raw: unknown): TaskInfo[] | undefined {
     const title = bounded(task.title, LIMITS.taskTitleChars);
     const detail = bounded(task.detail, LIMITS.taskDetailChars);
     const createdAt = iso(task.createdAt);
-    if (typeof task.id !== "string" || task.id === "" || task.id.length > 96) return [];
+    if (typeof task.id !== "string" || !LIMITS.taskIdPattern.test(task.id)) return [];
     if (task.kind !== "worker" && task.kind !== "cron") return [];
     if (typeof task.state !== "string" || !Object.hasOwn(STATE_LABEL, task.state)) return [];
     if (title === undefined || createdAt === undefined) return [];

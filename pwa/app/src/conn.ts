@@ -3,23 +3,46 @@ import {
   LIMITS,
   MAIN_THREAD,
   PROTOCOL_VERSION,
-  type ActivityStep,
+  parseActivitySteps,
+  parseDurableEvent,
+  parsePresets,
+  parseThreadInfo,
+  validAgentName,
   type CommandInfo,
   type ControlCommand,
-  type PresetInfo,
+  type Event as ServerEvent,
   type PushSubscriptionInfo,
   type Reaction,
   type QuestionOptionId,
   type Request,
-  type Response,
-  type ServerFrame,
+  type ResponseMap,
   type ThreadId,
+  type ThreadInfo,
 } from "./protocol";
 import type { Outgoing, Store, ThreadCreate } from "./store";
-import { uploadErrorText, uploadFile } from "./uploads";
+import { releaseUpload, uploadLocal } from "./uploads";
+
+type Op = Request["op"];
+type RequestOf<O extends Op> = Extract<Request, { op: O }>;
+/** A reply handler; `undefined` means the stream closed before the reply arrived. */
+type Handler<O extends Op> = (res?: ResponseMap[O]) => void | Promise<void>;
+type AnyReply = ResponseMap[Op];
+
+/** What the connection tells the layer above it; it never navigates on its own. */
+export type ConnectionEvents = {
+  /** A `thread.create` sent from `from` was accepted as `thread`. */
+  onThreadCreated?: (thread: ThreadId, from: ThreadId) => void;
+};
 
 const BASE_DELAY_MS = 1_000;
 const MAX_DELAY_MS = 30_000;
+/**
+ * Defensive cap on one incoming frame, in UTF-16 units. Far above `LIMITS.frameBytes` on purpose:
+ * records stored before the gateway split long messages replay unchanged and may be larger, and
+ * closing on them would trap the device in a reconnect loop. `frameBytes` still bounds what the
+ * app sends and what the gateway produces today.
+ */
+const SERVER_FRAME_MAX_CHARS = 16 * 1024 * 1024;
 
 /**
  * One WebSocket to same-origin /v1/stream. Owns hello/replay/ack, pings,
@@ -29,7 +52,7 @@ const MAX_DELAY_MS = 30_000;
 export class Connection {
   private ws: WebSocket | null = null;
   private nextId = 0;
-  private pending = new Map<string, (res?: Response) => void | Promise<void>>();
+  private pending = new Map<string, (res?: AnyReply) => void | Promise<void>>();
   private attempt = 0;
   private sending = new Set<string>();
   private creating = new Set<string>();
@@ -43,6 +66,8 @@ export class Connection {
   private replaying = false;
   private replayCount = 0;
   private replayCursor: number | null = null;
+  /** The cursor the current replay batch was requested from; a re-hello must move past it. */
+  private helloCursor: number | null = null;
   private replayHead: number | null = null;
   private replayComplete = false;
   /** 4409: another stream replaced us; stay quiet until the app is visible. */
@@ -50,33 +75,72 @@ export class Connection {
   /** 4401/4426: only revive() (pairing success) starts us again. */
   private dead = false;
   private ackFrozen = false;
+  /**
+   * Acks never pass a durable event this device refused (malformed, unknown to this build, or
+   * oversized): the gateway keeps it for replay instead of retiring it as stored. `null` while
+   * nothing was refused. Fencing lives and dies with one socket: a reconnect replays everything
+   * above the checkpoint — refused events included — and re-refuses (or accepts, once repaired)
+   * them there, so a stale ceiling never outlives the stream that set it.
+   */
+  private ackCeiling: number | null = null;
   private ackCursor: number | null = null;
   private ackTimer: ReturnType<typeof setTimeout> | undefined;
-  private selectCreated: { thread: ThreadId; from: ThreadId } | undefined;
+  private disposed = false;
+  private readonly offQueueChange: () => void;
+  private readonly onVisible = () => {
+    if (!document.hidden) {
+      this.suppressed = false;
+      this.kick();
+      // iOS kills sockets in standby without a close frame: probe now
+      // instead of waiting for the next 25 s tick.
+      this.pingTick();
+    }
+  };
+  private readonly onOnline = () => this.kick();
 
-  constructor(private store: Store) {
+  constructor(private store: Store, private events: ConnectionEvents = {}) {
     this.pingTimer = setInterval(
       () => this.pingTick(),
       LIMITS.pingIntervalMs,
     );
-    document.addEventListener("visibilitychange", () => {
-      if (!document.hidden) {
-        this.suppressed = false;
-        this.kick();
-        // iOS kills sockets in standby without a close frame: probe now
-        // instead of waiting for the next 25 s tick.
-        this.pingTick();
-      }
-    });
-    addEventListener("online", () => this.kick());
-    store.onQueueChange(() => {
+    document.addEventListener("visibilitychange", this.onVisible);
+    addEventListener("online", this.onOnline);
+    this.offQueueChange = store.onQueueChange(() => {
       void store.reloadQueue().then(() => this.flushQueue()).catch(console.error);
     });
     this.connect();
   }
 
+  /**
+   * Stop for good: close the stream without reconnecting, answer every pending reply with
+   * `undefined`, and release every timer and listener. A new `Connection` may follow.
+   */
+  dispose() {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.dead = true;
+    clearInterval(this.pingTimer);
+    clearTimeout(this.pingWatch);
+    clearTimeout(this.reconnectTimer);
+    clearTimeout(this.ackTimer);
+    for (const timer of this.uploadTimers.values()) clearTimeout(timer);
+    this.uploadTimers.clear();
+    document.removeEventListener("visibilitychange", this.onVisible);
+    removeEventListener("online", this.onOnline);
+    this.offQueueChange();
+    const ws = this.ws;
+    this.ws = null;
+    if (ws) {
+      ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
+      ws.close();
+    }
+    for (const handler of this.pending.values()) void handler();
+    this.pending.clear();
+  }
+
   /** After a successful pairing (or manual retry) connect again. */
   revive() {
+    if (this.disposed) return;
     this.dead = false;
     this.suppressed = false;
     this.attempt = 0;
@@ -93,6 +157,7 @@ export class Connection {
   selectPreset(thread: ThreadId, preset: string) {
     if (this.store.connState !== "open" || !this.store.canWrite(thread)) return;
     if (this.request({ type: "req", id: this.id(), op: "control", thread, command: "model", args: preset }, (res) => {
+      if (this.disposed) return;
       if (!res?.ok && this.store.pendingModel(thread) === preset) this.store.setPendingModel(thread, undefined);
     })) this.store.setPendingModel(thread, preset);
   }
@@ -155,7 +220,7 @@ export class Connection {
     });
   }
 
-  private mutate(frame: Request): Promise<Response | undefined> {
+  private mutate<O extends Op>(frame: RequestOf<O>): Promise<ResponseMap[O] | undefined> {
     return new Promise((resolve) => {
       if (this.store.connState !== "open" || !this.request(frame, resolve)) resolve(undefined);
     });
@@ -164,25 +229,26 @@ export class Connection {
   searchThreads(query: string, onResults: (ids: ReadonlySet<ThreadId>) => void) {
     if (this.store.connState !== "open") return;
     this.request({ type: "req", id: this.id(), op: "threads", query }, async (res) => {
-      if (res?.ok && res.threads) {
-        await this.store.mergeThreads(res.threads).catch(console.error);
+      const threads = res?.ok ? threadList(res.threads) : undefined;
+      if (threads && !this.disposed) {
+        await this.store.mergeThreads(threads).catch(console.error);
+        if (this.disposed) return;
         this.flushOutgoing();
-        onResults(new Set(res.threads.map((t) => t.id)));
+        onResults(new Set(threads.map((t) => t.id)));
       }
     });
   }
 
   sendCreate(c: ThreadCreate, openFrom?: ThreadId) {
     const current = this.store.creates.get(c.key);
-    if (this.store.connState !== "open" || this.creating.has(c.key) || !current || current.failed) return;
+    if (this.disposed || this.store.connState !== "open" || this.creating.has(c.key) || !current || current.failed) return;
     if (this.request({ type: "req", id: this.id(), op: "thread.create", key: c.key, title: c.title, from: c.from }, async (res) => {
       this.creating.delete(c.key);
-      if (!res) return; // No reply: retry the same key after replay.
+      if (!res || this.disposed) return; // No reply: retry the same key after replay.
       await this.store.finishCreate(c, res.ok, !!c.from && !res.ok && res.error === "bad_request");
-      if (res.ok && res.thread && openFrom === this.store.openThread) {
-        if (this.store.threads.has(res.thread)) this.store.selectThread(res.thread);
-        else this.selectCreated = { thread: res.thread, from: openFrom };
-      }
+      // A disposed connection never navigates: the app may have remounted on a new one.
+      if (this.disposed) return;
+      if (res.ok && typeof res.thread === "string" && openFrom !== undefined) this.events.onThreadCreated?.(res.thread, openFrom);
     })) this.creating.add(c.key);
   }
 
@@ -192,7 +258,7 @@ export class Connection {
    */
   sendOutgoing(entry: Outgoing, retriedRace = false) {
     const current = this.store.outgoing(entry.thread, entry.key);
-    if (this.store.connState !== "open" || !this.store.canWrite(entry.thread) || this.sending.has(entry.key) ||
+    if (this.disposed || this.store.connState !== "open" || !this.store.canWrite(entry.thread) || this.sending.has(entry.key) ||
         (current?.state !== "queued" && current?.state !== "sent")) return;
     // Files upload over HTTP first, and a key's attachments never change, so a
     // send waits until every queued file has an upload id (v2.md, Files).
@@ -208,12 +274,13 @@ export class Connection {
     if (this.request(frame, async (res) => {
       const cur = this.store.outgoing(m.thread, m.key);
       this.sending.delete(m.key);
-      if (!res || !cur || (cur.state !== "queued" && cur.state !== "sent")) return;
+      if (!res || this.disposed || !cur || (cur.state !== "queued" && cur.state !== "sent")) return;
       if (!res.ok && res.error === "bad_request" && m.thread !== MAIN_THREAD) {
         // Archive may have won the race with this send. The protocol doesn't
         // distinguish that from other bad requests, so check the thread list.
         this.sending.add(m.key);
         await this.store.setOutgoingState(m.key, "queued").catch(console.error);
+        if (this.disposed) return;
         this.checkRejectedSend(m, retriedRace);
         return;
       }
@@ -228,15 +295,17 @@ export class Connection {
   private checkRejectedSend(m: Outgoing, retriedRace: boolean) {
     if (this.request({ type: "req", id: this.id(), op: "threads" }, async (res) => {
       this.sending.delete(m.key);
-      if (!res) return;
-      if (!res.ok || !res.threads) {
+      if (!res || this.disposed) return;
+      const threads = res.ok ? threadList(res.threads) : undefined;
+      if (!threads) {
         this.store.markThreadUnconfirmed(m.thread);
         return;
       }
-      await this.store.mergeThreads(res.threads, true).catch(console.error);
+      await this.store.mergeThreads(threads, true).catch(console.error);
+      if (this.disposed) return;
       // An older archive may be absent from the bounded listing. Keep it
       // queued in that case too, until a restore event or reconnect.
-      if (!res.threads.some((t) => t.id === m.thread && !t.archived)) return;
+      if (!threads.some((t) => t.id === m.thread && !t.archived)) return;
       const cur = this.store.outgoing(m.thread, m.key);
       if (cur?.state !== "queued") return;
       if (retriedRace) await this.store.setOutgoingState(m.key, "failed");
@@ -247,7 +316,7 @@ export class Connection {
 
   /** Upload a queued send's files, freeze their ids on the entry, then send it. */
   private async uploadPending(m: Outgoing) {
-    if (this.store.connState !== "open" || this.uploading.has(m.key)) return;
+    if (this.disposed || this.store.connState !== "open" || this.uploading.has(m.key)) return;
     const due = this.uploadRetryAt.get(m.key) ?? 0;
     if (Date.now() < due) {
       this.scheduleUpload(m, due - Date.now());
@@ -258,25 +327,36 @@ export class Connection {
       for (const file of m.pending ?? []) {
         if (file.uploadId) continue;
         const blob = await this.store.fileBlob(file.id);
+        if (this.disposed) return;
         if (!blob) {
           await this.store.setOutgoingState(m.key, "failed", "The file is no longer on this device.");
           return;
         }
-        const outcome = await uploadFile(blob, file.name, file.type);
-        if (!outcome.ok) {
-          if (outcome.retry) {
-            const delay = outcome.error === "rate_limited" ? 10_000 : 20_000;
-            this.uploadRetryAt.set(m.key, Date.now() + delay);
-            this.scheduleUpload(m, delay);
-            return;
-          }
-          await this.store.setOutgoingState(m.key, "failed", uploadErrorText(outcome.error, file.name));
+        const step = await uploadLocal(file.id, blob, file.name, file.type);
+        if (this.disposed) return;
+        if (step.kind === "retry") {
+          this.uploadRetryAt.set(m.key, Date.now() + step.delayMs);
+          this.scheduleUpload(m, step.delayMs);
           return;
         }
-        if (!await this.store.setPendingUploadId(m.key, file.id, outcome.id)) return;
+        if (step.kind === "failed") {
+          await this.store.setOutgoingState(m.key, "failed", step.note);
+          return;
+        }
+        const saved = await this.store.setPendingUploadId(m.key, file.id, step.id);
+        // The id is on the row now (or the row is gone), so it is no longer the uploader's to
+        // hand out: a retry under a new key uploads afresh instead of reusing it, and the
+        // eager upload that landed it was still POSTed exactly once.
+        releaseUpload(file.id);
+        if (!saved || this.disposed) return;
       }
       const promoted = await this.store.promotePending(m.key);
-      if (promoted) this.sendOutgoing(promoted);
+      if (promoted) {
+        // These ids are frozen on the entry now; the uploader must not hand them out again.
+        // (Most were already released one by one above; this is the belt to that suspenders.)
+        for (const file of promoted.pending ?? []) releaseUpload(file.id);
+        if (!this.disposed) this.sendOutgoing(promoted);
+      }
     } catch (err) {
       console.error("a file upload did not finish", err);
     } finally {
@@ -299,6 +379,7 @@ export class Connection {
   }
 
   private flushQueue() {
+    if (this.disposed) return;
     this.flushOutgoing();
     for (const c of this.store.creates.values()) if (!c.failed) this.sendCreate(c);
   }
@@ -338,7 +419,11 @@ export class Connection {
     this.ackTimer = undefined;
     this.ackCursor = null;
     this.replayComplete = false;
-    this.selectCreated = undefined;
+    // Refusal fencing is scoped to the socket: the next replay resends everything above the
+    // checkpoint — the refused event included — and re-fences it there if it is still bad, so a
+    // repaired replay can advance acks instead of staying frozen at the old stream's ceiling.
+    this.ackFrozen = false;
+    this.ackCeiling = null;
     this.store.setConn("offline");
     switch (code) {
       case CLOSE.unauthorized:
@@ -383,39 +468,53 @@ export class Connection {
   }
 
   private write(frame: Request): boolean {
+    if (this.disposed) return false;
     const ws = this.ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
     ws.send(JSON.stringify(frame));
     return true;
   }
 
-  private request(frame: Request, handler: (res?: Response) => void | Promise<void>): boolean {
+  /** Send one request; `handler` gets exactly that op's reply (or `undefined` on close). */
+  private request<O extends Op>(frame: RequestOf<O>, handler: Handler<O>): boolean {
     if (!this.write(frame)) return false;
-    this.pending.set(frame.id, handler);
+    // Replies are matched by id, so this handler only ever sees the reply to this op.
+    this.pending.set(frame.id, handler as (res?: AnyReply) => void | Promise<void>);
     return true;
   }
 
   private async frame(ws: WebSocket, data: string) {
     if (this.ws !== ws) return;
-    if (new TextEncoder().encode(data).length > LIMITS.frameBytes) {
-      this.ws?.close(CLOSE.protocol);
+    if (data.length > SERVER_FRAME_MAX_CHARS) {
+      // Not parsed and not stored, but never a reason to drop the stream: reconnecting would only
+      // replay it again. It may have been a durable event, so acks stop where they are.
+      console.error("oversized server frame skipped; acks stop");
+      this.ackFrozen = true;
+      if (this.replaying) this.replayCount++;
       return;
     }
-    let f: ServerFrame;
+    let raw: unknown;
     try {
-      f = JSON.parse(data) as ServerFrame;
+      raw = JSON.parse(data);
     } catch {
       this.ws?.close(CLOSE.protocol);
       return;
     }
-    if (f.type === "res") {
-      const handler = this.pending.get(f.id);
-      if (handler) {
-        this.pending.delete(f.id);
-        await handler(f);
-      }
+    if (raw === null || typeof raw !== "object") return;
+    const frame = raw as { type?: unknown; id?: unknown; event?: unknown };
+    if (frame.type === "res") {
+      const handler = typeof frame.id === "string" ? this.pending.get(frame.id) : undefined;
+      if (!handler) return;
+      this.pending.delete(frame.id as string);
+      const reply = raw as { ok?: unknown; error?: unknown };
+      // A reply without a boolean `ok` (or a failure without a string code) is a failure the
+      // gateway did not explain; the handler sees it as `internal`, never as success.
+      const wellFormed = reply.ok === true || (reply.ok === false && typeof reply.error === "string");
+      await handler(wellFormed ? raw as AnyReply : { type: "res", id: frame.id as string, ok: false, error: "internal" });
       return;
     }
+    if (frame.type !== "event") return;
+    const f = raw as ServerEvent;
     switch (f.event) {
       case "message":
       case "settled":
@@ -423,37 +522,45 @@ export class Connection {
       case "reaction":
       case "question":
       case "thread": {
-        // A durable event must carry a positive integer cursor; a malformed one from a broken
-        // gateway is dropped instead of being stored and taking the UI down.
-        if (!Number.isSafeInteger(f.cursor) || f.cursor <= 0) {
-          console.error("durable event without a valid cursor dropped", f.event);
+        // Only a well-formed durable event is stored; a malformed one from a broken gateway is
+        // dropped (and never acked as stored) instead of corrupting the cache or the UI.
+        const ev = parseDurableEvent(raw);
+        const known = durableCursor(raw);
+        // Replay accounting counts every durable frame the gateway sent, refused or not, so a full
+        // batch with a bad event in it is still recognised as full.
+        if (this.replaying && this.replayHead !== null && (known === undefined || known <= this.replayHead)) {
+          this.replayCount++;
+          if (known !== undefined) this.replayCursor = Math.max(this.replayCursor ?? 0, known);
+        }
+        if (!ev) {
+          // Never acked as stored: the checkpoint stays below it, so the gateway keeps it.
+          if (known === undefined) this.ackFrozen = true;
+          else this.ackCeiling = Math.min(this.ackCeiling ?? known, known - 1);
+          console.error("malformed durable event refused; acks stay below it", f.event);
           break;
         }
-        if (this.replaying && this.replayHead !== null && f.cursor <= this.replayHead) {
-          this.replayCount++;
-          this.replayCursor = f.cursor;
-        }
-        if (!await this.store.applyDurable(f)) this.ackFrozen = true;
+        // The store write is store-level and always completes (wire order kept); only the
+        // fencing below is this socket's, so a replacement stream decides its own.
+        const stored = await this.store.applyDurable(ev);
         if (this.ws !== ws) break;
-        if (f.event === "thread") {
-          if (f.thread.id === this.selectCreated?.thread) {
-            if (this.store.openThread === this.selectCreated.from) this.store.selectThread(f.thread.id);
-            this.selectCreated = undefined;
-          }
-          if (!f.thread.archived) this.flushOutgoing(f.thread.id);
-        }
+        if (!stored) this.ackFrozen = true;
+        if (ev.event === "thread" && !ev.thread.archived) this.flushOutgoing(ev.thread.id);
         this.ack(ws);
         break;
       }
       case "preview":
-        this.store.notePreview(f.thread, f.key);
+        if (typeof f.thread === "string" && typeof f.key === "string") this.store.notePreview(f.thread, f.key);
         break;
       case "status":
-        this.store.setStatus(f);
+        if (typeof f.thread !== "string" ||
+            !["idle", "queued", "thinking", "tool", "error"].includes(f.state)) break;
+        this.store.setStatus({ ...f, label: typeof f.label === "string" ? f.label : undefined });
         // Main status is guaranteed after each batch, even when all threads
         // are idle. Other status frames are routed normally, in any order.
         if (f.thread === MAIN_THREAD && this.replaying) {
-          if (this.replayCount >= LIMITS.replayBatch) this.hello(this.replayCursor);
+          // A full batch asks for the next one, but only from a cursor past this batch's start, so
+          // a batch of events without usable cursors can never loop.
+          if (this.replayCount >= LIMITS.replayBatch && this.replayCursor !== this.helloCursor) this.hello(this.replayCursor);
           else {
             this.replaying = false;
             this.replayComplete = true;
@@ -477,12 +584,27 @@ export class Connection {
         break;
       case "activity": {
         // Tool steps are display-only: keep well-formed steps, never renderer input.
-        const steps = activitySteps(f.steps);
+        const steps = parseActivitySteps(f.steps);
         const omitted = typeof f.omitted === "number" && Number.isSafeInteger(f.omitted) && f.omitted > 0
           ? f.omitted : undefined;
         if (typeof f.thread === "string" && typeof f.key === "string" && steps.length > 0) {
           this.store.setActivity({ ...f, steps, ...(omitted === undefined ? {} : { omitted }) });
         }
+        break;
+      }
+      default: {
+        // An event name this build does not know. With a durable cursor it is a newer gateway's
+        // event type: refused exactly like a malformed one — counted toward the batch, never
+        // stored, never acked past — so the gateway keeps it until an upgraded client. Without a
+        // cursor it is ephemeral, like `status` or `preview`, and safe to ignore.
+        const known = durableCursor(raw);
+        if (known === undefined) break;
+        if (this.replaying && this.replayHead !== null && known <= this.replayHead) {
+          this.replayCount++;
+          this.replayCursor = Math.max(this.replayCursor ?? 0, known);
+        }
+        this.ackCeiling = Math.min(this.ackCeiling ?? known, known - 1);
+        console.warn("unknown durable event refused; acks stay below it", String((raw as { event?: unknown }).event));
         break;
       }
     }
@@ -504,14 +626,15 @@ export class Connection {
       this.replaying = true;
       this.replayCount = 0;
       this.replayCursor = cursor;
-      this.replayHead = res.head ?? null;
+      this.helloCursor = cursor;
+      this.replayHead = typeof res.head === "number" ? res.head : null;
       this.store.resetStatuses();
       this.store.resetModels();
       this.store.resetActivities();
       const device = typeof res.device === "string" ? res.device : undefined;
       const name = typeof res.agent === "string" ? res.agent.trim() : "";
-      this.store.setIdentity(device, name && [...name].length <= 40 ? name : undefined, commandList(res.commands),
-        presetList(res.presets), typeof res.uploads === "boolean" ? res.uploads : false);
+      this.store.setIdentity(device, validAgentName(name) ? name : undefined, commandList(res.commands),
+        parsePresets(res.presets), typeof res.uploads === "boolean" ? res.uploads : false);
       this.store.setMode("chat");
     });
   }
@@ -519,7 +642,8 @@ export class Connection {
   private refreshThreads(ws: WebSocket) {
     this.request({ type: "req", id: this.id(), op: "threads" }, async (res) => {
       if (!res) return;
-      if (res.ok && res.threads) await this.store.mergeThreads(res.threads, true).catch(console.error);
+      const threads = res.ok ? threadList(res.threads) : undefined;
+      if (threads) await this.store.mergeThreads(threads, true).catch(console.error);
       else this.store.setThreadListUnavailable();
       if (this.ws !== ws) return;
       await this.store.reloadQueue().catch(console.error);
@@ -536,12 +660,14 @@ export class Connection {
     if (document.hidden) return;
     const ws = this.ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    const id = this.id();
-    this.pending.set(id, () => {
+    // One probe at a time: a visibility probe and the interval tick must not stack watchdogs, or
+    // the earlier one would be orphaned and close a healthy stream later.
+    if (this.pingWatch !== undefined) return;
+    const ok = this.request({ type: "req", id: this.id(), op: "ping" }, () => {
       clearTimeout(this.pingWatch);
       this.pingWatch = undefined;
     });
-    if (!this.write({ type: "req", id, op: "ping" })) return;
+    if (!ok) return;
     this.pingWatch = setTimeout(() => {
       // No reply within the timeout: the stream is dead even though the
       // socket looks open. Drop it; the close handler reconnects.
@@ -553,8 +679,11 @@ export class Connection {
   /** Coalesce acks so a big replay does not become one frame per event. */
   private ack(ws: WebSocket) {
     if (!this.replayComplete || this.ackFrozen || this.store.cursor === null) return;
-    // Only called after the triggering event (or the whole replay) commits.
-    this.ackCursor = this.store.cursor;
+    // Only called after the triggering event (or the whole replay) commits, and never past an
+    // event this device refused.
+    const cursor = Math.min(this.store.cursor, this.ackCeiling ?? Infinity);
+    if (cursor < 1) return;
+    this.ackCursor = cursor;
     if (this.ackTimer !== undefined) return;
     this.ackTimer = setTimeout(() => {
       this.ackTimer = undefined;
@@ -571,58 +700,36 @@ export class Connection {
         if (this.write({ type: "req", id: this.id(), op: "ack", cursor })) this.store.setAcked(cursor);
       }
     } catch (err) {
-      this.ackFrozen = true;
+      // A failed checkpoint is a store-level problem, but the freeze is this socket's: a
+      // replacement stream re-freezes itself through its own writes (applyDurable's
+      // durableWriteFailed, or its own flushAck failing here), so an old socket's error never
+      // poisons the stream that replaced it.
+      if (this.ws === ws) this.ackFrozen = true;
       console.error("replay checkpoint not persisted; acks stop", err);
     }
   }
 }
 
-/** Well-formed `activity.steps` entries, bounded to the protocol's own limits. */
-export function activitySteps(raw: unknown): ActivityStep[] {
-  if (!Array.isArray(raw)) return [];
-  const out: ActivityStep[] = [];
-  for (const item of raw.slice(0, LIMITS.maxActivitySteps)) {
-    if (!item || typeof item !== "object") continue;
-    const { id, tool, state, startedAt, endedAt } = item as Record<string, unknown>;
-    if (typeof id !== "string" || id === "" || typeof tool !== "string" || tool === "") continue;
-    if (state !== "running" && state !== "done" && state !== "failed") continue;
-    if (typeof startedAt !== "string" || Number.isNaN(Date.parse(startedAt))) continue;
-    out.push({
-      id: id.slice(0, 64),
-      tool: tool.slice(0, LIMITS.activityToolChars),
-      state,
-      startedAt,
-      ...(typeof endedAt === "string" && !Number.isNaN(Date.parse(endedAt)) ? { endedAt } : {}),
-    });
-  }
-  return out;
+/** A durable event's replay cursor, if the frame carries a usable one. */
+function durableCursor(raw: unknown): number | undefined {
+  const cursor = (raw as { cursor?: unknown }).cursor;
+  return typeof cursor === "number" && Number.isSafeInteger(cursor) && cursor > 0 ? cursor : undefined;
 }
 
-const COMMAND_NAME = /^[a-z][a-z0-9_-]{0,22}$/;
+/** A `threads` reply's well-formed entries; `undefined` when the field is not a list. */
+function threadList(raw: unknown): ThreadInfo[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  return raw.flatMap((t) => parseThreadInfo(t) ?? []);
+}
+
 /** Keeps only well-formed `hello.commands` entries; undefined if none were sent. */
 function commandList(raw: unknown): CommandInfo[] | undefined {
   if (!Array.isArray(raw)) return undefined;
   return raw.flatMap((c): CommandInfo[] => {
     if (!c || typeof c !== "object") return [];
     const { name, args, summary, usage } = c as Record<string, unknown>;
-    if (typeof name !== "string" || !COMMAND_NAME.test(name) || typeof summary !== "string"
+    if (typeof name !== "string" || !LIMITS.commandNamePattern.test(name) || typeof summary !== "string"
       || typeof usage !== "string" || (args !== undefined && typeof args !== "string")) return [];
     return [{ name, summary, usage, ...(args ? { args } : {}) }];
-  });
-}
-
-/** Keeps only well-formed, uniquely named `hello.presets` entries; undefined if none were sent. */
-function presetList(raw: unknown): PresetInfo[] | undefined {
-  if (!Array.isArray(raw)) return undefined;
-  const seen = new Set<string>();
-  const text = (v: unknown, max: number) => typeof v === "string" && v.trim() !== "" && v.length <= max && !/[\p{Cc}]/u.test(v);
-  return raw.flatMap((p): PresetInfo[] => {
-    if (!p || typeof p !== "object") return [];
-    const { name, label, model, thinking } = p as Record<string, unknown>;
-    if (!text(name, 64) || /\s/.test(name as string) || seen.has(name as string) || !text(model, 200)
-      || (label !== undefined && !text(label, 40)) || (thinking !== undefined && !text(thinking, 40))) return [];
-    seen.add(name as string);
-    return [{ name: name as string, model: model as string, ...(label ? { label: label as string } : {}),
-      ...(thinking ? { thinking: thinking as string } : {}) }];
   });
 }

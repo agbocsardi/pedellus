@@ -200,12 +200,16 @@ this one (stay quiet while hidden), anything else is a network-class reconnect.
 | File | Role |
 |---|---|
 | `src/App.tsx` | Loads the store, then starts the connection; first-run vs chat; iOS keyboard handling via `visualViewport` |
-| `src/conn.ts` | The one WebSocket: `hello` + replay, ack, pings, backoff, close-code reactions, the outbox and upload queue |
-| `src/store.ts` | All state and its IndexedDB cache; renders through `useSyncExternalStore` |
-| `src/Chat.tsx` | Thread header, model chip, message list, composer, sheets (menu, commands, model, tasks, thread list) |
+| `src/conn.ts` | The one WebSocket: `hello` + replay, ack, pings, backoff, close-code reactions, the outbox and upload queue; validates every durable frame before the store sees it |
+| `src/store.ts` | All state; renders through `useSyncExternalStore`, with a per-thread snapshot so a view re-renders only for its own thread |
+| `src/db.ts`, `src/db-constants.ts` | IndexedDB schema, migrations, snapshot load and retention; the names the service worker shares |
+| `src/Chat.tsx` | Thread header, model chip, sidebar, sheet and artifact-viewer state |
+| `src/MessageList.tsx`, `src/useAnchoredScroll.ts` | The conversation (memoized; Markdown re-renders only when its text changes) and its scroll pinning/anchoring |
+| `src/Composer.tsx`, `src/useVoiceRecorder.ts` | Drafts, picked files, the `/` menu, eager uploads and the voice-note recorder |
+| `src/Sheets.tsx`, `src/ThreadList.tsx`, `src/Attachments.tsx` | The sheets (menu, commands, model, tasks, titles, notifications), the thread list, files and artifacts |
 | `src/sw.ts` | App-shell precache and the Web Push handler |
 | `src/push.ts` | Permission, subscribe/unsubscribe, VAPID key rotation, badge |
-| `src/uploads.ts` | `POST /v1/upload` with the protocol's bounds and owner-facing errors |
+| `src/uploads.ts` | `POST /v1/upload` with the protocol's bounds and owner-facing errors; the one upload path for picks and the outbox |
 | `src/recorder.ts` | Voice-note capture (`audio/mp4` on iOS, Opus/WebM elsewhere) |
 | `src/Question.tsx`, `LoginCard.tsx`, `Reactions.tsx`, `ActivitySteps.tsx`, `TasksSheet.tsx` | The cards and sheets for questions, MCP logins, reactions, tool steps and tasks |
 
@@ -222,7 +226,8 @@ the hole is gone, so a replay can never skip a message.
   reload, and every pending/sent row is re-sent with the same key on reconnect.
 - Uploads run before the send they belong to, retry with backoff on
   rate-limit/network errors, and fail honestly (with a note) when the gateway
-  refuses them.
+  refuses them. A file picked in the composer and its queued send share one
+  request, so sending mid-upload never uploads the bytes twice.
 - A `BroadcastChannel` keeps the outbox in step across two open windows.
 - The service worker is separate state: it reads two cached keys (agent name,
   thread title) and shows a notification; the app clears the badge once it is
@@ -286,6 +291,12 @@ IndexedDB database `durable-app` (version 3):
 | `creates` | Offline `thread.create` keys |
 | `view` | Last viewed cursor per thread (unread state) |
 | `settings` | `openThread`, `resumeCursor`, `identity` (device, agent, commands, presets, uploads), `push` |
+
+Retention (`RETENTION` in `src/db.ts`): only events at or below the replay
+checkpoint are ever dropped, oldest first, so each thread keeps its newest
+2 000 and the whole cache its newest 10 000; a long message goes as a whole,
+and superseded `thread` snapshots go too. Records that fail validation on load
+are skipped, not shown.
 
 Never persisted: MCP login URLs (memory only, dropped on reload, expiry or the
 outcome notice), `activity` steps, `status`, `model`, `preview` text, upload

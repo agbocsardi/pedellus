@@ -1,6 +1,8 @@
 /// <reference lib="webworker" />
 import { clientsClaim } from "workbox-core";
 import { cleanupOutdatedCaches, precacheAndRoute } from "workbox-precaching";
+import { DB_NAME, DEFAULT_AGENT_NAME, STORES } from "./db-constants";
+import { LIMITS, MAIN_THREAD, validThreadId, type PushPayload } from "./protocol";
 
 declare const self: ServiceWorkerGlobalScope & {
   __WB_MANIFEST: { url: string; revision: string | null }[];
@@ -21,13 +23,6 @@ cleanupOutdatedCaches();
 // cached from `hello`, the body only says that a message arrived in a thread
 // whose title the app has cached. No payload text ever reaches the screen.
 
-/** Must match the app's store (src/store.ts). */
-const DB_NAME = "durable-app";
-const DEFAULT_AGENT = "Pedellus";
-const UNREAD_CAP = 99;
-const THREAD_ID = /^(main|t_[A-Za-z0-9_-]{1,40})$/;
-
-type PushPayload = { v: 2; thread: string; unread: number };
 
 /** One IndexedDB read. The cache may be absent, empty or blocked; never throw. */
 function read<T>(store: string, key: IDBValidKey): Promise<T | undefined> {
@@ -62,8 +57,8 @@ function parse(data: PushMessageData | null): PushPayload | null {
     const raw: unknown = data.json();
     if (!raw || typeof raw !== "object") return null;
     const { v, thread, unread } = raw as Record<string, unknown>;
-    if (v !== 2 || typeof thread !== "string" || !THREAD_ID.test(thread)) return null;
-    const count = Number.isInteger(unread) ? Math.min(Math.max(unread as number, 0), UNREAD_CAP) : 0;
+    if (v !== 2 || !validThreadId(thread)) return null;
+    const count = Number.isInteger(unread) ? Math.min(Math.max(unread as number, 0), LIMITS.pushUnreadCap) : 0;
     return { v: 2, thread, unread: count };
   } catch {
     return null;
@@ -74,13 +69,13 @@ type BadgeScope = { setAppBadge?: (contents?: number) => Promise<void> };
 
 async function showPush(event: PushEvent) {
   const payload = parse(event.data);
-  const thread = payload?.thread ?? "main";
+  const thread = payload?.thread ?? MAIN_THREAD;
   const [identity, info] = await Promise.all([
-    read<{ agent?: string }>("settings", "identity"),
-    read<{ title?: string }>("threads", thread),
+    read<{ agent?: string }>(STORES.settings, "identity"),
+    read<{ title?: string }>(STORES.threads, thread),
   ]);
-  const agent = identity?.agent?.trim() || DEFAULT_AGENT;
-  const title = thread === "main" ? "" : info?.title?.trim() ?? "";
+  const agent = identity?.agent?.trim() || DEFAULT_AGENT_NAME;
+  const title = thread === MAIN_THREAD ? "" : info?.title?.trim() ?? "";
   await self.registration.showNotification(agent, {
     body: title ? `New message in ${title}` : "New message",
     icon: "/icons/icon-192.png",
@@ -104,7 +99,7 @@ self.addEventListener("push", (event) => {
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   const data = event.notification.data as { thread?: string; url?: string } | undefined;
-  const thread = typeof data?.thread === "string" && THREAD_ID.test(data.thread) ? data.thread : "main";
+  const thread = validThreadId(data?.thread) ? data.thread : MAIN_THREAD;
   event.waitUntil((async () => {
     const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
     const client = windows.find((c) => {

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { useSyncExternalStore } from "react";
 import { Connection } from "./conn";
 import type { Store } from "./store";
@@ -7,24 +7,32 @@ import { Chat } from "./Chat";
 import { Avatar } from "./Avatar";
 
 export function App({ store }: { store: Store }) {
-  useSyncExternalStore(store.subscribe, store.getSnapshot);
-  const connRef = useRef<Connection | null>(null);
+  // Only what picks the screen; each screen subscribes to what it shows.
+  useSyncExternalStore(store.subscribe, () => `${store.mode}\u0000${store.storageBlocked}\u0000${store.agentName}`);
   const [conn, setConn] = useState<Connection | null>(null);
 
   useEffect(() => {
     // The store is the source of truth; the connection starts once it is
     // loaded so the hello cursor matches what is actually persisted.
     let alive = true;
+    let connection: Connection | undefined;
     store
       .init()
       .catch((err) => console.error("store init failed; continuing with empty cache", err))
       .finally(() => {
         if (!alive) return;
-        connRef.current = new Connection(store);
-        setConn(connRef.current);
+        connection = new Connection(store, {
+          // Navigation stays with the store: the connection only reports the accepted create.
+          onThreadCreated: (thread, from) => store.followCreated(thread, from),
+        });
+        setConn(connection);
       });
+    // StrictMode (and any real unmount) tears both down; a remount reopens the same store.
     return () => {
       alive = false;
+      connection?.dispose();
+      store.dispose();
+      setConn(null);
     };
   }, [store]);
 

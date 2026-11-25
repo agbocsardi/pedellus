@@ -71,6 +71,82 @@ export async function uploadFile(blob: Blob, name: string, type: string): Promis
   return { ok: false, error: "http", retry: true };
 }
 
+/** What the caller does next with one file: use its id, try again later, or give up with a note. */
+export type UploadStep =
+  | { kind: "done"; id: string }
+  | { kind: "retry"; rateLimited: boolean; delayMs: number }
+  | { kind: "failed"; note: string };
+
+const inflight = new Map<string, Promise<UploadOutcome>>();
+/**
+ * Accepted upload ids by local file id, not yet frozen onto a queued send. An eager upload that
+ * finishes after Send was tapped (but before the outbox entry was saved) lands here, and the
+ * outbox's pass picks it up instead of POSTing the bytes again. Bounded; ids are dropped once
+ * consumed (`forgetUpload`), because an admitted send uses each one up.
+ */
+const accepted = new Map<string, string>();
+const MAX_ACCEPTED = 100;
+
+/** File ids owned by a queued send; their accepted ids are the send's, not the composer's. */
+const owned = new Set<string>();
+/** Safety bound only: sends release their ids as they consume them, and discarded rows leak at most this much. */
+const MAX_OWNED = 200;
+
+/**
+ * The listed files belong to a queued send from now on (their picks may still be on screen until
+ * the outbox entry is saved). From here only the outbox pass may consume their accepted ids, so
+ * a remove tapped mid-handoff can never discard an accepted upload and force a second POST of
+ * the same bytes.
+ */
+export function ownUploads(ids: readonly string[]): void {
+  for (const id of ids) {
+    owned.add(id);
+    if (owned.size > MAX_OWNED) owned.delete(owned.values().next().value!);
+  }
+}
+
+/** Undo `ownUploads`: the id is consumed (frozen onto an entry) or the send never queued. */
+export function releaseUpload(fileId: string): void {
+  owned.delete(fileId);
+  accepted.delete(fileId);
+}
+
+/**
+ * The one upload path for a local file, whether it was picked in the composer or is waiting in
+ * the outbox. `fileId` is the local id the file keeps from pick to outbox, so a send queued while
+ * its file is uploading (or just after) reuses that request's result instead of uploading again.
+ */
+export async function uploadLocal(fileId: string, blob: Blob, name: string, type: string): Promise<UploadStep> {
+  const done = accepted.get(fileId);
+  if (done !== undefined) return { kind: "done", id: done };
+  let pending = inflight.get(fileId);
+  if (!pending) {
+    pending = uploadFile(blob, name, type).then((outcome) => {
+      if (outcome.ok) {
+        accepted.set(fileId, outcome.id);
+        if (accepted.size > MAX_ACCEPTED) accepted.delete(accepted.keys().next().value!);
+      }
+      return outcome;
+    }).finally(() => inflight.delete(fileId));
+    inflight.set(fileId, pending);
+  }
+  const outcome = await pending;
+  if (outcome.ok) return { kind: "done", id: outcome.id };
+  if (outcome.retry) {
+    const rateLimited = outcome.error === "rate_limited";
+    return { kind: "retry", rateLimited, delayMs: rateLimited ? 10_000 : 20_000 };
+  }
+  return { kind: "failed", note: uploadErrorText(outcome.error, name) };
+}
+
+/** The file's upload id is now owned by a queued send (or the file was dropped): never reuse it. */
+export function forgetUpload(fileId: string): void {
+  // A queued send keeps its claim through the composer-to-outbox handoff; only the outbox pass
+  // (via `releaseUpload`, once the id is frozen onto the entry) may consume it.
+  if (owned.has(fileId)) return;
+  accepted.delete(fileId);
+}
+
 /** One owner-facing line for a failed upload; never echoes gateway internals. */
 export function uploadErrorText(error: string, name: string): string {
   switch (error) {

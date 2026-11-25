@@ -14,13 +14,18 @@ import {
   MAIN_THREAD,
   PAIR_ALPHABET,
   PROTOCOL_VERSION,
+  validAgentName,
+  validDeviceLabel,
+  validPresetToken,
+  validThreadId,
+  validThreadTitle as validWireThreadTitle,
   type ActivityStep,
   type CommandInfo,
   type AttachmentInfo,
+  type DurableEvent,
   type ErrorCode,
   type PresetInfo,
-  type Reaction,
-  type QuestionEvent,
+  type ThreadEvent,
   type ThreadInfo,
   type ThreadOrigin,
 } from "./generated/protocol-v2.js";
@@ -36,10 +41,6 @@ export const APP_LIMITS = Object.freeze({
   /** More than five pairing failures per minute across all clients refuses the next attempt. */
   pairRateWindowMs: 60_000,
   pairRateMax: 5,
-  /** `hello.presets`: at most this many entries, each field bounded in characters. */
-  maxPresets: 50,
-  presetNameChars: 80,
-  presetModelChars: 240,
   cookieName: "durable_device",
   /** Distinct paired devices retained; further pairing is refused until one is revoked. */
   maxDevices: 16,
@@ -52,8 +53,6 @@ export const APP_LIMITS = Object.freeze({
   /** `send` keys are remembered for idempotency; pruning is by age only (keys are tiny). */
   sendKeyTtlMs: 7 * 24 * 60 * 60_000,
   maxUnresolvedControls: 64,
-  /** `task.cancel.task`: one namespaced task id (`w:` worker, `c:` scheduled job). */
-  taskIdPattern: /^[wc]:[A-Za-z0-9_-]{1,80}$/,
 } as const);
 
 /** Fixed WebSocket close codes; the upgrade is always completed first. */
@@ -65,7 +64,10 @@ export type AppErrorCode = ErrorCode;
 export type AppCommandInfo = CommandInfo;
 /** One `hello.presets` entry; `model` is `provider/model`. */
 export type AppPresetInfo = PresetInfo;
-/** Accepted ops; `history` is declared in v2.md as later work. */
+/**
+ * Accepted ops. `history` stays although no client sends it: v2.md reserves it as later work and
+ * the gateway answers it `unsupported` rather than closing the stream as a protocol violation.
+ */
 export const APP_REQUEST_OPS: readonly string[] = [
   "hello", "send", "ack", "control", "ping", "history", "tasks", "task.cancel", "answer",
   "threads", "thread.create", "thread.rename", "thread.archive",
@@ -85,41 +87,42 @@ export type AppThreadInfo = ThreadInfo;
 /** One tool step of a turn: id, bounded tool name, state and times; never its arguments or result. */
 export type AppActivityStep = ActivityStep;
 
+/** A thread title (shared wire validator): 1–80 characters, not blank, nothing unprintable. */
 export function validThreadTitle(value: unknown): value is string {
-  return typeof value === "string" && Array.from(value).length <= APP_LIMITS.threadTitleChars &&
-    value.trim() !== "" && !/[\p{C}\p{Zl}\p{Zp}]/u.test(value);
+  return validWireThreadTitle(value);
 }
 
 export function parseThreadId(value: unknown): string | undefined {
-  return typeof value === "string" && APP_LIMITS.threadIdPattern.test(value) ? value : undefined;
+  return validThreadId(value) ? value : undefined;
 }
 
-/** A printable device label: 1–40 characters, no control or format characters. */
+/** A printable device label: 1–40 characters, no control or format characters (shared wire validator). */
 export function validAppLabel(value: unknown): value is string {
-  if (typeof value !== "string") return false;
-  if (value.length < APP_LIMITS.labelMinChars || value.length > APP_LIMITS.labelMaxChars) return false;
-  // Spaces are fine inside a label ("Gergo's iPhone"), never at either end.
-  if (value.trim() !== value) return false;
-  return /^[\x20-\x7e\u00a0-\uffff]+$/u.test(value) && !/[\u202a-\u202e\u2066-\u2069]/u.test(value);
+  return validDeviceLabel(value);
 }
 
-/** The hello reply's agent display name: 1–40 printable characters (spaces allowed). */
+/** The hello reply's agent display name: 1–40 printable characters (shared wire validator). */
 export function validAppAgentName(value: unknown): value is string {
-  if (typeof value !== "string" || value.length === 0) return false;
-  if (value.length > APP_LIMITS.agentNameMaxChars || value.trim() === "") return false;
-  return /^[\x20-\x7e\u00a0-\uffff]+$/u.test(value) && !/[\u202a-\u202e\u2066-\u2069]/u.test(value);
+  return validAgentName(value);
+}
+
+/**
+ * A preset name exactly as the hello projection bounds it (the shared wire validator): the
+ * `/model` control accepts the same names `appPresetInfos` can advertise, never a wider set.
+ */
+export function validAppPresetName(value: unknown): value is string {
+  return validPresetToken(value, APP_LIMITS.presetNameChars);
 }
 
 /** Project configured presets onto the bounded wire shape; entries with unprintable fields are dropped. */
 export function appPresetInfos(
   presets: readonly { name: string; provider: string; modelId: string; thinkingLevel?: string }[] | undefined,
 ): AppPresetInfo[] {
-  const printable = (value: unknown, max: number): value is string => typeof value === "string" &&
-    value.length > 0 && value.length <= max && !/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069\s]/u.test(value);
   const out: AppPresetInfo[] = [];
   for (const preset of presets ?? []) {
     const model = `${preset.provider}/${preset.modelId}`;
-    if (!printable(preset.name, APP_LIMITS.presetNameChars) || !printable(model, APP_LIMITS.presetModelChars)) continue;
+    if (!validPresetToken(preset.name, APP_LIMITS.presetNameChars) ||
+        !validPresetToken(model, APP_LIMITS.presetModelChars)) continue;
     out.push({ name: preset.name, model, ...(preset.thinkingLevel === undefined ? {} : { thinking: preset.thinkingLevel }) });
     if (out.length >= APP_LIMITS.maxPresets) break;
   }
@@ -157,42 +160,13 @@ export type AppUploadRecord = {
   readonly messageId?: string;
 };
 
-/** Durable, cursor-numbered events; stored without the `type` wrapper and wrapped on the wire. */
-export type AppDurableEvent =
-  | {
-    event: "message";
-    cursor: number;
-    /** Missing only on legacy v1 records; they belong to main. */
-    thread?: string;
-    id: string;
-    role: "user" | "assistant" | "notice";
-    text: string;
-    at: string;
-    key?: string;
-    /** Files sent with this user message, in send order; first part only when split. */
-    attachments?: AttachmentInfo[];
-    /** Assistant only: the turn's tool steps, first part only when split (protocol v2, Activity). */
-    steps?: AppActivityStep[];
-    /** Assistant only: steps dropped by the `maxActivitySteps` bound. */
-    omitted?: number;
-    /** Present only on a split message: part `i` (from 0) of `n`; see v2.md, Long messages. */
-    part?: { i: number; n: number };
-  }
-  | { event: "settled"; cursor: number; thread?: string; key: string; outcome: "answered" | "failed" | "aborted" }
-  | {
-    event: "reaction";
-    cursor: number;
-    thread?: string;
-    /** The durable `message` id this reaction is on. */
-    message: string;
-    /** Protocol v2 defines exactly one reacting party for now. */
-    by: "owner";
-    /** The reaction, or `null` when the owner cleared it. */
-    emoji: Reaction | null;
-  }
-  | { event: "divider"; cursor: number; thread?: string; at: string; reason: "new" | "idle" }
-  | (Omit<QuestionEvent, "type" | "thread"> & { thread?: string })
-  | { event: "thread"; cursor: number; thread: AppThreadInfo };
+/**
+ * One durable event as stored: the wire event without its `type` wrapper (added back on the wire).
+ * Records written before threads existed carry no `thread`; they belong to main.
+ */
+type StoredDurableEvent<E> = E extends ThreadEvent ? Omit<E, "type">
+  : E extends DurableEvent ? Omit<E, "type" | "thread"> & { thread?: string } : never;
+export type AppDurableEvent = StoredDurableEvent<DurableEvent>;
 
 /** One pending model input (an admitted `send`) or held host notice. */
 export type AppPendingInput = {

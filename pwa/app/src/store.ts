@@ -1,49 +1,22 @@
-import { openDB, type DBSchema, type IDBPDatabase } from "idb";
-import { MAIN_THREAD, type ActivityEvent, type CommandInfo, type DurableEvent, type LoginEvent, type ModelEvent, type PresetInfo, type Reaction, type StatusEvent, type ThreadId, type ThreadInfo, type ThreadOrigin } from "./protocol";
+import { DEFAULT_AGENT_NAME, QUEUE_CHANNEL } from "./db-constants";
+import {
+  loadSnapshot, openAppDb, retireRecords, RETENTION,
+  type AppDb, type Identity, type Outgoing, type OutgoingState, type PushState, type StoredFile, type ThreadCreate,
+} from "./db";
+import {
+  MAIN_THREAD, parseDurableEvent,
+  type ActivityEvent, type CommandInfo, type DurableEvent, type LoginEvent, type ModelEvent, type PresetInfo,
+  type Reaction, type StatusEvent, type ThreadId, type ThreadInfo, type ThreadOrigin,
+} from "./protocol";
 
+export type { Outgoing, OutgoingState, PendingFile, PushState, ThreadCreate } from "./db";
 export type ConnState = "offline" | "connecting" | "replaying" | "open";
 export type Mode = "boot" | "chat" | "pair" | "update";
-export type OutgoingState = "queued" | "sent" | "admitted" | "answered" | "failed" | "aborted";
-/** A file in a queued send that the gateway has not accepted yet (no upload id). */
-export type PendingFile = { id: string; name: string; type: string; size: number; uploadId?: string };
-export type Outgoing = {
-  key: string; thread: ThreadId; text: string; state: OutgoingState; at: number;
-  /** Upload ids in send order; set once, never changed for this key. */
-  attachments?: string[];
-  /** Local files still waiting for an upload id, kept so a reconnect can finish them. */
-  pending?: PendingFile[];
-  /** IndexedDB blob ids for cleanup; the bytes stay until the turn is over. */
-  fileIds?: string[];
-  /** Short delivery explanation, e.g. why an upload stopped. */
-  note?: string;
-};
 /** A file picked in the composer, handed to the outbox when its message is sent. */
 export type NewAttachment = { id: string; name: string; type: string; size: number; blob: Blob; uploadId?: string };
-export type ThreadCreate = { key: string; title?: string; from?: ThreadOrigin; failed?: boolean };
 export type AgentStatus = Pick<StatusEvent, "state" | "label">;
 type ChatEvent = Exclude<DurableEvent, { event: "thread" }>;
-type Identity = { device?: string; agent?: string; commands?: CommandInfo[]; presets?: PresetInfo[]; uploads?: boolean };
 type LiveStatus = AgentStatus & { turnKey?: string };
-/**
- * Web Push opt-in. `endpoint` is set only once the gateway accepted it; `key`
- * is the gateway VAPID key that subscription was made with.
- */
-export type PushState = { endpoint?: string; key?: string; gatewayUnsupported?: boolean };
-
-type StoredFile = { id: string; name: string; type: string; size: number; blob: Blob };
-
-interface Db extends DBSchema {
-  events: { key: number; value: DurableEvent };
-  outbox: { key: string; value: Outgoing };
-  files: { key: string; value: StoredFile };
-  threads: { key: string; value: ThreadInfo };
-  creates: { key: string; value: ThreadCreate };
-  view: { key: string; value: { thread: ThreadId; cursor: number } };
-  settings: {
-    key: "openThread" | "resumeCursor" | "identity" | "push";
-    value: ThreadId | number | Identity | PushState;
-  };
-}
 
 const IDLE: AgentStatus = { state: "idle" };
 const MAIN: ThreadInfo = { id: MAIN_THREAD, title: "Main", archived: false, createdAt: "", lastAt: "" };
@@ -66,6 +39,16 @@ export function openableLoginUrl(url: string): boolean {
   if (parsed.protocol !== "http:") return false;
   return parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1";
 }
+
+/** Cursors of the questions still open: the latest event for each id, in state `open`. */
+function openQuestionCursors(events: readonly ChatEvent[]): Set<number> {
+  const latest = new Map<string, Extract<ChatEvent, { event: "question" }>>();
+  for (const ev of events) if (ev.event === "question") latest.set(ev.id, ev);
+  return new Set([...latest.values()].filter((q) => q.state === "open").map((q) => q.cursor));
+}
+
+/** The id of a split message part; `undefined` for anything else. */
+const splitId = (ev: ChatEvent) => ev.event === "message" && ev.part !== undefined ? ev.id : undefined;
 
 /** Same key alphabet as the protocol's request ids. */
 function newKey(): string {
@@ -111,8 +94,16 @@ export class Store {
   private viewed = new Map<ThreadId, number>();
   /** Split messages by `${thread}\u0000${id}`: the parts received so far, keyed by `i`. */
   private splitMessages = new Map<string, { n: number; texts: Map<number, string> }>();
-  private db: IDBPDatabase<Db> | null = null;
-  private queueChanges = typeof BroadcastChannel === "undefined" ? undefined : new BroadcastChannel("durable-app-queue");
+  private db: AppDb | null = null;
+  private queueChanges: BroadcastChannel | undefined;
+  private opening: Promise<void> | undefined;
+  /** The cache has been read into memory once; a reopen after `dispose()` only reattaches. */
+  private loaded = false;
+  private disposed = false;
+  /** A created thread to open once it is known, if the owner is still where they created it. */
+  private follow: { thread: ThreadId; from: ThreadId } | undefined;
+  /** Stored `thread` events superseded by a newer one for the same thread; retired with the rest. */
+  private staleThreadEvents: number[] = [];
   private durableWriteFailed = false;
   private seenCursors = new Set<number>();
   private threadCursors = new Map<ThreadId, number>();
@@ -126,18 +117,37 @@ export class Store {
   private searchCache?: { query: string; remote: ReadonlySet<string> | undefined; results: { thread: ThreadInfo; snippet?: string }[] };
   private listeners = new Set<() => void>();
   private version = 0;
+  /** Version of the last change that may affect every thread. */
+  private broadVersion = 0;
+  /** Version of the last change scoped to one thread (or to one of its side threads). */
+  private threadVersions = new Map<ThreadId, number>();
 
   subscribe = (fn: () => void) => {
     this.listeners.add(fn);
     return () => { this.listeners.delete(fn); };
   };
+  /** Changes with every update. */
   getSnapshot = () => this.version;
-  private changed() {
+  /**
+   * Changes only when something shown in `thread` may have: its events, outbox rows, status,
+   * activity, login, metadata or a side thread forked from it, or a change not scoped to a thread.
+   */
+  threadSnapshot = (thread: ThreadId) => Math.max(this.broadVersion, this.threadVersions.get(thread) ?? 0);
+
+  /** `undefined`: may affect anything; a thread id: only that thread (and its parent); `null`: no thread view. */
+  private changed(scope?: ThreadId | null) {
     this.version++;
+    if (scope === undefined) this.broadVersion = this.version;
+    else if (scope !== null) {
+      this.threadVersions.set(scope, this.version);
+      // A side thread's title and signals show as a fork chip in its parent.
+      const parent = this.threads.get(scope)?.origin?.thread;
+      if (parent !== undefined) this.threadVersions.set(parent, this.version);
+    }
     for (const fn of this.listeners) fn();
   }
 
-  get agentName() { return this.identity?.agent ?? "Pedellus"; }
+  get agentName() { return this.identity?.agent ?? DEFAULT_AGENT_NAME; }
   /** The gateway's last advertised commands; undefined until a hello listed them. */
   get commands() { return this.identity?.commands; }
   /** The gateway's last advertised model presets; undefined until a hello listed them. */
@@ -145,79 +155,107 @@ export class Store {
   /** `hello.uploads`: whether this gateway accepts files (protocol v2, Files). */
   get uploads() { return this.identity?.uploads === true; }
 
-  async init() {
-    const db = await openDB<Db>("durable-app", 3, {
-      blocked: () => {
-        this.storageBlocked = true;
-        this.changed();
-      },
-      upgrade(db, oldVersion) {
-        if (oldVersion < 1) {
-          db.createObjectStore("events", { keyPath: "cursor" });
-          db.createObjectStore("outbox", { keyPath: "key" });
-        }
-        if (oldVersion < 2) {
-          db.createObjectStore("threads", { keyPath: "id" });
-          db.createObjectStore("creates", { keyPath: "key" });
-          db.createObjectStore("view", { keyPath: "thread" });
-          db.createObjectStore("settings");
-        }
-        // Uploaded/failed file bytes for queued sends (protocol v2, Files).
-        if (oldVersion < 3) db.createObjectStore("files", { keyPath: "id" });
-      },
+  /**
+   * Open the cache and load it. Safe to call again after `dispose()` (React StrictMode mounts
+   * twice): a second call while opening joins the first, and a reopen only reattaches storage.
+   */
+  init(): Promise<void> {
+    this.disposed = false;
+    // Already open: never a second handle over the first.
+    if (this.db && this.loaded) return Promise.resolve();
+    return this.opening ??= this.open().finally(() => { this.opening = undefined; });
+  }
+
+  /** Release storage, the cross-window channel and every timer. `init()` may follow. */
+  dispose() {
+    this.disposed = true;
+    for (const timer of this.loginTimers.values()) clearTimeout(timer);
+    this.loginTimers.clear();
+    this.logins.clear();
+    this.queueChanges?.close();
+    this.queueChanges = undefined;
+    this.db?.close();
+    this.db = null;
+  }
+
+  private async open() {
+    const db = await openAppDb(() => {
+      this.storageBlocked = true;
+      this.changed();
     });
+    if (this.disposed) {
+      db.close();
+      return;
+    }
     let closed = false;
     db.onversionchange = () => {
       closed = true;
       db.close();
-      this.db = null;
+      if (this.db === db) this.db = null;
     };
     this.storageBlocked = false;
+    this.queueChanges ??= typeof BroadcastChannel === "undefined" ? undefined : new BroadcastChannel(QUEUE_CHANNEL);
+    if (this.loaded) {
+      if (this.db && this.db !== db) this.db.close();
+      this.db = db;
+      this.changed();
+      return;
+    }
     // Load the replay checkpoint and everything it covers from one snapshot.
-    const tx = db.transaction(["events", "outbox", "threads", "creates", "view", "settings"], "readonly");
-    const [events, outbox, threads, creates, viewed, open, resume, identity, push] = await Promise.all([
-      tx.objectStore("events").getAll(), tx.objectStore("outbox").getAll(),
-      tx.objectStore("threads").getAll(), tx.objectStore("creates").getAll(), tx.objectStore("view").getAll(),
-      tx.objectStore("settings").get("openThread"), tx.objectStore("settings").get("resumeCursor"),
-      tx.objectStore("settings").get("identity"), tx.objectStore("settings").get("push"), tx.done,
-    ]).catch((err) => { db.close(); throw err; });
+    const snap = await loadSnapshot(db).catch((err) => { db.close(); throw err; });
+    if (this.disposed) {
+      db.close();
+      return;
+    }
     if (!closed) this.db = db;
-    const cachedThreads = new Set(threads.map((t) => t.id));
-    for (const t of threads) this.cacheThread(t);
-    for (const m of outbox) {
+    const cachedThreads = new Set(snap.threads.map((t) => t.id));
+    for (const t of snap.threads) this.cacheThread(t);
+    for (const m of snap.outbox) {
       const thread = m.thread ?? MAIN_THREAD;
       this.ensureThread(thread);
       this.outbox.set(m.key, { ...m, thread });
     }
-    // IndexedDB returns events in primary-key (cursor) order. Normalize old
-    // records on read; the upgrade never rewrites or drops the v1 log/outbox.
-    for (const ev of events) {
+    // IndexedDB returns events in primary-key (cursor) order. Normalize old records on read; the
+    // upgrade never rewrites or drops the v1 log/outbox. A record that is not a well-formed event
+    // (a corrupt or foreign write) is skipped rather than taking the UI down.
+    for (const raw of snap.events) {
+      const stored = raw !== null && typeof raw === "object" ? raw as Record<string, unknown> : {};
+      const legacy = stored.thread === undefined;
+      const ev = parseDurableEvent({ ...stored, type: "event", thread: stored.thread ?? MAIN_THREAD });
+      if (!ev) continue;
       this.cursor = ev.cursor;
       this.seenCursors.add(ev.cursor);
       if (ev.event === "thread") {
+        const previous = this.threadCursors.get(ev.thread.id);
+        if (previous !== undefined) this.staleThreadEvents.push(previous);
         this.threadCursors.set(ev.thread.id, ev.cursor);
         if (!cachedThreads.has(ev.thread.id)) this.cacheThread(ev.thread);
       } else {
         // Existing v2 caches have no checkpoint. Replay from the last v1
         // cursor (or the beginning) rather than trusting their high-water mark.
-        if (ev.thread === undefined) this.resumeCursor = ev.cursor;
-        this.absorbChat({ ...ev, thread: ev.thread ?? MAIN_THREAD });
+        if (legacy) this.resumeCursor = ev.cursor;
+        this.absorbChat(ev);
       }
     }
-    for (const c of creates) this.creates.set(c.key, c);
-    for (const v of viewed) this.viewed.set(v.thread, v.cursor);
-    if (typeof open === "string") {
-      this.ensureThread(open);
-      this.openThread = open;
+    for (const c of snap.creates) this.creates.set(c.key, c);
+    for (const v of snap.view) this.viewed.set(v.thread, v.cursor);
+    if (typeof snap.openThread === "string") {
+      this.ensureThread(snap.openThread);
+      this.openThread = snap.openThread;
     }
-    if (typeof resume === "number") this.resumeCursor = resume;
-    if (typeof identity === "object" && identity) this.identity = identity as Identity;
-    if (typeof push === "object" && push) this.push = push as PushState;
+    if (typeof snap.resumeCursor === "number") this.resumeCursor = snap.resumeCursor;
+    if (typeof snap.identity === "object" && snap.identity) this.identity = snap.identity as Identity;
+    if (typeof snap.push === "object" && snap.push) this.push = snap.push as PushState;
+    this.loaded = true;
     this.changed();
+    void this.retire().catch(console.error);
   }
 
-  onQueueChange(listener: () => void) {
-    this.queueChanges?.addEventListener("message", listener);
+  /** Another window changed the outbox or the create queue. Returns the unsubscribe. */
+  onQueueChange(listener: () => void): () => void {
+    const channel = this.queueChanges;
+    channel?.addEventListener("message", listener);
+    return () => channel?.removeEventListener("message", listener);
   }
 
   async reloadQueue() {
@@ -246,11 +284,19 @@ export class Store {
     let info: ThreadInfo | undefined;
     if (ev.event === "thread") {
       const prev = this.threads.get(ev.thread.id);
-      if (ev.cursor > (this.threadCursors.get(ev.thread.id) ?? 0)) {
+      const previous = this.threadCursors.get(ev.thread.id);
+      if (ev.cursor > (previous ?? 0)) {
+        if (previous !== undefined) this.staleThreadEvents.push(previous);
         this.threadCursors.set(ev.thread.id, ev.cursor);
         const lastAt = prev && Date.parse(prev.lastAt) > Date.parse(ev.thread.lastAt) ? prev.lastAt : ev.thread.lastAt;
         info = { ...ev.thread, lastAt };
         this.cacheThread(info);
+      } else {
+        this.staleThreadEvents.push(ev.cursor);
+      }
+      if (ev.thread.id === this.follow?.thread) {
+        if (this.openThread === this.follow.from) this.selectThread(ev.thread.id);
+        this.follow = undefined;
       }
     } else {
       outgoing = this.absorbChat(ev);
@@ -260,7 +306,7 @@ export class Store {
         this.cacheThread(info);
       }
     }
-    this.changed();
+    this.changed(ev.event === "thread" ? ev.thread.id : ev.thread);
     if (!this.db || this.durableWriteFailed) return false;
     try {
       const tx = this.db.transaction(["events", "outbox", "threads"], "readwrite");
@@ -290,8 +336,113 @@ export class Store {
     if (cursor > (this.resumeCursor ?? 0)) {
       await this.db.put("settings", cursor, "resumeCursor");
       this.resumeCursor = Math.max(this.resumeCursor ?? 0, cursor);
+      void this.retire().catch(console.error);
     }
     return true;
+  }
+
+  /**
+   * Keep local history bounded (`RETENTION`): drop the oldest events at or below the replay
+   * checkpoint, which the gateway never resends, from memory and from IndexedDB. What the UI still
+   * acts on stays: an open question's card, and a long message unless all its parts go. A user
+   * message's outbox row goes with its echo, so an admitted send can never come back as "Not
+   * sent" once the echo that hid it is gone. Superseded `thread` snapshots go too.
+   */
+  private async retire() {
+    const floor = this.resumeCursor ?? 0;
+    if (!this.db || this.durableWriteFailed || floor === 0) return;
+    const dropped: number[] = [];
+    /** User echoes being retired, with the thread that must match their outbox row. */
+    const echoes: { key: string; thread: ThreadId }[] = [];
+    /** Retire `thread`'s oldest retirable events, in cursor order, while `take` accepts them. */
+    const cut = (thread: ThreadId, take: (ev: ChatEvent, taken: number) => boolean) => {
+      const events = this.events.get(thread);
+      if (!events) return;
+      const open = openQuestionCursors(events);
+      const out = new Set<number>();
+      for (let i = 0; i < events.length; i++) {
+        const ev = events[i];
+        if (ev.cursor > floor || !take(ev, out.size)) break;
+        if (!open.has(ev.cursor)) out.add(i);
+      }
+      // Never split a long message: its parts go only when every expected distinct part is
+      // here and each is at or below the checkpoint — an interrupted replay must be able to
+      // complete the message later, so an incomplete split retires nothing at all.
+      const parts = new Map<string, number[]>();
+      events.forEach((ev, i) => {
+        const id = splitId(ev);
+        if (id !== undefined) parts.set(id, [...parts.get(id) ?? [], i]);
+      });
+      for (const [id, indices] of parts) {
+        if (!indices.some((i) => out.has(i))) continue;
+        const whole = indices.every((i) => events[i].cursor <= floor) &&
+          this.splitMessage(thread, id)?.complete === true;
+        for (const i of indices) {
+          if (whole) out.add(i);
+          else out.delete(i);
+        }
+      }
+      if (!out.size) return;
+      const removed = events.filter((_, i) => out.has(i));
+      this.events.set(thread, events.filter((_, i) => !out.has(i)));
+      dropped.push(...this.forget(thread, removed, echoes));
+    };
+    for (const thread of [...this.events.keys()]) {
+      const excess = (this.events.get(thread)?.length ?? 0) - RETENTION.perThread;
+      if (excess > 0) cut(thread, (_ev, taken) => taken < excess);
+    }
+    let total = 0;
+    for (const events of this.events.values()) total += events.length;
+    if (total > RETENTION.total) {
+      const old: number[] = [];
+      for (const events of this.events.values()) {
+        const open = openQuestionCursors(events);
+        for (const ev of events) if (ev.cursor <= floor && !open.has(ev.cursor)) old.push(ev.cursor);
+      }
+      old.sort((a, b) => a - b);
+      const threshold = old[Math.min(total - RETENTION.total, old.length) - 1];
+      if (threshold !== undefined) for (const thread of [...this.events.keys()]) cut(thread, (ev) => ev.cursor <= threshold);
+    }
+    const stale = this.staleThreadEvents.filter((cursor) => cursor <= floor);
+    this.staleThreadEvents = this.staleThreadEvents.filter((cursor) => cursor > floor);
+    for (const cursor of stale) this.seenCursors.delete(cursor);
+    dropped.push(...stale);
+    if (!dropped.length) return;
+    if (dropped.length > stale.length) this.changed();
+    // The outbox rows go by durable echo key in the same transaction, whatever this store's
+    // in-memory copy says: another window may hold the row this one never saw.
+    const pruned = await retireRecords(this.db, dropped, echoes).catch((err) => {
+      console.error("retention did not finish", err);
+      return [];
+    });
+    if (echoes.length) this.queueChanges?.postMessage(null);
+    if (pruned.length) await this.deleteFiles(pruned);
+  }
+
+  /**
+   * Forget the derived state of retired events; returns their cursors. A user echo also names its
+   * outbox row by key for `retireRecords` to delete — by thread identity, straight from the
+   * transaction, never by this store's possibly stale in-memory copy. Cached bytes are cleaned
+   * from what that committed transaction deleted, never from the in-memory row: a retry under a
+   * new key may still reference them.
+   */
+  private forget(thread: ThreadId, removed: ChatEvent[], echoes: { key: string; thread: ThreadId }[]): number[] {
+    this.searchCache = undefined;
+    for (const ev of removed) {
+      this.seenCursors.delete(ev.cursor);
+      this.searchText.delete(ev.cursor);
+      if (ev.event === "message" && ev.part) this.splitMessages.delete(`${thread}\u0000${ev.id}`);
+      if (ev.event === "message" && ev.role === "user" && ev.key !== undefined) {
+        echoes.push({ key: ev.key, thread });
+        const m = this.outbox.get(ev.key);
+        if (m && m.thread === thread) this.outbox.delete(ev.key);
+      }
+      if (ev.event === "reaction" && this.reactions.get(thread)?.get(ev.message)?.cursor === ev.cursor) {
+        this.reactions.get(thread)!.delete(ev.message);
+      }
+    }
+    if (!this.events.get(thread)?.length) this.events.delete(thread);
+    return removed.map((ev) => ev.cursor);
   }
 
   private absorbChat(ev: ChatEvent): Outgoing | undefined {
@@ -388,7 +539,7 @@ export class Store {
 
   setThreadListUnavailable() {
     this.threadListUnavailable = true;
-    this.changed();
+    this.changed(null);
   }
 
   async mergeThreads(list: ThreadInfo[], refresh = false) {
@@ -438,7 +589,7 @@ export class Store {
     if (id === MAIN_THREAD || !t?.createdAt || t.archived) return;
     const unconfirmed = { ...t, createdAt: "" };
     this.cacheThread(unconfirmed);
-    this.changed();
+    this.changed(id);
     return unconfirmed;
   }
 
@@ -471,6 +622,16 @@ export class Store {
     return results;
   }
 
+  /**
+   * A `thread.create` made from `from` succeeded: open the new thread, now or once its `thread`
+   * event arrives, but only while the owner is still in the thread they created it from.
+   */
+  followCreated(thread: ThreadId, from: ThreadId) {
+    if (from !== this.openThread) return;
+    if (this.threads.has(thread)) this.selectThread(thread);
+    else this.follow = { thread, from };
+  }
+
   selectThread(thread: ThreadId) {
     if (thread === this.openThread) return;
     this.ensureThread(thread);
@@ -495,7 +656,7 @@ export class Store {
   markViewed(thread: ThreadId, cursor: number) {
     if (!this.replayReady || cursor <= (this.viewed.get(thread) ?? 0)) return;
     this.viewed.set(thread, cursor);
-    this.changed();
+    this.changed(thread);
     void this.db?.put("view", { thread, cursor }).catch(console.error);
   }
 
@@ -530,19 +691,10 @@ export class Store {
 
   /** The thread's offered MCP login, if one is live and unexpired. Never read from storage. */
   login(thread: ThreadId): LoginEvent | undefined {
+    // A pure read: renders call this. The expiry timer set in `setLogin` removes the offer; until
+    // it fires (a throttled background timer can be late) an expired offer is just not shown.
     const login = this.logins.get(thread);
-    if (login === undefined) return undefined;
-    if (Date.parse(login.expiresAt) <= Date.now()) {
-      const timer = this.loginTimers.get(thread);
-      if (timer !== undefined) {
-        clearTimeout(timer);
-        this.loginTimers.delete(thread);
-      }
-      // Not `clearLogin`: a render may call this, and a render must not notify listeners.
-      this.logins.delete(thread);
-      return undefined;
-    }
-    return login;
+    return login !== undefined && Date.parse(login.expiresAt) > Date.now() ? login : undefined;
   }
 
   setLogin(ev: LoginEvent) {
@@ -554,11 +706,11 @@ export class Store {
       this.loginTimers.delete(ev.thread);
       if (this.logins.get(ev.thread) === ev) {
         this.logins.delete(ev.thread);
-        this.changed();
+        this.changed(ev.thread);
       }
     }, Math.max(0, Math.min(expiresAtMs - Date.now(), 2_147_483_647)));
     this.loginTimers.set(ev.thread, timer);
-    this.changed();
+    this.changed(ev.thread);
   }
 
   private clearLogin(thread: ThreadId) {
@@ -567,7 +719,7 @@ export class Store {
       clearTimeout(timer);
       this.loginTimers.delete(thread);
     }
-    if (this.logins.delete(thread)) this.changed();
+    if (this.logins.delete(thread)) this.changed(thread);
   }
 
   resetActivities() {
@@ -577,19 +729,19 @@ export class Store {
 
   setActivity(ev: ActivityEvent) {
     this.activities.set(ev.thread, ev);
-    this.changed();
+    this.changed(ev.thread);
   }
 
   setModel(ev: Pick<ModelEvent, "thread" | "preset">) {
     this.models.set(ev.thread, ev.preset);
     this.pendingModels.delete(ev.thread);
-    this.changed();
+    this.changed(null);
   }
 
   setPendingModel(thread: ThreadId, preset: string | undefined) {
     if (preset === undefined) this.pendingModels.delete(thread);
     else this.pendingModels.set(thread, preset);
-    this.changed();
+    this.changed(null);
   }
 
   setStatus(s: StatusEvent) {
@@ -599,7 +751,7 @@ export class Store {
     const turnKey = running ? this.statuses.get(s.thread)?.turnKey ??
       this.unfinished.get(s.thread)?.values().next().value : undefined;
     this.statuses.set(s.thread, { state: s.state, label: s.label, turnKey });
-    this.changed();
+    this.changed(s.thread);
   }
 
   notePreview(thread: ThreadId, key: string) {
@@ -615,7 +767,11 @@ export class Store {
       this.connState = s;
       if (s === "connecting" || s === "replaying") this.replayReady = false;
       if (s === "open") this.replayReady = true;
-      if (s === "offline") this.statuses.clear();
+      if (s === "offline") {
+        this.statuses.clear();
+        // A create reply that is still owed is lost with the stream; don't jump later.
+        this.follow = undefined;
+      }
       this.changed();
     }
   }
@@ -624,7 +780,7 @@ export class Store {
   setAcked(cursor: number) {
     if (this.ackedCursor !== null && cursor <= this.ackedCursor) return;
     this.ackedCursor = cursor;
-    this.changed();
+    this.changed(null);
   }
 
   setMode(m: Mode) {
@@ -656,7 +812,7 @@ export class Store {
     if (next.endpoint === this.push.endpoint && next.key === this.push.key
       && next.gatewayUnsupported === this.push.gatewayUnsupported) return;
     this.push = next;
-    this.changed();
+    this.changed(null);
     await this.db?.put("settings", next, "push").catch(console.error);
   }
 
@@ -704,7 +860,7 @@ export class Store {
     if (retryKey) this.outbox.delete(retryKey);
     this.outbox.set(m.key, m);
     this.queueChanges?.postMessage(null);
-    this.changed();
+    this.changed(thread);
     return m;
   }
 
@@ -715,7 +871,7 @@ export class Store {
     if (m?.fileIds?.length) void this.deleteFiles(m.fileIds).catch(console.error);
     this.outbox.delete(key);
     this.queueChanges?.postMessage(null);
-    this.changed();
+    this.changed(m?.thread ?? null);
   }
 
   async setOutgoingState(key: string, state: "queued" | "sent" | "admitted" | "failed", note?: string) {
@@ -723,7 +879,7 @@ export class Store {
     if (!m || m.state === state || m.state === "admitted" || terminal(m.state)) return;
     const next = this.updateOutgoing(m, state);
     if (note) next.note = note;
-    this.changed();
+    this.changed(m.thread);
     if (!this.db) return;
     const tx = this.db.transaction("outbox", "readwrite");
     await Promise.all([this.persistReceipt(tx.store, next), tx.done]);
@@ -746,7 +902,7 @@ export class Store {
     const next = { ...saved, pending: saved.pending.map((p) => p.id === fileId ? { ...p, uploadId } : p) };
     await Promise.all([tx.store.put(next), tx.done]);
     this.outbox.set(key, next);
-    this.changed();
+    this.changed(next.thread);
     this.queueChanges?.postMessage(null);
     return next;
   }
@@ -766,7 +922,7 @@ export class Store {
     const next = { ...saved, attachments: saved.pending.map((p) => p.uploadId!) };
     await Promise.all([tx.store.put(next), tx.done]);
     this.outbox.set(key, next);
-    this.changed();
+    this.changed(next.thread);
     this.queueChanges?.postMessage(null);
     return next;
   }
@@ -793,14 +949,14 @@ export class Store {
     await this.db.put("creates", c);
     this.creates.set(c.key, c);
     this.queueChanges?.postMessage(null);
-    this.changed();
+    this.changed(null);
     return c;
   }
 
   clearForkRejection() {
     if (!this.forkRejected) return;
     this.forkRejected = false;
-    this.changed();
+    this.changed(null);
   }
 
   async finishCreate(c: ThreadCreate, ok: boolean, rejectedFork = false) {
@@ -814,7 +970,7 @@ export class Store {
       await this.db?.put("creates", failed);
       this.creates.set(c.key, failed);
     }
-    this.changed();
+    this.changed(null);
   }
 
   /** Messages that must (re)reach the gateway: never-sent or reply-less. */

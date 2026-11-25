@@ -1,4 +1,6 @@
+import type { Connection } from "./conn";
 import { LIMITS, type PushSubscriptionInfo } from "./protocol";
+import type { Store } from "./store";
 
 /**
  * Web Push enrolment for this device. Nothing here runs on its own: the app
@@ -149,4 +151,114 @@ export async function subscribedServerKey(): Promise<string | undefined> {
   } catch {
     return undefined;
   }
+}
+
+// -- Enrolment with the gateway ------------------------------------------------------------------
+
+type PushConn = Pick<Connection, "pushKey" | "pushSubscribe" | "pushUnsubscribe">;
+type PushStore = Pick<Store, "push" | "setPush">;
+/** What the Notifications row shows next: the browser permission it learned, and a receipt. */
+export type PushOutcome = { permission?: PushPermission; note?: string };
+
+/** One form for comparing keys: base64url alphabet, no padding (a gateway may send plain base64). */
+export function normalizeServerKey(key: string): string {
+  return key.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/**
+ * Browser subscribe with the gateway's key, then `push.subscribe`. Permission must be granted
+ * already; nothing here prompts. On failure nothing stays half on: the browser subscription is
+ * dropped and `push.subscribe` is never sent.
+ */
+async function subscribeDevice(store: PushStore, conn: PushConn, key: string): Promise<{
+  permission: PushPermission; note?: string;
+}> {
+  const attempt = await enablePush(key);
+  const permission = pushPermission();
+  if (attempt.kind !== "subscribed") {
+    return { permission, note: attempt.kind === "denied"
+      ? "Notifications are blocked for this app. Allow them in browser settings, then try again."
+      : "Could not subscribe this device. Try again." };
+  }
+  const saved = await conn.pushSubscribe(attempt.subscription);
+  if (!saved?.ok) {
+    await disablePush();
+    if (saved?.error === "unsupported") await store.setPush({ gatewayUnsupported: true });
+    return { permission, note: saved
+      ? "The gateway did not accept this device. Try again."
+      : "Reconnect to finish turning notifications on, then try again." };
+  }
+  await store.setPush({ endpoint: attempt.subscription.endpoint, key });
+  return { permission };
+}
+
+/**
+ * Learn the gateway's push answer when the menu opens (never asking for permission), and rebuild
+ * the subscription when the gateway rotated its VAPID key under a device the owner turned
+ * notifications on for. `renewing` is called just before such a rebuild. `undefined`: nothing to say.
+ */
+export async function refreshPush(store: PushStore, conn: PushConn, renewing: () => void): Promise<PushOutcome | undefined> {
+  if (!pushSupported()) return undefined;
+  // A cleared store must not claim "on" when the browser dropped it.
+  if (store.push.endpoint && !(await hasPushSubscription())) {
+    await store.setPush({ endpoint: undefined, key: undefined });
+  }
+  const res = await conn.pushKey();
+  if (!res) return undefined; // offline: nothing to compare against yet
+  if (!res.ok) {
+    if (res.error === "unsupported") await store.setPush({ gatewayUnsupported: true });
+    return undefined;
+  }
+  if (typeof res.key !== "string" || res.key === "") return undefined;
+  const gatewayKey = normalizeServerKey(res.key);
+  // Compare against the key the store last saw before overwriting it.
+  const rotated = store.push.key !== undefined && store.push.key !== gatewayKey;
+  await store.setPush({ gatewayUnsupported: false, key: gatewayKey });
+  if (!store.push.endpoint) return undefined;
+  if (!rotated && await subscribedServerKey() === gatewayKey) return undefined;
+  // The gateway's key changed under a live subscription: rebuild it on the new key rather than
+  // leaving pushes the gateway cannot address.
+  renewing();
+  const renewed = await subscribeDevice(store, conn, gatewayKey);
+  if (!renewed.note) return { permission: renewed.permission, note: "Notifications renewed for this device." };
+  // The old subscription is gone; say so instead of claiming "on".
+  await store.setPush({ endpoint: undefined });
+  return renewed;
+}
+
+/** The owner's tap on the Notifications row: turn this device's notifications off, or on. */
+export async function togglePush(store: PushStore, conn: PushConn, online: boolean): Promise<PushOutcome> {
+  if (store.push.endpoint) {
+    // Offline the gateway cannot drop the subscription, so nothing here is "off" until it says
+    // so; the browser side is kept in step after.
+    if (!online) return { note: "Reconnect to turn notifications off." };
+    const off = await conn.pushUnsubscribe();
+    if (!off?.ok) {
+      return { note: off
+        ? "The gateway did not confirm that notifications are off. Try again."
+        : "Reconnect to turn notifications off." };
+    }
+    await disablePush();
+    await store.setPush({ endpoint: undefined, key: undefined });
+    return { note: "Notifications are off." };
+  }
+  if (!online) return { note: "Reconnect to turn notifications on." };
+  // Permission first: the prompt must come straight off the tap.
+  const granted = await requestPushPermission();
+  if (granted !== "granted") {
+    return { permission: granted, note: granted === "denied"
+      ? "Notifications are blocked for this app. Allow them in browser settings, then try again."
+      : granted === "unsupported"
+        ? "This browser cannot receive notifications. On iPhone, open the installed home-screen app."
+        : "Notifications were not allowed. Tap again to ask." };
+  }
+  const key = await conn.pushKey();
+  if (!key) return { permission: granted, note: "Reconnect to turn notifications on." };
+  if (!key.ok) {
+    if (key.error === "unsupported") await store.setPush({ gatewayUnsupported: true });
+    return { permission: granted, note: key.error === "unsupported" ? undefined : "Could not reach notifications on this gateway. Try again." };
+  }
+  if (!key.key) return { permission: granted, note: "The gateway did not send a notification key. Try again." };
+  const result = await subscribeDevice(store, conn, key.key);
+  return { permission: result.permission, note: result.note ?? "Notifications are on for this device." };
 }

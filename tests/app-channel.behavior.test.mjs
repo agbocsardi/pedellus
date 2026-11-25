@@ -527,6 +527,12 @@ test('hello lists the app command catalogue and control routes args to the owner
 
     // Bad arguments answer with the catalogue's usage line and no effect.
     assert.match(await lastNotice('u1', { command: 'model', args: 'a b' }, 'model usage'), /^Usage: \/model .*Nothing was sent/u);
+    // The control reuses the shared preset-token validator: a name hello cannot advertise — a C1
+    // control (e.g. NEL) or DEL — is usage, not an unknown-but-acceptable preset.
+    assert.match(await lastNotice('u1c', { command: 'model', args: 'bad\u0085name' }, 'model usage for a C1 name'),
+      /^Usage: \/model .*Nothing was sent/u);
+    assert.match(await lastNotice('u1d', { command: 'model', args: 'del\u007fname' }, 'model usage for a DEL name'),
+      /^Usage: \/model .*Nothing was sent/u);
     assert.match(await lastNotice('u2', { command: 'new', args: 'now' }, 'new usage'), /^Usage: \/new \(no arguments\)\./u);
     assert.match(await lastNotice('u3', { command: 'digest', args: 'later' }, 'digest usage'), /^Usage: \/digest /u);
     assert.equal(device.events('divider').length, 0, 'a usage refusal reset nothing');
@@ -2422,3 +2428,85 @@ test('the idle archive cancels a quarantined question whose live open card the r
         await device.close();
       });
   });
+
+// The wire validators live once in pwa/protocol/v2.ts; the gateway and the app both apply them.
+test('hello.presets at the gateway bounds survive the app parser; past them they are dropped', async () => {
+  const { appPresetInfos } = await import('../dist/channels/app-protocol.js');
+  const { LIMITS, parsePresets } = await import('../dist/channels/generated/protocol-v2.js');
+  const name = 'p'.repeat(LIMITS.presetNameChars);
+  const longName = 'q'.repeat(65); // the app used to drop 65–80 characters
+  const provider = 'fixture';
+  const modelId = 'm'.repeat(LIMITS.presetModelChars - provider.length - 1); // model = 240 characters
+  const projected = appPresetInfos([
+    { name, provider, modelId, thinkingLevel: 'high' },
+    { name: longName, provider, modelId: 'm'.repeat(201 - provider.length - 1) },
+    { name: 'x'.repeat(LIMITS.presetNameChars + 1), provider, modelId: 'alpha' },
+    { name: 'too-long-model', provider, modelId: 'm'.repeat(LIMITS.presetModelChars) },
+    { name: 'spaced name', provider, modelId: 'alpha' },
+  ]);
+  assert.deepEqual(projected.map((p) => p.name), [name, longName]);
+  assert.equal(projected[0].model.length, LIMITS.presetModelChars);
+  assert.deepEqual(parsePresets(projected), projected, 'the app keeps every preset the gateway sends');
+  assert.deepEqual(parsePresets([...projected, { name, model: 'dup/model' }]), projected, 'duplicate names are dropped');
+  assert.equal(parsePresets(undefined), undefined);
+  // C1 controls (U+0080–U+009F, e.g. NEL U+0085) and DEL are refused on both sides.
+  assert.deepEqual(appPresetInfos([{ name: 'nel\u0085x', provider, modelId: 'alpha' },
+    { name: 'ok', provider, modelId: 'a\u009fb' }, { name: 'del\u007f', provider, modelId: 'alpha' }]), []);
+  assert.deepEqual(parsePresets([{ name: 'nel\u0085x', model: 'a/b' }, { name: 'ok', model: 'a/\u0080b' }]), []);
+  assert.equal(parsePresets(Array.from({ length: LIMITS.maxPresets + 5 }, (_, i) => ({ name: `p${i}`, model: 'a/b' }))).length,
+    LIMITS.maxPresets);
+});
+
+test('shared field validators: titles, labels, agent names, pair codes, thread ids', async () => {
+  const v = await import('../dist/channels/generated/protocol-v2.js');
+  const gateway = await import('../dist/channels/app-protocol.js');
+  assert.ok(v.validThreadTitle('Trip ✈ plans'));
+  assert.ok(v.validThreadTitle('x'.repeat(v.LIMITS.threadTitleChars)));
+  assert.ok(!v.validThreadTitle('x'.repeat(v.LIMITS.threadTitleChars + 1)));
+  assert.ok(!v.validThreadTitle('   '));
+  assert.ok(!v.validThreadTitle('line break'));
+  assert.ok(!v.validThreadTitle('tab\there'));
+  assert.equal(gateway.validThreadTitle('ok'), true);
+  for (const label of ["Gergo's iPhone", ' padded', 'x'.repeat(41), '', 'bidi‮']) {
+    assert.equal(v.validDeviceLabel(label), gateway.validAppLabel(label), label);
+  }
+  assert.ok(v.validDeviceLabel("Gergo's iPhone") && !v.validDeviceLabel(' padded') && !v.validDeviceLabel('bidi‮'));
+  assert.ok(v.validAgentName('Pedellus') && !v.validAgentName('x'.repeat(41)) && !v.validAgentName('  '));
+  assert.equal(v.normalizePairCode('ab-cd io23 9xyz'), 'ABCD239X');
+  assert.ok(v.validPairCode('ABCD2345') && !v.validPairCode('ABCD234') && !v.validPairCode('ABCDI234'));
+  assert.ok(v.validThreadId('main') && v.validThreadId('t_abc') && !v.validThreadId('t_') && !v.validThreadId('other'));
+  assert.equal(gateway.parseThreadId('t_abc'), 't_abc');
+  assert.ok(v.LIMITS.taskIdPattern.test('w:12') && v.LIMITS.taskIdPattern.test('c:job_1') && !v.LIMITS.taskIdPattern.test('x:1'));
+  assert.equal(gateway.APP_LIMITS.taskIdPattern, v.LIMITS.taskIdPattern, 'one task id rule for both sides');
+});
+
+test('parseDurableEvent keeps well-formed events and refuses malformed ones before the app stores them', async () => {
+  const { parseDurableEvent, parseThreadInfo } = await import('../dist/channels/generated/protocol-v2.js');
+  const message = {
+    type: 'event', event: 'message', cursor: 7, thread: 'main', id: 'm1', role: 'assistant', text: 'hi',
+    at: '2026-11-24T10:00:00.000Z', key: 'k1', extra: 'dropped',
+    attachments: [{ id: `f_${'a'.repeat(22)}`, name: 'a.png', type: 'image/png', size: 3, kind: 'image' }, { id: '../x' }],
+    steps: [{ id: 's1', tool: 'read', state: 'done', startedAt: '2026-11-24T10:00:00.000Z' }, { id: 's2' }],
+    part: { i: 0, n: 2 },
+  };
+  const parsed = parseDurableEvent(message);
+  assert.equal(parsed.extra, undefined, 'unknown fields are not persisted');
+  assert.equal(parsed.attachments.length, 1, 'a malformed attachment is dropped, not the message');
+  assert.equal(parsed.steps.length, 1);
+  assert.deepEqual(parsed.part, { i: 0, n: 2 });
+  for (const broken of [
+    { ...message, cursor: 0 }, { ...message, cursor: 1.5 }, { ...message, thread: '../etc' }, { ...message, role: 'system' },
+    { ...message, text: 3 }, { ...message, part: { i: 2, n: 2 } }, { ...message, type: 'res' },
+    { type: 'event', event: 'settled', cursor: 8, thread: 'main', key: 'k1', outcome: 'maybe' },
+    { type: 'event', event: 'reaction', cursor: 9, thread: 'main', message: 'm1', by: 'owner', emoji: '💩' },
+    { type: 'event', event: 'divider', cursor: 10, thread: 'main', at: 'x', reason: 'later' },
+    { type: 'event', event: 'question', cursor: 11, thread: 'main', id: 'nothex', prompt: 'p', options: [], expiresAt: 'x', state: 'open' },
+    { type: 'event', event: 'thread', cursor: 12, thread: { id: 'nope', title: 't', archived: false, createdAt: '', lastAt: '' } },
+    { type: 'event', event: 'preview', cursor: 13, thread: 'main', key: 'k', text: 'live only' },
+  ]) assert.equal(parseDurableEvent(broken), undefined, JSON.stringify(broken).slice(0, 80));
+  assert.deepEqual(parseDurableEvent({ type: 'event', event: 'reaction', cursor: 9, thread: 'main', message: 'm1', by: 'owner', emoji: null }),
+    { type: 'event', event: 'reaction', cursor: 9, thread: 'main', message: 'm1', by: 'owner', emoji: null });
+  const info = { id: 't_a', title: 'Side', archived: false, createdAt: 'c', lastAt: 'l', origin: { thread: 'main', messageId: 'm1' } };
+  assert.deepEqual(parseThreadInfo(info), info);
+  assert.equal(parseThreadInfo({ ...info, origin: { thread: 'main' } }), undefined);
+});
