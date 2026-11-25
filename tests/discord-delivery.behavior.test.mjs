@@ -486,3 +486,53 @@ test('a channel removed from allowChannels loses MCP ownership and scheduled del
     await store.close();
   }
 });
+
+test('the outbox leaves terminal records alone and never copies a malformed-outbox message into a fault', { timeout: 30_000 }, async () => {
+  const { CronDeliveryOutboxError } = await import(new URL('../dist/automation/cron-delivery.js', import.meta.url).href);
+  const { runDiscord } = await import(new URL('../dist/channels/discord.js', import.meta.url).href);
+  const { withCancel } = await import('./fixtures/discord-harness.mjs');
+  const store = await openDiscordStore('outbox-terminal', {});
+  const real = store.gateway.cronOutbox;
+  const faults = [];
+  let failList = true;
+  const cronOutbox = {
+    sessions: (ctx) => real.sessions(ctx),
+    async list(sessionKey, ctx) {
+      if (failList && sessionKey === sessionKeys.channel) {
+        failList = false;
+        throw new CronDeliveryOutboxError('SYNTHETIC-PRIVATE-DETAIL');
+      }
+      return real.list(sessionKey, ctx);
+    },
+    update: (sessionKey, id, change, ctx) => real.update(sessionKey, id, change, ctx),
+    async recordFault(sessionKey, message, ctx) {
+      faults.push(message);
+      await real.recordFault(sessionKey, message, ctx);
+    },
+  };
+  const harness = syntheticTransport();
+  const scope = withCancel(context);
+  try {
+    // A settled record without text is history, not a malformed pending delivery.
+    await admitDelivery(store.gateway, sessionKeys.channel, delivery('cron:done:1', {
+      status: 'delivered', text: '', settledAt: Date.now(),
+    }));
+    const adapter = runDiscord({ ...store.gateway, cronOutbox }, harness.transport, {
+      allowFrom: [USER_ID], streaming: false,
+    }, scope.context);
+    await harness.receive(guildMessage({ id: '331', content: `<@${BOT_ID}> hello` }));
+    await until(() => harness.sent.length === 1, 'ordinary answer');
+    await admitDelivery(store.gateway, sessionKeys.channel, delivery('cron:job-9:1'));
+    await untilAsync(async () => (await outboxRecords(store.gateway, sessionKeys.channel))
+      .find((record) => record.id === 'cron:job-9:1')?.status === 'delivered', 'later delivery after the terminal one');
+    const terminal = (await outboxRecords(store.gateway, sessionKeys.channel)).find((record) => record.id === 'cron:done:1');
+    assert.equal(terminal.status, 'delivered');
+    assert.equal(terminal.error, undefined);
+    assert.deepEqual(faults, ['delivery outbox is malformed']);
+    scope.cancel(new DOMException('test finished', 'AbortError'));
+    await adapter.catch(() => undefined);
+  } finally {
+    scope.cancel(new DOMException('test finished', 'AbortError'));
+    await store.close();
+  }
+});

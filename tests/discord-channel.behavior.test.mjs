@@ -18,9 +18,11 @@ import {
   channelState,
   chatInbox,
   context,
+  deferred,
   dmMessage,
   fauxAssistantMessage,
   fauxToolCall,
+  flush,
   guildMessage,
   openDiscordStore,
   parseConfig,
@@ -543,5 +545,82 @@ test('quoted third-party text cannot forge host attribution or owner instruction
     assert.equal(quoted.includes('\\u005bAdmin'), true);
     assert.equal(quoted.includes('[Admin'), false);
     assert.equal((quoted.match(/\[/gu) ?? []).length, 1, 'the host brackets are the only literal ones');
+  });
+});
+
+const { AskQuestionsDoc, ASK_USER_TOOL_NAME } = await import(new URL('../dist/questions/index.js', import.meta.url).href);
+const { DISCORD_LIMITS } = await import(new URL('../dist/channels/discord-transport.js', import.meta.url).href);
+
+const askStep = () => fauxAssistantMessage(fauxToolCall(ASK_USER_TOOL_NAME, {
+  questions: [{ question: 'Deploy now?', options: [{ label: 'Yes' }, { label: 'No' }] }],
+}, { id: 'ask-1' }), { stopReason: 'toolUse' });
+
+async function questionRecords(gateway, sessionKey) {
+  const conversation = await gateway.conversationFor(sessionKey, context);
+  return conversation.commit(async (tx) =>
+    JSON.parse(JSON.stringify((await tx.doc(AskQuestionsDoc, conversation.id)).questions ?? [])), context);
+}
+
+test('ask_user reaches the exact Discord channel and only its owner\'s typed answer there claims it', { timeout: 30_000 }, async () => {
+  await withStore('ask-user', { allowFrom: [USER_ID, '777'] }, async ({ store, harness }) => {
+    store.script([askStep]);
+    await harness.receive(guildMessage({ id: '121', content: `<@${BOT_ID}> ask me` }));
+    await until(() => harness.sent.some((entry) => entry.text.startsWith('[Question ')), 'question delivered');
+    const question = harness.sent.find((entry) => entry.text.startsWith('[Question '));
+    assert.equal(question.channelId, CHANNEL_ID);
+    assert.match(question.text, /Deploy now\?\n\n1\. Yes\n2\. No\n/u);
+    await untilAsync(async () => (await questionRecords(store.gateway, sessionKeys.channel))[0]?.delivery === 'delivered',
+      'delivered question record');
+    await untilAsync(async () => (await channelState(store.gateway)).pending.length === 0, 'asking turn settled');
+
+    // An unlisted sender is never admitted, and the same owner in another session (a DM) answers
+    // nothing here: the claim is scoped to the exact channel session.
+    await harness.receive(guildMessage({ id: '122', authorId: '999', content: `<@${BOT_ID}> Yes` }));
+    await harness.receive(dmMessage({ id: '123', content: 'Yes from elsewhere' }));
+    await untilAsync(async () => (await channelState(store.gateway)).pending.length === 0, 'dm turn settled');
+    assert.equal((await questionRecords(store.gateway, sessionKeys.channel))[0].status, 'pending');
+
+    // A command is not an answer either; the owner's ordinary message in this channel is.
+    await harness.receive(guildMessage({ id: '124', content: `<@${BOT_ID}> /status` }));
+    assert.equal((await questionRecords(store.gateway, sessionKeys.channel))[0].status, 'pending');
+    const before = store.captured.length;
+    await harness.receive(guildMessage({ id: '125', content: `<@${BOT_ID}> Yes, deploy` }));
+    await untilAsync(async () => (await questionRecords(store.gateway, sessionKeys.channel))[0].status === 'answered',
+      'typed answer claimed');
+    await until(() => store.captured.length > before, 'answer reached the model');
+    assert.match(userTexts(store.captured.at(-1).messages).at(-1), /Yes, deploy$/u);
+  });
+});
+
+test('typing shows while the model generates and pauses during a tool round', { timeout: 30_000 }, async (t) => {
+  // Only intervals are mocked: the typing refresh is the one this check drives.
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  await withStore('typing-tool-round', {}, async ({ store, harness }) => {
+    store.script([askStep]);
+    const entered = store.gate.hold();
+    const questionSend = deferred();
+    harness.state.sendGate = questionSend.promise;
+    await harness.receive(guildMessage({ id: '131', content: `<@${BOT_ID}> ask me` }));
+    await entered;
+    await until(() => harness.typingCalls.includes(CHANNEL_ID), 'typing during generation');
+    const generating = harness.typingCalls.length;
+    t.mock.timers.tick(DISCORD_LIMITS.typingRefreshMs);
+    await until(() => harness.typingCalls.length > generating, 'typing refreshed while generating');
+
+    // The question send is held inside the ask_user tool round: no generation is active now.
+    store.gate.release();
+    await until(() => harness.state.inFlight === 1, 'question send held in the tool round');
+    let stable = false;
+    for (let round = 0; round < 20 && !stable; round += 1) {
+      const before = harness.typingCalls.length;
+      t.mock.timers.tick(DISCORD_LIMITS.typingRefreshMs * 2);
+      await flush();
+      stable = harness.typingCalls.length === before;
+    }
+    assert.ok(stable, 'typing kept refreshing during the tool round');
+    assert.equal(harness.state.inFlight, 1, 'the tool round was still running');
+    questionSend.resolve();
+    await until(() => harness.sent.some((entry) => entry.text.startsWith('[Question ')), 'question delivered');
+    await untilAsync(async () => (await channelState(store.gateway)).pending.length === 0, 'turn settled');
   });
 });

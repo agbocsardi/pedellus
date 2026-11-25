@@ -109,7 +109,7 @@ test('/model selects one configured preset for this channel only', { timeout: 30
 
     await harness.receive(say('222', '/model deep'));
     await until(() => harness.sent.length === 2, 'preset applied');
-    assert.equal(harness.texts()[1], 'Model set to fixture/beta (thinking: high) for this chat.');
+    assert.equal(harness.texts()[1], 'Model set to preset deep: fixture/beta (thinking: high) for this channel.');
     const state = await channelState(store.gateway);
     assert.equal(state.controls.at(-1).command, 'model');
     assert.equal(state.controls.at(-1).status, 'applied');
@@ -372,11 +372,12 @@ async function withFlakyHost(label, failures, body) {
 
 test('a deferred control retries on the adapter cadence and releases the channel when it settles', { timeout: 30_000 }, async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.now() });
-  // Two transient failures: the first message's own delivery and the control's first flush attempt.
+  // Three transient failures: the first message's best-effort question-answer lookup at admission,
+  // its own delivery, and the control's first flush attempt.
   const store = await openDiscordStore('deferred-applied', {});
   const harness = syntheticTransport();
   const scope = withCancel(context);
-  const adapter = runDiscord(flakyGateway(store.gateway, sessionKeys.channel, 2), harness.transport, {
+  const adapter = runDiscord(flakyGateway(store.gateway, sessionKeys.channel, 3), harness.transport, {
     allowFrom: [USER_ID],
     streaming: false,
   }, scope.context);
@@ -468,6 +469,36 @@ test('a callback-shaped message is consumed before admission, mention-prefixed o
     assert.ok(!persisted.includes(CODE) && !persisted.includes(STATE), 'no callback secret is stored in channel state');
   } finally {
     await adapter.stop();
+    await store.close();
+  }
+});
+
+test('an exhausted deferred /restart is reported with the restart wording and never requested', { timeout: 40_000 }, async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.now() });
+  const store = await openDiscordStore('deferred-restart', {});
+  const harness = syntheticTransport();
+  const scope = withCancel(context);
+  let requests = 0;
+  const adapter = runDiscord(flakyGateway(store.gateway, sessionKeys.channel, Number.MAX_SAFE_INTEGER), harness.transport, {
+    allowFrom: [USER_ID],
+    streaming: false,
+    restart: { supported: true, request: async () => { requests += 1; } },
+  }, scope.context);
+  try {
+    await harness.receive(guildMessage({ id: '721', content: `<@${BOT_ID}> first` }));
+    await harness.receive(say('722', '/restart'));
+    await untilAsync(async () => harness.texts().includes('Restart pending.'), 'deferred acknowledgement');
+    for (let elapsed = 0; elapsed < 40_000; elapsed += 2_000) {
+      t.mock.timers.tick(2_000);
+      await flush(4);
+      if (harness.texts().some((text) => /interrupted; outcome unknown/u.test(text))) break;
+    }
+    assert.ok(harness.texts().includes('Restart interrupted; outcome unknown. Not retried.'));
+    assert.ok(harness.texts().every((text) => !/^Command interrupted/u.test(text)), 'generic wording for a restart');
+    assert.equal(requests, 0, 'an unconfirmed restart is never requested');
+  } finally {
+    scope.cancel(new DOMException('test finished', 'AbortError'));
+    await adapter.catch(() => undefined);
     await store.close();
   }
 });

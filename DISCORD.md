@@ -6,7 +6,12 @@ Durable agent loop, storage, tool policy, cron, workers, memory and MCP authorit
 are unchanged. `src/channels/discord.ts` owns ingress admission and the durable
 channel outbox; `src/channels/discord-js.ts` is the real discord.js transport;
 `src/channels/discord-transport.ts` is the narrow contract plus the pure text and
-failure rules both sides share.
+failure rules both sides share. Host capabilities, the mutating-control engine,
+submission ordering, shared-answer grouping, typing/preview watching and the
+scheduled-outbox drainer are the shared channel core (`contracts.ts`,
+`controls.ts`, `turn-runtime.ts`, `outbox-drainer.ts`); Discord keeps its own
+authentication, write-ahead send fence, attachment ingestion, receipts and
+interaction acknowledgements.
 
 Status: offline-verified only. No live bot login, guild, channel, DM, attachment
 download or rate-limit interaction has been exercised in this repository. Treat
@@ -121,7 +126,14 @@ unauthorized when the original sender has left `allowFrom`.
 * Completed cron results and startup interruption notices are read from the
   gateway's channel-neutral durable outbox, delivered chunk by chunk with the
   same intent protocol, and marked `delivered`, `failed`, `withheld` or
-  `unauthorized`. They are ordinary messages with no reply reference.
+  `unauthorized`. They are ordinary messages with no reply reference. Only a
+  `pending` record is validated for delivery; an already settled, held or
+  unknown record is never re-settled, and an unreadable outbox records only the
+  fixed fault `delivery outbox is malformed` or `delivery outbox could not be
+  read`.
+* Typing follows the committed live state: it shows only while the admitted
+  message's run has an active generation attempt, and pauses while queued, in a
+  tool round, waiting on other work or retrying.
 * The message snowflake is the Durable request ID, so a repeated Gateway event
   cannot become a second turn. A steered message settles with the same committed
   answer as the run it joined, and exactly one admitted message delivers it.
@@ -132,7 +144,8 @@ unauthorized when the original sender has left `allowFrom`.
 * A command whose earlier inputs keep failing transiently is retried on the
   adapter's scan cadence (bounded) while its channel stays gated, then reported
   once as unconfirmed or applied; it is never applied twice. An interrupted
-  command found at reopen is reported once, never replayed.
+  command found at reopen is reported once, never replayed. An interrupted
+  `/restart` always says `Restart interrupted; outcome unknown. Not retried.`
 * Host notices are chunked inside the same 2 000-character bound; a notice that
   exceeds its own cap keeps its head and ends with `… (truncated)` rather than
   dropping text silently.
@@ -216,6 +229,18 @@ no longer authorized refuses the delivery and cancels the login. A
 callback-shaped message is consumed before transcript admission and is accepted
 only from the sender that owns the channel.
 
+`ask_user` questions from a mapped Discord chat are delivered to that exact
+channel (or DM) as plain text with numbered options; nothing is offered for a
+channel that is no longer authorized. There are no buttons: the owner answers
+with an ordinary message in the same channel (mentioning or replying to the bot
+in a mention-gated guild). That message claims the oldest delivered question of
+that exact session in the same commit that admits it, then reaches the model as
+a normal turn. Commands, OAuth callbacks, unlisted senders and other sessions
+never claim it. An ambiguous question send is quarantined as unknown and never
+resent. If the chat's conversation cannot be resolved at admission, the message
+is still admitted (a Gateway event is not redelivered) and the question stays
+open for the next answer or its expiry.
+
 ## Bounded and default-deny behavior
 
 * During durable startup recovery, at most 64 Gateway message events are buffered
@@ -282,7 +307,9 @@ discord.js client, a faux provider and a temporary store. They assert admission,
 session isolation, attribution, chunking, mentions, receipts, referenced
 attachments, the input bound, bots, strict config keys, chunked/withheld/
 unauthorized/unknown scheduled delivery, interruption notices, restart
-confirmation, deferred-control retry and exhaustion, pre-send intents, callback
+confirmation, deferred-control retry and exhaustion (including the restart
+wording), `ask_user` delivery and typed-answer claiming, typing pauses during
+tool rounds, terminal outbox records, pre-send intents, callback
 interception, progressive edits, the real event/interaction/error mapping,
 startup ingress capture and replay, rate-limit cooldowns, control-admission
 failure, unconfirmed-control pruning, scheduled intent-commit failure, quoted-text
