@@ -9,12 +9,11 @@ import type {
   EntryRecord,
   LiveState,
   SettledSubmissionRecord,
-  UsageState,
 } from "@earendil-works/pi-durable";
 import type { AssistantMessage, ImageContent, Message, TextContent } from "@earendil-works/pi-ai";
 import type { FollowUpMode } from "../config.js";
 import { originOccurrencePending } from "../automation/cron.js";
-import type { BackgroundStatus } from "../background-status.js";
+import { projectConversationStatus, type ConversationStatus } from "../channels/contracts.js";
 
 /** Plain typed input, or the text/image parts of a stored attachment submission. */
 export type TerminalInput = string | (TextContent | ImageContent)[];
@@ -144,30 +143,8 @@ export interface TerminalSnapshot {
   readonly answers: readonly TerminalAnswer[];
 }
 
-export interface TerminalStatus {
-  readonly model?: { readonly provider: string; readonly modelId: string };
-  readonly run?: { readonly taskId: number; readonly inputs: number; readonly attempt?: number };
-  readonly inbox: {
-    readonly total: number;
-    readonly steer: number;
-    readonly followUp: number;
-    readonly write: number;
-    readonly scanned: number;
-  };
-  readonly tools: {
-    readonly total: number;
-    readonly running: number;
-    readonly pending: number;
-    readonly scanned: number;
-  };
-  readonly compactions: number;
-  readonly usage?: UsageState;
-  /**
-   * Host-read, bounded background activity for this conversation. Absent leaves the core status
-   * unchanged: an older host adds no field and a failing read omits it rather than claiming idle.
-   */
-  readonly background?: BackgroundStatus;
-}
+/** Point-in-time status of this conversation; the shared channel projection. */
+export type TerminalStatus = ConversationStatus;
 
 /** Submissions this terminal surface remembers as its own, so a run it started stays identifiable. */
 const TERMINAL_ADMITTED_SUBMISSIONS = 256;
@@ -183,7 +160,6 @@ const TERMINAL_SURFACE_LIMITS = Object.freeze({
   snapshotEntryScan: 500,
   snapshotAnswers: 8,
   snapshotAnswerChars: 128_000,
-  statusQueueScan: 2_000,
 });
 
 /** Project a committed conversation revision to the fields a terminal renders. */
@@ -232,48 +208,6 @@ function projectSnapshot(view: ConversationView): TerminalSnapshot {
           },
         }),
     answers,
-  };
-}
-
-/** Project one conversation view and resolved agent model to a bounded status record. */
-function projectStatus(
-  view: ConversationView,
-  model: { readonly provider: string; readonly modelId: string } | undefined,
-): TerminalStatus {
-  const live = view.docs["pi.live"] as unknown as LiveState | undefined;
-  const inbox = view.docs["pi.inbox"] as unknown as { readonly items?: readonly { readonly mode?: string }[] } | undefined;
-  const usage = view.docs["pi.usage"] as unknown as UsageState | undefined;
-  const queued = inbox?.items ?? [];
-  const modeCounts = { steer: 0, followUp: 0, write: 0 };
-  const scanned = Math.min(queued.length, TERMINAL_SURFACE_LIMITS.statusQueueScan);
-  for (let index = 0; index < scanned; index++) {
-    const mode = queued[index]!.mode;
-    if (mode === "steer" || mode === "followUp" || mode === "write") modeCounts[mode]++;
-  }
-  const tools = live?.tools ?? [];
-  const toolsScanned = Math.min(tools.length, TERMINAL_SURFACE_LIMITS.statusQueueScan);
-  let running = 0;
-  let pending = 0;
-  for (let index = 0; index < toolsScanned; index++) {
-    if (tools[index]!.status === "running") running++;
-    else if (tools[index]!.status === "pending") pending++;
-  }
-  const run = live?.run;
-  return {
-    ...(model === undefined ? {} : { model: { provider: model.provider, modelId: model.modelId } }),
-    ...(run === undefined
-      ? {}
-      : {
-          run: {
-            taskId: run.taskId,
-            inputs: run.inputs.length,
-            ...(live?.generation === undefined ? {} : { attempt: live.generation.attempt }),
-          },
-        }),
-    inbox: { total: queued.length, scanned, ...modeCounts },
-    tools: { total: tools.length, scanned: toolsScanned, running, pending },
-    compactions: live?.compactions?.length ?? 0,
-    ...(usage === undefined ? {} : { usage }),
   };
 }
 
@@ -416,7 +350,7 @@ export function inProcessTerminalConversation(
   followUpMode: FollowUpMode = "followUp",
   owner?: {
     readonly sessionKey: string;
-    readonly harness: Pick<Harness, "submission">;
+    readonly harness: Pick<Harness, "submission"> & Partial<Pick<Harness, "snapshot">>;
     /** Decides a prepared idle rollover just before the owner input is submitted. */
     readonly beforeInput?: (content: TerminalInput, context: Context) => Promise<void>;
   },
@@ -482,13 +416,10 @@ export function inProcessTerminalConversation(
       };
     },
     async status(context) {
-      const agent = await conversation.agent(context);
-      const watch = await conversation.watch(context);
-      try {
-        return projectStatus(watch.value, agent.model);
-      } finally {
-        await watch.stop();
-      }
+      const reader = typeof owner?.harness.snapshot === "function"
+        ? { snapshot: owner.harness.snapshot.bind(owner.harness) }
+        : undefined;
+      return projectConversationStatus(conversation, context, reader);
     },
     async entries(query, limit, cursor, context) {
       const page = await conversation.entries(query, limit, cursor, context);

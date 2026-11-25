@@ -881,3 +881,740 @@ test("ambiguous question delivery is quarantined rather than reported as non-del
   assert.equal(doc.questions[0].status, "unknown");
   assert.equal(doc.questions[0].delivery, "unknown");
 });
+
+// ── Shared channel core primitives ──────────────────────────────────────────
+
+const { createSingleHostRegistry, projectConversationStatus, detectHostCapabilities } = await import(pathToFileURL(`${pkg}/dist/channels/contracts.js`).href);
+const controls = await import(pathToFileURL(`${pkg}/dist/channels/controls.js`).href);
+const { SubmissionOrderQueue, isLiveGenerating, isLiveGeneratingFor, createPreviewWatcher } = await import(pathToFileURL(`${pkg}/dist/channels/turn-runtime.js`).href);
+const { pendingRecordProblem, outboxFaultMessage, createOutboxDrainer } = await import(pathToFileURL(`${pkg}/dist/channels/outbox-drainer.js`).href);
+const { WorkGate, boundedResponseBody, boundedLabel } = await import(pathToFileURL(`${pkg}/dist/media/outbound.js`).href);
+const { MediaRejected } = await import(pathToFileURL(`${pkg}/dist/media/attachments.js`).href);
+const { CronDeliveryOutboxError } = await import(pathToFileURL(`${pkg}/dist/automation/cron-delivery.js`).href);
+const { inProcessTerminalConversation } = await import(pathToFileURL(`${pkg}/dist/terminal/conversation.js`).href);
+const { ConversationBusy, UsageDoc } = await import(pathToFileURL(`${pkg}/node_modules/@earendil-works/pi-durable/dist/index.js`).href);
+
+/** Timers that only fire when a check says so. */
+function manualTimers() {
+  const pending = new Map();
+  let next = 0;
+  return {
+    pending,
+    set(callback, milliseconds) { const id = ++next; pending.set(id, { callback, milliseconds }); return id; },
+    clear(id) { pending.delete(id); },
+    fire() { const due = [...pending.values()]; pending.clear(); for (const timer of due) timer.callback(); },
+  };
+}
+
+/** An in-memory control ledger recording every durable commit the coordinator asks for. */
+function memoryLedger() {
+  const records = new Map();
+  const notices = new Map();
+  const late = [];
+  const refusals = [];
+  const published = [];
+  const state = {
+    failAdmit: false,
+    failMarkApplied: false,
+    deliverOnRelease: false,
+    onRelease: undefined,
+  };
+  const release = (key, text) => {
+    const notice = notices.get(key);
+    if (notice === undefined) return false;
+    if (text !== undefined) notice.text = text;
+    notice.hold = false;
+    if (state.deliverOnRelease) {
+      notices.delete(key);
+      published.push({ key, text: notice.text });
+    }
+    return true;
+  };
+  return {
+    records, notices, late, refusals, published, state,
+    ledger: {
+      status: (key) => records.get(key)?.status,
+      unresolved: () => [...records.values()].filter((entry) => entry.status === "admitted" || entry.status === "unconfirmed").length,
+      async admit(record, ackText) {
+        if (state.failAdmit) throw new Error("synthetic admission commit failure");
+        records.set(record.key, { command: record.command, status: "admitted" });
+        notices.set(record.key, { text: ackText, hold: true });
+      },
+      async markApplied(record) {
+        if (state.failMarkApplied) throw new Error("synthetic markApplied failure");
+        records.get(record.key).status = "applied";
+      },
+      async release(key, text) {
+        if (state.onRelease !== undefined) await state.onRelease(key, text);
+        release(key, text);
+      },
+      async markRefused(record, text, isLate) {
+        records.get(record.key).status = "refused";
+        if (!release(record.key, text) && isLate) {
+          late.push({ key: record.key, text });
+          published.push({ key: record.key, text });
+        }
+      },
+      async markUnconfirmed(key, text, lateRecord) {
+        const entry = records.get(key);
+        if (entry) entry.status = "unconfirmed";
+        if (!release(key, text) && lateRecord !== undefined) {
+          late.push({ key: lateRecord.key, text });
+          published.push({ key: lateRecord.key, text });
+        }
+      },
+      async publishLate(record, text) {
+        late.push({ key: record.key, text });
+        published.push({ key: record.key, text });
+      },
+      async refuse(record, text) { refusals.push({ key: record.key, text }); },
+    },
+  };
+}
+
+function coordinatorFixture({ inputs = () => [], submit = async () => undefined, execute, maxAttempts } = {}) {
+  const memory = memoryLedger();
+  const timers = manualTimers();
+  const restarts = [];
+  const fatal = [];
+  const coordinator = controls.createControlCoordinator({
+    ledger: memory.ledger,
+    flush: { inputs, prepareInput: async (input) => `prepared ${input}`, submit },
+    order: new SubmissionOrderQueue(),
+    execute: execute ?? (async (record) => record.command === "restart"
+      ? { kind: "applied", text: controls.CONTROL_ACK.restart, requestRestart: true }
+      : { kind: "applied" }),
+    requestRestart: () => restarts.push(1),
+    onFatal: (error) => fatal.push(error),
+    drain: () => undefined,
+    active: () => true,
+    timers,
+    ...(maxAttempts === undefined ? {} : { maxAttempts }),
+  });
+  return { coordinator, memory, timers, restarts, fatal };
+}
+
+test("shared status projection is strictly read-only and uses snapshots without opening a watch", { timeout: 20_000 }, async (t) => {
+  const { gateway, provider } = await makeEnvironment(t);
+  provider.setResponses([fauxAssistantMessage("status fixture answer")]);
+  const conversation = await gateway.conversationFor("cli:default", context);
+  await (await conversation.submit({ type: "input", content: "hello" }, context)).wait(context);
+  let watches = 0;
+  const guarded = new Proxy(conversation, {
+    get(target, key) {
+      if (key === "watch") return async () => { watches++; throw new Error("status must not open a watch"); };
+      const value = Reflect.get(target, key);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const status = await projectConversationStatus(guarded, context, gateway.harness);
+  assert.equal(watches, 0);
+  assert.deepEqual(status.model, (await conversation.agent(context)).model);
+  assert.equal(status.run, undefined);
+  assert.deepEqual(status.inbox, { total: 0, scanned: 0, steer: 0, followUp: 0, write: 0 });
+  assert.ok(Object.keys(status.usage.models).length > 0, "the answered turn's usage is in the projection");
+  // The terminal surface with a host Harness delegates to the same snapshot projection without a watch.
+  assert.deepEqual(
+    await inProcessTerminalConversation(guarded, "followUp", { sessionKey: "cli:default", harness: gateway.harness }).status(context),
+    status,
+  );
+  assert.equal(watches, 0);
+
+  // Retiring `pi.usage` makes it absent; status must stay read-only and never recreate it.
+  await conversation.commit((tx) => tx.retireDoc(UsageDoc, conversation.id), context);
+  assert.equal(await gateway.harness.snapshot(UsageDoc, conversation.id, context), undefined);
+  const withoutUsage = await projectConversationStatus(guarded, context, gateway.harness);
+  assert.equal(watches, 0);
+  assert.equal(withoutUsage.usage, undefined, "absent UsageDoc stays undefined");
+  assert.equal(await gateway.harness.snapshot(UsageDoc, conversation.id, context), undefined, "snapshot status never recreates retired UsageDoc");
+  // Even without a Harness reader, the watch fallback stays read-only and never recreates UsageDoc.
+  const fallbackStatus = await inProcessTerminalConversation(conversation).status(context);
+  assert.equal(fallbackStatus.usage, undefined);
+  assert.equal(await gateway.harness.snapshot(UsageDoc, conversation.id, context), undefined, "watch fallback never recreates retired UsageDoc");
+  // Recreating an empty UsageDoc distinguishes an empty ledger from an absent one.
+  await conversation.commit(async (tx) => { await tx.doc(UsageDoc, conversation.id); }, context);
+  const emptyUsageStatus = await projectConversationStatus(guarded, context, gateway.harness);
+  assert.deepEqual(emptyUsageStatus.usage, { models: {}, tools: {} });
+});
+
+test("a single-host registry detaches exactly its own attachment", () => {
+  const registry = createSingleHostRegistry();
+  const first = { name: "first" };
+  const second = { name: "second" };
+  const detachFirst = registry.attach(first);
+  const detachSecond = registry.attach(second);
+  assert.equal(registry.current(), second);
+  detachFirst();
+  assert.equal(registry.current(), second, "a stale detach never removes the live host");
+  detachSecond();
+  assert.equal(registry.current(), undefined, "a detached host is never resurrected");
+  const again = registry.attach(first);
+  const twice = registry.attach(first);
+  twice();
+  twice();
+  assert.equal(registry.current(), first, "re-attaching the same host is an independent attachment");
+  again();
+  assert.equal(registry.current(), undefined);
+  const narrow = detectHostCapabilities({ conversationFor: async () => assert.fail() });
+  assert.equal(narrow.status || narrow.model || narrow.restart || narrow.digest || narrow.mcp || narrow.notices, false);
+});
+
+test("shared new-session control turns every busy refusal into a refusal", async () => {
+  const busy = new ConversationBusy(1);
+  const thrown = await controls.executeNewSession({
+    conversationFor: async () => assert.fail("paired reset needs no conversation"),
+    resetSession: async () => { throw busy; },
+  }, "telegram:1:chat:1", context);
+  assert.deepEqual(thrown, { kind: "refused", text: controls.RESET_BUSY });
+  const reported = await controls.executeNewSession({
+    conversationFor: async () => assert.fail(),
+    resetSession: async () => ({ status: "busy" }),
+  }, "telegram:1:chat:1", context, { busyText: "Reset refused: thread busy." });
+  assert.deepEqual(reported, { kind: "refused", text: "Reset refused: thread busy." });
+  const plain = await controls.executeNewSession({
+    conversationFor: async () => ({ reset: async () => { throw Object.assign(new Error("busy"), { name: "ConversationBusy" }); } }),
+  }, "telegram:1:chat:1", context);
+  assert.equal(plain.kind, "refused");
+  await assert.rejects(controls.executeNewSession({
+    conversationFor: async () => ({ reset: async () => { throw new Error("storage failed"); } }),
+  }, "telegram:1:chat:1", context), /storage failed/u);
+});
+
+test("a failed control admission commit releases its scope gate", async () => {
+  const { coordinator, memory } = coordinatorFixture();
+  memory.state.failAdmit = true;
+  await assert.rejects(coordinator.admit({ key: 1, scope: "chat", command: "new" }), /synthetic admission/u);
+  assert.equal(coordinator.gated("chat"), false);
+  memory.state.failAdmit = false;
+  assert.equal(await coordinator.admit({ key: 2, scope: "chat", command: "new" }), "started");
+  await coordinator.idle();
+  assert.equal(memory.records.get(2).status, "applied");
+  assert.deepEqual(memory.notices.get(2), { text: controls.CONTROL_ACK.new, hold: false });
+  assert.equal(coordinator.gated("chat"), false);
+});
+
+test("an interrupted restart is reported with the restart wording, never the generic one", async () => {
+  const { coordinator, memory } = coordinatorFixture({
+    inputs: () => ["earlier"],
+    submit: async () => { throw new Error("earlier input cannot be placed"); },
+    maxAttempts: 1,
+  });
+  await coordinator.admit({ key: "r", scope: "chat", command: "restart" });
+  await coordinator.idle();
+  assert.equal(memory.records.get("r").status, "unconfirmed");
+  assert.equal(memory.notices.get("r").text, controls.UNCONFIRMED_RESTART);
+  await coordinator.admit({ key: "n", scope: "chat", command: "new" });
+  await coordinator.idle();
+  assert.equal(memory.notices.get("n").text, controls.UNCONFIRMED_CONTROL);
+  // A record left admitted by an earlier process: replay and startup recovery agree.
+  memory.records.set("old", { command: "restart", status: "admitted" });
+  memory.notices.set("old", { text: controls.CONTROL_ACK.restart, hold: true });
+  assert.match(await coordinator.replay({ key: "old", command: "restart", status: "admitted" }), /not requested again/u);
+  assert.equal(memory.notices.get("old").text, controls.UNCONFIRMED_RESTART);
+  const stored = [{ key: "a", command: "restart", status: "admitted" }, { key: "b", command: "model", status: "admitted" }];
+  const pending = [{ key: "a", notice: true, hold: true, text: controls.CONTROL_ACK.restart }];
+  const reported = [];
+  const count = controls.recoverInterruptedControls(stored, pending, {
+    controlKey: (entry) => entry.key,
+    noticeKey: (item) => item.key,
+    report: (entry, text) => { reported.push({ key: entry.key, text }); return true; },
+  });
+  assert.equal(count, 2);
+  assert.deepEqual(pending, [{ key: "a", notice: true, text: controls.UNCONFIRMED_RESTART }]);
+  assert.deepEqual(reported, [{ key: "b", text: controls.UNCONFIRMED_CONTROL }]);
+  assert.deepEqual(stored.map((entry) => entry.status), ["unconfirmed", "unconfirmed"]);
+});
+
+test("a deferred control's final outcome is published and still requests the restart", async () => {
+  let placeable = false;
+  const submitted = [];
+  const executed = [];
+  const { coordinator, memory, restarts, timers } = coordinatorFixture({
+    inputs: (record) => record.key === "restart" ? ["earlier"] : ["other"],
+    submit: async (input, content) => {
+      if (!placeable) throw new Error("transient placement failure");
+      submitted.push(content);
+    },
+    execute: async (record) => {
+      executed.push(record.key);
+      return record.command === "restart"
+        ? { kind: "applied", text: controls.CONTROL_ACK.restart, requestRestart: true }
+        : { kind: "refused", text: controls.RESET_BUSY };
+    },
+  });
+  // Simulate the pending notice being delivered before the deferred retry completes.
+  memory.state.deliverOnRelease = true;
+  await coordinator.admit({ key: "restart", scope: "a", command: "restart" });
+  await coordinator.admit({ key: "reset", scope: "b", command: "new" });
+  await coordinator.idle();
+  assert.deepEqual(memory.published, [
+    { key: "restart", text: controls.CONTROL_PENDING.restart },
+    { key: "reset", text: controls.CONTROL_PENDING.new },
+  ]);
+  assert.equal(coordinator.gated("a"), true, "a deferred control keeps its scope gated");
+  assert.equal(await coordinator.admit({ key: "later", scope: "a", command: "abort" }), "busy");
+  assert.equal(timers.pending.size, 0, "the pending-notice timer is cleared with the first outcome");
+  placeable = true;
+  coordinator.resumeDeferred();
+  await coordinator.idle();
+  assert.deepEqual(submitted, ["prepared earlier", "prepared other"], "earlier inputs are prepared before submission");
+  assert.equal(restarts.length, 1);
+  assert.equal(memory.records.get("restart").status, "applied");
+  assert.equal(memory.records.get("reset").status, "refused");
+  assert.deepEqual(
+    [...memory.late].sort((left, right) => left.key.localeCompare(right.key)),
+    [
+      { key: "reset", text: controls.RESET_BUSY },
+      { key: "restart", text: controls.CONTROL_ACK.restart },
+    ],
+  );
+  assert.equal(memory.published.length, 4, "each deferred control publishes pending once and final outcome once");
+  assert.equal(coordinator.gated("a") || coordinator.gated("b"), false);
+  coordinator.resumeDeferred();
+  await coordinator.idle();
+  assert.deepEqual(executed, ["restart", "reset"], "a final outcome is never retried");
+});
+
+test("a deferred control is never executed twice when markApplied throws", async () => {
+  let placeable = false;
+  let executions = 0;
+  const { coordinator, memory, fatal } = coordinatorFixture({
+    inputs: () => ["earlier"],
+    submit: async () => {
+      if (!placeable) throw new Error("transient placement failure");
+    },
+    execute: async () => {
+      executions += 1;
+      return { kind: "applied" };
+    },
+  });
+  await coordinator.admit({ key: "new-1", scope: "chat", command: "new" });
+  await coordinator.idle();
+  assert.equal(executions, 0);
+  assert.equal(coordinator.inFlight("new-1"), true);
+
+  placeable = true;
+  memory.state.failMarkApplied = true;
+  coordinator.resumeDeferred();
+  await coordinator.idle();
+  assert.equal(executions, 1);
+  assert.equal(fatal.length, 1);
+  assert.equal(memory.records.get("new-1").status, "admitted", "unconfirmed effect stays admitted for recovery");
+  assert.equal(coordinator.inFlight("new-1"), false);
+  assert.equal(coordinator.gated("chat"), false);
+
+  // Subsequent retries must never re-run the native effect even though the record is still admitted.
+  memory.state.failMarkApplied = false;
+  coordinator.resumeDeferred();
+  await coordinator.idle();
+  assert.equal(executions, 1, "uncertain outcome goes to recovery, never back into retry");
+});
+
+test("pending-notice timer serializes ahead of settlement and late refusals emit one notice", async () => {
+  let releasePendingWrite;
+  let releaseExecute;
+  const order = [];
+  const { coordinator, memory, timers } = coordinatorFixture({
+    execute: () => new Promise((resolve) => { releaseExecute = resolve; }),
+  });
+  memory.state.onRelease = async (key, text) => {
+    order.push(`start:${key}:${text}`);
+    if (text === controls.CONTROL_PENDING.new) {
+      await new Promise((resolve) => { releasePendingWrite = resolve; });
+    }
+    order.push(`end:${key}:${text}`);
+  };
+
+  await coordinator.admit({ key: "slow", scope: "chat", command: "new" });
+  // Fire the 30s pending timer while execute() is still running, pausing its ledger write.
+  timers.fire();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(releasePendingWrite !== undefined, "pending timer started its ledger release");
+
+  // Finish execute() while the pending timer's write is still in flight.
+  releaseExecute({ kind: "applied" });
+  let idleDone = false;
+  const waitingIdle = coordinator.idle().then(() => { idleDone = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(idleDone, false, "idle() waits for the pending timer write and serialized settlement");
+  assert.equal(memory.late.length, 0, "settlement waits for the pending timer write before publishing");
+
+  releasePendingWrite();
+  await waitingIdle;
+  assert.deepEqual(order, [
+    `start:slow:${controls.CONTROL_PENDING.new}`,
+    `end:slow:${controls.CONTROL_PENDING.new}`,
+  ]);
+  assert.deepEqual(memory.late, [{ key: "slow", text: controls.CONTROL_ACK.new }]);
+
+  // When a still-queued pending notice exists, a late refusal rewrites it in place (no duplicate).
+  let releaseRefused;
+  const second = coordinatorFixture({
+    execute: () => new Promise((resolve) => { releaseRefused = resolve; }),
+  });
+  await second.coordinator.admit({ key: "r1", scope: "chat", command: "new" });
+  second.timers.fire();
+  await new Promise((resolve) => setImmediate(resolve));
+  releaseRefused({ kind: "refused", text: controls.RESET_BUSY });
+  await second.coordinator.idle();
+  assert.equal(second.memory.records.get("r1").status, "refused");
+  assert.equal(second.memory.notices.get("r1").text, controls.RESET_BUSY);
+  assert.equal(second.memory.late.length, 0, "still-queued notice rewritten in place with no duplicate late notice");
+});
+
+test("shared OAuth callback handling never echoes or stores the callback", async () => {
+  const line = "http://127.0.0.1:1/callback?code=secret-code&state=s";
+  assert.match((await controls.handleOAuthCallback(async () => assert.fail(), line, { authenticated: false, scope: "channel" })).text, /owns this channel/u);
+  assert.deepEqual(await controls.handleOAuthCallback(undefined, line), { accepted: false, text: controls.OAUTH_CALLBACK_UNAVAILABLE });
+  assert.deepEqual(await controls.handleOAuthCallback(async () => { throw new Error(line); }, line), { accepted: false, text: controls.OAUTH_CALLBACK_UNHANDLED });
+  assert.deepEqual(await controls.handleOAuthCallback(async () => ({ handled: false, accepted: false, text: "" }), line), { accepted: false, text: controls.OAUTH_CALLBACK_UNHANDLED });
+  assert.deepEqual(await controls.handleOAuthCallback(async () => ({ handled: true, accepted: true, text: "MCP login complete." }), line), { accepted: true, text: "MCP login complete." });
+});
+
+test("shared outbox validation ignores terminal records and never leaks a malformed-outbox message", async () => {
+  assert.equal(pendingRecordProblem({ id: "cron:a:1", status: "delivered" }), undefined);
+  assert.equal(pendingRecordProblem({ id: "cron:a:2", status: "unknown", text: "" }), undefined);
+  assert.equal(pendingRecordProblem({ id: "cron:a:3", status: "pending", text: "hi" }), "delivery record has no origin session");
+  assert.equal(pendingRecordProblem({ id: "cron:a:4", status: "bogus", sessionKey: "s", text: "hi" }), "delivery record has an invalid status");
+  const leaky = new CronDeliveryOutboxError("Stored outbox at /home/owner/secret contains token=abc");
+  assert.equal(outboxFaultMessage(leaky), "delivery outbox is malformed");
+  assert.equal(outboxFaultMessage(new Error("raw")), "delivery outbox could not be read");
+
+  const records = new Map([
+    ["s1", [
+      { id: "done", sessionKey: "s1", status: "delivered", text: "", nextChunkIndex: 0, createdAtMs: 0 },
+      { id: "ready", sessionKey: "s1", status: "pending", text: "result", nextChunkIndex: 0, createdAtMs: 0 },
+      { id: "held", sessionKey: "s1", status: "sending", text: "result", nextChunkIndex: 0, createdAtMs: 0, sendIntent: { text: "result", chunkIndex: 0, startedAt: 0 } },
+    ]],
+  ]);
+  const faults = [];
+  const sent = [];
+  const outbox = {
+    sessions: async () => [{ sessionKey: "s1" }, { sessionKey: "s2" }, { sessionKey: "foreign" }],
+    list: async (sessionKey) => {
+      if (sessionKey === "s2") throw leaky;
+      return records.get(sessionKey) ?? [];
+    },
+    update: async (sessionKey, id, change) => {
+      const record = records.get(sessionKey)?.find((entry) => entry.id === id);
+      if (record === undefined) return undefined;
+      change(record);
+      return { ...record };
+    },
+    recordFault: async (sessionKey, message) => { faults.push({ sessionKey, message }); },
+  };
+  const drainer = createOutboxDrainer({
+    outbox,
+    context,
+    cleanupContext: context,
+    decodeSession: (sessionKey) => sessionKey === "foreign" ? undefined : { chat: sessionKey },
+    scopeOf: (target) => target.chat,
+    authorizeOrigin: () => ({ status: "deliver" }),
+    deliverRecord: async (_sessionKey, _target, record) => { sent.push(record.id); return "delivered"; },
+    maxActive: 4,
+    active: () => true,
+    label: "Synthetic",
+    now: () => 42,
+    warn: () => undefined,
+  });
+  await drainer.recover();
+  await drainer.scan();
+  await drainer.idle();
+  const byId = Object.fromEntries(records.get("s1").map((entry) => [entry.id, entry]));
+  assert.deepEqual(sent, ["ready"]);
+  assert.equal(byId.done.status, "delivered");
+  assert.equal(byId.done.error, undefined, "a terminal record is never re-settled as malformed");
+  assert.equal(byId.ready.status, "delivered");
+  assert.equal(byId.held.status, "unknown", "an interrupted send is quarantined, never resent");
+  assert.equal(byId.held.sendIntent, undefined);
+  assert.ok(faults.length > 0);
+  for (const fault of faults) assert.equal(fault.message, "delivery outbox is malformed");
+});
+
+test("concurrent outbox scans never double-dispatch and withholding races never strand a released record", async () => {
+  // 1. Concurrent scan() + requestScan() awaiting admitDispatch must single-flight and dispatch once.
+  const records1 = new Map([
+    ["s1", [{ id: "r1", sessionKey: "s1", status: "pending", text: "once", nextChunkIndex: 0, createdAtMs: 0 }]],
+  ]);
+  const sent1 = [];
+  let releaseAdmit;
+  let releaseDeliver;
+  let admitCalls = 0;
+  const drainer1 = createOutboxDrainer({
+    outbox: {
+      sessions: async () => [{ sessionKey: "s1" }],
+      list: async (sessionKey) => (records1.get(sessionKey) ?? []).map((entry) => ({ ...entry })),
+      update: async (sessionKey, id, change) => {
+        const record = records1.get(sessionKey)?.find((entry) => entry.id === id);
+        if (record === undefined) return undefined;
+        change(record);
+        return { ...record };
+      },
+      recordFault: async () => undefined,
+    },
+    context,
+    cleanupContext: context,
+    decodeSession: (sessionKey) => ({ chat: sessionKey }),
+    scopeOf: (target) => target.chat,
+    authorizeOrigin: () => ({ status: "deliver" }),
+    admitDispatch: async () => {
+      admitCalls += 1;
+      await new Promise((resolve) => { releaseAdmit = resolve; });
+      return true;
+    },
+    deliverRecord: async (_sessionKey, _target, record) => {
+      sent1.push(record.id);
+      await new Promise((resolve) => { releaseDeliver = resolve; });
+      return "delivered";
+    },
+    maxActive: 1,
+    active: () => true,
+    label: "Synthetic",
+    now: () => 42,
+    warn: () => undefined,
+  });
+
+  const scanA = drainer1.scan();
+  const scanB = drainer1.scan();
+  drainer1.requestScan();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(admitCalls, 1, "single-flight guard prevents overlapping scans from probing admitDispatch twice");
+  releaseAdmit();
+  await Promise.all([scanA, scanB]);
+  assert.deepEqual(sent1, ["r1"], "record is dispatched at most once");
+  releaseDeliver();
+  await drainer1.idle();
+  assert.equal(records1.get("s1")[0].status, "delivered");
+
+  // 2. Fresh admission / releaseWithheld() racing a withholding commit never strands the record.
+  for (const pauseAfterChange of [false, true]) {
+    const records2 = new Map([
+      ["s1", [{ id: "w1", sessionKey: "s1", status: "pending", text: "after auth", nextChunkIndex: 0, createdAtMs: 0 }]],
+    ]);
+    let authorized = false;
+    const sent2 = [];
+    let pauseWithhold;
+    let paused = false;
+    const drainer2 = createOutboxDrainer({
+      outbox: {
+        sessions: async () => [{ sessionKey: "s1" }],
+        list: async (sessionKey) => (records2.get(sessionKey) ?? []).map((entry) => ({ ...entry })),
+        update: async (sessionKey, id, change) => {
+          const record = records2.get(sessionKey)?.find((entry) => entry.id === id);
+          if (record === undefined) return undefined;
+          if (!paused && record.status === "pending") {
+            paused = true;
+            if (!pauseAfterChange) await new Promise((resolve) => { pauseWithhold = resolve; });
+            change(record);
+            if (pauseAfterChange) await new Promise((resolve) => { pauseWithhold = resolve; });
+            return { ...record };
+          }
+          change(record);
+          return { ...record };
+        },
+        recordFault: async () => undefined,
+      },
+      context,
+      cleanupContext: context,
+      decodeSession: (sessionKey) => ({ chat: sessionKey }),
+      scopeOf: (target) => target.chat,
+      authorizeOrigin: () => authorized ? { status: "deliver" } : { status: "withheld", reason: "no evidence" },
+      deliverRecord: async (_sessionKey, _target, record) => { sent2.push(record.id); return "delivered"; },
+      maxActive: 2,
+      active: () => true,
+      label: "Synthetic",
+      now: () => 42,
+      warn: () => undefined,
+    });
+
+    await drainer2.scan();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(pauseWithhold !== undefined, "withholding commit paused");
+    // Fresh owner admission arrives while withholding is paused.
+    authorized = true;
+    await drainer2.releaseWithheld("s1");
+    pauseWithhold();
+    await drainer2.idle();
+    assert.deepEqual(sent2, ["w1"], `record delivered after withholding race (pauseAfterChange=${pauseAfterChange})`);
+    assert.equal(records2.get("s1")[0].status, "delivered");
+  }
+});
+
+test("submission order is FIFO per scope and live generation excludes retries and waits", async () => {
+  const queue = new SubmissionOrderQueue();
+  const order = [];
+  const first = queue.beginSubmission("chat");
+  const second = queue.beginSubmission("chat");
+  const other = queue.beginSubmission("other");
+  const third = queue.submitInOrder("chat", async () => { order.push("third"); });
+  void second.prior.then(() => { order.push("second"); second.release(); });
+  await other.prior;
+  order.push("other");
+  other.release();
+  await Promise.resolve();
+  assert.deepEqual(order, ["other"], "a later place waits for every earlier one of its scope");
+  first.release();
+  first.release();
+  await third;
+  assert.deepEqual(order, ["other", "second", "third"]);
+  assert.equal(queue.activeScopes, 0);
+
+  // Releasing a newer slot early must not detach an older unreleased reservation.
+  const earlyOrder = [];
+  const slotA = queue.beginSubmission("scope");
+  const slotB = queue.beginSubmission("scope");
+  slotB.release();
+  assert.equal(queue.activeScopes, 1, "releasing B early keeps A's scope active");
+  const runC = queue.submitInOrder("scope", async () => { earlyOrder.push("C"); });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(earlyOrder, [], "C must wait while A is still held");
+  slotA.release();
+  await runC;
+  assert.deepEqual(earlyOrder, ["C"]);
+  assert.equal(queue.activeScopes, 0);
+
+  const run = { inputs: [3, 4] };
+  assert.equal(isLiveGenerating({ run, generation: { attempt: 1 } }), true);
+  assert.equal(isLiveGenerating({ run, generation: { attempt: 1, retry: { at: 1, error: "x" } } }), false);
+  assert.equal(isLiveGenerating({ run, generation: { attempt: 1, deferred: { pollAt: 1 } } }), false);
+  assert.equal(isLiveGenerating({ run }), false, "a tool round or a wait is not generating");
+  assert.equal(isLiveGenerating({ generation: { attempt: 1 } }), false);
+  assert.equal(isLiveGeneratingFor({ run, generation: { attempt: 1 } }, 4), true);
+  assert.equal(isLiveGeneratingFor({ run, generation: { attempt: 1 } }, 5), false);
+});
+
+test("the preview watcher coalesces partials of the run's first input and stops cleanly", async () => {
+  let listener;
+  let stopped = 0;
+  const conversation = {
+    async watch() {
+      return { value: { docs: {} }, start(next) { listener = next; }, async stop() { stopped++; } };
+    },
+  };
+  const timers = manualTimers();
+  const published = [];
+  const frames = [];
+  const watcher = await createPreviewWatcher({
+    conversation, context, delayMs: 700, timers,
+    publish: async (text) => { published.push(text); },
+    onFrame: (_view, frame) => frames.push(frame.ownsRun),
+  });
+  const frame = (inputs, text) => listener({ kind: "value", value: { docs: { "pi.live": {
+    run: { inputs }, generation: { attempt: 1, message: { content: [{ type: "text", text }] } },
+  } } } });
+  await frame([7], "before submission");
+  watcher.setSubmission(8);
+  await frame([7, 8], "a sibling never publishes");
+  assert.equal(timers.pending.size, 0);
+  watcher.setSubmission(7);
+  await frame([7, 8], "Hel");
+  await frame([7, 8], "Hello");
+  assert.equal(timers.pending.size, 1, "partials are coalesced behind one timer");
+  timers.fire();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(published, ["Hello"]);
+  await frame([7, 8], "Hello again");
+  await watcher.stop();
+  await watcher.stop();
+  timers.fire();
+  assert.deepEqual(published, ["Hello"], "nothing publishes after stop");
+  assert.equal(stopped, 1);
+  assert.deepEqual(frames, [false, false, true, true, true]);
+
+  // Concurrent stop() calls share the same teardown completion and publication failure.
+  let listener2;
+  let releaseWatchStop;
+  let releasePublishFail;
+  const timers2 = manualTimers();
+  const watchStopCalls = [];
+  const watcher2 = await createPreviewWatcher({
+    conversation: {
+      async watch() {
+        return {
+          value: { docs: {} },
+          start(next) { listener2 = next; },
+          stop() {
+            watchStopCalls.push(1);
+            return new Promise((resolve) => { releaseWatchStop = resolve; });
+          },
+        };
+      },
+    },
+    context,
+    delayMs: 100,
+    timers: timers2,
+    publishFailure: "rethrow",
+    publish: () => new Promise((_, reject) => { releasePublishFail = () => reject(new Error("preview failed")); }),
+  });
+  watcher2.setSubmission(1);
+  await listener2({ kind: "value", value: { docs: { "pi.live": {
+    run: { inputs: [1] }, generation: { attempt: 1, message: { content: [{ type: "text", text: "Hi" }] } },
+  } } } });
+  timers2.fire();
+  assert.ok(releasePublishFail !== undefined, "preview publication started");
+  let stop2Settled = false;
+  const stop1 = watcher2.stop();
+  const stop2 = watcher2.stop();
+  assert.equal(stop1, stop2, "concurrent stop() callers share the exact teardown promise");
+  const guarded2 = stop2.catch((error) => { stop2Settled = true; return error; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(stop2Settled, false, "second stop() caller waits for teardown");
+  releaseWatchStop();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(stop2Settled, false, "stop() waits for in-flight publish to finish");
+  releasePublishFail();
+  await assert.rejects(stop1, /preview failed/u);
+  const secondError = await guarded2;
+  assert.match(secondError.message, /preview failed/u);
+  assert.equal(watchStopCalls.length, 1);
+});
+
+test("shared outbound media gate, body cap and label sanitizer", async () => {
+  const gate = new WorkGate(2);
+  let active = 0;
+  let peak = 0;
+  const releases = [];
+  const work = () => gate.run(async () => {
+    active++;
+    peak = Math.max(peak, active);
+    await new Promise((resolve) => releases.push(resolve));
+    active--;
+  });
+  const runs = [work(), work(), work(), work()];
+  const cancelled = new AbortController();
+  const aborted = gate.run(async () => assert.fail("an aborted waiter never runs"), cancelled.signal);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(releases.length, 2);
+  cancelled.abort(new Error("cancelled"));
+  await assert.rejects(aborted, /cancelled/u);
+  while (releases.length > 0 || active > 0) {
+    releases.shift()?.();
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  await Promise.all(runs);
+  assert.equal(peak, 2);
+
+  const chunked = (sizes, headers = {}) => new Response(new ReadableStream({
+    start(controller) {
+      for (const size of sizes) controller.enqueue(new Uint8Array(size));
+      controller.close();
+    },
+  }), { headers });
+  const collect = async (body) => { let total = 0; for await (const chunk of body) total += chunk.byteLength; return total; };
+  assert.equal(await collect(boundedResponseBody(chunked([4, 4]), 8)), 8);
+  await assert.rejects(collect(boundedResponseBody(chunked([4, 4, 1]), 8)), (error) => error instanceof MediaRejected && error.reason === "too-large");
+  let cancelledOversized = false;
+  const oversized = new Response(new ReadableStream({
+    start(controller) { controller.enqueue(new Uint8Array(1)); },
+    cancel() { cancelledOversized = true; },
+  }), { headers: { "content-length": "9" } });
+  await assert.rejects(collect(boundedResponseBody(oversized, 8)), (error) => error instanceof MediaRejected && error.reason === "too-large");
+  assert.equal(cancelledOversized, true, "oversized advertised Content-Length cancels the response body");
+
+  assert.equal(boundedLabel("a\u0000b‮c⁦d‏\ne", 80), "a b c d e");
+  assert.equal(boundedLabel("x\ud800y", 80), "x�y");
+  assert.equal(boundedLabel("😀😀", 3), "😀", "a cut never splits a surrogate pair");
+  assert.equal(boundedLabel("  \u0007 ", 10), "(empty)");
+  assert.equal(boundedLabel(undefined, 10, { empty: "(unnamed)" }), "(unnamed)");
+  assert.equal(boundedLabel("[admin]: hi", 80, { stripBrackets: true }), "admin: hi");
+});
