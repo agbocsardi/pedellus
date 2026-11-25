@@ -42,6 +42,8 @@ const NO_SUCH_NOTICE =
   "No stale host notice with that exact id exists in this chat. Nothing was changed and nothing was resent.";
 const ONLY_HOST_NOTICES =
   "Only host notices can be dismissed here. Model answers and scheduled results are never dismissed or resent.";
+const ALREADY_DISMISSED =
+  "That host notice was already dismissed by the owner. Its original outcome stays unknown; it was not resent.";
 const NOT_UNKNOWN =
   "That host notice is not in an unknown state, so it was not dismissed. Nothing was changed and nothing was resent.";
 
@@ -62,20 +64,27 @@ export interface TelegramNoticesHost {
   readonly context: Context;
   /** The adapter's current committed pending records. */
   pending(): readonly TelegramNoticeRecord[];
-  /** One state commit that archives and drops one unknown pending notice (see {@link archiveUnknownNotice}). */
-  dismissPending(sessionKey: string, updateId: number, id: string): Promise<PendingDismissal>;
+  /**
+   * One state commit that archives and drops one unknown pending notice (see
+   * {@link archiveUnknownNotice}) AND admits the command's own receipt `receiptFor(outcome)` with
+   * its polling offset, so a failed commit leaves nothing behind and a re-polled update repeats it.
+   */
+  dismissPending(sessionKey: string, updateId: number, id: string, receiptFor: (outcome: PendingDismissal) => string): Promise<void>;
   /** Fixed usage notice for a malformed argument. */
   readonly usage: string;
   /** Notice length bound. */
   readonly maxChars: number;
 }
 
-/** Answer one `/notices [dismiss <id>]` of this chat with fixed, bounded text. */
+/**
+ * Answer one `/notices [dismiss <id>]` of this chat with fixed, bounded text, or `undefined` when
+ * the receipt was already admitted together with the dismissal itself.
+ */
 export async function telegramNoticesCommand(
   host: TelegramNoticesHost,
   sessionKey: string,
   args: string,
-): Promise<string> {
+): Promise<string | undefined> {
   const argument = args.trim();
   if (argument === "") return staleHostNoticesNotice(host, sessionKey);
   const dismiss = /^dismiss\s+(\S+)$/u.exec(argument);
@@ -158,16 +167,22 @@ async function staleHostNoticesNotice(host: TelegramNoticesHost, sessionKey: str
  * Retire exactly one stale host notice of this chat. An ambiguous send is never retried and a model
  * answer or scheduled result is never touched.
  */
-async function dismissStaleHostNotice(host: TelegramNoticesHost, sessionKey: string, id: string): Promise<string> {
+async function dismissStaleHostNotice(
+  host: TelegramNoticesHost,
+  sessionKey: string,
+  id: string,
+): Promise<string | undefined> {
   const outbox = host.outbox;
   if (outbox === undefined) return NOTICES_UNAVAILABLE_HOST;
   if (/^telegram:-?\d+$/.test(id)) {
     const updateId = Number(id.slice("telegram:".length));
     if (!Number.isSafeInteger(updateId) || id !== `telegram:${updateId}`) return NO_SUCH_NOTICE;
-    const outcome = await host.dismissPending(sessionKey, updateId, id);
-    if (outcome === "dismissed") return `Dismissed stale host notice ${id}. Its original outcome stays unknown; it was not resent.`;
-    if (outcome === "full") return "Notice dismissal archive is full. Nothing was changed or resent.";
-    return NO_SUCH_NOTICE;
+    await host.dismissPending(sessionKey, updateId, id, (outcome) => {
+      if (outcome === "dismissed") return `Dismissed stale host notice ${id}. Its original outcome stays unknown; it was not resent.`;
+      if (outcome === "full") return "Notice dismissal archive is full. Nothing was changed or resent.";
+      return NO_SUCH_NOTICE;
+    });
+    return undefined;
   }
   if (!isTurnInterruptionNotice({ id })) return ONLY_HOST_NOTICES;
   let records: readonly CronDeliveryRecord[];
@@ -179,6 +194,9 @@ async function dismissStaleHostNotice(host: TelegramNoticesHost, sessionKey: str
   const current = records.find((record) => record.id === id);
   if (current === undefined) return NO_SUCH_NOTICE;
   if (!isTurnInterruptionNotice(current)) return ONLY_HOST_NOTICES;
+  // The outbox commit is separate from the receipt's, so a re-polled update after a failed receipt
+  // finds its own earlier dismissal: report that truthfully instead of claiming nothing changed.
+  if (current.status === "failed" && current.error === STALE_HOST_NOTICE_DISMISSED) return ALREADY_DISMISSED;
   if (current.status !== "unknown") return NOT_UNKNOWN;
   let dismissed = false;
   try {

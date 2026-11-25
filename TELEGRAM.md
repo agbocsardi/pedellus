@@ -372,6 +372,14 @@ published once:
   final outcome (applied, refused or interrupted) is published later as one
   follow-up notice, and a late-applied `/restart` asks the host only then.
 
+Only a still-held acknowledgement is ever rewritten: a held notice is never
+dispatched, so rewriting it cannot race a send. Once released, that record may
+be sending, sent or quarantined as unknown, and it is never touched again; a
+late outcome goes on its own pending notice (`lateFor` names the control, its
+own update id is a host-allocated negative one), so the earlier record keeps its
+text and write-ahead provenance. The control record is kept while any queued
+notice still reports it.
+
 A held acknowledgement is never delivered early, and it is not tied to the input
 gate: notices are never model submissions, so a released notice can still reach
 the user while that chat's inputs are held, even when the reply bound is full.
@@ -425,7 +433,12 @@ held acknowledgement and offset in one commit). If that commit fails, the chat's
 gate is released, nothing of the command is applied, and the adapter stops the
 current batch and polls again from the durable offset, so Telegram serves the
 same update once more (after a short backoff). Five consecutive failures of the
-same update are fatal, as any other storage failure is.
+same update are fatal, as any other storage failure is. `/notices dismiss` of one of this
+adapter's pending notices commits the archive, the removal, its receipt and the
+offset together, so a re-polled update performs it once. Dismissing an outbox
+host notice is a separate outbox commit; a re-polled update whose receipt failed
+finds its own dismissal marker and says the notice was already dismissed rather
+than that nothing changed.
 
 Per-chat model submissions keep admission order, and each chat's place is
 reserved when a delivery is dispatched, before any asynchronous

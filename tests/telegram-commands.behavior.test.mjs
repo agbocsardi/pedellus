@@ -1329,13 +1329,13 @@ test('a deferred /restart publishes its late outcome and still asks the host onc
   }
 });
 
-test('a control whose admission commit fails is polled again without locking its chat', { timeout: 30_000 }, async () => {
-  const store = await syntheticStore('admit-failure');
+/**
+ * A host whose channel-state commits fail inside the transaction (so it aborts and nothing of it is
+ * durable) whenever `shouldFail(doc)` returns true for the state that commit would write.
+ */
+function failingStateHost(store, shouldFail) {
   const stateKey = `telegram:${BOT_ID}:channel-state`;
-  let failAdmission = true;
-  // One synthetic storage failure of exactly the commit that admits update 1700; the transaction
-  // aborts, so neither the record, its acknowledgement nor the offset is durable.
-  const host = Object.create(store.gateway, {
+  return Object.create(store.gateway, {
     conversationFor: {
       value: async (key, ctx) => {
         const conversation = await store.gateway.conversationFor(key, ctx);
@@ -1345,11 +1345,7 @@ test('a control whose admission commit fails is polled again without locking its
             if (property === 'commit') {
               return (change, commitContext) => target.commit(async (tx) => {
                 const result = await change(tx);
-                const doc = await tx.doc(TelegramState, target.id);
-                if (failAdmission && doc.controls.some((entry) => entry.updateId === 1700)) {
-                  failAdmission = false;
-                  throw new Error('synthetic storage failure');
-                }
+                if (shouldFail(await tx.doc(TelegramState, target.id))) throw new Error('synthetic storage failure');
                 return result;
               }, commitContext);
             }
@@ -1359,6 +1355,18 @@ test('a control whose admission commit fails is polled again without locking its
         });
       },
     },
+  });
+}
+
+test('a control whose admission commit fails is polled again without locking its chat', { timeout: 30_000 }, async () => {
+  const store = await syntheticStore('admit-failure');
+  let failAdmission = true;
+  // One synthetic storage failure of exactly the commit that admits update 1700; the transaction
+  // aborts, so neither the record, its acknowledgement nor the offset is durable.
+  const host = failingStateHost(store, (doc) => {
+    if (!failAdmission || !doc.controls.some((entry) => entry.updateId === 1700)) return false;
+    failAdmission = false;
+    return true;
   });
   let transport;
   transport = telegramMock([
@@ -1413,6 +1421,122 @@ test('a thrown ConversationBusy from the paired reset is a clean refusal, not an
       'Reset refused: chat busy. /abort or retry /new when idle.');
     assert.ok(!transport.sent.some((entry) => entry.text === 'Context reset.'), 'a refused reset never claims success');
     assert.equal(adapter.settled, false, 'the adapter keeps running');
+  } finally {
+    await cleanup(store, harness);
+    transport.restore();
+  }
+});
+
+test('a late control outcome never rewrites a quarantined acknowledgement; it is sent on its own record', { timeout: 30_000 }, async () => {
+  const store = await syntheticStore('late-quarantined');
+  // As in the deferred restart check: the earlier input's delivery and the command's flush fail once.
+  let failures = 2;
+  const host = Object.create(store.gateway, {
+    beforeOwnerInput: {
+      value: async (...args) => {
+        if (failures > 0) {
+          failures -= 1;
+          throw new Error('synthetic transient rollover failure');
+        }
+        return store.gateway.beforeOwnerInput(...args);
+      },
+    },
+  });
+  const requested = [];
+  const restart = { supported: true, async request() { requested.push(true); } };
+  let transport;
+  transport = telegramMock([
+    [textUpdate(1650, 1650, 'earlier input'), textUpdate(1651, 1651, '/restart')],
+    async () => {
+      await untilAsync(async () => (await stateDoc(store.gateway)).pending
+        .some((item) => item.updateId === 1651 && item.deliveryStatus === 'unknown'), 'quarantined pending notice');
+      return [];
+    },
+  ]);
+  // Telegram may have accepted "Restart pending." although its response was lost (a 5xx), so that
+  // notice is quarantined as unknown with its write-ahead intent.
+  const mockedFetch = globalThis.fetch;
+  let failPending = true;
+  globalThis.fetch = async (input, init = {}) => {
+    const method = String(input).slice(String(input).lastIndexOf('/') + 1);
+    if (failPending && method === 'sendRichMessage' && typeof init.body === 'string' &&
+        JSON.parse(init.body).rich_message?.markdown === 'Restart pending.') {
+      failPending = false;
+      return new Response(JSON.stringify({ ok: false, error_code: 502, description: 'Bad Gateway' }),
+        { status: 502, headers: { 'content-type': 'application/json' } });
+    }
+    return mockedFetch(input, init);
+  };
+  let harness;
+  try {
+    harness = start(store, transport, { restart, host });
+    await until(() => transport.sent.some((entry) => /^Restart requested; checking active work\.$/.test(entry.text)),
+      'completion on its own record');
+    assert.equal(failPending, false, 'the pending notice was quarantined');
+    await until(() => requested.length === 1, 'host restart request');
+    await untilAsync(async () => !(await stateDoc(store.gateway)).pending.some((item) => item.lateFor === 1651),
+      'late record delivered and forgotten');
+    const doc = await stateDoc(store.gateway);
+    const original = doc.pending.find((item) => item.updateId === 1651);
+    assert.equal(original.text, 'Restart pending.', 'the quarantined record keeps its own text');
+    assert.equal(original.deliveryStatus, 'unknown');
+    assert.equal(original.sendIntent.text, 'Restart pending.', 'its write-ahead provenance is unchanged');
+    assert.deepEqual(doc.controls.map((entry) => [entry.updateId, entry.status]), [[1651, 'applied']]);
+    assert.equal(transport.sent.filter((entry) => entry.text.startsWith('Restart requested')).length, 1);
+    assert.equal(requested.length, 1);
+  } finally {
+    globalThis.fetch = mockedFetch;
+    await cleanup(store, harness);
+    transport.restore();
+  }
+});
+
+test('a re-polled /notices dismiss after a failed receipt commit reports the dismissal truthfully', { timeout: 30_000 }, async () => {
+  const store = await syntheticStore('dismiss-retry');
+  const session = `telegram:${BOT_ID}:chat:${CHAT_ID}`;
+  const unknownSince = Date.UTC(2026, 10, 1, 9, 0, 0);
+  await seedDeliveries(store.gateway, CHAT_ID, [{
+    id: 'host:turn-interrupted:921', sessionKey: session, text: 'HOST-NOTICE-921',
+    createdAtMs: unknownSince, status: 'unknown', nextChunkIndex: 0, unknownSince,
+  }]);
+  const stateConversation = await store.gateway.conversationFor(`telegram:${BOT_ID}:channel-state`, context);
+  await stateConversation.commit(async (tx) => {
+    const doc = await tx.doc(TelegramState, stateConversation.id);
+    doc.pending.push({ updateId: -820, text: 'Restarted.', notice: true, sessionKey: session, chatId: CHAT_ID,
+      senderId: '501', nextChunkIndex: 0, deliveryStatus: 'unknown', unknownSince });
+  }, context);
+  // The first commit that would admit each receipt fails once; Telegram then serves the update again.
+  const failOnce = new Set([1900, 1901]);
+  const host = failingStateHost(store, (doc) => {
+    const receipt = doc.pending.find((item) => failOnce.has(item.updateId));
+    if (receipt === undefined) return false;
+    failOnce.delete(receipt.updateId);
+    return true;
+  });
+  const transport = telegramMock([
+    [textUpdate(1900, 1900, '/notices dismiss telegram:-820')],
+    [textUpdate(1900, 1900, '/notices dismiss telegram:-820')],
+    [textUpdate(1901, 1901, '/notices dismiss host:turn-interrupted:921')],
+    [textUpdate(1901, 1901, '/notices dismiss host:turn-interrupted:921')],
+  ]);
+  let harness;
+  try {
+    harness = start(store, transport, { host });
+    await until(() => transport.sent.length === 2, 'one receipt per dismissal');
+    assert.equal(failOnce.size, 0, 'both receipt commits failed once');
+    const texts = transport.sent.map((entry) => rendered(entry.text));
+    // The adapter's own pending notice is dismissed in the same commit as its receipt, so the retry
+    // performs it exactly once.
+    assert.equal(texts[0], 'Dismissed stale host notice telegram:-820. Its original outcome stays unknown; it was not resent.');
+    const archived = await store.gateway.harness.snapshot(TelegramNoticeDismissals, stateConversation.id, context);
+    assert.deepEqual(archived.records.map((entry) => entry.id), ['telegram:-820']);
+    // The outbox dismissal committed before the failed receipt; its retry says so instead of
+    // claiming that nothing changed.
+    assert.match(texts[1], /^That host notice was already dismissed by the owner\./);
+    assert.doesNotMatch(texts[1], /Nothing was changed/);
+    const record = (await deliveries(store.gateway, CHAT_ID)).find((entry) => entry.id === 'host:turn-interrupted:921');
+    assert.equal(record.status, 'failed');
+    assert.equal(record.text, 'HOST-NOTICE-921');
   } finally {
     await cleanup(store, harness);
     transport.restore();

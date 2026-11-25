@@ -124,8 +124,7 @@ import {
   NOTICES_UNAVAILABLE_HOST,
   TelegramNoticeDismissals,
   archiveUnknownNotice,
-  telegramNoticesCommand,
-  type PendingDismissal,
+  telegramNoticesCommand
 } from "./telegram-notices.js";
 import {
   POLL_TIMEOUT_MAX,
@@ -272,6 +271,13 @@ export type TelegramPendingDelivery = {
    * means never merged; a merged record is never merged again, so a retry cannot exceed the bound.
    */
   coalescedParts?: number;
+  /**
+   * The control update whose final outcome this separate notice reports. It is used once that
+   * control's own acknowledgement was already released (and may be sending, sent or quarantined), so
+   * that record and its write-ahead provenance stay untouched; this one has its own host-allocated
+   * negative update id.
+   */
+  lateFor?: number;
 };
 /**
  * One authenticated control command. `admitted` is committed with the acknowledgement and the polling offset before
@@ -394,6 +400,9 @@ export const TelegramState = defineDoc<ChannelState>({
         if (stored !== undefined && (!Number.isSafeInteger(stored) || (stored as number) < 1)) {
           throw new Error("Stored Telegram state contains invalid pending coalescing metadata");
         }
+      }
+      if (item.lateFor !== undefined && (!Number.isSafeInteger(item.lateFor) || (item.lateFor as number) < 0)) {
+        throw new Error("Stored Telegram state contains an invalid late control notice");
       }
     }
     return {
@@ -1036,17 +1045,30 @@ export async function runTelegram(
     notice: true,
   });
 
-  /** Publish the held acknowledgement, optionally rewritten; `lateNotice` is queued when it is gone. */
-  const releaseControlNotice = (key: number, text: string | undefined, lateNotice?: PendingReply) =>
-    mutateState((doc) => {
-      const notice = doc.pending.find((item) => item.notice === true && item.updateId === key);
-      if (notice !== undefined) {
-        if (text !== undefined) notice.text = text;
-        delete notice.hold;
-      } else if (lateNotice !== undefined && doc.pending.length < MAX_ADMITTED) {
-        doc.pending.push(lateNotice);
-      }
-    });
+  /**
+   * Inside one state commit: rewrite (when `text` is given) and release this control's acknowledgement
+   * while it is still held. A held notice is never dispatched, so rewriting it cannot race a send. Once
+   * released it may be sending, sent or quarantined as unknown, so it is never touched again: a `late`
+   * outcome then goes on its own record instead of being dropped or overwriting that provenance.
+   */
+  const settleControlNotice = (
+    doc: Draft<ChannelState>,
+    key: number,
+    text: string | undefined,
+    late?: TelegramControlRequest,
+  ): void => {
+    const notice = doc.pending.find((item) => item.notice === true && item.updateId === key);
+    if (notice?.hold === true) {
+      if (text !== undefined) notice.text = text;
+      delete notice.hold;
+      return;
+    }
+    if (late === undefined || text === undefined || doc.pending.length >= MAX_ADMITTED) return;
+    const used = new Set(doc.pending.map((item) => item.updateId));
+    let updateId = RESTART_LIVE_UPDATE_ID;
+    while (used.has(updateId)) updateId -= 1;
+    doc.pending.push({ ...controlNotice(late, text), updateId, lateFor: late.key });
+  };
 
   const controlLedger: ControlLedger<number, number, TelegramControlRequest> = {
     status: (key) => state.controls.find((entry) => entry.updateId === key)?.status,
@@ -1084,20 +1106,14 @@ export async function runTelegram(
       }, adapterContext);
     },
     async release(key, text) {
-      await releaseControlNotice(key, text);
+      await mutateState((doc) => settleControlNotice(doc, key, text));
     },
     async markRefused(record, text, late) {
       const bounded = text.slice(0, MAX_NOTICE_CHARS);
       await mutateState((doc) => {
         const entry = doc.controls.find((item) => item.updateId === record.key);
         if (entry !== undefined) entry.status = "refused";
-        const notice = doc.pending.find((item) => item.notice === true && item.updateId === record.key);
-        if (notice !== undefined) {
-          notice.text = bounded;
-          delete notice.hold;
-        } else if (late === true && doc.pending.length < MAX_ADMITTED) {
-          doc.pending.push(controlNotice(record, bounded));
-        }
+        settleControlNotice(doc, record.key, bounded, late === true ? record : undefined);
         doc.controls = pruneTelegramControls(doc.controls, doc.pending);
       });
     },
@@ -1105,18 +1121,12 @@ export async function runTelegram(
       await mutateState((doc) => {
         const entry = doc.controls.find((item) => item.updateId === key);
         if (entry !== undefined) entry.status = "unconfirmed";
-        const notice = doc.pending.find((item) => item.notice === true && item.updateId === key);
-        if (notice !== undefined) {
-          notice.text = text;
-          delete notice.hold;
-        } else if (lateRecord !== undefined && doc.pending.length < MAX_ADMITTED) {
-          doc.pending.push(controlNotice(lateRecord, text));
-        }
+        settleControlNotice(doc, key, text, lateRecord);
       });
     },
     async publishLate(record, text) {
       const body = text.slice(0, MAX_LATE_CONTROL_CHARS);
-      await releaseControlNotice(record.key, body, controlNotice(record, body));
+      await mutateState((doc) => settleControlNotice(doc, record.key, body, record));
     },
     async refuse(record, text) {
       await admitNotice(record.key, record.scope, record.senderId, record.sessionKey, text);
@@ -1631,10 +1641,14 @@ export async function runTelegram(
     earlySubmissions.delete(updateId);
     state = await stateConversation.commit(async (tx) => {
       const doc = await tx.doc(TelegramState, stateConversation.id);
+      const lateFor = doc.pending.find((entry) => entry.updateId === updateId)?.lateFor;
       doc.pending = doc.pending.filter((entry) => entry.updateId !== updateId);
-      // Its terminal report (interrupted or refused) is now durably delivered, so the record has served its purpose.
+      // Its terminal report (interrupted or refused) is now durably delivered, so the record has served
+      // its purpose, unless another queued notice (its own acknowledgement or a late one) still reports it.
+      const reported = reportedControls(doc.pending);
       doc.controls = doc.controls.filter((entry) =>
-        !(entry.updateId === updateId && (entry.status === "unconfirmed" || entry.status === "refused")));
+        !((entry.updateId === updateId || entry.updateId === lateFor) && !reported.has(entry.updateId) &&
+          (entry.status === "unconfirmed" || entry.status === "refused")));
       return copyJson(doc) as unknown as ChannelState;
     }, cleanupContext);
   };
@@ -2451,7 +2465,8 @@ export async function runTelegram(
         drain();
         return;
       }
-      await admitMessageNotice(update, message, sessionKey, await noticesCommand(sessionKey, parsed.args));
+      const notices = await noticesCommand(update, message, sessionKey, parsed.args);
+      if (notices !== undefined) await admitMessageNotice(update, message, sessionKey, notices);
       drain();
       return;
     }
@@ -2611,28 +2626,42 @@ export async function runTelegram(
     }
   }
 
-  /** This chat's `/notices`, against the outbox and this adapter's own pending notices. */
-  function noticesCommand(sessionKey: string, args: string): Promise<string> {
+  /**
+   * This chat's `/notices`, against the outbox and this adapter's own pending notices. Dismissing one
+   * of this adapter's pending notices commits the archive, the removal, this command's receipt and
+   * its offset together: a failed commit changes nothing, and a re-polled update repeats it once.
+   */
+  function noticesCommand(update: Update, message: TelegramMessage, sessionKey: string, args: string): Promise<string | undefined> {
     return telegramNoticesCommand({
       outbox,
       context: adapterContext,
       pending: () => state.pending,
       usage: usageNotice("notices"),
       maxChars: MAX_NOTICE_CHARS,
-      async dismissPending(dismissKey, updateId, id) {
-        const committed = await stateConversation.commit(async (tx) => {
+      async dismissPending(dismissKey, updateId, id, receiptFor) {
+        state = await stateConversation.commit(async (tx) => {
           const doc = await tx.doc(TelegramState, stateConversation.id);
-          const archive = await tx.doc(TelegramNoticeDismissals, stateConversation.id);
-          const outcome: PendingDismissal =
-            archiveUnknownNotice(doc.pending, archive, { sessionKey: dismissKey, updateId, id, now: Date.now() });
-          // Dismissal frees only the delivery queue slot and never claims external delivery.
-          if (outcome === "dismissed") {
-            doc.pending = doc.pending.filter((entry) => !(entry.updateId === updateId && entry.sessionKey === dismissKey));
+          if (!doc.pending.some((entry) => entry.updateId === update.update_id)) {
+            const archive = await tx.doc(TelegramNoticeDismissals, stateConversation.id);
+            const outcome = archiveUnknownNotice(doc.pending, archive, { sessionKey: dismissKey, updateId, id, now: Date.now() });
+            // Dismissal frees only the delivery queue slot and never claims external delivery.
+            if (outcome === "dismissed") {
+              doc.pending = doc.pending.filter((entry) => !(entry.updateId === updateId && entry.sessionKey === dismissKey));
+            }
+            if (doc.pending.length >= MAX_ADMITTED) throw new Error("Telegram durable output queue is full");
+            doc.pending.push({
+              updateId: update.update_id,
+              nextChunkIndex: 0,
+              chatId: message.chat.id,
+              sessionKey,
+              senderId: String(message.from!.id),
+              text: receiptFor(outcome).slice(0, MAX_NOTICE_CHARS),
+              notice: true,
+            });
           }
-          return { outcome, state: copyJson(doc) as unknown as ChannelState };
+          doc.offset = Math.max(doc.offset, update.update_id + 1);
+          return copyJson(doc) as unknown as ChannelState;
         }, adapterContext);
-        state = committed.state;
-        return committed.outcome;
       },
     }, sessionKey, args);
   }
@@ -2989,8 +3018,18 @@ function pruneTelegramControls<R extends TelegramControlRecord>(
   controls: readonly R[],
   pending: readonly TelegramPendingDelivery[],
 ): R[] {
-  const reported = new Set(pending.filter((item) => item.notice === true).map((item) => item.updateId));
+  const reported = reportedControls(pending);
   return pruneControls(controls, (entry) => reported.has(entry.updateId));
+}
+
+/** Control update ids a queued notice still reports: its own acknowledgement or a late outcome. */
+function reportedControls(pending: readonly TelegramPendingDelivery[]): Set<number> {
+  const reported = new Set<number>();
+  for (const item of pending) {
+    if (item.notice !== true) continue;
+    reported.add(item.lateFor ?? item.updateId);
+  }
+  return reported;
 }
 
 function requestIdFor(botId: string, updateId: number): string {

@@ -15,7 +15,6 @@ import {
   OutboundFileRejected,
   outboundRejectionText as sharedRejectionText,
   readOutboundFile,
-  type OutboundFile,
   type OutboundRejection,
 } from "../media/outbound.js";
 import type { TelegramFileKind } from "./telegram-interactions.js";
@@ -54,11 +53,22 @@ const KIND_EXTENSIONS: Readonly<Record<TelegramFileKind, ReadonlySet<string> | u
 /** A permanent refusal: retrying the same path cannot succeed. */
 export type TelegramOutboundRejection = OutboundRejection;
 
-/** The shared pre-send refusal, under its historical Telegram name. */
-export const TelegramOutboundRejected = OutboundFileRejected;
-export type TelegramOutboundRejected = OutboundFileRejected;
+/** The shared pre-send refusal under its historical Telegram name; it is also an {@link OutboundFileRejected}. */
+export class TelegramOutboundRejected extends OutboundFileRejected {
+  constructor(reason: TelegramOutboundRejection) {
+    super(reason);
+    this.name = "TelegramOutboundRejected";
+  }
+}
 
-export type TelegramOutboundFile = OutboundFile;
+export interface TelegramOutboundFile {
+  /** Pinned bytes; exactly the file's size at open time, never more. */
+  readonly bytes: Buffer;
+  /** Bounded display name for Telegram; derived from the resolved file name only. */
+  readonly filename: string;
+  /** Lower-case extension of the resolved name, without the dot. */
+  readonly extension?: string;
+}
 
 /**
  * Resolve and read one workspace file for a bounded upload. Every failure is a fixed pre-send
@@ -71,12 +81,17 @@ export async function readTelegramOutboundFile(options: {
   readonly maxBytes?: number;
 }): Promise<TelegramOutboundFile> {
   const allowed = KIND_EXTENSIONS[options.kind];
-  return readOutboundFile({
-    workspace: options.workspace,
-    path: options.path,
-    maxBytes: options.maxBytes ?? TELEGRAM_OUTBOUND_LIMITS.maxFileBytes,
-    ...(allowed === undefined ? {} : { allowedExtensions: allowed }),
-  });
+  try {
+    return await readOutboundFile({
+      workspace: options.workspace,
+      path: options.path,
+      maxBytes: options.maxBytes ?? TELEGRAM_OUTBOUND_LIMITS.maxFileBytes,
+      ...(allowed === undefined ? {} : { allowedExtensions: allowed }),
+    });
+  } catch (error) {
+    if (error instanceof OutboundFileRejected) throw new TelegramOutboundRejected(error.reason);
+    throw error;
+  }
 }
 
 /** Fixed model-facing explanation for a refusal; never includes a path or bytes. */
