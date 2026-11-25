@@ -10,8 +10,9 @@
  * Fence matching is inherited from Telegram's splitter: it tracks literal ``` markers by parity
  * rather than full CommonMark fence nesting (tilde ~~~ fences, longer ```` fences and inline
  * triple-backticks are not parsed as nested fences). A cut inside an open ``` block moves before
- * its opening marker when possible, or closes and reopens the same fence line in the next chunk.
- * Cuts prefer a line boundary, then a word boundary, and never split a surrogate pair. The limit
+ * its opening marker when possible, closes and reopens the same fence line in the next chunk, or
+ * falls back to an unbalanced split when the limit is too small to fit the closing and reopening
+ * fence. Cuts prefer a line boundary, then a word boundary, and never split a surrogate pair. The limit
  * counts UTF-16 units, which is never smaller than a character count.
  */
 export function splitRichText(text: string, limit: number): string[] {

@@ -194,7 +194,15 @@ export function createOutboxDrainer<Target>(options: OutboxDrainerOptions<Target
     }
   };
 
-  const deliver = async (sessionKey: string, target: Target, record: CronDeliveryRecord): Promise<"done" | "rescan"> => {
+  const deliver = async (sessionKey: string, target: Target, initial: CronDeliveryRecord): Promise<"done" | "rescan"> => {
+    // Recheck durable status under the active reservation so a scan snapshot taken before an
+    // earlier delivery settled can never dispatch the same record twice.
+    const latest = await list(sessionKey, options.context);
+    const fresh = latest?.find((value): value is CronDeliveryRecord =>
+      value !== null && typeof value === "object" && !Array.isArray(value) &&
+      (value as { id?: unknown }).id === initial.id);
+    if (fresh === undefined || fresh.status !== "pending") return "done";
+    const record = fresh;
     if (record.sessionKey !== sessionKey) {
       await markFailed(sessionKey, record.id, "outbox session does not match its origin");
       return "done";

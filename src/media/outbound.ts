@@ -274,9 +274,9 @@ export async function* boundedResponseBody(
   maxBytes: number,
   signal?: AbortSignal,
 ): AsyncIterable<Uint8Array> {
-  const header = response.headers.get("content-length");
-  const advertised = header === null || header.trim() === "" ? Number.NaN : Number(header);
-  if (Number.isSafeInteger(advertised) && advertised > maxBytes) {
+  const header = response.headers.get("content-length")?.trim() ?? "";
+  const tooLarge = /^\d+$/.test(header) && BigInt(header) > BigInt(Math.max(0, Math.floor(maxBytes)));
+  if (tooLarge) {
     try {
       await response.body?.cancel();
     } catch {
