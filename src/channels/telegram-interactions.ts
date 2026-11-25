@@ -37,6 +37,7 @@
 
 import type { Draft } from "@earendil-works/chord";
 
+import { validOutboundFilePath } from "../media/outbound.js";
 import { TELEGRAM_CONTENT_LIMITS, isTelegramContentSource, type TelegramContentSource } from "./telegram-content.js";
 
 export const TELEGRAM_TARGET_LIMITS = Object.freeze({
@@ -89,14 +90,7 @@ export function isTelegramFileKind(value: unknown): value is TelegramFileKind {
  * escapes and pins the bytes before the external call.
  */
 export function validTelegramFilePath(value: unknown): value is string {
-  if (typeof value !== "string" || value === "" || value.length > TELEGRAM_ACTION_LIMITS.filePathChars) {
-    return false;
-  }
-  if (value !== value.trim()) return false;
-  if (value.startsWith("/") || value.includes("\\")) return false;
-  if (/[\u0000-\u001f\u007f]/.test(value)) return false;
-  const segments = value.split("/");
-  return segments.every((segment) => segment !== "" && segment !== "." && segment !== "..");
+  return validOutboundFilePath(value, TELEGRAM_ACTION_LIMITS.filePathChars);
 }
 
 export type TelegramTargetDirection = "incoming" | "outgoing";
