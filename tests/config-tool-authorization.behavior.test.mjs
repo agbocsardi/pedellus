@@ -200,4 +200,23 @@ test('captured config authority is bounded by the current ceiling and a validate
   assert.deepEqual(boundedCapturedTools(['bash', 'read', 'unknown'], ['read', 'bash'], true), ['read', 'bash']);
   assert.deepEqual(boundedCapturedTools(['read'], ['read'], false), []);
   assert.deepEqual(boundedCapturedTools('read', ['read'], true), []);
+  // Mixed-type arrays must be rejected identically to call-time verification, never filtered into a grant.
+  assert.deepEqual(boundedCapturedTools(['read', 42], ['read', 'bash'], true), []);
+  assert.deepEqual(boundedCapturedTools([null, 'read'], ['read', 'bash'], true), []);
+
+  // When capturedCeiling returns [] (unverified/damaged non-chat conversation), the coding hook
+  // refuses even if a valid capture document is present.
+  const gatedHook = createConfigToolHook(['read', 'bash'], (id) => id === chatId, ['history'], undefined, (id) =>
+    id === 99 ? ['read'] : []);
+  const gatedBeforeTool = gatedHook.handlers.beforeTool;
+  assert.equal(
+    await gatedBeforeTool(call('read'), api(99, { originConversationId: chatId, tools: ['read'] }), context),
+    undefined,
+    'verified live background target with valid capture is allowed',
+  );
+  assert.match(
+    (await gatedBeforeTool(call('read'), api(rawId, { originConversationId: chatId, tools: ['read'] }), context))?.block ?? '',
+    /not enabled for this conversation/,
+    'unverified non-chat conversation with empty capturedCeiling is refused even with a valid capture',
+  );
 });

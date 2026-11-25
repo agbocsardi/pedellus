@@ -66,36 +66,39 @@ export async function restoreAuthority(options: RestoreOptions): Promise<Restore
   const { registry } = authority;
   const allowed = (model: ModelReference) => models.allowModel(model);
 
-  // The stored mapping is read once here, before any scope decision: a scheduled run's automation
-  // conversation has to be classified before a mapped key naming it can be admitted as chat.
-  let storedMappedSessions: readonly MappedSession[] | undefined;
+  // The stored mapping is read unconditionally before any scope decision: a scheduled run's
+  // automation conversation has to be classified before a mapped key naming it can be admitted as
+  // chat, even when cron is disabled on this open.
   if (contextHost.enabled || options.cronEnabled) {
     await root.commit(async (tx) => { await tx.doc(SessionMap, root.id); }, context);
-    const mapping = await harness.snapshot(SessionMap, root.id, context);
-    storedMappedSessions = readMappedSessions(mapping?.sessions, root.id);
-    if (contextHost.enabled) {
-      // Archived app threads hold no snapshot, so they do not count against the slot cap here.
-      const active = await root.commit(async (tx) => {
-        const archived = await options.archivedSessionKeys(tx);
-        return storedMappedSessions!.filter(({ sessionKey }) => !archived.has(encodedSessionKey(sessionKey))).length;
-      }, context);
-      if (active > CONTEXT_LIMITS.maxConversations) {
-        throw new Error(`Context snapshots support at most ${CONTEXT_LIMITS.maxConversations} mapped conversations`);
-      }
+  }
+  const mapping = await harness.snapshot(SessionMap, root.id, context);
+  const storedMappedSessions: readonly MappedSession[] = mapping === undefined
+    ? []
+    : readMappedSessions(mapping.sessions, root.id);
+  if (contextHost.enabled) {
+    // Archived app threads hold no snapshot, so they do not count against the slot cap here.
+    const active = await root.commit(async (tx) => {
+      const archived = await options.archivedSessionKeys(tx);
+      return storedMappedSessions.filter(({ sessionKey }) => !archived.has(encodedSessionKey(sessionKey))).length;
+    }, context);
+    if (active > CONTEXT_LIMITS.maxConversations) {
+      throw new Error(`Context snapshots support at most ${CONTEXT_LIMITS.maxConversations} mapped conversations`);
     }
   }
 
   // Restore the class of every automation conversation this store names, before the mapped-chat
-  // authority pass below can see a key that names one. The conversation's own durable marker
-  // decides, and it names its own origin and job, so a mapped conversation is classified whether or
-  // not its origin's document still records it. Committed cron documents are read as an index as
-  // well, because a live run's target is ownerless and unmapped: nothing else names it for the task
-  // scan below. Documents never decide the class, so a damaged pointer can only fail to enumerate a
-  // conversation, never promote a chat or hide an automation conversation a key names. Only a
-  // conversation that is still ownerless and unforked and whose marker names another conversation is
-  // classified (`classifyAutomationConversation`). A marker written onto a chat by hand buys denial
-  // of that chat's surfaces, never authority. This is a read: it creates no document and starts nothing.
-  if (options.cronEnabled && storedMappedSessions !== undefined) {
+  // authority pass below can see a key that names one — regardless of whether cron is enabled on
+  // this open. The conversation's own durable marker decides, and it names its own origin and job,
+  // so a mapped conversation is classified whether or not its origin's document still records it.
+  // Committed cron documents are read as an index as well, because a live run's target is ownerless
+  // and unmapped: nothing else names it for the task scan below. Documents never decide the class,
+  // so a damaged pointer can only fail to enumerate a conversation, never promote a chat or hide an
+  // automation conversation a key names. Only a conversation that is still ownerless and unforked
+  // and whose marker names another conversation is classified (`classifyAutomationConversation`). A
+  // marker written onto a chat by hand buys denial of that chat's surfaces, never authority. This is
+  // a read: it creates no document and starts nothing.
+  if (storedMappedSessions.length > 0) {
     const candidates = new Set<ConversationId>();
     for (const { conversationId } of storedMappedSessions) candidates.add(conversationId);
     for (const { conversationId: originConversationId } of storedMappedSessions) {
@@ -153,7 +156,7 @@ export async function restoreAuthority(options: RestoreOptions): Promise<Restore
     registry.admitChat(conversationId, sessionKey);
   }
 
-  if (storedMappedSessions !== undefined) {
+  if ((contextHost.enabled || options.cronEnabled) && storedMappedSessions.length > 0) {
     const sessions = storedMappedSessions;
     // A stored key names a mapped session only while its conversation is still ordinary chat: the
     // class pass above removed this host's automation conversations, and the shared scope rule
@@ -195,9 +198,11 @@ export async function restoreAuthority(options: RestoreOptions): Promise<Restore
   // bounds: a digest turn's prompt is its own bounded input, so it gets no host context snapshot.
   const workerChildPolicies = new Map<ConversationId, NonNullable<ReturnType<typeof workerChildPolicy>>>();
   const digestTargetPolicies = new Map<ConversationId, NonNullable<ReturnType<typeof memoryDigestTaskPolicy>>>();
-  // Live children whose captured model left the current catalog. They are denied before scheduling
-  // resumes, never silently moved to the configured default.
+  // Live children whose captured model left the current catalog, or whose task policy is damaged
+  // and cannot be reconstructed. Both are denied before scheduling resumes, never silently given
+  // the configured default model, foreground coding ceiling or main workspace.
   const pinnedModelRemoved = new Set<ConversationId>();
+  const damagedBackgroundTargets = new Set<ConversationId>();
   const runTasksById = new Map<number, { readonly originConversationId: ConversationId; readonly targetConversationId: ConversationId | null }>();
   // A background run's target conversation is task-owned, never a chat. Interruption recovery
   // resolves its legitimate owning surface and class back through the run task that created it.
@@ -230,16 +235,25 @@ export async function restoreAuthority(options: RestoreOptions): Promise<Restore
               originConversationId: task.conversationId as ConversationId,
               surface: task.kind === WORKER_TASK_NAME ? "worker" : task.kind === MEMORY_DIGEST_TASK_NAME ? "digest" : "scheduled",
             });
-            if (snapshotTarget !== undefined) backgroundRunTargets.push(snapshotTarget);
-            const policy = workerChildPolicy(task);
-            if (policy !== undefined && policy.targetConversationId === target.id) {
-              workerChildPolicies.set(target.id, policy);
-              if (!allowed(policy.model)) pinnedModelRemoved.add(target.id);
-            }
-            const digestPolicy = memoryDigestTaskPolicy(task);
-            if (digestPolicy !== undefined && digestPolicy.targetConversationId === target.id) {
-              digestTargetPolicies.set(target.id, digestPolicy);
-              if (!allowed(digestPolicy.model)) pinnedModelRemoved.add(target.id);
+            if (task.kind === WORKER_TASK_NAME) {
+              const policy = workerChildPolicy(task);
+              if (policy !== undefined && policy.targetConversationId === target.id) {
+                workerChildPolicies.set(target.id, policy);
+                if (!allowed(policy.model)) pinnedModelRemoved.add(target.id);
+                if (snapshotTarget !== undefined) backgroundRunTargets.push(snapshotTarget);
+              } else {
+                damagedBackgroundTargets.add(target.id);
+              }
+            } else if (task.kind === MEMORY_DIGEST_TASK_NAME) {
+              const digestPolicy = memoryDigestTaskPolicy(task);
+              if (digestPolicy !== undefined && digestPolicy.targetConversationId === target.id) {
+                digestTargetPolicies.set(target.id, digestPolicy);
+                if (!allowed(digestPolicy.model)) pinnedModelRemoved.add(target.id);
+              } else {
+                damagedBackgroundTargets.add(target.id);
+              }
+            } else if (snapshotTarget !== undefined) {
+              backgroundRunTargets.push(snapshotTarget);
             }
           }
         }
@@ -265,12 +279,14 @@ export async function restoreAuthority(options: RestoreOptions): Promise<Restore
   }
   for (const [id, policy] of digestTargetPolicies) registry.beginDigest(id, policy.limits);
 
-  // A pinned child (worker or digest target) whose captured model was removed must not reach a
-  // provider with it, or with a silently substituted default. Before scheduling resumes, stop its
-  // own conversation's pending work through native ownership: queued inputs, and live tasks that
-  // hold no saved provider dispatch. A saved dispatch is deliberately left alone; the prepared-model
-  // guard above refuses to open the gateway in that case instead of cancelling it.
-  if (pinnedModelRemoved.size > 0) {
+  // A pinned child (worker or digest target) whose captured model was removed — or whose task
+  // policy is damaged and cannot be reconstructed — must not reach a provider or tool with it, or
+  // with a silently substituted default. Before scheduling resumes, stop its own conversation's
+  // pending work through native ownership: queued inputs, and live tasks that hold no saved
+  // provider dispatch. A saved dispatch is deliberately left alone; the prepared-model guard above
+  // refuses to open the gateway in that case instead of cancelling it.
+  const deniedBackgroundTargets = new Set([...pinnedModelRemoved, ...damagedBackgroundTargets]);
+  if (deniedBackgroundTargets.size > 0) {
     let inspection: Awaited<ReturnType<HarnessType["inspect"]>> | undefined;
     try {
       inspection = await harness.inspect(context);
@@ -279,7 +295,7 @@ export async function restoreAuthority(options: RestoreOptions): Promise<Restore
     }
     if (inspection !== undefined) {
       for (const submission of inspection.submissions) {
-        if (submission.status !== "queued" || !pinnedModelRemoved.has(submission.conversationId)) continue;
+        if (submission.status !== "queued" || !deniedBackgroundTargets.has(submission.conversationId)) continue;
         try {
           await harness.abortSubmission(submission.id, context, submission.conversationId);
         } catch {
@@ -290,7 +306,7 @@ export async function restoreAuthority(options: RestoreOptions): Promise<Restore
         const record = inspectionTask.record;
         if (record.state.status === "terminal" || record.state.status === "completing") continue;
         if (record.kind === WORKER_TASK_NAME || record.kind === MEMORY_DIGEST_TASK_NAME) continue;
-        if (!pinnedModelRemoved.has(record.conversationId)) continue;
+        if (!deniedBackgroundTargets.has(record.conversationId)) continue;
         if (preparedTaskModel(record) !== undefined) continue;
         try {
           await harness.abortTask(record.id, context);
@@ -338,8 +354,7 @@ export async function restoreAuthority(options: RestoreOptions): Promise<Restore
   // finished run or a missing capture is a deny rather than authority.
   const backgroundToolBounds = new Map<ConversationId, ReadonlySet<string>>();
   for (const { conversationId: target, originConversationId } of runTargetCandidates) {
-    const tools = new Set<string>();
-    const capture = await harness.snapshot(ConfigToolCaptureDoc, target, context);
+    if (damagedBackgroundTargets.has(target)) continue;
     // A live scheduled run's target is classified from the run task that still targets it, never
     // from its capture: losing the capture makes it deny, not stop being a run target.
     const scheduledRun = backgroundTargetRuns.get(target)?.surface === "scheduled";
@@ -347,6 +362,9 @@ export async function restoreAuthority(options: RestoreOptions): Promise<Restore
     const kind: BackgroundRoleKind | undefined = workerChildPolicies.has(target) ? "worker"
       : scheduledRun ? "scheduledRun"
         : digestTargetPolicies.has(target) ? "digest" : undefined;
+    if (kind === undefined) continue;
+    const tools = new Set<string>();
+    const capture = await harness.snapshot(ConfigToolCaptureDoc, target, context);
     if (capture !== undefined && capture.originConversationId === originConversationId && registry.isChat(originConversationId)) {
       for (const name of boundedCapturedTools(capture.tools, authority.ceilingFor(kind, originConversationId), true)) tools.add(name);
     }
@@ -390,10 +408,12 @@ export async function restoreAuthority(options: RestoreOptions): Promise<Restore
               ...toolFilter,
             });
             if ((workerPolicy !== undefined && !allowed(workerPolicy.model))
-              || (digestPolicy !== undefined && !allowed(digestPolicy.model))) {
-              // Removed model: no fallback dispatch and no captured authority. The target's own
-              // pending work was withdrawn above; the task commits the terminal error on resume.
-              // Code Mode selection goes too, so no stale script can compose a retired capture.
+              || (digestPolicy !== undefined && !allowed(digestPolicy.model))
+              || damagedBackgroundTargets.has(conversation.id)) {
+              // Removed model or damaged policy: no fallback dispatch and no captured authority.
+              // The target's own pending work was withdrawn above; the task commits the terminal
+              // error on resume. Code Mode selection goes too, so no stale script can compose a
+              // retired capture.
               await authority.retireCaptured(tx, conversation.id);
             }
           }

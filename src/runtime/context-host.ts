@@ -22,13 +22,14 @@ import {
 } from "@earendil-works/pi-durable";
 import {
   CONTEXT_LIMITS,
+  createContextExtension,
   createContextExtensionBuilder,
-  type ContextExtensionReplacement,
   type ConversationContextSnapshot,
 } from "../context/index.js";
-import { createSkillTool, type SkillTableUpdate } from "../context/skill-tool.js";
+import { createSkillTool } from "../context/skill-tool.js";
 import { appendIdleRolloverReset, type IdleRolloverReset } from "../history/idle-rollover.js";
 import { AskQuestionsDoc, cancelPendingQuestions } from "../questions/index.js";
+import type { CommitEffects, ContextOverlay } from "./authority.js";
 import { SessionMap } from "./sessions.js";
 import type { GatewayContextSnapshotProvider, GatewaySessionReset } from "./types.js";
 
@@ -48,12 +49,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function countSnapshotSkills(conversationId: ConversationId, snapshot: ConversationContextSnapshot): number {
+  return createSkillTool().setConversation(conversationId, snapshot).skills;
+}
+
 export interface ContextHostOptions {
   /** Explicit host-owned snapshots; absent, no context extension and no skill loader exist. */
   readonly provider: GatewayContextSnapshotProvider | undefined;
   readonly now: () => number;
   /** A mapped session's snapshot owns its slot and is never evicted for another conversation. */
   readonly isMapped: (id: ConversationId) => boolean;
+  /** Post-commit publication for in-tx snapshot installations and refreshes. */
+  readonly effects: CommitEffects;
 }
 
 /** What installing and refreshing need from the open gateway, bound once the harness is open. */
@@ -64,14 +71,17 @@ export interface ContextHostBinding {
   /** Encoded keys of archived app threads: mapped, but their idle snapshots are evictable. */
   readonly archivedSessionKeys: (tx: Tx) => Promise<Set<string>>;
   /** Reapply the conversation's extension selection and tool filter in this commit. */
-  readonly applyPolicy: (tx: Tx, id: ConversationId) => Promise<void>;
+  readonly applyPolicy: (tx: Tx, id: ConversationId, contextOverride?: ContextOverlay) => Promise<void>;
 }
 
 export type ContextHost = ReturnType<typeof createContextHost>;
 
 export function createContextHost(options: ContextHostOptions) {
-  const { provider } = options;
+  const { provider, effects } = options;
   const builder = createContextExtensionBuilder();
+  // Descriptor carrying the `nanobot-context` extension name for in-tx AgentDoc selection before
+  // the first snapshot commits and publishes the real extension.
+  const extensionRef: Extension | undefined = provider === undefined ? undefined : createContextExtension([]);
   let extension: Extension | undefined;
   const contextConversations = new Set<ConversationId>();
   const skillConversations = new Set<ConversationId>();
@@ -92,76 +102,115 @@ export function createContextHost(options: ContextHostOptions) {
     bound().install(next);
   };
 
-  /** Archived app mappings stay chat owners, but their idle workspace snapshots are evictable. */
-  async function makeSnapshotRoom(target: ConversationId, ctx: Context, commit?: Tx): Promise<void> {
-    if (contextConversations.size < CONTEXT_LIMITS.maxConversations) return;
+  /** Read-only selection of one idle evictable snapshot slot; performs no in-memory mutation. */
+  async function findEvictableCandidate(tx: Tx, target: ConversationId): Promise<ConversationId | undefined> {
+    if (contextConversations.size < CONTEXT_LIMITS.maxConversations) return undefined;
     const { root } = bound();
-    async function evict(tx: Tx): Promise<void> {
-      if (contextConversations.size < CONTEXT_LIMITS.maxConversations) return;
-      const map = await tx.doc(SessionMap, root.id);
-      const candidates = backgroundTargets.filter((id) => !options.isMapped(id));
-      for (const key of await bound().archivedSessionKeys(tx)) {
-        const id = map.sessions[key] as ConversationId | undefined;
-        if (id !== undefined) candidates.push(id);
-      }
-      for (const candidate of candidates) {
-        if (candidate === target || !contextConversations.has(candidate) || loads.has(candidate)) continue;
-        if ((await tx.doc(LiveDoc, candidate)).run !== undefined ||
-            (await tx.doc(InboxDoc, candidate)).items.length > 0) continue;
-        const index = backgroundTargets.indexOf(candidate);
-        if (index >= 0) backgroundTargets.splice(index, 1);
-        contextConversations.delete(candidate);
-        skillConversations.delete(candidate);
-        skillTool?.removeConversation(candidate);
-        publish(builder.remove(candidate));
-        return;
+    const map = await tx.doc(SessionMap, root.id);
+    const candidates = backgroundTargets.filter((id) => !options.isMapped(id));
+    for (const key of await bound().archivedSessionKeys(tx)) {
+      const id = map.sessions[key] as ConversationId | undefined;
+      if (id !== undefined) candidates.push(id);
+    }
+    for (const candidate of candidates) {
+      if (candidate === target || !contextConversations.has(candidate) || loads.has(candidate)) continue;
+      if ((await tx.doc(LiveDoc, candidate)).run !== undefined ||
+          (await tx.doc(InboxDoc, candidate)).items.length > 0) continue;
+      return candidate;
+    }
+    return undefined;
+  }
+
+  /** Apply one already-selected eviction after its read or enclosing commit has settled. */
+  function applyEviction(candidate: ConversationId): void {
+    if (!contextConversations.has(candidate)) return;
+    const index = backgroundTargets.indexOf(candidate);
+    if (index >= 0) backgroundTargets.splice(index, 1);
+    contextConversations.delete(candidate);
+    skillConversations.delete(candidate);
+    skillTool?.removeConversation(candidate);
+    publish(builder.remove(candidate));
+  }
+
+  /** Apply one validated snapshot installation in memory (post-commit when called from a tx). */
+  function applySnapshot(
+    conversationId: ConversationId,
+    snapshot: ConversationContextSnapshot,
+    backgroundTarget: boolean,
+    evictCandidate: ConversationId | undefined,
+  ): boolean {
+    if (!contextConversations.has(conversationId) && contextConversations.size >= CONTEXT_LIMITS.maxConversations
+      && evictCandidate !== undefined) {
+      applyEviction(evictCandidate);
+    }
+    const installed = contextConversations.has(conversationId);
+    if (backgroundTarget && !installed && !backgroundTargets.includes(conversationId)) {
+      backgroundTargets.push(conversationId);
+    }
+    const replacement = installed
+      ? builder.replace(snapshot)
+      : { extension: builder.add(snapshot) };
+    contextConversations.add(conversationId);
+    let skillsPresent = false;
+    if (skillTool !== undefined) {
+      if (skillTool.setConversation(conversationId, snapshot).skills > 0) {
+        skillConversations.add(conversationId);
+        skillsPresent = true;
+      } else {
+        skillConversations.delete(conversationId);
       }
     }
-    if (commit === undefined) await root.commit(evict, ctx);
-    else await evict(commit);
+    publish(replacement.extension);
+    return skillsPresent;
   }
 
   /**
-   * Install one conversation's workspace snapshot and report whether skills were delivered. A mapped
-   * chat is installed once per process; a background target is rebuilt on every call.
+   * Install one conversation's workspace snapshot and report whether context and skills were
+   * delivered. A mapped chat is installed once per process; a background target is rebuilt on
+   * every call. When called inside a transaction (`tx !== undefined`), in-memory snapshot/skill
+   * mutations are deferred via `effects.defer(tx, ...)` so a rolled-back commit never pollutes
+   * snapshot slots or tables.
    */
   const install = async (
     sessionKey: string, conversationId: ConversationId, ctx: Context, backgroundTarget: boolean, tx?: Tx,
-  ): Promise<boolean> => {
-    if (!provider) return false;
+  ): Promise<ContextOverlay> => {
+    if (!provider) return { hasContext: false, hasSkills: false };
     const loading = loads.get(conversationId);
     if (loading !== undefined && tx === undefined) {
       await loading;
-      return skillConversations.has(conversationId);
+      return { hasContext: contextConversations.has(conversationId), hasSkills: skillConversations.has(conversationId) };
     }
     const installed = contextConversations.has(conversationId);
-    if (installed && !backgroundTarget) return skillConversations.has(conversationId);
-    if (backgroundTarget && !installed && !backgroundTargets.includes(conversationId)) backgroundTargets.push(conversationId);
+    if (installed && !backgroundTarget) {
+      return { hasContext: true, hasSkills: skillConversations.has(conversationId) };
+    }
     const pending = Promise.resolve()
       .then(() => provider(sessionKey, conversationId, ctx))
-      .then(async (supplied) => {
+      .then(async (supplied): Promise<ContextOverlay> => {
         if (supplied !== undefined && !isRecord(supplied)) {
           throw new TypeError("Context snapshot provider must return an object or undefined");
         }
         const snapshot = bindContextSnapshot(supplied, conversationId);
-        if (!contextConversations.has(conversationId) && contextConversations.size >= CONTEXT_LIMITS.maxConversations) {
-          await makeSnapshotRoom(conversationId, ctx, tx);
-        }
-        const replacement = contextConversations.has(conversationId)
-          ? builder.replace(snapshot)
-          : { extension: builder.add(snapshot) };
-        contextConversations.add(conversationId);
-        let skillsPresent = false;
-        if (skillTool !== undefined) {
-          if (skillTool.setConversation(conversationId, snapshot).skills > 0) {
-            skillConversations.add(conversationId);
-            skillsPresent = true;
-          } else {
-            skillConversations.delete(conversationId);
+        // Validate snapshot structure before any slot lookup or deferred apply.
+        createContextExtension([snapshot]);
+        const needsRoom = !contextConversations.has(conversationId)
+          && contextConversations.size >= CONTEXT_LIMITS.maxConversations;
+        if (tx !== undefined) {
+          const evictCandidate = needsRoom ? await findEvictableCandidate(tx, conversationId) : undefined;
+          if (needsRoom && evictCandidate === undefined) {
+            throw new RangeError(`At most ${CONTEXT_LIMITS.maxConversations} conversation snapshots are accepted`);
           }
+          const skillsPresent = skillTool !== undefined && countSnapshotSkills(conversationId, snapshot) > 0;
+          await effects.defer(tx, () => {
+            applySnapshot(conversationId, snapshot, backgroundTarget, evictCandidate);
+          });
+          return { hasContext: true, hasSkills: skillsPresent };
         }
-        publish(replacement.extension);
-        return skillsPresent;
+        const evictCandidate = needsRoom
+          ? await bound().root.commit((innerTx) => findEvictableCandidate(innerTx, conversationId), ctx)
+          : undefined;
+        const skillsPresent = applySnapshot(conversationId, snapshot, backgroundTarget, evictCandidate);
+        return { hasContext: true, hasSkills: skillsPresent };
       })
       .finally(() => {
         if (loads.get(conversationId) === pending) loads.delete(conversationId);
@@ -176,9 +225,9 @@ export function createContextHost(options: ContextHostOptions) {
    * leaves the captured snapshot untouched. Refresh changes no tool authority: it re-renders the
    * skills summary and replaces the on-demand skill table, while the normal policy pass reapplies
    * the configured tool filter. The refresh registers in `loads` so an install for the same
-   * conversation cannot build a competing snapshot; any failed commit restores the prior in-memory
-   * extension and table. `reset` appends `/new`'s native reset (or an idle rollover's guarded one)
-   * in the same commit as the prompt replacement.
+   * conversation cannot build a competing snapshot; in-memory extension and table updates are
+   * deferred post-commit so a rolled-back commit leaves them untouched. `reset` appends `/new`'s
+   * native reset (or an idle rollover's guarded one) in the same commit as the prompt replacement.
    */
   const refresh = async (
     sessionKey: string, conversationId: ConversationId, ctx: Context, reset: boolean | IdleRolloverReset = false,
@@ -203,41 +252,22 @@ export function createContextHost(options: ContextHostOptions) {
         throw new TypeError("Context snapshot provider must return an object or undefined");
       }
       const snapshot = bindContextSnapshot(supplied, conversationId);
-      const hadContext = contextConversations.has(conversationId);
-      const hadSkills = skillConversations.has(conversationId);
-      const previousExtension = extension;
-      let replacement: ContextExtensionReplacement | undefined;
-      let table: SkillTableUpdate | undefined;
-      try {
-        return await conversation.commit(async (tx) => {
-          const live = await tx.doc(LiveDoc, conversationId);
-          if (live.run !== undefined) throw new ConversationBusy(conversationId);
-          replacement ??= builder.replace(snapshot);
-          table ??= skillTool?.setConversation(conversationId, snapshot);
-          const count = table?.skills ?? 0;
-          contextConversations.add(conversationId);
-          if (count > 0) skillConversations.add(conversationId);
-          else skillConversations.delete(conversationId);
-          // Publish synchronously inside the commit: a deferred install could race a builder change
-          // from another conversation and publish an older superset under the same extension name.
-          publish(replacement.extension);
-          await applyPolicy(tx, conversationId);
-          // Idle-only reset and prompt replacement share one commit, including across multiple
-          // CLI attachments. No submission can begin between the two effects.
-          if (reset === true) await tx.appendEntry(conversationId, { kind: ResetEntry.kind, head: "self" });
-          else if (reset !== false) await appendIdleRolloverReset(tx, conversationId, reset, options.now());
-          return count;
-        }, ctx);
-      } catch (error) {
-        table?.restore();
-        if (hadContext) contextConversations.add(conversationId);
-        else contextConversations.delete(conversationId);
-        if (hadSkills) skillConversations.add(conversationId);
-        else skillConversations.delete(conversationId);
-        if (replacement !== undefined) publish(replacement.restore());
-        else extension = previousExtension;
-        throw error;
-      }
+      createContextExtension([snapshot]);
+      const skillsCount = skillTool === undefined ? 0 : countSnapshotSkills(conversationId, snapshot);
+      const overlay: ContextOverlay = { hasContext: true, hasSkills: skillsCount > 0 };
+      return await conversation.commit(async (tx) => {
+        const live = await tx.doc(LiveDoc, conversationId);
+        if (live.run !== undefined) throw new ConversationBusy(conversationId);
+        await applyPolicy(tx, conversationId, overlay);
+        // Idle-only reset and prompt replacement share one commit, including across multiple
+        // CLI attachments. No submission can begin between the two effects.
+        if (reset === true) await tx.appendEntry(conversationId, { kind: ResetEntry.kind, head: "self" });
+        else if (reset !== false) await appendIdleRolloverReset(tx, conversationId, reset, options.now());
+        await effects.defer(tx, () => {
+          applySnapshot(conversationId, snapshot, false, undefined);
+        });
+        return skillsCount;
+      }, ctx);
     })();
     loads.set(conversationId, pending);
     try {
@@ -281,11 +311,13 @@ export function createContextHost(options: ContextHostOptions) {
     bind(next: ContextHostBinding): void { binding = next; },
     /** The current context extension; `undefined` until a snapshot is installed or without a provider. */
     extension: (): Extension | undefined => extension,
+    /** Extension name reference available whenever context snapshots are configured. */
+    extensionRef: (): Extension | undefined => extensionRef,
     has: (id: ConversationId): boolean => contextConversations.has(id),
     hasSkills: (id: ConversationId): boolean => skillConversations.has(id),
     install,
     /** A mapped chat's snapshot, installed once per process. */
-    ensure: (sessionKey: string, id: ConversationId, ctx: Context): Promise<boolean> => install(sessionKey, id, ctx, false),
+    ensure: (sessionKey: string, id: ConversationId, ctx: Context): Promise<ContextOverlay> => install(sessionKey, id, ctx, false),
     refresh,
     resetSession,
   };

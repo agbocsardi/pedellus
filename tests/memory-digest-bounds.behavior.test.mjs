@@ -906,3 +906,74 @@ test('a live digest target reopened with bash in toolAllowlist stays bounded to 
     releaseAfterReopen.resolve();
   }
 });
+
+test('a malformed mixed-type capture on a live digest target fails closed on reopen instead of widening', { timeout: 40_000 }, async (t) => {
+  const { ConfigToolCaptureDoc } = await import(new URL('../dist/tools/index.js', import.meta.url).href);
+  const { AgentDoc } = await import(`${modules}/pi-durable/dist/index.js`);
+  const fixture = await fixtureWorkspace();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  await writeFile(join(fixture.workspace, 'SOUL.md'), 'owner rules\n', 'utf8');
+
+  const entered = deferred();
+  const store = await openStore(fixture, async (_request, options) => {
+    entered.resolve();
+    await new Promise((resolve) => {
+      const signal = options?.signal;
+      if (signal?.aborted) return resolve();
+      signal?.addEventListener('abort', resolve, { once: true });
+    });
+    return fauxAssistantMessage('interrupted');
+  });
+
+  let reopened;
+  t.after(async () => {
+    await reopened?.close(context).catch(() => undefined);
+    await store.gateway.close(context).catch(() => undefined);
+  });
+
+  const origin = await store.gateway.conversationFor(SESSION, context);
+  await closedEpisode(store.gateway.harness, origin.id, [user('Malformed capture fact.'), assistant('Noted.')]);
+  const started = await startDigest(store.gateway);
+  assert.equal(started.status, 'started');
+  await within(entered.promise, WAIT_MS, 'the live digest target never reached its first request');
+
+  const digestTarget = await targetOf(store.gateway.harness, started.taskId);
+  assert.ok(digestTarget !== undefined);
+  // Write a malformed mixed-type tools array into the durable capture document.
+  await store.gateway.harness.commit(async (tx) => {
+    const capture = await tx.doc(ConfigToolCaptureDoc, digestTarget.id);
+    capture.tools = ['read', 42];
+  }, context);
+
+  await store.gateway.close(context);
+
+  const afterReopenEntered = deferred();
+  const releaseAfterReopen = deferred();
+  const reopenedStore = await openStore(fixture, async (request, options) => {
+    if (!transcriptText(request.messages).includes('read-malformed')) {
+      afterReopenEntered.resolve();
+      await new Promise((resolve) => {
+        const signal = options?.signal;
+        if (signal?.aborted) return resolve();
+        signal?.addEventListener('abort', resolve, { once: true });
+        releaseAfterReopen.promise.then(resolve);
+      });
+      return toolRead('SOUL.md', 'read-malformed');
+    }
+    return fauxAssistantMessage('read was refused.');
+  });
+  reopened = reopenedStore.gateway;
+
+  try {
+    await within(afterReopenEntered.promise, WAIT_MS, 'reopened digest task never resumed');
+    const agent = await reopened.harness.snapshot(AgentDoc, digestTarget.id, context);
+    assert.deepEqual(agent?.tools ?? [], [], 'malformed mixed-type capture grants no tools after reopen');
+    assert.equal(await reopened.harness.snapshot(ConfigToolCaptureDoc, digestTarget.id, context), undefined,
+      'malformed mixed-type capture is retired on reopen instead of repaired into a grant');
+    releaseAfterReopen.resolve();
+    const task = await settleTask(reopened.harness, started.taskId);
+    assert.equal(task.state.outcome.status, 'failed');
+  } finally {
+    releaseAfterReopen.resolve();
+  }
+});

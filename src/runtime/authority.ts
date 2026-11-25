@@ -47,7 +47,7 @@ import { isChatSessionKey } from "../history/scope.js";
 import type { McpAdmin, McpIntegration } from "../mcp/index.js";
 import { MEMORY_TOOL_NAMES } from "../memory/contracts.js";
 import { modelKey } from "../config.js";
-import { ConfigToolCaptureDoc, verifyCapturedTool } from "../tools/config-authority.js";
+import { ConfigToolCaptureDoc, validCapturedToolNames, verifyCapturedTool } from "../tools/config-authority.js";
 
 /** The durable class of one cron automation conversation, as this host recorded it. */
 export interface AutomationClass {
@@ -111,10 +111,11 @@ export class ConversationRegistry {
     return this.isChat(id) && key !== undefined && isChatSessionKey(key);
   }
   isMapped(id: ConversationId): boolean { return this.#entries.get(id)?.mapped === true; }
-  /** Origin sessions only, keyed by the mapped session key; a run target is never an owner. */
+  /** Origin sessions only: authenticated mapped ordinary chats, never channel state or run targets. */
   cronOwner(id: ConversationId): CronOwner | undefined {
     const entry = this.#entries.get(id);
-    return entry?.mapped === true && entry.sessionKey !== undefined
+    return entry?.mapped === true && entry.role?.kind === "chat"
+      && entry.sessionKey !== undefined && isChatSessionKey(entry.sessionKey)
       ? { ownerId: entry.sessionKey, sessionKey: entry.sessionKey }
       : undefined;
   }
@@ -289,6 +290,12 @@ export interface AuthorityCapabilities {
   };
 }
 
+/** In-tx context snapshot state staged for post-commit publication. */
+export interface ContextOverlay {
+  readonly hasContext: boolean;
+  readonly hasSkills: boolean;
+}
+
 export interface AuthorityOptions {
   readonly registry: ConversationRegistry;
   readonly toolAllowlist: readonly string[];
@@ -305,6 +312,7 @@ export interface AuthorityOptions {
   /** The conversation's own host prompt snapshot: its extension, and whether skills were delivered. */
   readonly context: {
     readonly extension: () => Extension | undefined;
+    readonly extensionRef: () => Extension | undefined;
     readonly has: (id: ConversationId) => boolean;
     readonly hasSkills: (id: ConversationId) => boolean;
   };
@@ -360,12 +368,12 @@ export function createAuthorityPolicy(options: AuthorityOptions) {
     ...(live.mcp()?.toolNames ?? []),
   ];
 
-  /** The ceiling one background role captures from, and is re-bounded against, for `origin`. */
-  const ceilingFor = (kind: BackgroundRoleKind | undefined, origin: ConversationId): string[] =>
+  /** The ceiling one verified background role captures from, and is re-bounded against, for `origin`. */
+  const ceilingFor = (kind: BackgroundRoleKind, origin: ConversationId): string[] =>
     kind === "worker" ? workerToolNames()
       : kind === "scheduledRun" ? [...toolAllowlist, ...scheduledRunCapabilityNames(origin)]
         : kind === "digest" ? memoryDigestCurationTools(toolAllowlist)
-          : [...toolAllowlist];
+          : [];
 
   /** Names a new capture may hold: the current ceiling of an authenticated origin, otherwise nothing. */
   const captureFor = (kind: BackgroundRoleKind, origin: ConversationId): string[] =>
@@ -440,9 +448,11 @@ export function createAuthorityPolicy(options: AuthorityOptions) {
   const extensionsPolicy = (
     id: ConversationId,
     role: ConversationRole | undefined = registry.role(id),
+    contextOverride?: ContextOverlay,
   ): Pick<AgentChange, "extensions"> => {
     const selected: Extension[] = [];
     const chat = role?.kind === "chat";
+    const allowsContext = chat || role?.kind === "worker" || role?.kind === "scheduledRun";
     const mcp = live.mcp();
     const codeMode = live.codeMode();
     // The vision hook carries no tool or workspace authority; selecting it everywhere keeps
@@ -475,34 +485,42 @@ export function createAuthorityPolicy(options: AuthorityOptions) {
       // makes write create-only.
       selected.push(caps.digestScope);
     }
-    const contextExtension = options.context.extension();
-    if (contextExtension !== undefined && options.context.has(id)) selected.push(contextExtension);
-    if (caps.skill && options.context.has(id) && options.context.hasSkills(id)) selected.push(caps.skill.extension);
+    const hasContext = contextOverride !== undefined ? contextOverride.hasContext : options.context.has(id);
+    const hasSkills = contextOverride !== undefined ? contextOverride.hasSkills : options.context.hasSkills(id);
+    const contextExtension = options.context.extension() ?? options.context.extensionRef();
+    if (allowsContext && contextExtension !== undefined && hasContext) selected.push(contextExtension);
+    if (allowsContext && caps.skill && hasContext && hasSkills) selected.push(caps.skill.extension);
     if (chat && caps.memory) selected.push(caps.memory.extension);
     if (chat && caps.web) selected.push(caps.web.extension);
     if (caps.telegram && chat && registry.isChatOn(id, "telegram:")) selected.push(caps.telegram.extension);
     if (caps.app && chat && registry.isChatOn(id, "app:")) selected.push(caps.app.extension);
     if (caps.discordHistory && chat && registry.isChatOn(id, "discord:")) selected.push(caps.discordHistory.extension);
     const cron = live.cron();
-    if (cron !== undefined && registry.isMapped(id)) selected.push(cron.foundation, cron.tool.extension);
+    if (cron !== undefined && chat && registry.cronOwner(id) !== undefined) selected.push(cron.foundation, cron.tool.extension);
     const worker = live.worker();
     if (worker !== undefined && chat && registry.isWorkerSpawner(id)) selected.push(worker.extension);
     return { extensions: selected };
   };
 
   /** Non-coding tools offered outside the coding ceiling, each by its own scope rule. */
-  const contextToolsFor = (id: ConversationId, role: ConversationRole | undefined): ToolRegistration[] => {
+  const contextToolsFor = (
+    id: ConversationId,
+    role: ConversationRole | undefined,
+    contextOverride?: ContextOverlay,
+  ): ToolRegistration[] => {
     const chat = role?.kind === "chat";
     const worker = role?.kind === "worker";
+    const allowsContext = chat || worker || role?.kind === "scheduledRun";
+    const hasSkills = contextOverride !== undefined ? contextOverride.hasSkills : options.context.hasSkills(id);
     const one = (registration: ToolRegistration | undefined, offered: boolean) =>
       registration !== undefined && offered ? [registration] : [];
     const cron = live.cron();
     const admin = live.mcpAdmin();
     return [
       // The skill loader is context delivery, not an effectful tool, offered for captured skills.
-      ...one(skillRegistration, options.context.hasSkills(id)),
-      // The cron tool is owner-scoped scheduling, offered only in an origin session.
-      ...one(registrationOf(cron?.tool), registry.isMapped(id)),
+      ...one(skillRegistration, allowsContext && hasSkills),
+      // The cron tool is owner-scoped scheduling, offered only in an authenticated mapped chat.
+      ...one(registrationOf(cron?.tool), chat && registry.cronOwner(id) !== undefined),
       // Recall is read-only over mapped chats; workers and a live scheduled run hold it by capture.
       ...(options.historyEnabled && (chat || worker || role?.kind === "scheduledRun") ? memoryRegistrations : []),
       // Channel capabilities are offered only in a mapped chat of that channel; each live adapter
@@ -530,12 +548,14 @@ export function createAuthorityPolicy(options: AuthorityOptions) {
     id: ConversationId,
     backgroundTools?: ReadonlySet<string>,
     role: ConversationRole | undefined = registry.role(id),
+    contextOverride?: ContextOverlay,
   ): Promise<Pick<AgentChange, "tools" | "modelTools">> => {
     const worker = role?.kind === "worker";
     const scheduledRun = role?.kind === "scheduledRun";
+    const digest = role?.kind === "digest";
     const authorized = role?.kind === "chat";
     const captured = worker || scheduledRun ? backgroundTools ?? new Set<string>() : undefined;
-    const contextTools = contextToolsFor(id, role).filter((tool) =>
+    const contextTools = contextToolsFor(id, role, contextOverride).filter((tool) =>
       captured === undefined || captured.has(tool.name)
         // A scheduled run's `skill` loader is context delivery for the snapshot installed for that
         // run, not a captured tool, so its restored snapshot decides and it is never filtered here.
@@ -565,8 +585,11 @@ export function createAuthorityPolicy(options: AuthorityOptions) {
     });
     if (worker) {
       const capture = await tx.doc(ConfigToolCaptureDoc, id);
+      const existing = validCapturedToolNames(capture.tools);
       const grants = workerToolNames();
-      capture.tools = grants.filter((name) => captured!.has(name) && capture.tools.includes(name));
+      capture.tools = existing === undefined
+        ? []
+        : grants.filter((name) => captured!.has(name) && existing.includes(name));
       // Use the pruned durable capture, not the launch input, so removing Code Mode from worker
       // config or a reopen cannot resurrect classifiers from a stale grant.
       const capturedCodeMode = codeMode !== undefined
@@ -594,10 +617,15 @@ export function createAuthorityPolicy(options: AuthorityOptions) {
     // channel-state conversation, a fork, a raw conversation and any other task-owned target are
     // denied even when agent state still names a tool.
     if (authorized) return withContext(toolAllowlist);
-    if (backgroundTools !== undefined) {
+    if ((scheduledRun || digest) && backgroundTools !== undefined) {
       const capture = await tx.doc(ConfigToolCaptureDoc, id);
-      const ceiling = role?.kind === "digest" ? memoryDigestCurationTools(toolAllowlist) : toolAllowlist;
-      const names = ceiling.filter((name) => backgroundTools.has(name) && capture.tools.includes(name));
+      const existing = validCapturedToolNames(capture.tools);
+      if (existing === undefined) {
+        await tx.retireDoc(ConfigToolCaptureDoc, id);
+        return withContext([]);
+      }
+      const ceiling = digest ? memoryDigestCurationTools(toolAllowlist) : toolAllowlist;
+      const names = ceiling.filter((name) => backgroundTools.has(name) && existing.includes(name));
       // A scheduled run's captured recall and MCP names are re-bounded the same way, so a revoke, a
       // narrowed config or a closed server is pruned from the durable document here and cannot
       // return when that capability is enabled again later.
@@ -605,7 +633,7 @@ export function createAuthorityPolicy(options: AuthorityOptions) {
       const originAuthorized = Number.isSafeInteger(origin) && origin > 0 && registry.isChat(origin as ConversationId);
       const capabilities = scheduledRun && originAuthorized
         ? scheduledRunCapabilityNames(origin as ConversationId).filter((name) =>
-          backgroundTools.has(name) && capture.tools.includes(name))
+          backgroundTools.has(name) && existing.includes(name))
         : [];
       // Persist the prune so a later call-time check cannot revive a name the origin lost.
       capture.tools = [...names, ...capabilities];
@@ -648,12 +676,17 @@ export function createAuthorityPolicy(options: AuthorityOptions) {
    * ceiling. `undefined` means no capture: the target keeps no tool and any capture is retired.
    */
   const configureCaptured = async (
-    tx: Tx, target: ConversationId, role: ConversationRole, agent: AgentChange, captured: readonly string[] | undefined,
+    tx: Tx,
+    target: ConversationId,
+    role: ConversationRole,
+    agent: AgentChange,
+    captured: readonly string[] | undefined,
+    contextOverride?: ContextOverlay,
   ): Promise<void> => {
     await configure(tx, target, {
       ...agent,
-      ...extensionsPolicy(target, role),
-      ...await toolFilterFor(tx, target, captured === undefined ? undefined : new Set(captured), role),
+      ...extensionsPolicy(target, role, contextOverride),
+      ...await toolFilterFor(tx, target, captured === undefined ? undefined : new Set(captured), role, contextOverride),
     });
   };
 

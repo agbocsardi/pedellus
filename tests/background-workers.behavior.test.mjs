@@ -2910,3 +2910,85 @@ test('worktree worker environments are closed and evicted on finalize and abort 
     await rm(fixture.directory, { recursive: true, force: true });
   }
 });
+
+test('a live worker whose task policy is damaged on reopen fails closed without foreground tools', { timeout: 30_000 }, async () => {
+  const { DatabaseSync } = await import('node:sqlite');
+  const fixture = await fixtureWorkspace({ git: true });
+  const childStarted = deferred();
+  let blocked = false;
+  const issued = new Set();
+  const store = await syntheticStore(fixture, async (transcript, options) => {
+    const input = lastUserText(transcript.messages);
+    if (input.includes('Background worker task.')) {
+      if (!blocked) {
+        blocked = true;
+        childStarted.resolve();
+        await new Promise((resolve) => {
+          const signal = options?.signal;
+          if (signal?.aborted) return resolve();
+          signal?.addEventListener('abort', () => resolve(), { once: true });
+        });
+      }
+      return fauxAssistantMessage('INTERRUPTED');
+    }
+    if (input.includes('[internal worker result]')) return fauxAssistantMessage('noted');
+    if (input === 'spawn damaged policy worker' && !issued.has(input)) {
+      issued.add(input);
+      return fauxAssistantMessage([
+        fauxToolCall(WORKER_TOOL_NAME, {
+          action: 'start',
+          task: 'DAMAGED-POLICY-WORKER wait across reopen',
+          workspace_mode: 'worktree',
+        }, { id: 'start-damaged-worker' }),
+      ], { stopReason: 'toolUse' });
+    }
+    return fauxAssistantMessage('ok');
+  }, { toolAllowlist: ['read', 'write', 'bash'] });
+
+  let workerTaskId;
+  let targetConversationId;
+  try {
+    const conversation = await store.gateway.conversationFor(ORIGIN, context);
+    const first = await conversation.submit({ type: 'input', content: 'spawn damaged policy worker', requestId: 'damaged-1' }, context);
+    assert.equal((await first.wait(context)).status, 'done');
+    await within(childStarted.promise, WAIT_MS, 'worker never reached its first model request');
+    const record = (await store.gateway.harness.snapshot(WorkerRecordsDoc, conversation.id, context)).workers[0];
+    workerTaskId = record.taskId;
+    targetConversationId = record.conversationId;
+    assert.ok(typeof targetConversationId === 'number', 'worker target conversation exists');
+  } finally {
+    await store.gateway.close(context);
+  }
+
+  // Corrupt the live worker task's stored input model so workerChildPolicy() returns undefined
+  // while workerBackgroundTarget() and task ownership still identify targetConversationId.
+  const db = new DatabaseSync(join(fixture.dataDir, 'nanobot.sqlite'));
+  try {
+    const row = db.prepare('SELECT record FROM tasks WHERE id = ?').get(workerTaskId);
+    assert.ok(row && typeof row.record === 'string', 'live worker task row exists in sqlite');
+    const parsed = JSON.parse(row.record);
+    parsed.input.model = null;
+    db.prepare('UPDATE tasks SET record = ? WHERE id = ?').run(JSON.stringify(parsed), workerTaskId);
+  } finally {
+    db.close();
+  }
+
+  // Reopen: the damaged worker target must fail closed (no foreground tools, retired capture).
+  const reopened = await syntheticStore(fixture, () => fauxAssistantMessage('SHOULD-NOT-RUN-TOOLS'), {
+    toolAllowlist: ['read', 'write', 'bash'],
+  });
+  try {
+    await waitFor(async () => (await reopened.gateway.harness.getTask(workerTaskId, context))?.state.status === 'terminal',
+      'damaged worker task to settle terminal');
+    const task = await reopened.gateway.harness.getTask(workerTaskId, context);
+    assert.equal(task.state.outcome.status, 'failed');
+    const agent = await reopened.gateway.harness.snapshot(AgentDoc, targetConversationId, context);
+    assert.deepEqual(agent?.tools ?? [], [], 'damaged worker target keeps no coding tools on reopen');
+    assert.deepEqual(agent?.modelTools ?? [], [], 'damaged worker target keeps no modelTools on reopen');
+    assert.equal(await reopened.gateway.harness.snapshot(ConfigToolCaptureDoc, targetConversationId, context), undefined,
+      'damaged worker target capture is retired');
+  } finally {
+    await reopened.gateway.close(context);
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});

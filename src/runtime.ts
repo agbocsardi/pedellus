@@ -86,7 +86,7 @@ import { WORKER_LIMITS } from "./workers/limits.js";
 import { createWorkerWorkspace, type WorkerWorkspace } from "./workers/workspace.js";
 import type { DigestSource } from "./history/digestion.js";
 import { DIGEST_RUN_LIMITS_DEFAULT, type DigestRunLimits } from "./history/digest-limits.js";
-import { createMemoryDigest, createMemoryDigestScopeExtension, type MemoryDigest } from "./history/memory-digest.js";
+import { createMemoryDigest, createMemoryDigestScopeExtension, memoryDigestCurationTools, type MemoryDigest } from "./history/memory-digest.js";
 import { createEpisodeSummaryPass, openHistoryHost, type HistoryHost, type HistoryHostParts } from "./history/host.js";
 import { extractAssistantText } from "./tasks/background.js";
 import {
@@ -296,14 +296,18 @@ export async function openGateway(config: PortConfig, context: Context, options:
     });
   }
   const contextHost = createContextHost({
-    provider: options.contextSnapshotProvider, now, isMapped: (id) => registry.isMapped(id),
+    provider: options.contextSnapshotProvider, now, isMapped: (id) => registry.isMapped(id), effects,
   });
   const skillTool = contextHost.skillTool;
   const toolExtension: Extension | undefined = toolsEnabled
     ? createCodingToolExtension({
         tools: registeredCodingTools as readonly CodingToolName[],
         ceiling: toolAllowlist,
-        capturedCeiling: (id) => registry.isWorker(id) ? workerCodingTools : toolAllowlist,
+        capturedCeiling: (id) =>
+          registry.isWorker(id) ? workerCodingTools
+            : registry.isScheduledRun(id) ? toolAllowlist
+              : registry.isDigest(id) ? memoryDigestCurationTools(toolAllowlist)
+                : [],
         // Capabilities with their own call-time scope hooks are exempt from the coding ceiling, each
         // only while its gated extension is actually installed.
         contextTools: [
@@ -417,7 +421,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
         worker: () => workerTool,
       },
     },
-    context: { extension: contextHost.extension, has: contextHost.has, hasSkills: contextHost.hasSkills },
+    context: {
+      extension: contextHost.extension,
+      extensionRef: contextHost.extensionRef,
+      has: contextHost.has,
+      hasSkills: contextHost.hasSkills,
+    },
   });
   const { extensionsPolicy, toolFilterFor } = authority;
   const memoryDigestRef: { current?: MemoryDigest } = {};
@@ -454,8 +463,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
           // authorized spawning chat, plus the snapshot path a scheduled run uses; snapshot delivery
           // cannot add a skill tool the worker configuration withheld.
           const spawnerKey = registry.sessionKeyFor(spawnerConversationId);
-          const skillsInstalled = spawnerKey !== undefined
-            && await contextHost.install(spawnerKey, target, ctx, true, tx);
+          const contextState = spawnerKey === undefined
+            ? undefined
+            : await contextHost.install(spawnerKey, target, ctx, true, tx);
+          const skillsInstalled = contextState?.hasSkills === true;
           const captured = await authority.writeCapture(tx, target, spawnerConversationId,
             authority.captureFor("worker", spawnerConversationId).filter((name) => skillsInstalled || name !== SKILL_TOOL_NAME));
           await authority.configureCaptured(tx, target, {
@@ -465,7 +476,7 @@ export async function openGateway(config: PortConfig, context: Context, options:
             model: input.model,
             // The captured level may predate a provider catalog change; the current catalog wins.
             thinkingLevel: modelHost.pinnedThinkingLevel(input.model, input.thinkingLevel, "default"),
-          }, captured);
+          }, captured, contextState);
         },
         finalize: async ({ tx, targetConversationId: target, settlement }) => {
           // A worker's captured authority, Code Mode selection included, ends in the same terminal
@@ -557,6 +568,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
           continue;
         }
         await conversation.commit(async (tx) => {
+          // Recheck live background role inside the commit: a worker or scheduled run that
+          // finalized while waiting for this commit must stay retired and never have context or
+          // `skill` re-attached.
+          if (!registry.isWorker(id) && !registry.isScheduledRun(id)) return;
           const capture = await tx.doc(ConfigToolCaptureDoc, id);
           const toolFilter = await toolFilterFor(tx, id, new Set(capture.tools));
           await configure(tx, id, { ...extensionsPolicy(id), ...toolFilter });
@@ -756,9 +771,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
       root,
       install: (extension) => registry_.install(extension),
       archivedSessionKeys: (tx) => archivedAppSessionKeys(tx, root.id),
-      applyPolicy: async (tx, id) => {
-        const toolFilter = await toolFilterFor(tx, id);
-        await configure(tx, id, { ...extensionsPolicy(id), ...toolFilter });
+      applyPolicy: async (tx, id, contextOverride) => {
+        const toolFilter = await toolFilterFor(tx, id, undefined, undefined, contextOverride);
+        await configure(tx, id, { ...extensionsPolicy(id, undefined, contextOverride), ...toolFilter });
       },
     });
     modelHost.bind({

@@ -42,18 +42,26 @@ export const ConfigToolCaptureDoc = defineDoc<ConfigToolCaptureDocument>({
   checkpointWhen: () => true,
 });
 
+/** Strict read of a capture's tool list: every entry must be a string; mixed-type arrays are invalid. */
+export function validCapturedToolNames(tools: unknown): readonly string[] | undefined {
+  if (!Array.isArray(tools) || tools.some((name) => typeof name !== "string")) return undefined;
+  return tools as readonly string[];
+}
+
 /**
  * Names a scheduled run may hold right now: captured names the host still configures, in host
  * ceiling order. The origin check is supplied by the host because only it knows which
- * conversations are authenticated chat sessions.
+ * conversations are authenticated chat sessions. A malformed or mixed-type array fails closed.
  */
 export function boundedCapturedTools(
   captured: readonly string[],
   ceiling: readonly string[],
   originAuthorized: boolean,
 ): string[] {
-  if (!originAuthorized || !Array.isArray(captured)) return [];
-  const capturedNames = new Set<string>(captured.filter((name): name is string => typeof name === "string"));
+  if (!originAuthorized) return [];
+  const valid = validCapturedToolNames(captured);
+  if (valid === undefined) return [];
+  const capturedNames = new Set<string>(valid);
   return ceiling.filter((name) => capturedNames.has(name));
 }
 
@@ -87,8 +95,8 @@ export async function verifyCapturedTool(
   const origin = capture.originConversationId;
   if (typeof origin !== "number" || !Number.isSafeInteger(origin) || origin < 1) return { ok: false, reason: "origin" };
   if (!originAuthorized(origin as ConversationId)) return { ok: false, reason: "unauthorized" };
-  const tools = capture.tools;
-  if (!Array.isArray(tools) || tools.some((name) => typeof name !== "string") || !tools.includes(tool)) {
+  const tools = validCapturedToolNames(capture.tools);
+  if (tools === undefined || !tools.includes(tool)) {
     return { ok: false, reason: "tool" };
   }
   return { ok: true, capture: value as ConfigToolCaptureDocument, origin: origin as ConversationId };
@@ -128,11 +136,17 @@ export function createConfigToolHook(
       if (ungated.has(call.name)) return undefined;
       if (delegatedTools?.(call.name) === true) return undefined;
       const chat = isAuthenticatedChat(api.conversationId);
-      const enabled = chat || capturedCeiling === undefined
-        ? allowed.has(call.name)
-        : capturedCeiling(api.conversationId).includes(call.name);
-      if (!enabled) return { block: `Tool ${call.name} is outside the host tool ceiling` };
-      if (chat) return undefined;
+      if (chat) {
+        if (!allowed.has(call.name)) return { block: `Tool ${call.name} is outside the host tool ceiling` };
+        return undefined;
+      }
+      if (capturedCeiling !== undefined) {
+        const targetCeiling = capturedCeiling(api.conversationId);
+        if (targetCeiling.length === 0) return { block: `Tool ${call.name} is not enabled for this conversation` };
+        if (!targetCeiling.includes(call.name)) return { block: `Tool ${call.name} is outside the host tool ceiling` };
+      } else if (!allowed.has(call.name)) {
+        return { block: `Tool ${call.name} is outside the host tool ceiling` };
+      }
       const verdict = await verifyCapturedTool(
         () => api.snapshot(ConfigToolCaptureDoc, api.conversationId, context), call.name, isAuthenticatedChat,
       );

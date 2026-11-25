@@ -110,21 +110,24 @@ export function createCronHost(options: CronHostOptions) {
         // An origin-mode run answers in the origin chat; an app side thread may not hold its
         // snapshot yet (archived and evicted), so it is installed with the chat's own policy.
         if (owner !== undefined && isAppSideThreadSessionKey(owner.sessionKey) && !contextHost.has(originConversationId)) {
-          await contextHost.install(owner.sessionKey, originConversationId, ctx, false, tx);
+          const contextState = await contextHost.install(owner.sessionKey, originConversationId, ctx, false, tx);
           await configure(tx, originConversationId, {
-            ...authority.extensionsPolicy(originConversationId),
-            ...await authority.toolFilterFor(tx, originConversationId),
+            ...authority.extensionsPolicy(originConversationId, undefined, contextState),
+            ...await authority.toolFilterFor(tx, originConversationId, undefined, undefined, contextState),
           });
         }
         return;
       }
       // Classify from the durable marker the foundation wrote in this same commit: a forged or stale
-      // mapping can never be mistaken for chat via this host. The registry learns the class and the
-      // live run only once this commit is stored.
+      // mapping can never be mistaken for chat via this host. Defer classification before any
+      // fallible preparation step because cron.ts commits the marker even if prepare throws.
       const marker = automationConversationOf(await tx.doc(CronConversationDoc, target));
       const automation = marker === undefined
         ? registry.automation(target)
         : { originConversationId, conversationClass: marker.conversationClass, jobId: marker.jobId };
+      if (automation !== undefined) {
+        await effects.defer(tx, () => registry.classifyAutomation(target, automation));
+      }
       // Fail closed on a run whose origin cannot be attributed to a known owner: it gets no captured
       // authority, so every effectful call stays denied. Otherwise the capture is the origin's
       // current coding ceiling plus the read-only recall and exact MCP tools it holds right now.
@@ -137,7 +140,9 @@ export function createCronHost(options: CronHostOptions) {
       // The automation conversation is default-deny between runs, so it receives the origin's
       // workspace context through the same snapshot path, rebuilt in this same preparation so a later
       // episode renders the workspace as it is now. The cron tool and foundation are never offered.
-      if (owner !== undefined) await contextHost.install(owner.sessionKey, target, ctx, true, tx);
+      const contextState = owner === undefined
+        ? undefined
+        : await contextHost.install(owner.sessionKey, target, ctx, true, tx);
       // An automation conversation is ownerless, so Durable copies no agent state into it: the
       // workspace, model and thinking level this run uses are prepared here, per run.
       const originAgent = await tx.doc(AgentDoc, originConversationId);
@@ -145,9 +150,8 @@ export function createCronHost(options: CronHostOptions) {
         cwd: options.workspace,
         ...(originAgent.model === undefined ? {} : { model: { ...originAgent.model } }),
         ...(originAgent.thinkingLevel === undefined ? {} : { thinkingLevel: originAgent.thinkingLevel }),
-      }, captured);
+      }, captured, contextState);
       await effects.defer(tx, () => {
-        if (automation !== undefined) registry.classifyAutomation(target, automation);
         registry.beginScheduledRun(target);
       });
     },
