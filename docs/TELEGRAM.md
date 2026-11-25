@@ -960,8 +960,8 @@ A grammY 400 `message is not modified` error is treated as success for the exact
 short description or a bounded detailed description with that exact prefix
 followed by `: `; this classification applies only to `editMessageText`. An exact
 `message to edit not found` error clears stale preview metadata and sends a
-replacement. Other 400 errors remain failures. See `THIRD_PARTY_NOTICES.md` for
-policy provenance.
+replacement. Other 400 errors remain failures (policy adapted from OpenClaw; see
+`docs/OPENCLAW-ASSESSMENT.md`).
 
 ## Delivery boundary and current limitation
 

@@ -148,5 +148,5 @@ crash, and this layer has no retry framework.
 ## Dependencies
 
 `htmlparser2` 12.0.0 parses HTML; `ipaddr.js` 2.3.0 classifies addresses. Both
-are pinned direct dependencies. See `THIRD_PARTY_NOTICES.md` for the adapted
-Brave contract notice and licenses.
+are pinned direct dependencies. The Brave search contract is adapted from
+`@juicesharp/rpiv-web-tools` (MIT).

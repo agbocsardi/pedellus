@@ -90,3 +90,13 @@ npm run --silent test:core-acceptance    # core acceptance & budget-ledger check
 ```
 
 TypeScript source edits take effect on gateway restart without a separate build step.
+
+---
+
+## Acknowledgments
+
+- **[nanobot](https://github.com/HKUDS/nanobot)** — original inspiration for the lightweight self-hosted assistant architecture, plain-Markdown workspace memory, and multi-channel model.
+- **[Letta Code](https://github.com/letta-ai/letta-code)** — inspiration for memory-first stateful agent design, long-horizon recall, and digestion workflows.
+- **[Pi](https://pi.dev)** (`@earendil-works/pi-ai`, `pi-durable`, `chord`) — the durable agent runtime stack and MCP tool-naming/result conventions.
+- **[OpenClaw](https://github.com/openclaw/openclaw)** — Telegram transport, flood-gate, and delivery resilience patterns.
+- **`@juicesharp/rpiv-web-tools`** — adapted Brave web search provider contract.

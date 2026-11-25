@@ -11,8 +11,8 @@ Reuse selectively, not the entire channel plugin. Prefer grammY for Telegram's
 client/types, adapt useful OpenClaw transport policies, and retain a small
 Pi Durable admission/watch/delivery adapter. This would replace some hand-written
 HTTP plumbing, not our durable state or exactly-once admission boundary. The owner approved this direction and it is now implemented with exact-pinned
-grammY1.46.0, manual typed API polling, and Durable-owned delivery state. The
-package-local `THIRD_PARTY_NOTICES.md` records the policy provenance and MIT notices.
+grammY 1.46.0, manual typed API polling, and Durable-owned delivery state.
+OpenClaw is credited in `README.md`.
 
 ## License
 

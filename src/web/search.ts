@@ -3,7 +3,7 @@
  *
  * The endpoint, header and response shape follow the Brave Search API
  * (`GET https://api.search.brave.com/res/v1/web/search`) and the proven
- * @juicesharp/rpiv-web-tools provider contract; see THIRD_PARTY_NOTICES.md.
+ * @juicesharp/rpiv-web-tools provider contract (MIT).
  * This adaptation adds bounded body/timeout handling and sanitized fixed
  * errors, and keeps the subscription token out of every result and log.
  */
