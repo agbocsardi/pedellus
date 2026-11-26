@@ -2,7 +2,7 @@
  * The model-facing `cron` tool.
  *
  * Cron is an internal agent capability: the user asks the agent, the agent schedules work here.
- * There is no user scheduler, slash command, or UI. Every operation is owner-scoped to the calling
+ * There is no user scheduler, slash command, or UI. Every operation is owner-scoped to its origin
  * conversation's job document, and the tool never widens authority:
  *
  * - a job gets the origin conversation's enabled tools when each of its runs is prepared, so
@@ -12,8 +12,12 @@
  *   captured for that run and nothing from another conversation's state;
  * - `origin` runs answer in the conversation that scheduled them.
  *
+ * The host may place the calling conversation's jobs in another conversation of the same channel:
+ * an app side thread schedules into the app's Main chat. Every action then reads and writes Main's
+ * job document with Main's owner, so `list` and `remove` from a side thread address Main's jobs.
+ *
  * The tool itself is not grant-gated and is not part of the host coding-tool ceiling: it can only
- * write owner-scoped job records in the calling conversation, and it executes no filesystem or shell
+ * write owner-scoped job records in its origin conversation, and it executes no filesystem or shell
  * work. Reading, writing and shell work inside a scheduled run still needs that run's inherited
  * authority.
  */
@@ -37,20 +41,50 @@ import {
   type CronScheduleInput,
   type CronScheduleReceipt,
   type CronWithdrawal,
+  CronRequestError,
+  cronJobMatchesRequest,
 } from "./cron.js";
-import { CRON_DEFAULT_TIME_ZONE, cronScheduleText, parseCronInstant } from "./cron-schedule.js";
+import { CRON_DEFAULT_TIME_ZONE, CronScheduleError, cronScheduleText, parseCronInstant } from "./cron-schedule.js";
 
 export const CRON_TOOL_NAME = "cron";
+
+/**
+ * The one answer for a redirected call that could not be verified or completed. It never claims that
+ * nothing was scheduled: a replay after a crash may already have committed this very call's job, so
+ * the only honest instruction is to look before retrying. Nothing host-supplied reaches the model.
+ */
+const UNVERIFIED = "Could not verify or schedule this job. Check Main's cron list before retrying.";
+
+/**
+ * Where one tool call's jobs live. It is usually the calling conversation and its owner, but the host
+ * may name a different conversation of the same channel: an app side thread's jobs belong to the
+ * app's Main chat, which outlives every short-lived side thread.
+ */
+export interface CronToolOrigin {
+  readonly conversationId: ConversationId;
+  readonly owner: CronOwner;
+  /** Model-facing name of a host-redirected target (for example "Main"); absent for the caller. */
+  readonly label?: string;
+  /**
+   * The calling conversation's own owner when the host redirected its jobs elsewhere. It is used for
+   * one thing only: recognising a job a build before the redirect committed in the caller's own job
+   * document, so a replay of that call reports it instead of scheduling a duplicate.
+   */
+  readonly callerOwner?: CronOwner;
+}
 
 export interface CronToolOptions {
   readonly foundation: CronFoundation;
   /**
-   * Host-resolved owner of a conversation. `undefined` means the conversation is not an origin
-   * session (for example a scheduled run's automation conversation), so cron is unavailable.
+   * Host-resolved scheduling origin of a conversation. `undefined` means the conversation is not an
+   * origin session (for example a scheduled run's automation conversation), so cron is unavailable.
+   * A host that re-homes a conversation's jobs throws instead, and nothing is scheduled.
    */
-  readonly ownerFor: (conversationId: ConversationId, context: Context) => CronOwner | undefined;
+  readonly originFor: (
+    conversationId: ConversationId, context: Context,
+  ) => CronToolOrigin | undefined | Promise<CronToolOrigin | undefined>;
   /**
-   * Optional host check for a `digest`-intent job: the calling conversation must currently be an
+   * Optional host check for a `digest`-intent job: the scheduling origin must currently be an
    * authenticated mapped chat with the curation tools. Scheduling is refused otherwise instead of
    * recording a job that can only fail. Absent means `digest` is unavailable.
    */
@@ -90,6 +124,15 @@ const text = (value: string, isError = false) => ({
 
 const reasonText = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
+/**
+ * Whether a scheduling failure is an explicit request validation the model can act on (a malformed
+ * or past schedule, a bad field): the foundation and this tool throw those as `CronRequestError`,
+ * and the schedule parser as `CronScheduleError`. Anything else, including a plain `TypeError` from
+ * a malformed stored document, is an unexpected failure whose text stays internal.
+ */
+const isRequestValidationError = (error: unknown): boolean =>
+  error instanceof CronRequestError || error instanceof CronScheduleError;
+
 function iso(ms: number | null): string {
   return ms === null ? "none" : new Date(ms).toISOString();
 }
@@ -97,19 +140,19 @@ function iso(ms: number | null): string {
 function scheduleOf(args: CronToolArguments, zone: string): CronScheduleInput["schedule"] {
   const present = SCHEDULE_FIELDS.filter((field) => args[field] !== undefined);
   if (present.length === 0) {
-    throw new TypeError("add requires exactly one of at, after_seconds, every_seconds or cron_expr");
+    throw new CronRequestError("add requires exactly one of at, after_seconds, every_seconds or cron_expr");
   }
   if (present.length > 1) {
-    throw new TypeError(`add accepts one schedule, not ${present.join(" + ")}`);
+    throw new CronRequestError(`add accepts one schedule, not ${present.join(" + ")}`);
   }
   if (args.at !== undefined) return { kind: "at", at: parseCronInstant(args.at) };
   if (args.after_seconds !== undefined) {
     const seconds = args.after_seconds;
     if (!Number.isSafeInteger(seconds) || seconds <= 0) {
-      throw new TypeError("after_seconds must be a positive whole number of seconds");
+      throw new CronRequestError("after_seconds must be a positive whole number of seconds");
     }
     const afterMs = seconds * 1000;
-    if (!Number.isSafeInteger(afterMs)) throw new TypeError("after_seconds is too large");
+    if (!Number.isSafeInteger(afterMs)) throw new CronRequestError("after_seconds is too large");
     // The foundation resolves this once, at admission, against its own clock. The tool never
     // reads a clock, so a safe replay carries the same relative request and dedupes against the
     // original stored deadline.
@@ -118,19 +161,19 @@ function scheduleOf(args: CronToolArguments, zone: string): CronScheduleInput["s
   if (args.every_seconds !== undefined) {
     const seconds = args.every_seconds;
     if (!Number.isSafeInteger(seconds) || seconds <= 0) {
-      throw new TypeError("every_seconds must be a positive integer number of seconds");
+      throw new CronRequestError("every_seconds must be a positive integer number of seconds");
     }
     const everyMs = seconds * 1000;
-    if (!Number.isSafeInteger(everyMs)) throw new TypeError("every_seconds is too large");
+    if (!Number.isSafeInteger(everyMs)) throw new CronRequestError("every_seconds is too large");
     return { kind: "every", everyMs };
   }
   const expr = args.cron_expr;
   if (typeof expr !== "string" || expr.trim() === "") {
-    throw new TypeError("cron_expr must be a non-empty cron expression");
+    throw new CronRequestError("cron_expr must be a non-empty cron expression");
   }
   const timeZone = args.tz === undefined ? zone : args.tz;
   if (typeof timeZone !== "string" || timeZone.trim() === "") {
-    throw new TypeError("tz must be a non-empty IANA time zone name");
+    throw new CronRequestError("tz must be a non-empty IANA time zone name");
   }
   return { kind: "cron", expr: expr.trim(), timeZone: timeZone.trim() };
 }
@@ -195,6 +238,8 @@ export function createCronTool(options: CronToolOptions): CronTool {
       "posts a short sanitized notice. A job that is not silent always sends its committed final " +
       "answer, so write the message with the reminder or report you expect back, and answer with " +
       "that text when it fires. " +
+      "In an app side thread, the job is added to that app's Main chat: it runs and delivers there, " +
+      "and `list`/`remove` address Main's jobs. " +
       "Scheduled runs inherit this conversation's enabled tools; they never " +
       "gain more. `intent: \"digest\"` schedules one bounded memory-digestion run instead of a model " +
       "turn; it needs read/write/edit authority in this conversation and reports through an internal " +
@@ -260,16 +305,35 @@ export function createCronTool(options: CronToolOptions): CronTool {
       })),
     }),
     // Every action is safe to rerun after an interrupted execution: `add` dedupes a retry on the
-    // tool call ID, `list` only reads, and `remove` is idempotent because a second cancel reports
-    // `already_terminal`. Declaring it safe keeps the call ID stable across recovery, which is what
-    // makes `tool:<callId>` dedupe a commit that succeeded without a committed result.
+    // host's own tool-task identity, `list` only reads, and `remove` is idempotent because a second
+    // cancel reports `already_terminal`. Declaring it safe keeps the call ID stable across recovery,
+    // which is what makes that identity stable for a commit that succeeded without a committed result.
     replay: "safe",
     outputLimits: { maxBytes: 64 * 1024, maxLines: 1_000, retain: "head" },
     async execute(args, api, context) {
-      const owner = options.ownerFor(api.conversationId, context);
-      if (owner === undefined) {
+      let origin: CronToolOrigin | undefined;
+      try {
+        origin = await options.originFor(api.conversationId, context);
+      } catch {
+        // The host is an ordinary chat whose jobs cannot be placed where they belong right now. A
+        // redirect that failed may follow a replay whose job is already committed, so this answer
+        // never claims that nothing was scheduled and never carries the host's error text.
+        return text(UNVERIFIED, true);
+      }
+      if (origin === undefined) {
         return text("Scheduling is not available in this conversation.", true);
       }
+      const owner = origin.owner;
+      const originId = origin.conversationId;
+      // A redirected origin names itself in every receipt, so the model can tell the owner where the
+      // job went instead of implying it lives in this conversation.
+      const here = origin.label ?? "this conversation";
+      const herePossessive = origin.label === undefined ? "this conversation's" : `${origin.label}'s`;
+      const scheduled = origin.label === undefined ? "Scheduled." : `Scheduled in ${origin.label}.`;
+      // A redirect reads and writes another conversation's job document. Its failures are reported as
+      // fixed text instead of the exception's, which may carry host paths or a damaged record; only
+      // an explicit request-validation error is actionable enough to quote back.
+      const redirected = origin.label !== undefined;
       const actor: CronActor = { owner };
       let harness: Harness;
       try {
@@ -278,18 +342,20 @@ export function createCronTool(options: CronToolOptions): CronTool {
         return text("Scheduling is not available yet: the runtime is still starting.", true);
       }
       const writer: CronConversationWriter = {
-        id: api.conversationId,
+        id: originId,
         commit: <T>(change: (tx: Tx) => T | Promise<T>, ctx: Context) => harness.commit(change, ctx),
       };
       const request = args as unknown as CronToolArguments;
       if (request.action === "list") {
         let views: CronJobView[];
         try {
-          views = await options.foundation.list(harness, api.conversationId, actor, context);
+          views = await options.foundation.list(harness, originId, actor, context);
         } catch (error) {
-          return text(`Could not read scheduled jobs: ${reasonText(error)}`, true);
+          return text(redirected
+            ? `Could not read scheduled jobs in ${here}. Nothing was changed.`
+            : `Could not read scheduled jobs: ${reasonText(error)}`, true);
         }
-        if (views.length === 0) return text("No scheduled jobs in this conversation.");
+        if (views.length === 0) return text(`No scheduled jobs in ${here}.`);
         return text(views.map(describe).join("\n\n"));
       }
       if (request.action === "remove") {
@@ -297,7 +363,7 @@ export function createCronTool(options: CronToolOptions): CronTool {
         if (jobId === "") return text("remove requires job_id; use action `list` to see the IDs.", true);
         let result: CronCancellation;
         try {
-          result = await options.foundation.cancel(harness, api.conversationId, jobId, actor, context);
+          result = await options.foundation.cancel(harness, originId, jobId, actor, context);
         } catch (error) {
           // A thrown cancel may still have committed the cancellation before a task-abort or
           // withdrawal failure. Re-read the job before claiming failure: reporting a durable
@@ -305,19 +371,21 @@ export function createCronTool(options: CronToolOptions): CronTool {
           const reason = reasonText(error);
           let view: CronJobView | undefined;
           try {
-            view = await options.foundation.inspect(harness, api.conversationId, jobId, actor, context);
+            view = await options.foundation.inspect(harness, originId, jobId, actor, context);
           } catch {
             view = undefined;
           }
           if (view !== undefined && view.job.cancelledAtMs !== null) {
             return text(
               `Cancelled ${jobId} (${view.job.name}). The cancellation is recorded, but cleaning up ` +
-              `its queued work failed: ${reason}`,
+              `its queued work failed` + (redirected ? "." : `: ${reason}`),
             );
           }
-          return text(`Could not remove scheduled job ${jobId}: ${reason}`, true);
+          return text(redirected
+            ? `Could not remove scheduled job ${jobId}. Check ${herePossessive} cron list before retrying.`
+            : `Could not remove scheduled job ${jobId}: ${reason}`, true);
         }
-        if (result.status === "not_found") return text(`No scheduled job ${jobId} in this conversation.`, true);
+        if (result.status === "not_found") return text(`No scheduled job ${jobId} in ${here}.`, true);
         if (result.status === "forbidden") return text(`Scheduled job ${jobId} belongs to another owner.`, true);
         if (result.status === "already_terminal") {
           return text(`Scheduled job ${jobId} is already finished or cancelled; nothing to remove.`);
@@ -338,7 +406,7 @@ export function createCronTool(options: CronToolOptions): CronTool {
         return text("intent must be \"message\" or \"digest\".", true);
       }
       const intent = request.intent ?? "message";
-      if (intent === "digest" && !(options.digestAvailable?.(api.conversationId) ?? false)) {
+      if (intent === "digest" && !(options.digestAvailable?.(originId) ?? false)) {
         return text(
           "Memory digestion cannot be scheduled from this conversation: it needs an authenticated " +
           "mapped chat with read, write and edit in toolAllowlist and the configured background " +
@@ -356,21 +424,67 @@ export function createCronTool(options: CronToolOptions): CronTool {
       if (request.silent !== undefined && typeof request.silent !== "boolean") {
         return text("silent must be true or false.", true);
       }
-      let receipt: CronScheduleReceipt;
+      // The request this call would store, built once so the pre-redirect replay check compares the
+      // real payload. Its own validation errors are the only actionable failure text below.
+      let add: CronScheduleInput;
       try {
-        // A call ID is stable across a retried call, so a replay cannot create a second job.
-        receipt = await options.foundation.schedule(actor, writer, {
+        add = {
           message: intent === "digest" ? "Memory digestion run" : message,
           ...(request.name === undefined ? {} : { name: request.name }),
           schedule: scheduleOf(request, zone),
           mode: intent === "digest" || request.isolated === false ? "origin" : "background",
           intent,
           silent: request.silent === true,
-          idempotencyKey: `tool:${api.callId}`,
-        }, context);
+          // A provider may reuse one tool-call ID in two threads. A non-redirected add stays keyed by
+          // it, exactly as before, but a redirected add puts two threads' jobs in one document, so it
+          // uses the host's own tool-task identity, in a namespace that can never collide with a
+          // historical `tool:` key. A replay of the same execution keeps that task ID and still
+          // dedupes.
+          idempotencyKey: redirected ? `side:${api.taskId}` : `tool:${api.callId}`,
+        };
+      } catch (error) {
+        return text(`Scheduling failed: ${reasonText(error)}`, true);
+      }
+      // A build before the redirect committed a job in this very conversation, keyed by the
+      // provider's tool-call ID, and did not commit its result. A replay now resolves another
+      // conversation's job document, so that commit is recognised here. It is not migrated: the job
+      // stays in the caller's conversation.
+      if (origin.callerOwner !== undefined) {
+        const callerOwner = origin.callerOwner;
+        let legacy: CronJobView | undefined;
+        try {
+          const views = await options.foundation.list(
+            harness, api.conversationId, { owner: callerOwner }, context,
+          );
+          legacy = views.find((view) => view.job.idempotencyKey === `tool:${api.callId}`);
+        } catch {
+          // The caller's own jobs could not be read, so a replay cannot be told from a new add and a
+          // previous commit cannot be ruled out. Refuse instead of risking a second job beside it.
+          return text(UNVERIFIED, true);
+        }
+        if (legacy !== undefined) {
+          // The key alone does not name the requested job: the old build also keyed a cancelled or
+          // different request of the same call. Only an exact match may be reported as this job.
+          if (cronJobMatchesRequest(legacy.job, add)) {
+            return text(
+              "This call already scheduled a job before this conversation's jobs moved to " +
+              `${origin.label ?? "another conversation"}; it stays in this conversation.` +
+              `\n\n${describe(legacy)}`,
+            );
+          }
+          return text(
+            "An earlier job with this call already exists in this conversation, so nothing new was " +
+            `scheduled. It was not added to ${here}.`,
+          );
+        }
+      }
+      let receipt: CronScheduleReceipt;
+      try {
+        receipt = await options.foundation.schedule(actor, writer, add, context);
       } catch (error) {
         // Model-visible scheduling errors are actionable (bad expression, past time). They carry no
         // credentials or host paths: the schedule parser and request validator own the message text.
+        if (redirected && !isRequestValidationError(error)) return text(UNVERIFIED, true);
         return text(`Scheduling failed: ${reasonText(error)}`, true);
       }
       // The job is durably created from here on. A failed follow-up read must not be reported as a
@@ -378,12 +492,14 @@ export function createCronTool(options: CronToolOptions): CronTool {
       const when = iso(receipt.nextAtMs);
       let view: CronJobView | undefined;
       try {
-        view = await options.foundation.inspect(harness, api.conversationId, receipt.jobId, actor, context);
+        view = await options.foundation.inspect(harness, originId, receipt.jobId, actor, context);
       } catch {
         view = undefined;
       }
-      if (view !== undefined) return text(`Scheduled.\n\n${describe(view)}`);
-      return text(`Scheduled ${receipt.jobId}; first run at ${when}.`);
+      if (view !== undefined) return text(`${scheduled}\n\n${describe(view)}`);
+      return text(origin.label === undefined
+        ? `Scheduled ${receipt.jobId}; first run at ${when}.`
+        : `${scheduled} First run at ${when}.`);
     },
   });
 

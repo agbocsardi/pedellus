@@ -145,10 +145,10 @@ test('tasks lists one thread\'s own workers and scheduled jobs, newest first and
     // A created-but-unused thread is mapped but has no work; the read creates nothing.
     assert.deepEqual(await channel.tasks(first), []);
 
-    assert.equal((await channel.request('send', { thread: first, key: 'start-tasks', text: 'start tasks' })).ok, true);
-    let listed = await channel.tasks(first);
+    assert.equal((await channel.request('send', { key: 'start-tasks', text: 'start tasks' })).ok, true);
+    let listed = await channel.tasks();
     await untilAsync(async () => {
-      listed = await channel.tasks(first);
+      listed = await channel.tasks();
       return listed.length === 2;
     }, 'the thread lists its worker and its scheduled job');
 
@@ -180,9 +180,11 @@ test('tasks lists one thread\'s own workers and scheduled jobs, newest first and
     assert.equal(wire.includes(channel.store.workspace), false, 'a workspace path must not appear');
     assert.equal(wire.includes(encodeURIComponent(channel.store.workspace)), false);
 
-    // Another thread lists nothing, and the list never leaks across threads.
+    // Another thread lists nothing, and the list never leaks across threads. A side thread holds no
+    // part of a turn run in Main, including the cron job that turn scheduled: an app side thread
+    // re-homes its cron jobs to Main, so only Main's list carries it.
+    assert.deepEqual(await channel.tasks(first), []);
     assert.deepEqual(await channel.tasks(second), []);
-    assert.deepEqual(await channel.tasks(), []);
     // An unknown thread id is a bounded read, never a new mapping.
     assert.deepEqual(await channel.tasks('t_unknown-1'), []);
   } finally {
@@ -203,8 +205,13 @@ test('task.cancel cancels, removes, reports finished, and never touches another 
     let listed = [];
     await untilAsync(async () => {
       listed = await channel.tasks(mine);
-      return listed.length === 2;
-    }, 'this thread has its worker and job');
+      return listed.length === 1;
+    }, 'this thread has its worker');
+    let jobs = [];
+    await untilAsync(async () => {
+      jobs = await channel.tasks();
+      return jobs.length === 1;
+    }, 'Main has the scheduled job the side thread added');
     let foreign = [];
     await untilAsync(async () => {
       foreign = await channel.tasks(other);
@@ -212,7 +219,7 @@ test('task.cancel cancels, removes, reports finished, and never touches another 
     }, 'the other thread has its own live worker');
 
     const workerId = listed.find((task) => task.kind === 'worker').id;
-    const jobId = listed.find((task) => task.kind === 'cron').id;
+    const jobId = jobs.find((task) => task.kind === 'cron').id;
 
     // A worker from another thread is not ours to cancel: nothing changes there.
     const denied = await channel.request('task.cancel', { thread: mine, task: foreign[0].id });
@@ -234,13 +241,14 @@ test('task.cancel cancels, removes, reports finished, and never touches another 
       event.thread === mine && event.role === 'notice' && event.text === `Cancelled task “${WORKER_TASK}”.`),
       'the cancellation receipt is a durable notice in this thread');
 
-    // Remove the scheduled job; a second attempt is already terminal.
-    const removed = await channel.request('task.cancel', { thread: mine, task: jobId });
+    // Remove the scheduled job from Main, where the side thread's cron turn placed it; a second
+    // attempt is already terminal.
+    const removed = await channel.request('task.cancel', { thread: 'main', task: jobId });
     assert.equal(removed.ok, true);
     assert.equal(removed.outcome, 'cancelled');
-    await untilAsync(async () => (await channel.tasks(mine))
+    await untilAsync(async () => (await channel.tasks())
       .find((task) => task.id === jobId)?.state === 'cancelled', 'the job is cancelled');
-    const again = await channel.request('task.cancel', { thread: mine, task: jobId });
+    const again = await channel.request('task.cancel', { thread: 'main', task: jobId });
     assert.equal(again.ok, true);
     assert.equal(again.outcome, 'finished');
 

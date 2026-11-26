@@ -25,6 +25,7 @@ import {
   type DurableEvent,
   type ErrorCode,
   type PresetInfo,
+  type ThreadBadge,
   type ThreadEvent,
   type ThreadInfo,
   type ThreadOrigin,
@@ -84,6 +85,8 @@ export function parseQuestionId(value: unknown): string | undefined {
 
 export type AppThreadOrigin = ThreadOrigin;
 export type AppThreadInfo = ThreadInfo;
+/** A side thread's display badge: an emoji and a verb, both from the gateway's fixed lists. */
+export type AppThreadBadge = ThreadBadge;
 /** One tool step of a turn: id, bounded tool name, state and times; never its arguments or result. */
 export type AppActivityStep = ActivityStep;
 

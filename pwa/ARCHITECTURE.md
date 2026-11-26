@@ -207,6 +207,7 @@ this one (stay quiet while hidden), anything else is a network-class reconnect.
 | `src/MessageList.tsx`, `src/useAnchoredScroll.ts` | The conversation (memoized; Markdown re-renders only when its text changes) and its scroll pinning/anchoring |
 | `src/Composer.tsx`, `src/useVoiceRecorder.ts` | Drafts, picked files, the `/` menu, eager uploads and the voice-note recorder |
 | `src/Sheets.tsx`, `src/ThreadList.tsx`, `src/Attachments.tsx` | The sheets (menu, commands, model, tasks, titles, notifications), the thread list, files and artifacts |
+| `src/ThreadBubbles.tsx` | The phone-only quick-switch row above the composer |
 | `src/sw.ts` | App-shell precache and the Web Push handler |
 | `src/push.ts` | Permission, subscribe/unsubscribe, VAPID key rotation, badge |
 | `src/uploads.ts` | `POST /v1/upload` with the protocol's bounds and owner-facing errors; the one upload path for picks and the outbox |
@@ -241,6 +242,12 @@ Main thread plus owner-created side threads, in one window.
   from 900px up) with the main thread pinned, open side threads by activity and
   archived ones below; title search goes through `threads {query}`, message-text
   search covers what this device has cached.
+- **Thread bubbles (phones only, below 900px)**: a row of up to five round
+  buttons above the composer for one-tap switching — Main (🏠) first, then
+  open side threads by newest activity, never the one on screen. A bubble shows
+  the thread's `badge` emoji and verb, or the title's first character without
+  one, plus the unread dot and a running/error ring. It hides while the
+  composer has focus; the list sheet stays the full thread UI.
 - **Chat**: avatar and status pill, streaming markdown, files and images, the
   turn's activity disclosure, question cards, the login card, and a floating
   capsule composer (commands, attach, text, send/stop, or the mic).

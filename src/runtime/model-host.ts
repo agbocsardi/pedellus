@@ -192,6 +192,10 @@ export function resolveBackgroundModels(
   if (config.idleRollover !== undefined && startup.classifierGrant === undefined) {
     throw new StartupDiagnosticError("configInvalid", { detail: "idleRollover requires classifierModel" });
   }
+  // App thread badges are a second opt-in that classifies through the same one model.
+  if (config.app?.threadBadges === true && startup.classifierGrant === undefined) {
+    throw new StartupDiagnosticError("configInvalid", { detail: "app.threadBadges requires classifierModel" });
+  }
   if (config.workspaceContext?.memory === "proactive" && startup.classifierGrant === undefined) {
     throw new StartupDiagnosticError("configInvalid", { detail: "workspaceContext.memory requires classifierModel in proactive mode" });
   }

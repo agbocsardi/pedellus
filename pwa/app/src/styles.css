@@ -2059,6 +2059,86 @@ input#pair-code {
   font-size: 0.8rem;
   text-align: center;
 }
+
+/* ── Thread bubbles: the phone-only quick switch above the composer ───────── */
+
+.thread-bubbles {
+  /* Above the composer's fade, which would otherwise wash out the captions. */
+  position: relative;
+  z-index: 1;
+  display: flex;
+  gap: 2px;
+  padding: 2px max(var(--gutter), calc((100% - 44rem) / 2)) 0;
+  background: var(--bg);
+}
+.thread-bubbles::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 100%;
+  height: 14px;
+  background: linear-gradient(transparent, var(--bg));
+  pointer-events: none;
+}
+/* Typing (and, on a phone, the open keyboard) gets the whole height back. */
+.kb-open .thread-bubbles,
+.thread-bubbles:has(+ .composer textarea:focus) {
+  display: none;
+}
+.thread-bubble {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  width: 54px;
+  min-height: 44px;
+  padding: 2px 0;
+  border: 0;
+  border-radius: 12px;
+  background: none;
+}
+.thread-bubble-face {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: var(--card);
+  box-shadow: 0 1px 2px rgb(30 25 15 / 0.06);
+  font-size: 1.05rem;
+  line-height: 1;
+  color: var(--ink);
+}
+.thread-bubble[data-signal="running"] .thread-bubble-face {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+.thread-bubble[data-signal="error"] .thread-bubble-face {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 1px var(--danger);
+}
+.thread-bubble-dot {
+  position: absolute;
+  top: -1px;
+  right: -1px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 2px var(--bg);
+}
+.thread-bubble-caption {
+  max-width: 100%;
+  overflow: hidden;
+  color: var(--muted-ink);
+  font-size: 0.66rem;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 /* ── Activity: a turn's tool steps (protocol v2, "Activity") ──────────────── */
 
 .activity {

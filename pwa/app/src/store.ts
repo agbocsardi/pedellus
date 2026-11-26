@@ -567,7 +567,8 @@ export class Store {
     const old = this.threads.get(info.id);
     if (old && old.title === info.title && old.archived === info.archived && old.archivedReason === info.archivedReason &&
         old.createdAt === info.createdAt && old.lastAt === info.lastAt && old.origin?.thread === info.origin?.thread &&
-        old.origin?.messageId === info.origin?.messageId) return;
+        old.origin?.messageId === info.origin?.messageId && old.badge?.emoji === info.badge?.emoji &&
+        old.badge?.verb === info.badge?.verb) return;
     this.threads.set(info.id, info);
     this.searchCache = undefined;
     if (info.origin) this.ensureThread(info.origin.thread);

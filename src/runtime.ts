@@ -42,6 +42,8 @@ import { MEMORY_TOOL_NAMES, type MemoryService } from "./memory/contracts.js";
 import { TELEGRAM_TOOL_NAME, createTelegramActionRegistry, createTelegramTool } from "./channels/telegram-tool.js";
 import { DISCORD_HISTORY_TOOL_NAME, createDiscordHistoryRegistry, createDiscordHistoryTool } from "./channels/discord-history.js";
 import { APP_TOOL_NAME, createAppActionRegistry, createAppTool } from "./channels/app-tool.js";
+import { classifyThreadBadge, type ThreadBadgeRequest } from "./channels/app-badge.js";
+import { APP_CHAT_SESSION_KEY } from "./channels/app.js";
 import {
   AppThreadCapacityError,
   appForkAdmissible,
@@ -443,6 +445,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
   });
   const { extensionsPolicy, toolFilterFor } = authority;
   const memoryDigestRef: { current?: MemoryDigest } = {};
+  // The gateway object is built after this host, so the app Main resolver is late-bound: a scheduled
+  // job created in an app side thread re-homes to Main, whose conversation only the gateway's own
+  // mapped-chat admission can resolve.
+  const appMainRef: { current?: (context: Context) => Promise<Conversation | undefined> } = {};
   const cronHost = cronEnabled ? createCronHost({
     now,
     ownerSteering: config.followUpMode === "steer",
@@ -456,6 +462,11 @@ export async function openGateway(config: PortConfig, context: Context, options:
     contextHost,
     harness: openHarness,
     memoryDigest: () => memoryDigestRef.current!,
+    // A scheduled job created from an app side thread re-homes to Main: side threads are short-lived
+    // and scheduled results belong in the chat that outlives them.
+    ...(config.app === undefined ? {} : {
+      appMainConversation: (ctx: Context) => appMainRef.current?.(ctx) ?? Promise.resolve(undefined),
+    }),
   }) : undefined;
   // Bounded ordinary background workers. The foundation owns the Durable task, its child conversation
   // and the internal result event; the host supplies capture, model, workspace and retirement. A
@@ -886,6 +897,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
       ...(discordHistory === undefined ? {} : { discordHistory }),
       ...(appConsole === undefined ? {} : { appConsole }),
       ...(appActions === undefined ? {} : { appActions }),
+      // App thread badges: one off-path classifier call, only with the explicit app opt-in and the
+      // one configured classifier. Without either, the channel never offers to classify anything.
+      ...(config.app?.threadBadges === true && classifierGrant !== undefined ? {
+        classifyThreadBadge: (request: ThreadBadgeRequest, ctx: Context) =>
+          classifyThreadBadge({ models: () => modelHost.state().models, classifier: classifierGrant }, request, ctx),
+      } : {}),
       // The rollover starts after resume; until then (and without config) there is nothing to decide.
       beforeOwnerInput: async (sessionKey, conversationId, content, ctx) =>
         idleRollover?.beforeOwnerInput(sessionKey, conversationId, content, ctx),
@@ -929,6 +946,15 @@ export async function openGateway(config: PortConfig, context: Context, options:
         // become a cron owner or receive chat policy.
         const scopeReason = await root.commit((tx) => sessions.chatScopeForSession(tx, sessionKey, id), ctx);
         if (scopeReason !== undefined) throw new Error(chatScopeMessage(scopeReason));
+        // A mapped conversation is admitted under exactly one host key. A stored map that names a
+        // conversation this host already registered under a different key is an alias: admitting it
+        // would silently move that conversation's authority to the new key, and a later call with the
+        // new key would then find the alias already in place. The scope check above is a read, so
+        // nothing has changed yet; refuse here, before the first registry write.
+        const registeredKey = registry.sessionKeyFor(id);
+        if (registeredKey !== undefined && registeredKey !== sessionKey) {
+          throw new Error("Stored conversation mapping aliases another session");
+        }
         // The exact host-owned session key is what a channel action host revalidates; it is never
         // supplied by the model. Only a chat key becomes a chat; a state key carries no authority.
         if (isChatSessionKey(sessionKey)) registry.admitChat(id, sessionKey);
@@ -1030,6 +1056,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
         if (failure !== undefined) throw failure.error;
       },
     };
+    // A later tool call in a side thread can now resolve Main through the ordinary mapped-chat
+    // admission, exactly as a Main message would.
+    appMainRef.current = (ctx: Context) => gateway.conversationFor(APP_CHAT_SESSION_KEY, ctx);
     await history.settleSummaries(context);
     // Scheduling begins only after the registry and all persisted conversation policies are ready.
     memoryServiceRef.current = history.memoryService;

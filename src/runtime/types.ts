@@ -249,6 +249,13 @@ export interface Gateway {
    */
   readonly appTaskCancel?: NonNullable<AppGateway["appTaskCancel"]>;
   /**
+   * The app channel's one off-path classifier call: a fixed-list badge emoji and verb for a side
+   * thread, from its title and (when at hand) its first owner message. Present only with
+   * `app.threadBadges` and a configured `classifierModel`; it classifies and answers, and never
+   * writes, renames or starts a turn itself.
+   */
+  readonly classifyThreadBadge?: NonNullable<AppGateway["classifyThreadBadge"]>;
+  /**
    * MCP server connection state; absent when MCP is not configured and enabled. A failed server has
    * no tools; its status carries a fixed failure code, never a transport message or configured value.
    */

@@ -117,7 +117,8 @@ never falls back to the provider's ambient variables. See
 Classifiers are outside this allowlist and never appear in `/model`. Exactly one
 optional `classifierModel` `{ provider, modelId }` pair is reachable—through
 native Code Mode `models.*` in an authenticated mapped chat or a captured ordinary
-worker, and on the host for opt-in `idleRollover` and `workspaceContext.memory: "proactive"`;
+worker, and on the host for opt-in `idleRollover`, `app.threadBadges` and
+`workspaceContext.memory: "proactive"`;
 absent, classifiers are unavailable. See
 [classifiers](./CODEMODE.md#classifiers-and-image-generation). Image generation
 is not installed.
