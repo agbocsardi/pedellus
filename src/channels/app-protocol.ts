@@ -18,7 +18,6 @@ import {
   validDeviceLabel,
   validPresetToken,
   validThreadId,
-  validThreadBadge as validWireThreadBadge,
   validThreadTitle as validWireThreadTitle,
   type ActivityStep,
   type CommandInfo,
@@ -94,11 +93,6 @@ export type AppActivityStep = ActivityStep;
 /** A thread title (shared wire validator): 1–80 characters, not blank, nothing unprintable. */
 export function validThreadTitle(value: unknown): value is string {
   return validWireThreadTitle(value);
-}
-
-/** A badge within the wire bounds (shared wire validator); fixed-list membership is checked by the app channel. */
-export function validAppThreadBadge(value: unknown): value is AppThreadBadge {
-  return validWireThreadBadge(value);
 }
 
 export function parseThreadId(value: unknown): string | undefined {
