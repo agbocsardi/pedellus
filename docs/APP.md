@@ -187,6 +187,8 @@ answer is dropped when its title is no longer the thread's title or it arrives a
 a rename made during a classification always wins. Only a listed emoji and verb are ever applied.
 `main` is never badged or renamed, an archived thread is left alone, and a manual rename that wins
 the race is kept. Devices receive the change as an ordinary durable `thread` event.
+On a phone the app shows the badge in its quick-switch row of thread bubbles above the composer
+(`pwa/ARCHITECTURE.md`, *Interface*); a thread without one shows its title's first character.
 
 The adapter grants no tool: coding tools, MCP, web, cron, memory and worker authority are whatever
 the configuration already gives that mapped chat. Its one model-facing tool is the `app` file

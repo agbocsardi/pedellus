@@ -31,7 +31,9 @@ What the mock answers, all offline and with no real agent:
 
 - Threads: create, rename, archive/restore, forks with a validated `from`
   origin that is recorded but not copied into the new thread, and title search
-  through `threads {query}`.
+  through `threads {query}`. `DEMO_THREADS=1` seeds side threads for the
+  phone's thread bubbles: badged and not, unread, one running until `/abort`,
+  one empty and one archived.
 - Model presets `fast`/`smart`/`deep` as `hello.presets` plus per-thread `model`
   events, and the command catalogue (`new`, `abort`, `status`, `model`, `digest`,
   `compact`, `help`), so the header chip, the wrench sheet and the `/` menu all
@@ -86,6 +88,13 @@ preview server on free ports, pairs a headless Chromium, asks for a long answer
 on fresh threads, and fails if any `.msg-partial` is still in the DOM 800 ms
 after the turn is idle (or if a message id has duplicate rows or a truncated
 answer). Default is 10 runs.
+
+The phone's thread bubbles have one too: `node dev/thread-bubbles.mjs [dir]`
+runs the mock with `DEMO_THREADS=1` and checks the row's order, its cap of
+five, that the open thread is left out, that a focused composer hides it and
+that there is none from 900px; with a directory it also saves light and dark
+screenshots. Both checks need Playwright; set `PLAYWRIGHT_MODULE` to its entry
+point when it is not installed here.
 
 ## Build output
 

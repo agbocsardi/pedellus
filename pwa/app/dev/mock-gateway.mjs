@@ -1054,6 +1054,35 @@ function onStream(ws, token) {
   });
 }
 
+// DEMO_THREADS=1 seeds side threads for the phone's thread bubbles: badged and not, unread (they
+// have a message this device has not seen), one running (a turn that never ends until aborted),
+// one empty and one archived, all in the past so the order is fixed. Main gets a short exchange.
+if (process.env.DEMO_THREADS === "1") {
+  const ago = (min) => new Date(Date.now() - min * 60_000).toISOString();
+  const say = (thread, role, text, min) => emit(thread, "message", { id: `d${cursor + 1}`, role, text, at: ago(min) });
+  say(main, "user", "Plan this week's groceries around two dinners with guests.", 50);
+  say(main, "assistant", "Here is a list by aisle, with the two guest dinners first.", 49);
+  const demo = [
+    { title: "🪪 Check", badge: { emoji: "🪪", verb: "Check" }, min: 2, ask: "Do I need an appointment to pick up my driver's license?" },
+    { title: "Flights to Lisbon", badge: { emoji: "✈️", verb: "Book" }, min: 5, ask: "Find flights to Lisbon for the long weekend.", running: true },
+    { title: "Tax receipts 2026", min: 12, ask: "Which receipts do I keep for the 2026 tax return?" },
+    { title: "🚲 Bike repair", min: 30 },
+    { title: "Phone plans", badge: { emoji: "🧾", verb: "Compare" }, min: 90 },
+    { title: "New thread", min: 180 },
+    { title: "Trip notes", badge: { emoji: "🗺️", verb: "Plan" }, min: 600, archived: true },
+  ];
+  demo.forEach(({ title, badge, min, ask, running, archived }, i) => {
+    const t = addThread(`t_demo${i}`, title);
+    Object.assign(t.info, { createdAt: ago(min + 1), lastAt: ago(min), ...(badge ? { badge } : {}) });
+    if (archived) Object.assign(t.info, { archived: true, archivedReason: "idle" });
+    threadChanged(t);
+    if (ask) say(t, "user", ask, min);
+    if (!running) return;
+    t.running = { key: "demo-running", timers: [] };
+    t.state = "tool";
+  });
+}
+
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`mock gateway on http://127.0.0.1:${PORT} (pair code ${pairCode})`);
   if (!PUSH) console.log("push: disabled (NO_PUSH=1)");

@@ -12,6 +12,7 @@ import { LIMITS, MAIN_THREAD, type CommandInfo } from "./protocol";
 import { clearAppBadge } from "./push";
 import { badTitle, SheetHost, type Sheet } from "./Sheets";
 import type { Store } from "./store";
+import { ThreadBubbles } from "./ThreadBubbles";
 import { openThreads, ThreadList } from "./ThreadList";
 import { Icon } from "./ui";
 
@@ -316,6 +317,8 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
 
       <MessageList store={store} conn={conn} thread={thread} covered={!!sheet} wide={wide} pinned={pinned}
         onSheet={show} onRetry={retry} onError={setError} onOpenArtifact={setArtifact} openArtifactId={artifact?.id} />
+
+      {!wide && <ThreadBubbles store={store} />}
 
       <Composer ref={composer} store={store} conn={conn} thread={thread} info={info} online={online}
         writable={writable} running={running} sheetOpen={!!sheet} toolsOpen={sheet?.kind === "tools"}
