@@ -83,10 +83,18 @@ nowhere else:
   conversation and an automation conversation never redirect; they are never offered the tool at
   all, because it is selected only for a mapped chat that already has a cron owner.
 - The target is this app channel's Main conversation (`app:chat`), resolved through the gateway's
-  ordinary mapped-chat admission, and only when it is a different conversation that is an ordinary
-  app chat. If Main cannot be resolved that way, the call is refused with one short fixed message and
-  nothing is scheduled: a session map pointing Main at this same side thread costs a refusal, and
-  every other mis-mapping is still caught by the same admission checks the channel uses.
+  ordinary mapped-chat admission, and only when it is a different conversation whose owner key is
+  exactly `app:chat`. If Main cannot be resolved that way, the call is refused with one short fixed
+  message and nothing is scheduled anywhere. A stored map that points Main at this same side thread
+  is refused by that admission *before* it registers anything, because a mapped conversation is
+  admitted under one host key and an alias is rejected: the refusal is therefore repeatable instead
+  of leaving the side thread registered as Main, and every other mis-mapping is still caught by the
+  same admission checks the channel uses.
+- The dedupe identity of an `add` is the host's own tool-task identity (`tool:<task id>`), never the
+  provider's tool-call ID. That matters most once a redirect puts several threads' jobs in Main's one
+  document: two side threads can reuse one provider ID, and it would merge two unrelated requests (or
+  silently return the first job's receipt for the second). A replayed execution of the same tool task
+  keeps the same task ID, so a commit retried after a crash still dedupes.
 - From there the job is Main's in every respect: its document, its `owner` record (`app:chat`), its
   timer and run tasks, its automation conversation's origin, its origin-mode target and its delivery
   session key. Archiving or evicting the side thread touches none of it.
@@ -112,7 +120,13 @@ Two known consequences, both deliberate and documented in APP.md:
   own document, timer, automation conversation, delivery target and owner for the rest of their
   life, and no rebuild re-homes them. The redirect changes only a new `cron add`; and because `list`
   and `remove` now address Main, such a legacy job is no longer visible to the tool from its own
-  thread. `pedellus cron cancel <jobId>` (which searches every mapped chat) still cancels it.
+  thread (its thread's app task sheet still lists it, and its results still arrive there).
+  `pedellus cron cancel <jobId>` (which searches every mapped chat) still cancels it.
+- An `add` the old build committed in a side thread without committing its tool result is not
+  duplicated on replay. A redirected `add` first looks for that exact invocation in the caller's own
+  job document, under the key the old build used (`tool:<provider call ID>`), and reports the job it
+  finds — naming the fact that it stays in that conversation — instead of scheduling again. Nothing is
+  migrated and no second job is written anywhere.
 
 Automation conversations are a distinct conversation class, not chats: they are ownerless so they
 outlive every run task, they carry a `nanobot.cron.conversation` marker naming their class, origin

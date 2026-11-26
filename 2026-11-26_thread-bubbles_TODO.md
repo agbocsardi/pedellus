@@ -23,3 +23,18 @@
 - Recorded the deliberate consequences in `docs/CRON.md` and `docs/APP.md`: the app channel still holds
   a Main result until Main has its own admission evidence, the thread `tasks` view stays per-thread,
   and legacy side-thread jobs are not migrated (cancel them with `pedellus cron cancel`).
+
+### 2026-11-26 (Brief 3 review fixes)
+- Independent review found five real issues and one doc nit; all were verified against the code and
+  fixed, each with a check that fails on the pre-fix build.
+- Blocker: the idempotency key is now the host's tool-task identity, not the provider's call ID, so two
+  side threads that reuse an ID schedule two jobs in Main's one document.
+- An alias in the session map (`app:chat` naming a side thread) is refused before admission can
+  register that thread as Main, so the refusal repeats instead of silently succeeding next time.
+- A pre-upgrade `add` committed without its tool result is recognised in the caller's own document and
+  reported, so a replay after the upgrade cannot add a duplicate in Main.
+- Tests: the archive check now proves the run started after the archive (armed timer + deadline still
+  ahead at archive time) rather than racing a one-second wall clock, and both list results are read
+  from the transcripts that hold them instead of searching the whole capture for a job name the add
+  receipt already contained.
+- `docs/APP.md` now separates task-sheet visibility from delivery admission.

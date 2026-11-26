@@ -565,6 +565,13 @@ that is not mapped lists nothing, and the read maps no conversation, so it creat
 `main` thread stays empty until it has received input. Entries are newest first and capped at
 `LIMITS.maxListedTasks`; ids are namespaced (`w:<task id>` for a worker, `c:<job id>` for a job).
 
+Task visibility is not delivery admission. A job appears in the task sheet of the chat that owns it
+as soon as it is committed, so a job placed in `main` from a side thread is listed there before
+`main` has received any input, while its first result still waits in the outbox for that thread's own
+admission evidence. A job an earlier build created inside a side thread keeps its own document, so it
+stays listed in that thread's sheet — where its results still arrive — even though `cron list` in
+that thread now reports Main's jobs instead.
+
 `TaskInfo.title` is a bounded one-line label (the worker's instruction or the job's name, never a
 stored prompt body in full), and `detail` is a bounded derived line such as the job's schedule and
 its last-run status. Neither carries worker output, a credential or a host path; the read calls no
@@ -588,16 +595,19 @@ A `cron add` made while answering a side thread is placed in `main`, not in that
 document, its owner (`app:chat`), its timer and run tasks, its captured authority, its origin-mode
 answers and every delivery belong to Main, and the model-facing receipt says `Scheduled in Main.`
 `cron list` and `cron remove` in a side thread therefore address Main's jobs, because after this
-change a side thread has no job document of its own to read.
+change a side thread creates no job document of its own.
 
 The redirect lives in the cron tool's origin resolution and applies only to an authenticated mapped
 app side-thread key. `main` itself, Telegram and Discord keep exactly the origin they have, and no
 other conversation class (root, denied fork, raw, state, task-owned, automation) can be redirected
 because none of them is ever offered the tool. It is not a reach across channels: the target is
 always this app channel's `main` key, resolved through the gateway's ordinary mapped-chat admission,
-and a Main that cannot be resolved as a *different* ordinary app chat refuses the call with one
-short fixed message instead of placing the job anywhere else. Captured authority cannot widen: Main
-and a side thread are both ordinary app chats under the same chat policy, so Main's capture set is
+and the call is refused with one short fixed message — nothing is scheduled anywhere — unless that
+resolves to a different conversation whose owner key is exactly `app:chat`. Because a mapped
+conversation is admitted under one host key only, a stored map that points `main` at a side thread is
+refused by the admission itself before it can register that side thread as Main, so the refusal is
+repeatable and never turns the next call into a Main call. Captured authority cannot widen: Main and
+a side thread are both ordinary app chats under the same chat policy, so Main's capture set is
 exactly the set the creating thread would have captured (`CRON.md`).
 
 Consequences, all deliberate:
@@ -608,9 +618,11 @@ Consequences, all deliberate:
 - Archiving the side thread neither stops the job nor changes its target, and a result delivered to
   Main never restores the archived side thread. The job outlives the thread because it lives in Main.
 - Jobs created by an earlier build stay inside the side thread that created them: no migration, no
-  rewrite, and their results still deliver there. `cron list` in that thread now shows Main's jobs, so
-  cancelling such a legacy job goes through `pedellus cron cancel <jobId>`, which searches every
-  mapped chat.
+  rewrite, and their results still deliver there. Such a job stays listed in that thread's task sheet,
+  but `cron list` in the thread now reports Main's jobs, so cancelling it goes through
+  `pedellus cron cancel <jobId>`, which searches every mapped chat. A replay of an unfinished add
+  from the old build is recognised: the tool reports the job that call already committed instead of
+  adding a second one in Main.
 
 ## Scheduled results and interruption notices
 
