@@ -56,6 +56,12 @@ export interface CronToolOrigin {
   readonly owner: CronOwner;
   /** Model-facing name of a host-redirected target (for example "Main"); absent for the caller. */
   readonly label?: string;
+  /**
+   * The calling conversation's own owner when the host redirected its jobs elsewhere. It is used for
+   * one thing only: recognising a job a build before the redirect committed in the caller's own job
+   * document, so a replay of that call reports it instead of scheduling a duplicate.
+   */
+  readonly callerOwner?: CronOwner;
 }
 
 export interface CronToolOptions {
@@ -390,9 +396,38 @@ export function createCronTool(options: CronToolOptions): CronTool {
       if (request.silent !== undefined && typeof request.silent !== "boolean") {
         return text("silent must be true or false.", true);
       }
+      // A build before the redirect committed a job in this very conversation, keyed by the
+      // provider's tool-call ID, and did not commit its result. A replay now resolves another
+      // conversation's job document, so that commit is recognised here and reported instead of a
+      // duplicate being added. It is not migrated: the job stays in the caller's conversation.
+      if (origin.callerOwner !== undefined) {
+        let legacy: CronJobView | undefined;
+        try {
+          const views = await options.foundation.list(
+            harness, api.conversationId, { owner: origin.callerOwner }, context,
+          );
+          legacy = views.find((view) => view.job.idempotencyKey === `tool:${api.callId}`);
+        } catch {
+          // The caller's own jobs could not be read, so a replay cannot be told from a new add.
+          // Refuse instead of risking a second job beside an unread one.
+          return text(
+            "Scheduling is unavailable in this conversation right now; nothing was scheduled.",
+            true,
+          );
+        }
+        if (legacy !== undefined) {
+          return text(
+            "This call already scheduled a job before this conversation's jobs moved to " +
+            `${origin.label}; it stays in this conversation.\n\n${describe(legacy)}`,
+          );
+        }
+      }
       let receipt: CronScheduleReceipt;
       try {
-        // A call ID is stable across a retried call, so a replay cannot create a second job.
+        // The host's own tool-task identity, never the provider's tool-call ID: a provider may reuse
+        // an ID in two threads, and a redirected add puts both threads' jobs in one document, so the
+        // ID would merge two unrelated requests. A replayed execution of the same tool task keeps
+        // the same task ID, so a commit retried after a crash still dedupes.
         receipt = await options.foundation.schedule(actor, writer, {
           message: intent === "digest" ? "Memory digestion run" : message,
           ...(request.name === undefined ? {} : { name: request.name }),
