@@ -63,8 +63,7 @@ export interface CronToolOptions {
   /**
    * Host-resolved scheduling origin of a conversation. `undefined` means the conversation is not an
    * origin session (for example a scheduled run's automation conversation), so cron is unavailable.
-   * A host that re-homes a conversation's jobs throws a short, value-free error instead, and nothing
-   * is scheduled.
+   * A host that re-homes a conversation's jobs throws instead, and nothing is scheduled.
    */
   readonly originFor: (
     conversationId: ConversationId, context: Context,
@@ -282,19 +281,19 @@ export function createCronTool(options: CronToolOptions): CronTool {
       })),
     }),
     // Every action is safe to rerun after an interrupted execution: `add` dedupes a retry on the
-    // tool call ID, `list` only reads, and `remove` is idempotent because a second cancel reports
-    // `already_terminal`. Declaring it safe keeps the call ID stable across recovery, which is what
-    // makes `tool:<callId>` dedupe a commit that succeeded without a committed result.
+    // host's own tool-task identity, `list` only reads, and `remove` is idempotent because a second
+    // cancel reports `already_terminal`. Declaring it safe keeps the call ID stable across recovery,
+    // which is what makes that identity stable for a commit that succeeded without a committed result.
     replay: "safe",
     outputLimits: { maxBytes: 64 * 1024, maxLines: 1_000, retain: "head" },
     async execute(args, api, context) {
       let origin: CronToolOrigin | undefined;
       try {
         origin = await options.originFor(api.conversationId, context);
-      } catch (error) {
-        // Host-authored, value-free text: the caller is an ordinary chat, but its jobs cannot be
-        // placed where they belong right now, so nothing is scheduled.
-        return text(`Scheduling is unavailable: ${reasonText(error)}`, true);
+      } catch {
+        // One fixed message: the caller is an ordinary chat, but its jobs cannot be placed where they
+        // belong right now, so nothing is scheduled and no host value reaches the model.
+        return text("Scheduling is unavailable in this conversation right now; nothing was scheduled.", true);
       }
       if (origin === undefined) {
         return text("Scheduling is not available in this conversation.", true);
@@ -401,7 +400,7 @@ export function createCronTool(options: CronToolOptions): CronTool {
           mode: intent === "digest" || request.isolated === false ? "origin" : "background",
           intent,
           silent: request.silent === true,
-          idempotencyKey: `tool:${api.callId}`,
+          idempotencyKey: `tool:${api.taskId}`,
         }, context);
       } catch (error) {
         // Model-visible scheduling errors are actionable (bad expression, past time). They carry no

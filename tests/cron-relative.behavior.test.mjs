@@ -271,7 +271,9 @@ test("the model-facing cron tool accepts after_seconds and acknowledges the stor
 
     const jobs = await readJobs(gateway.harness, conversation.id);
     assert.equal(jobs.length, 1);
-    assert.equal(jobs[0].idempotencyKey, "tool:call-relative-600");
+    // Dedupe identity is the host's own tool task, never the provider's tool-call ID: a provider may
+    // reuse one ID (see the app-channel checks for two threads that do).
+    assert.match(jobs[0].idempotencyKey, /^tool:[1-9][0-9]*$/u);
     assert.equal(jobs[0].schedule.kind, "at");
     assert.ok(jobs[0].schedule.at >= before + 600_000);
     assert.ok(jobs[0].schedule.at <= after + 600_000);
