@@ -18,6 +18,7 @@ import {
   validDeviceLabel,
   validPresetToken,
   validThreadId,
+  validThreadBadge as validWireThreadBadge,
   validThreadTitle as validWireThreadTitle,
   type ActivityStep,
   type CommandInfo,
@@ -25,6 +26,7 @@ import {
   type DurableEvent,
   type ErrorCode,
   type PresetInfo,
+  type ThreadBadge,
   type ThreadEvent,
   type ThreadInfo,
   type ThreadOrigin,
@@ -84,12 +86,19 @@ export function parseQuestionId(value: unknown): string | undefined {
 
 export type AppThreadOrigin = ThreadOrigin;
 export type AppThreadInfo = ThreadInfo;
+/** A side thread's display badge: an emoji and a verb, both from the gateway's fixed lists. */
+export type AppThreadBadge = ThreadBadge;
 /** One tool step of a turn: id, bounded tool name, state and times; never its arguments or result. */
 export type AppActivityStep = ActivityStep;
 
 /** A thread title (shared wire validator): 1–80 characters, not blank, nothing unprintable. */
 export function validThreadTitle(value: unknown): value is string {
   return validWireThreadTitle(value);
+}
+
+/** A badge within the wire bounds (shared wire validator); fixed-list membership is checked by the app channel. */
+export function validAppThreadBadge(value: unknown): value is AppThreadBadge {
+  return validWireThreadBadge(value);
 }
 
 export function parseThreadId(value: unknown): string | undefined {
