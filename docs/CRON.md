@@ -90,11 +90,15 @@ nowhere else:
   admitted under one host key and an alias is rejected: the refusal is therefore repeatable instead
   of leaving the side thread registered as Main, and every other mis-mapping is still caught by the
   same admission checks the channel uses.
-- The dedupe identity of an `add` is the host's own tool-task identity (`tool:<task id>`), never the
-  provider's tool-call ID. That matters most once a redirect puts several threads' jobs in Main's one
-  document: two side threads can reuse one provider ID, and it would merge two unrelated requests (or
-  silently return the first job's receipt for the second). A replayed execution of the same tool task
-  keeps the same task ID, so a commit retried after a crash still dedupes.
+- The dedupe identity of an `add` is per-direction. A conversation whose jobs are not redirected
+  keeps exactly the key it always had, the provider's tool-call ID (`tool:<provider call ID>`), so an
+  `add` committed by an earlier build still dedupes against its own replay after an upgrade. A
+  redirected `add` instead uses the host's own tool-task identity in a separate namespace
+  (`side:<task id>`), which can never collide with a historical `tool:` key even when a provider ID
+  is numeric. The separate namespace matters because a redirect puts several threads' jobs in Main's
+  one document: two side threads can reuse one provider ID, and it would merge two unrelated requests
+  (or silently return the first job's receipt for the second). A replayed execution of the same tool
+  task keeps the same task ID, so a commit retried after a crash still dedupes.
 - From there the job is Main's in every respect: its document, its `owner` record (`app:chat`), its
   timer and run tasks, its automation conversation's origin, its origin-mode target and its delivery
   session key. Archiving or evicting the side thread touches none of it.
@@ -111,7 +115,7 @@ set the creating side thread would have captured, and the run is re-authorized a
 ceiling on every call. If chat policy ever became key-dependent, that equality would end and a run
 would have to capture the intersection with the creating thread; today there is no such input.
 
-Two known consequences, both deliberate and documented in APP.md:
+Known consequences, all deliberate and documented in APP.md:
 
 - The app channel still requires its own durable admission evidence per thread. A job created in a
   side thread before Main was ever used holds its result in the outbox — never appended, never
@@ -123,10 +127,25 @@ Two known consequences, both deliberate and documented in APP.md:
   thread (its thread's app task sheet still lists it, and its results still arrive there).
   `pedellus cron cancel <jobId>` (which searches every mapped chat) still cancels it.
 - An `add` the old build committed in a side thread without committing its tool result is not
-  duplicated on replay. A redirected `add` first looks for that exact invocation in the caller's own
-  job document, under the key the old build used (`tool:<provider call ID>`), and reports the job it
-  finds — naming the fact that it stays in that conversation — instead of scheduling again. Nothing is
-  migrated and no second job is written anywhere.
+  duplicated on replay. A redirected `add` first looks for that key in the caller's own job document,
+  under the key the old build used (`tool:<provider call ID>`). A key match alone proves nothing, so
+  the found job is reported only when it is exactly the job this call would store — the same
+  message, name, mode, intent, delivery setting and schedule, compared after the same normalization
+  admission applies. That report names the fact that the job stays in that conversation. When the key
+  exists but the job differs, the call gets one fixed, value-free answer instead — an earlier job
+  with this call already exists in this conversation and nothing new was scheduled — which claims
+  nothing about the requested job. Either way nothing is migrated and no second job is written
+  anywhere.
+- When a redirected call cannot be verified or completed, the model gets one fixed answer and never
+  the exception's text: `Could not verify or schedule this job. Check Main's cron list before
+  retrying.` That covers a Main resolution that fails, a read of the caller's own job document that
+  fails (a replay may already have committed the job, so it must not be answered "nothing was
+  scheduled"), and any unexpected failure writing Main's job document. Only the explicit
+  request-validation errors the foundation itself raises (a malformed or past schedule, a bad field)
+  stay actionable; `list` answers `Could not read scheduled jobs in Main. Nothing was changed.`, and
+  a `remove` that failed gives `Could not remove scheduled job <id>. Check Main's cron list before
+  retrying.` A conversation whose jobs are not redirected is unchanged: it still gets the
+  foundation's own error text, as it always did.
 
 Automation conversations are a distinct conversation class, not chats: they are ownerless so they
 outlive every run task, they carry a `nanobot.cron.conversation` marker naming their class, origin
@@ -766,6 +785,13 @@ fault document is itself ignored rather than replacing job or outbox data.
 - The catch-all queue is a property of the origin conversation, not of a run: it is bounded at 16
   admitted runs and refuses rather than growing. A refused occurrence is visible only in the job
   record (`cron list` shows the fixed text); it is not announced in the chat.
+- A crash that lands between a redirected `add`'s job commit and its tool result is not exercised
+  by a committed restart test: reaching that window needs a crash mid-tool inside an app gateway,
+  which the offline harnesses cannot produce without new machinery. What is covered is the dedupe
+  identity that recovery relies on: the tool is executed twice with one host task identity across a
+  reopened store and adds one job, and a second execution with the provider's ID reused adds its
+  own. A tool whose replay identity is `unsafe` (every native coding tool, and MCP) settles as
+  interrupted instead, so this applies to the cron tool's own `replay: "safe"`.
 - A restart while a one-off run is queued is not covered by a committed test. The order is durable
   state (the origin's queue document plus each run task's native `waiting` state) and the run
   resumes from its own checkpoint, so the guarantee follows from the state model rather than from an

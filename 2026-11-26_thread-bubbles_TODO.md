@@ -38,3 +38,18 @@
   from the transcripts that hold them instead of searching the whole capture for a job name the add
   receipt already contained.
 - `docs/APP.md` now separates task-sheet visibility from delivery admission.
+
+### 2026-11-26 (Brief 3, second review — owner decisions)
+- Non-redirected adds go back to the key they always had (`tool:<provider call ID>`); only the
+  redirected side-thread add uses the host task identity, in its own namespace (`side:<task id>`), so
+  an `add` committed by an earlier build still dedupes after an upgrade.
+- The pre-redirect replay check no longer treats a key as proof: the found job is reported only when
+  it is exactly the job this call would store, and a differing job gets one fixed, value-free answer.
+- A redirected call that cannot be verified or completed answers with one fixed sentence instead of
+  claiming nothing was scheduled or leaking exception text; only explicit request-validation errors
+  stay actionable.
+- Tests: origin-mode redirect, `cron remove` from a side thread cancelling Main's job, the archive
+  check gated by a held model call instead of a five-second window, both legacy-replay cases, and the
+  host-task dedupe across a reopened store.
+- Known gap: no crash-mid-tool restart test for the redirected add (needs harness machinery a crash
+  inside an app gateway would require); the dedupe identity it relies on is covered instead.
