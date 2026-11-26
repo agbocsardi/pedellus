@@ -48,6 +48,13 @@ import {
   type ConversationCommitter,
 } from "../tasks/background.js";
 
+/**
+ * A schedule request the caller can fix (bad field, malformed or past schedule, key reuse). Its
+ * message is safe to show the model; any other error from scheduling is unexpected and stays
+ * internal. A `TypeError` so existing callers that catch validation that way are unchanged.
+ */
+export class CronRequestError extends TypeError {}
+
 export const CRON_EXTENSION_NAME = "nanobot.cron";
 /** Entry kind for a scheduled input placed by the cron run. */
 export const CRON_INPUT_ENTRY_KIND = "nanobot.cron";
@@ -487,7 +494,7 @@ function ownerOf(actor: CronActor): CronOwner {
     || typeof owner.ownerId !== "string" || owner.ownerId === ""
     || typeof owner.sessionKey !== "string" || owner.sessionKey === ""
   ) {
-    throw new TypeError("owner must carry non-empty ownerId and sessionKey");
+    throw new CronRequestError("owner must carry non-empty ownerId and sessionKey");
   }
   return { ownerId: owner.ownerId, sessionKey: owner.sessionKey };
 }
@@ -508,26 +515,26 @@ const silentOf = (job: CronJob): boolean => job.silent === true;
 
 function normalizeRequest(actor: CronActor, request: CronScheduleInput): NormalizedRequest {
   const owner = ownerOf(actor);
-  if (!isRecord(request)) throw new TypeError("schedule request must be an object");
+  if (!isRecord(request)) throw new CronRequestError("schedule request must be an object");
   const intent = request.intent === undefined ? "message" : request.intent;
   if (intent !== "message" && intent !== "digest") {
-    throw new TypeError("intent must be 'message' or 'digest'");
+    throw new CronRequestError("intent must be 'message' or 'digest'");
   }
   if (typeof request.message !== "string" || (intent === "message" && request.message.trim() === "")) {
-    throw new TypeError("message must be a non-empty string");
+    throw new CronRequestError("message must be a non-empty string");
   }
   if (typeof request.idempotencyKey !== "string" || request.idempotencyKey === "") {
-    throw new TypeError("idempotencyKey must be a non-empty string");
+    throw new CronRequestError("idempotencyKey must be a non-empty string");
   }
   if (request.name !== undefined && typeof request.name !== "string") {
-    throw new TypeError("name must be a string when provided");
+    throw new CronRequestError("name must be a string when provided");
   }
   if (request.silent !== undefined && typeof request.silent !== "boolean") {
-    throw new TypeError("silent must be a boolean when provided");
+    throw new CronRequestError("silent must be a boolean when provided");
   }
   const requestedMode = request.mode === undefined ? "background" : request.mode;
   if (requestedMode !== "background" && requestedMode !== "origin") {
-    throw new TypeError("mode must be 'background' or 'origin'");
+    throw new CronRequestError("mode must be 'background' or 'origin'");
   }
   // A digest occurrence runs from the authenticated origin itself: it has no model turn and must
   // never create or borrow a task-owned background conversation's authority.
@@ -536,7 +543,7 @@ function normalizeRequest(actor: CronActor, request: CronScheduleInput): Normali
   try {
     schedule = parseCronScheduleRequest(request.schedule);
   } catch (error) {
-    throw new TypeError(errorText(error));
+    throw new CronRequestError(errorText(error));
   }
   // A digest occurrence never queues a channel delivery, so its delivery setting is normalized off
   // instead of being stored as a meaningless difference in the dedupe identity.
@@ -580,6 +587,18 @@ function sameNormalizedRequest(job: CronJob, request: NormalizedRequest): boolea
     && intentOf(job) === request.intent
     && silentOf(job) === request.silent
     && sameScheduleRequest(job, request.schedule);
+}
+/**
+ * Whether a stored job is exactly the job this request would create: the same message, name, mode,
+ * intent, delivery setting and schedule (after the same normalization admission applies). The
+ * idempotency key is not compared, so a caller can ask whether an older key names this very job.
+ */
+export function cronJobMatchesRequest(job: CronJob, request: CronScheduleInput): boolean {
+  try {
+    return sameNormalizedRequest(job, normalizeRequest({ owner: job.owner }, request));
+  } catch {
+    return false;
+  }
 }
 function parseOccurrenceInput(value: unknown): CronOccurrenceInput | undefined {
   if (!isRecord(value) || typeof value.jobId !== "string" || value.jobId === "") return undefined;
@@ -1594,7 +1613,7 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
         );
         if (existing !== undefined) {
           if (!sameNormalizedRequest(existing, value)) {
-            throw new TypeError("idempotencyKey already names a different cron job");
+            throw new CronRequestError("idempotencyKey already names a different cron job");
           }
           const timer = existing.timerTaskId === null
             ? undefined
@@ -1612,18 +1631,18 @@ export function createCronFoundation(options: CronFoundationOptions): CronFounda
         try {
           schedule = materializeCronSchedule(value.schedule, now);
         } catch (error) {
-          throw new TypeError(errorText(error));
+          throw new CronRequestError(errorText(error));
         }
         const firstAtMs = schedule.kind === "at"
           ? schedule.at
           : schedule.kind === "every"
             ? schedule.anchorMs
             : nextCronOccurrence(schedule, now);
-        if (firstAtMs === null) throw new TypeError("schedule has no future occurrence");
+        if (firstAtMs === null) throw new CronRequestError("schedule has no future occurrence");
         // The shared renderable bound, enforced before the job record or its timer is written: a
         // commit beyond it would arm an unrenderable instant no receipt or renderer can print.
         if (firstAtMs > MAX_DATE_MS) {
-          throw new TypeError("the first occurrence is beyond the representable date range");
+          throw new CronRequestError("the first occurrence is beyond the representable date range");
         }
         const jobId = `cron-${randomUUID()}`;
         const generation = 1;

@@ -579,10 +579,19 @@ lazily so a gateway without `app.push` never loads it.
 
 `tasks {thread?}` lists one thread's own background work: the retained workers and scheduled jobs
 of that thread's mapped conversation, read through the same owner-scoped functions the agent's
-`worker list` and `cron list` use. Nothing another thread or chat owns is listed or named. A thread
+`worker list` and `cron list` use. Nothing another thread or chat owns is listed or named. A side
+thread's cron turns place their jobs in `main` (*Cron jobs created in a side thread*), so a side
+thread lists its own workers only, and `main` lists the jobs; `task.cancel` follows the same lists. A thread
 that is not mapped lists nothing, and the read maps no conversation, so it creates nothing and the
 `main` thread stays empty until it has received input. Entries are newest first and capped at
 `LIMITS.maxListedTasks`; ids are namespaced (`w:<task id>` for a worker, `c:<job id>` for a job).
+
+Task visibility is not delivery admission. A job appears in the task sheet of the chat that owns it
+as soon as it is committed, so a job placed in `main` from a side thread is listed there before
+`main` has received any input, while its first result still waits in the outbox for that thread's own
+admission evidence. A job an earlier build created inside a side thread keeps its own document, so it
+stays listed in that thread's sheet — where its results still arrive — even though `cron list` in
+that thread now reports Main's jobs instead.
 
 `TaskInfo.title` is a bounded one-line label (the worker's instruction or the job's name, never a
 stored prompt body in full), and `detail` is a bounded derived line such as the job's schedule and
@@ -600,6 +609,63 @@ after recording the cancellation still reports `cancelled`, as the cron tool doe
 receipt is one bounded durable `notice` in the thread; an archived thread refuses `task.cancel`
 with `bad_request`, like `send` and `control`. There is no task event stream: the app fetches the
 list when the sheet opens and after any durable event in that thread while it stays open.
+
+## Cron jobs created in a side thread
+
+A `cron add` made while answering a side thread is placed in `main`, not in that side thread: the job
+document, its owner (`app:chat`), its timer and run tasks, its captured authority, its origin-mode
+answers and every delivery belong to Main, and the model-facing receipt says `Scheduled in Main.`
+`cron list` and `cron remove` in a side thread therefore address Main's jobs, because after this
+change a side thread creates no job document of its own.
+
+The redirect lives in the cron tool's origin resolution and applies only to an authenticated mapped
+app side-thread key. `main` itself, Telegram and Discord keep exactly the origin they have, and no
+other conversation class (root, denied fork, raw, state, task-owned, automation) can be redirected
+because none of them is ever offered the tool. It is not a reach across channels: the target is
+always this app channel's `main` key, resolved through the gateway's ordinary mapped-chat admission,
+and the call is refused unless that resolves to a different conversation whose owner key is exactly
+`app:chat`. Because a mapped conversation is admitted under one host key only, a stored map that
+points `main` at a side thread is refused by the admission itself before it can register that side
+thread as Main, so the refusal is repeatable and never turns the next call into a Main call.
+
+A refused call answers with one fixed message and never with host error text: `Could not verify or
+schedule this job. Check Main's cron list before retrying.` It deliberately does not claim that
+nothing was scheduled, because a replay after a crash may already have committed this very call's
+job. The same fixed answer covers an unreadable read of the caller's own job document and any
+unexpected failure writing Main's job document; `cron list` answers `Could not read scheduled jobs in
+Main. Nothing was changed.` instead, and a failed `cron remove` gives `Could not remove scheduled job
+<id>. Check Main's cron list before retrying.` Captured authority cannot widen: Main and a side
+thread are both ordinary app chats under the same chat policy, so Main's capture set is exactly the
+set the creating thread would have captured (`CRON.md`).
+
+The dedupe identity follows the redirect. A job added in `main` — or in any conversation that is
+never redirected — keeps the key it always had, the provider's tool-call ID (`tool:<call ID>`), so an
+`add` committed before an upgrade still dedupes against its own replay. A redirected add uses the
+host's own tool-task identity in a separate namespace (`side:<task id>`), which cannot collide with a
+historical `tool:` key and cannot merge two side threads that reuse one provider ID.
+
+Consequences, all deliberate:
+
+- Main still needs its own durable admission evidence (below). A job created from a side thread on a
+  device that never used Main holds its first result in the outbox until one authenticated message
+  arrives in Main; nothing is dropped and nothing is appended early.
+- Archiving the side thread neither stops the job nor changes its target, and a result delivered to
+  Main never restores the archived side thread. The job outlives the thread because it lives in Main.
+- Jobs created by an earlier build stay inside the side thread that created them: no migration, no
+  rewrite, and their results still deliver there. Such a job stays listed in that thread's task sheet,
+  but `cron list` in the thread now reports Main's jobs, so cancelling it goes through
+  `pedellus cron cancel <jobId>`, which searches every mapped chat.
+- A replay of an unfinished add from the old build is recognised instead of adding a second job in
+  Main: the tool looks for the key the old build used (`tool:<call ID>`) in the caller's own job
+  document. A key match alone proves nothing, so the job is reported only when it is exactly the job
+  this call would store (same message, name, mode, intent, delivery setting and schedule). When the
+  key exists but the job differs, the answer is one fixed, value-free sentence saying an earlier job
+  with this call already exists in this thread and nothing new was scheduled. If the caller's own
+  document cannot be read, the call is refused with the fixed message above rather than risking a
+  duplicate.
+- A crash between a redirected add's job commit and its tool result is not exercised by a committed
+  restart test: that window needs a crash mid-tool inside an app gateway, which the offline harnesses
+  cannot produce. The dedupe identity recovery depends on is covered instead (`CRON.md`).
 
 ## Scheduled results and interruption notices
 
