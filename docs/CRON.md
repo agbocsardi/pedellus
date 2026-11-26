@@ -67,6 +67,53 @@ one execution. Scheduled work follows that split.
   one conversation with no catch-all, no new conversation and no cron-placed reset boundary. The
   owner's own `/new` is that conversation's reset.
 
+### An app side thread schedules into Main
+
+An app (PWA) chat is one mapped ordinary chat per thread: `app:chat` is Main, and every side thread
+is its own chat under `app:chat:<threadId>`. Both are authenticated mapped ordinary chats under the
+same chat policy, so both are legitimate origins. The `cron` tool nonetheless places a side thread's
+job in **Main**: side threads are short-lived (the idle scan archives them), and scheduled work
+belongs in the chat that outlives them.
+
+The redirect is one hop in the tool's own origin resolution (`CronToolOptions.originFor`), and
+nowhere else:
+
+- It applies only when the calling conversation is an authenticated mapped chat whose exact host key
+  is an app side-thread key. The root, a denied fork, a raw or state conversation, a task-owned
+  conversation and an automation conversation never redirect; they are never offered the tool at
+  all, because it is selected only for a mapped chat that already has a cron owner.
+- The target is this app channel's Main conversation (`app:chat`), resolved through the gateway's
+  ordinary mapped-chat admission, and only when it is a different conversation that is an ordinary
+  app chat. If Main cannot be resolved that way, the call is refused with one short fixed message and
+  nothing is scheduled: a session map pointing Main at this same side thread costs a refusal, and
+  every other mis-mapping is still caught by the same admission checks the channel uses.
+- From there the job is Main's in every respect: its document, its `owner` record (`app:chat`), its
+  timer and run tasks, its automation conversation's origin, its origin-mode target and its delivery
+  session key. Archiving or evicting the side thread touches none of it.
+- `list` and `remove` resolve the same redirected origin, so from a side thread they address Main's
+  jobs. `list` therefore reports Main's jobs, or `No scheduled jobs in Main.`
+- The receipt names the redirect (`Scheduled in Main.`), so the model can tell the owner where the
+  job went.
+
+Captured authority cannot widen. `captureFor("scheduledRun", origin)` is the configured
+`toolAllowlist` plus the origin's read-only recall and its live MCP tools, and it depends only on the
+origin being an authenticated mapped chat, the global allowlist and the live MCP set — never on which
+chat the origin is. Main and a side thread are both app chats, so Main's capture set is exactly the
+set the creating side thread would have captured, and the run is re-authorized against the same
+ceiling on every call. If chat policy ever became key-dependent, that equality would end and a run
+would have to capture the intersection with the creating thread; today there is no such input.
+
+Two known consequences, both deliberate and documented in APP.md:
+
+- The app channel still requires its own durable admission evidence per thread. A job created in a
+  side thread before Main was ever used holds its result in the outbox — never appended, never
+  dropped — until the owner sends one authenticated message in Main.
+- Job documents that earlier builds wrote inside side threads are **not migrated**. They keep their
+  own document, timer, automation conversation, delivery target and owner for the rest of their
+  life, and no rebuild re-homes them. The redirect changes only a new `cron add`; and because `list`
+  and `remove` now address Main, such a legacy job is no longer visible to the tool from its own
+  thread. `pedellus cron cancel <jobId>` (which searches every mapped chat) still cancels it.
+
 Automation conversations are a distinct conversation class, not chats: they are ownerless so they
 outlive every run task, they carry a `nanobot.cron.conversation` marker naming their class, origin
 and job, and the origin's own job document records the same ID. They never become chat sessions,

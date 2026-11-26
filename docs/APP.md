@@ -558,7 +558,9 @@ lazily so a gateway without `app.push` never loads it.
 
 `tasks {thread?}` lists one thread's own background work: the retained workers and scheduled jobs
 of that thread's mapped conversation, read through the same owner-scoped functions the agent's
-`worker list` and `cron list` use. Nothing another thread or chat owns is listed or named. A thread
+`worker list` and `cron list` use. Nothing another thread or chat owns is listed or named. A side
+thread's cron turns place their jobs in `main` (*Cron jobs created in a side thread*), so a side
+thread lists its own workers only, and `main` lists the jobs; `task.cancel` follows the same lists. A thread
 that is not mapped lists nothing, and the read maps no conversation, so it creates nothing and the
 `main` thread stays empty until it has received input. Entries are newest first and capped at
 `LIMITS.maxListedTasks`; ids are namespaced (`w:<task id>` for a worker, `c:<job id>` for a job).
@@ -579,6 +581,36 @@ after recording the cancellation still reports `cancelled`, as the cron tool doe
 receipt is one bounded durable `notice` in the thread; an archived thread refuses `task.cancel`
 with `bad_request`, like `send` and `control`. There is no task event stream: the app fetches the
 list when the sheet opens and after any durable event in that thread while it stays open.
+
+## Cron jobs created in a side thread
+
+A `cron add` made while answering a side thread is placed in `main`, not in that side thread: the job
+document, its owner (`app:chat`), its timer and run tasks, its captured authority, its origin-mode
+answers and every delivery belong to Main, and the model-facing receipt says `Scheduled in Main.`
+`cron list` and `cron remove` in a side thread therefore address Main's jobs, because after this
+change a side thread has no job document of its own to read.
+
+The redirect lives in the cron tool's origin resolution and applies only to an authenticated mapped
+app side-thread key. `main` itself, Telegram and Discord keep exactly the origin they have, and no
+other conversation class (root, denied fork, raw, state, task-owned, automation) can be redirected
+because none of them is ever offered the tool. It is not a reach across channels: the target is
+always this app channel's `main` key, resolved through the gateway's ordinary mapped-chat admission,
+and a Main that cannot be resolved as a *different* ordinary app chat refuses the call with one
+short fixed message instead of placing the job anywhere else. Captured authority cannot widen: Main
+and a side thread are both ordinary app chats under the same chat policy, so Main's capture set is
+exactly the set the creating thread would have captured (`CRON.md`).
+
+Consequences, all deliberate:
+
+- Main still needs its own durable admission evidence (below). A job created from a side thread on a
+  device that never used Main holds its first result in the outbox until one authenticated message
+  arrives in Main; nothing is dropped and nothing is appended early.
+- Archiving the side thread neither stops the job nor changes its target, and a result delivered to
+  Main never restores the archived side thread. The job outlives the thread because it lives in Main.
+- Jobs created by an earlier build stay inside the side thread that created them: no migration, no
+  rewrite, and their results still deliver there. `cron list` in that thread now shows Main's jobs, so
+  cancelling such a legacy job goes through `pedellus cron cancel <jobId>`, which searches every
+  mapped chat.
 
 ## Scheduled results and interruption notices
 
