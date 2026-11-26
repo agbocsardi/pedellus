@@ -271,9 +271,9 @@ test("the model-facing cron tool accepts after_seconds and acknowledges the stor
 
     const jobs = await readJobs(gateway.harness, conversation.id);
     assert.equal(jobs.length, 1);
-    // Dedupe identity is the host's own tool task, never the provider's tool-call ID: a provider may
-    // reuse one ID (see the app-channel checks for two threads that do).
-    assert.match(jobs[0].idempotencyKey, /^tool:[1-9][0-9]*$/u);
+    // A conversation whose jobs are not redirected keeps exactly the key it always had, so a replay
+    // after an upgrade still dedupes against a job the old build committed under the same call ID.
+    assert.equal(jobs[0].idempotencyKey, "tool:call-relative-600");
     assert.equal(jobs[0].schedule.kind, "at");
     assert.ok(jobs[0].schedule.at >= before + 600_000);
     assert.ok(jobs[0].schedule.at <= after + 600_000);
@@ -289,6 +289,65 @@ test("the model-facing cron tool accepts after_seconds and acknowledges the stor
     gateway = undefined;
   } finally {
     if (gateway !== undefined) await gateway.close(context).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a redirected cron add is keyed by the host task and a replay of that task adds nothing", { timeout: 10_000 }, async () => {
+  const dir = await temp("nanobot-cron-redirect-");
+  const db = resolve(dir, "probe.sqlite");
+  let harness;
+  try {
+    const foundation = createCronFoundation({ now: () => Date.now() });
+    const models = createModels();
+    harness = await openHarness(db, foundation.extension, models);
+    const caller = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const target = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+    const { createCronTool } = await load(`${pkg}/dist/automation/cron-tool.js`);
+    // The app host's side-thread -> Main redirect, at the tool's own boundary: the caller's jobs are
+    // written to another conversation under that conversation's owner.
+    const origin = {
+      conversationId: target.id,
+      owner: { ownerId: "app-owner", sessionKey: "app:chat" },
+      label: "Main",
+      callerOwner: { ownerId: "app-owner", sessionKey: "app:chat:side" },
+    };
+    const tool = createCronTool({
+      foundation,
+      originFor: () => origin,
+      harness: () => harness,
+    }).extension.tools[0];
+    const output = (result) => (result.output ?? []).map((part) => part.text ?? "").join("");
+    const args = { action: "add", message: "redirected probe", every_seconds: 3_600 };
+    const api = { conversationId: caller.id, taskId: 8421, callId: "provider-call-1" };
+
+    assert.match(output(await tool.execute(args, api, context)), /^Scheduled in Main\./u);
+    const [created] = await readJobs(harness, target.id);
+    assert.equal(created.idempotencyKey, "side:8421", "the host task, in its own namespace");
+    assert.equal(created.owner.sessionKey, "app:chat");
+    assert.deepEqual(await readJobs(harness, caller.id), [], "the caller's own document stays empty");
+
+    // A crash between the job commit and the tool result replays the same execution, which keeps the
+    // same task identity: the retry dedupes instead of adding a second job, also across a reopen.
+    await harness.abortTask(created.timerTaskId, context);
+    await harness.waitForTask(created.timerTaskId, context);
+    await harness.close(context);
+    harness = await openHarness(db, foundation.extension, models);
+    const replayed = output(await tool.execute(args, api, context));
+    assert.match(replayed, /^Scheduled in Main\./u);
+    assert.ok(replayed.includes(created.id), "the receipt names the job already committed");
+    assert.equal((await readJobs(harness, target.id)).length, 1);
+
+    // The provider's call ID is not the identity: a second execution of the same call adds its own
+    // job, which is what keeps two side threads' jobs apart in one document.
+    assert.match(output(await tool.execute(args, { ...api, taskId: 8422 }, context)), /^Scheduled in Main\./u);
+    const jobs = await readJobs(harness, target.id);
+    assert.deepEqual(jobs.map((job) => job.idempotencyKey).sort(), ["side:8421", "side:8422"]);
+    // Clear the one live deadline rather than leaving a timer behind the test.
+    await harness.abortTask(jobs[1].timerTaskId, context);
+    await harness.waitForTask(jobs[1].timerTaskId, context);
+  } finally {
+    if (harness !== undefined) await harness.close(context).catch(() => {});
     await rm(dir, { recursive: true, force: true });
   }
 });
