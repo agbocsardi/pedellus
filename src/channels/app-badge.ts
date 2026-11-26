@@ -147,8 +147,8 @@ export interface ThreadBadgeHost {
 /**
  * One classification: two fixed-list choices from the title and the first owner message. Any
  * failure, abort or non-`stop` result journals one content-free event and answers `undefined`, so
- * the thread stays exactly as it was. It never retries; a call lost to a restart is simply not made
- * again.
+ * the thread stays exactly as it was. Only fixed reason strings are journalled: never a returned
+ * value and never an error, either of which may quote the model's output or a provider payload.
  */
 export async function classifyThreadBadge(
   host: ThreadBadgeHost,
@@ -181,8 +181,13 @@ export async function classifyThreadBadge(
     journalEvent("app.threadBadge.unclassified", { reason: "failed" });
     return undefined;
   }
+  if (signal.aborted) {
+    // Aborted or timed out: the answer, if any, arrived too late to describe anything still current.
+    journalEvent("app.threadBadge.unclassified", { reason: "aborted" });
+    return undefined;
+  }
   if (result.stopReason !== "stop") {
-    journalEvent("app.threadBadge.unclassified", { stop: String(result.stopReason) });
+    journalEvent("app.threadBadge.unclassified", { reason: "incomplete" });
     return undefined;
   }
   const badge = selectThreadBadge(result.answers);
