@@ -4,7 +4,7 @@
 //
 // Real Gateway over a temporary store, faux chat provider, a synthetic classifier answering the
 // two fixed-list choices (no external service), one real loopback listener and a synthetic device
-// speaking protocol v2. Every wait is event-driven; no test sleeps on a schedule.
+// speaking protocol v2. Waits use the shared bounded `untilAsync` condition helper; no fixed sleeps.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { typesafeProvider } from '../node_modules/@earendil-works/pi-ai/dist/providers/typesafe.js';

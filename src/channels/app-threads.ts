@@ -307,6 +307,8 @@ export function createAppThreads(options: {
     // A stop or an abort between the answer and the commit abandons it: nothing is written.
     if (core.stopped() || core.context.abortSignal?.aborted === true || !isThreadBadge(answer)) return;
     await core.mutateState((doc) => {
+      // A stop that began while this write waited for the state transaction abandons it too.
+      if (core.stopped() || core.context.abortSignal?.aborted === true) return;
       const entry = threadInfo(doc, thread);
       if (entry === undefined || entry.archived) return;
       // The answer describes the title it was asked about; a rename since then makes it stale.
@@ -327,7 +329,9 @@ export function createAppThreads(options: {
   function badge(thread: string, trigger: AppThreadBadgeTrigger = {}): void {
     if (gateway.classifyThreadBadge === undefined || thread === APP_MAIN_THREAD || core.stopped()) return;
     if (badging.has(thread)) {
-      badgeQueued.set(thread, trigger);
+      // A queued rename is never replaced by a message trigger, which would skip an already-badged
+      // thread and leave the renamed title unclassified.
+      if (trigger.reason === "rename" || badgeQueued.get(thread)?.reason !== "rename") badgeQueued.set(thread, trigger);
       return;
     }
     badging.add(thread);
