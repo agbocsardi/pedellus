@@ -10,14 +10,10 @@
 //
 // Needs a built dist/ (`npm run build`). The mock and `vite preview` run on
 // free ports (never 8791/4173/8452/43190) and are killed by PID afterwards.
-import { spawn } from "node:child_process";
-import net from "node:net";
-import { fileURLToPath } from "node:url";
-const { chromium } = await import(process.env.PLAYWRIGHT_MODULE || "playwright");
+import { chromium, pair, startStack } from "./browser-harness.mjs";
 
 const RUNS = Number(process.argv[2] ?? 10);
 const IDLE_GRACE_MS = 800;
-const APP_DIR = fileURLToPath(new URL("..", import.meta.url));
 const PAIR_CODE = "ABCDEFGH";
 
 // The mock's long answer (`longAnswer` in mock-gateway.mjs): every paragraph
@@ -30,83 +26,16 @@ const PARAGRAPHS = (() => {
   return rows.length - 2;
 })();
 
-function freePort() {
-  return new Promise((resolve, reject) => {
-    const srv = net.createServer();
-    srv.on("error", reject);
-    srv.listen(0, "127.0.0.1", () => {
-      const { port } = srv.address();
-      srv.close(() => resolve(port));
-    });
-  });
-}
-
-async function waitForPort(port, timeoutMs = 20_000) {
-  const end = Date.now() + timeoutMs;
-  while (Date.now() < end) {
-    const ok = await new Promise((resolve) => {
-      const socket = net.connect(port, "127.0.0.1");
-      socket.once("connect", () => { socket.destroy(); resolve(true); });
-      socket.once("error", () => { socket.destroy(); resolve(false); });
-    });
-    if (ok) return;
-    await new Promise((r) => setTimeout(r, 100));
-  }
-  throw new Error(`port ${port} never opened`);
-}
-
-const children = [];
-function start(args, env, name) {
-  const child = spawn(args[0], args.slice(1), {
-    cwd: APP_DIR, env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"],
-  });
-  const log = [];
-  child.stdout.on("data", (d) => log.push(d.toString()));
-  child.stderr.on("data", (d) => log.push(d.toString()));
-  const handle = { child, log, name };
-  children.push(handle);
-  return handle;
-}
-
-/** Kill what this script started, by PID; a preview server ignores SIGTERM. */
-async function stop({ child, log, name }) {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  await new Promise((resolve) => {
-    const timer = setTimeout(() => { child.kill("SIGKILL"); resolve(); }, 2_000);
-    child.once("exit", () => { clearTimeout(timer); resolve(); });
-    child.kill("SIGTERM");
-  });
-  if (process.env.DEBUG_CHILD) console.error(`--- ${name} ---\n${log.join("")}`);
-}
-
-const mockPort = await freePort();
-const appPort = await freePort();
-start(["node", "dev/mock-gateway.mjs", PAIR_CODE], { PORT: String(mockPort), NO_PUSH: "1", IDLE_ARCHIVE_MS: "0" }, "mock");
-start(
-  ["node_modules/.bin/vite", "preview", "--host", "127.0.0.1", "--port", String(appPort), "--strictPort"],
-  { MOCK_PORT: String(mockPort) },
-  "preview",
-);
-
+const stack = await startStack(PAIR_CODE);
 let browser;
 const results = [];
 try {
-  await waitForPort(mockPort);
-  await waitForPort(appPort);
   browser = await chromium.launch();
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
   const page = await context.newPage();
   page.on("pageerror", (err) => console.error("page error:", err.message));
   page.on("console", (msg) => { if (msg.type() === "error") console.error("console:", msg.text()); });
-
-  await page.goto(`http://127.0.0.1:${appPort}/`);
-  // A fresh browser has no device cookie: the stream answers 4401 and the app
-  // shows the pairing screen (which can briefly look like chat while booting).
-  await page.waitForSelector("#pair-code", { timeout: 20_000 });
-  await page.fill("#pair-code", PAIR_CODE);
-  await page.fill("#pair-label", "check");
-  await page.click("button.primary");
-  await page.waitForSelector('textarea[aria-label="Message"]', { timeout: 20_000 });
+  await pair(page, stack.url, PAIR_CODE);
 
   for (let run = 1; run <= RUNS; run++) {
     await page.getByRole("button", { name: /New thread/ }).click();
@@ -178,7 +107,7 @@ try {
   }
 } finally {
   await browser?.close().catch(() => {});
-  for (const handle of children.slice().reverse()) await stop(handle);
+  await stack.stopAll();
 }
 
 const strays = results.reduce((sum, r) => sum + r.strays.length, 0);
