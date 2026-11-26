@@ -175,14 +175,18 @@ Lifecycle changes append durable `thread` events.
 With `app.threadBadges`, a side thread also carries a display `badge: {emoji, verb}`, and while
 its title is still exactly `New thread` the title becomes `<emoji> <verb>`. One classifier call on
 the configured `classifierModel` picks one emoji and one verb from fixed gateway lists, from the
-thread's title and its first owner message, once that first message is admitted into the thread;
-`thread.rename` classifies the new title again (and the first message when it is still retained),
-keeping the manual title. The call runs off the request path and never delays or blocks the send
-or its turn: a failure, an abort or a non-`stop` result journals one content-free event and leaves
-the thread exactly as it was, and it is never retried — a classification lost to a restart simply
-is never made and the thread stays unbadged. Only a listed emoji and verb are ever applied. `main`
-is never badged or renamed, an archived thread is left alone, and a manual rename that wins the
-race is kept. Devices receive the change as an ordinary durable `thread` event.
+thread's title and the owner message that triggered it: the first owner message admitted into the
+thread, or a later one when no badge was set yet, so a classification lost to a failure or a
+restart is recovered by the thread's next message. `thread.rename` classifies the new title again
+(and the first message when it is still retained), keeping the manual title. That message is the
+one the send admitted, handed over directly, never re-read from the transcript. The call runs off
+the request path and never delays or blocks the send or its turn: a failure, an abort or a
+non-`stop` result journals one content-free event and leaves the thread exactly as it was. A
+trigger that arrives while a call is in flight is coalesced into one more call afterwards, and an
+answer is dropped when its title is no longer the thread's title or it arrives after an abort, so
+a rename made during a classification always wins. Only a listed emoji and verb are ever applied.
+`main` is never badged or renamed, an archived thread is left alone, and a manual rename that wins
+the race is kept. Devices receive the change as an ordinary durable `thread` event.
 
 The adapter grants no tool: coding tools, MCP, web, cron, memory and worker authority are whatever
 the configuration already gives that mapped chat. Its one model-facing tool is the `app` file

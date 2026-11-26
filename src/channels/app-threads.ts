@@ -60,6 +60,17 @@ export function setArchived(
 type Reply = (body?: Record<string, unknown>) => void;
 type Refuse = (error: AppErrorCode) => void;
 
+/** What started one badge run: a rename, or the owner message that was just admitted. */
+interface AppThreadBadgeTrigger {
+  readonly reason?: "rename";
+  /**
+   * The admitted owner message this trigger came from, passed straight from the send that admitted
+   * it; a rename reads the thread's first retained message instead, and a message trigger never
+   * re-reads the transcript.
+   */
+  readonly message?: string;
+}
+
 export interface AppThreads {
   create(frame: Record<string, unknown>, sendOk: Reply, sendError: Refuse): Promise<void>;
   rename(frame: Record<string, unknown>, sendOk: Reply, sendError: Refuse): Promise<void>;
@@ -67,11 +78,12 @@ export interface AppThreads {
   /** Archive every open side thread idle past the configured age with nothing pending or running. */
   scanIdle(): Promise<void>;
   /**
-   * Classify a badge for one side thread off the request path: its first owner message, or its new
-   * title after a rename. A no-op without the host's classifier and on `main`; `rename` replaces an
-   * existing badge, while the first-message trigger only ever supplies a missing one.
+   * Classify a badge for one side thread off the request path: the owner message that triggered it,
+   * or the new title after a rename. A no-op without the host's classifier and on `main`; `rename`
+   * replaces an existing badge, while a message trigger only ever supplies a missing one. A trigger
+   * that arrives while a call is in flight is remembered and runs once more afterwards.
    */
-  badge(thread: string, reason?: "rename"): void;
+  badge(thread: string, trigger?: AppThreadBadgeTrigger): void;
   /** Whether a manual archive or restore of this thread is in progress. */
   archiving(thread: string): boolean;
 }
@@ -91,8 +103,9 @@ export function createAppThreads(options: {
   const { core } = options;
   const { gateway, now } = core;
   const archiving = new Set<string>();
-  /** Threads with a classification in flight; one per thread, and never a second on rename. */
+  /** Threads with a classification in flight, one per thread, and the latest trigger queued behind it. */
   const badging = new Set<string>();
+  const badgeQueued = new Map<string, AppThreadBadgeTrigger>();
 
   async function create(frame: Record<string, unknown>, sendOk: Reply, sendError: Refuse): Promise<void> {
     const key = frame.key;
@@ -174,7 +187,7 @@ export function createAppThreads(options: {
     sendOk();
     core.publish();
     // The new title is the strongest signal; the first message sharpens it when still retained.
-    badge(thread, "rename");
+    badge(thread, { reason: "rename" });
   }
 
   async function archive(frame: Record<string, unknown>, sendOk: Reply, sendError: Refuse): Promise<void> {
@@ -272,41 +285,65 @@ export function createAppThreads(options: {
   }
 
   /**
-   * The one badge trigger, off the request path. It reads the thread once, calls the host's
-   * classifier and, when that answers a listed badge, commits it in one transaction: `badge` is
-   * set, and the title becomes `<emoji> <verb>` only while it is still exactly "New thread", so a
-   * manual rename that won the race is kept. An archived thread is left alone, and nothing here
-   * retries: a classification lost to a restart simply never happens.
+   * One badge run: it re-reads the thread, calls the host's classifier and, when that answers a
+   * listed badge for the title it was given, commits it in one transaction: `badge` is set, and the
+   * title becomes `<emoji> <verb>` only while it is still exactly "New thread", so a manual rename
+   * that won the race is kept. An answer that arrives after an abort is dropped, and so is one whose
+   * title the thread no longer has: a rename during a call always wins.
    */
-  function badge(thread: string, reason?: "rename"): void {
-    if (gateway.classifyThreadBadge === undefined || thread === APP_MAIN_THREAD || badging.has(thread)) return;
+  async function runBadge(thread: string, trigger: AppThreadBadgeTrigger): Promise<void> {
+    const classify = gateway.classifyThreadBadge;
+    if (classify === undefined) return;
     const state = core.state();
     const info = threadInfo(state, thread);
     if (info === undefined || info.archived) return;
-    // Only a rename reclassifies an already-badged thread; a first message never does.
-    if (reason !== "rename" && info.badge !== undefined) return;
-    const firstMessage = firstOwnerMessage(state, thread);
+    // Only a rename reclassifies an already-badged thread; a message never does.
+    if (trigger.reason !== "rename" && info.badge !== undefined) return;
+    const message = trigger.message ?? (trigger.reason === "rename" ? firstOwnerMessage(state, thread) : undefined);
+    const title = info.title;
+    const answer: unknown = await classify(
+      { title, ...(message === undefined ? {} : { firstMessage: message }) }, core.context,
+    );
+    // A stop or an abort between the answer and the commit abandons it: nothing is written.
+    if (core.stopped() || core.context.abortSignal?.aborted === true || !isThreadBadge(answer)) return;
+    await core.mutateState((doc) => {
+      const entry = threadInfo(doc, thread);
+      if (entry === undefined || entry.archived) return;
+      // The answer describes the title it was asked about; a rename since then makes it stale.
+      if (entry.title !== title) return;
+      if (trigger.reason !== "rename" && entry.badge !== undefined) return;
+      entry.badge = { emoji: answer.emoji, verb: answer.verb };
+      if (entry.title === NEW_THREAD_TITLE) entry.title = `${answer.emoji} ${answer.verb}`;
+      appendEvent(doc, { event: "thread", thread: { ...entry } });
+    });
+    core.publish();
+  }
+
+  /**
+   * The one badge trigger, off the request path. A trigger that arrives while a run is in flight is
+   * not dropped: the latest one is remembered and runs once more after that run finishes, so a
+   * rename made during a classification still replaces the badge it was racing.
+   */
+  function badge(thread: string, trigger: AppThreadBadgeTrigger = {}): void {
+    if (gateway.classifyThreadBadge === undefined || thread === APP_MAIN_THREAD || core.stopped()) return;
+    if (badging.has(thread)) {
+      badgeQueued.set(thread, trigger);
+      return;
+    }
     badging.add(thread);
-    const applied = async (answer: unknown): Promise<void> => {
-      if (!isThreadBadge(answer)) return;
-      await core.mutateState((doc) => {
-        const entry = threadInfo(doc, thread);
-        if (entry === undefined || entry.archived) return;
-        if (reason !== "rename" && entry.badge !== undefined) return;
-        entry.badge = { emoji: answer.emoji, verb: answer.verb };
-        if (entry.title === NEW_THREAD_TITLE) entry.title = `${answer.emoji} ${answer.verb}`;
-        appendEvent(doc, { event: "thread", thread: { ...entry } });
-      });
-      core.publish();
-    };
-    void gateway.classifyThreadBadge(
-      { title: info.title, ...(firstMessage === undefined ? {} : { firstMessage }) },
-      core.context,
-    ).then(applied, () => undefined)
-      // A failed commit (the adapter stopping, a durability fault) leaves the thread unbadged; the
-      // error itself is never journalled.
-      .catch(() => journalEvent("app.threadBadge.unapplied", { reason: "failed" }))
-      .finally(() => { badging.delete(thread); });
+    void (async () => {
+      // Any host failure around the whole task leaves the thread exactly as it was; the error and
+      // any returned value stay out of the journal, which gets one fixed reason instead.
+      try {
+        await runBadge(thread, trigger);
+      } catch {
+        journalEvent("app.threadBadge.unapplied", { reason: "failed" });
+      }
+      badging.delete(thread);
+      const next = badgeQueued.get(thread);
+      badgeQueued.delete(thread);
+      if (next !== undefined) badge(thread, next);
+    })();
   }
 
   return { create, rename, archive, scanIdle, badge, archiving: (thread) => archiving.has(thread) };

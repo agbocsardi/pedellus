@@ -1576,8 +1576,9 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       journalEvent("app.admitted", { "send.key": key, "queue.depth": state.pending.length });
       void releaseWithheld(thread);
       drain();
-      // The thread's first admitted owner message is the badge trigger; it never delays this send.
-      threads.badge(thread);
+      // The message this admission just stored is the badge trigger, handed over as its own text so
+      // no transcript read can supply a trimmed or wrong one; it never delays this send.
+      threads.badge(thread, { message: text });
     }
     return { kind: "admitted", duplicate };
   }
