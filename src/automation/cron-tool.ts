@@ -41,6 +41,7 @@ import {
   type CronScheduleInput,
   type CronScheduleReceipt,
   type CronWithdrawal,
+  CronRequestError,
   cronJobMatchesRequest,
 } from "./cron.js";
 import { CRON_DEFAULT_TIME_ZONE, CronScheduleError, cronScheduleText, parseCronInstant } from "./cron-schedule.js";
@@ -125,11 +126,12 @@ const reasonText = (error: unknown): string => error instanceof Error ? error.me
 
 /**
  * Whether a scheduling failure is an explicit request validation the model can act on (a malformed
- * or past schedule, a bad field): the foundation re-throws those as `TypeError`, and the schedule
- * parser as `CronScheduleError`. Anything else is an unexpected failure whose text stays internal.
+ * or past schedule, a bad field): the foundation and this tool throw those as `CronRequestError`,
+ * and the schedule parser as `CronScheduleError`. Anything else, including a plain `TypeError` from
+ * a malformed stored document, is an unexpected failure whose text stays internal.
  */
 const isRequestValidationError = (error: unknown): boolean =>
-  error instanceof TypeError || error instanceof CronScheduleError;
+  error instanceof CronRequestError || error instanceof CronScheduleError;
 
 function iso(ms: number | null): string {
   return ms === null ? "none" : new Date(ms).toISOString();
@@ -138,19 +140,19 @@ function iso(ms: number | null): string {
 function scheduleOf(args: CronToolArguments, zone: string): CronScheduleInput["schedule"] {
   const present = SCHEDULE_FIELDS.filter((field) => args[field] !== undefined);
   if (present.length === 0) {
-    throw new TypeError("add requires exactly one of at, after_seconds, every_seconds or cron_expr");
+    throw new CronRequestError("add requires exactly one of at, after_seconds, every_seconds or cron_expr");
   }
   if (present.length > 1) {
-    throw new TypeError(`add accepts one schedule, not ${present.join(" + ")}`);
+    throw new CronRequestError(`add accepts one schedule, not ${present.join(" + ")}`);
   }
   if (args.at !== undefined) return { kind: "at", at: parseCronInstant(args.at) };
   if (args.after_seconds !== undefined) {
     const seconds = args.after_seconds;
     if (!Number.isSafeInteger(seconds) || seconds <= 0) {
-      throw new TypeError("after_seconds must be a positive whole number of seconds");
+      throw new CronRequestError("after_seconds must be a positive whole number of seconds");
     }
     const afterMs = seconds * 1000;
-    if (!Number.isSafeInteger(afterMs)) throw new TypeError("after_seconds is too large");
+    if (!Number.isSafeInteger(afterMs)) throw new CronRequestError("after_seconds is too large");
     // The foundation resolves this once, at admission, against its own clock. The tool never
     // reads a clock, so a safe replay carries the same relative request and dedupes against the
     // original stored deadline.
@@ -159,19 +161,19 @@ function scheduleOf(args: CronToolArguments, zone: string): CronScheduleInput["s
   if (args.every_seconds !== undefined) {
     const seconds = args.every_seconds;
     if (!Number.isSafeInteger(seconds) || seconds <= 0) {
-      throw new TypeError("every_seconds must be a positive integer number of seconds");
+      throw new CronRequestError("every_seconds must be a positive integer number of seconds");
     }
     const everyMs = seconds * 1000;
-    if (!Number.isSafeInteger(everyMs)) throw new TypeError("every_seconds is too large");
+    if (!Number.isSafeInteger(everyMs)) throw new CronRequestError("every_seconds is too large");
     return { kind: "every", everyMs };
   }
   const expr = args.cron_expr;
   if (typeof expr !== "string" || expr.trim() === "") {
-    throw new TypeError("cron_expr must be a non-empty cron expression");
+    throw new CronRequestError("cron_expr must be a non-empty cron expression");
   }
   const timeZone = args.tz === undefined ? zone : args.tz;
   if (typeof timeZone !== "string" || timeZone.trim() === "") {
-    throw new TypeError("tz must be a non-empty IANA time zone name");
+    throw new CronRequestError("tz must be a non-empty IANA time zone name");
   }
   return { kind: "cron", expr: expr.trim(), timeZone: timeZone.trim() };
 }
