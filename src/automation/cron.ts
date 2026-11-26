@@ -581,6 +581,18 @@ function sameNormalizedRequest(job: CronJob, request: NormalizedRequest): boolea
     && silentOf(job) === request.silent
     && sameScheduleRequest(job, request.schedule);
 }
+/**
+ * Whether a stored job is exactly the job this request would create: the same message, name, mode,
+ * intent, delivery setting and schedule (after the same normalization admission applies). The
+ * idempotency key is not compared, so a caller can ask whether an older key names this very job.
+ */
+export function cronJobMatchesRequest(job: CronJob, request: CronScheduleInput): boolean {
+  try {
+    return sameNormalizedRequest(job, normalizeRequest({ owner: job.owner }, request));
+  } catch {
+    return false;
+  }
+}
 function parseOccurrenceInput(value: unknown): CronOccurrenceInput | undefined {
   if (!isRecord(value) || typeof value.jobId !== "string" || value.jobId === "") return undefined;
   if (!Number.isSafeInteger(value.scheduledAtMs)) return undefined;
