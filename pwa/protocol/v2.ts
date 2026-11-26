@@ -355,7 +355,9 @@ export function parseThreadInfo(raw: unknown): ThreadInfo | undefined {
   const origin = record(t.origin);
   if (t.origin !== undefined && (!origin || !validThreadId(origin.thread) || !isId(origin.messageId))) return undefined;
   if (t.archivedReason !== undefined && !oneOf(t.archivedReason, ["manual", "idle"] as const)) return undefined;
-  if (t.badge !== undefined && !validThreadBadge(t.badge)) return undefined;
+  // A badge is display metadata for a side thread only: `main` never carries one, not even from a
+  // gateway or state file that sends one anyway.
+  if (t.badge !== undefined && (t.id === MAIN_THREAD || !validThreadBadge(t.badge))) return undefined;
   const badge = t.badge as ThreadBadge | undefined;
   return {
     id: t.id, title: t.title, archived: t.archived, createdAt: t.createdAt, lastAt: t.lastAt,
@@ -365,11 +367,12 @@ export function parseThreadInfo(raw: unknown): ThreadInfo | undefined {
   };
 }
 
-/** One badge field: 1–`max` code points, not blank, no control or format character. */
+/** One badge field: 1–`max` code points, printable (no control, line or paragraph separator or
+ * other format character) and not blank. */
 function badgeText(value: unknown, max: number): value is string {
   if (typeof value !== "string") return false;
   const length = Array.from(value).length;
-  return length > 0 && length <= max && !/[\p{C}\p{Zl}\p{Zp}]/u.test(value);
+  return length > 0 && length <= max && !/[\p{C}\p{Zl}\p{Zp}]/u.test(value) && !/^\s+$/u.test(value);
 }
 
 /** A `ThreadInfo.badge`: exactly an emoji and a verb within their bounds. */
