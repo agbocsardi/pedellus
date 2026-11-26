@@ -11,7 +11,9 @@
 import { randomBytes } from "node:crypto";
 import type { Draft } from "@earendil-works/chord";
 import type { Conversation } from "@earendil-works/pi-durable";
+import { journalEvent } from "../observability.js";
 import { AskQuestionsDoc, cancelPendingQuestions } from "../questions/index.js";
+import { isThreadBadge } from "./app-badge.js";
 import type { AppChannelState, AppCore } from "./app.js";
 import { appendEvent, publishQuestionEvents, pruneKeys, requestIdFor, sessionForThread, threadOf } from "./app.js";
 import {
@@ -27,6 +29,9 @@ import {
 /** A fork or first admission would exceed the host's snapshot-slot cap; nothing was created. */
 export class AppThreadCapacityError extends Error {}
 class ThreadCreateConflict extends Error {}
+
+/** The title `thread.create` gives a thread that has none; a badge replaces it while it is unchanged. */
+export const NEW_THREAD_TITLE = "New thread";
 
 export function threadInfo(doc: AppChannelState, thread: string): AppThreadInfo | undefined {
   return doc.threads?.find((entry) => entry.id === thread);
@@ -61,6 +66,12 @@ export interface AppThreads {
   archive(frame: Record<string, unknown>, sendOk: Reply, sendError: Refuse): Promise<void>;
   /** Archive every open side thread idle past the configured age with nothing pending or running. */
   scanIdle(): Promise<void>;
+  /**
+   * Classify a badge for one side thread off the request path: its first owner message, or its new
+   * title after a rename. A no-op without the host's classifier and on `main`; `rename` replaces an
+   * existing badge, while the first-message trigger only ever supplies a missing one.
+   */
+  badge(thread: string, reason?: "rename"): void;
   /** Whether a manual archive or restore of this thread is in progress. */
   archiving(thread: string): boolean;
 }
@@ -80,10 +91,12 @@ export function createAppThreads(options: {
   const { core } = options;
   const { gateway, now } = core;
   const archiving = new Set<string>();
+  /** Threads with a classification in flight; one per thread, and never a second on rename. */
+  const badging = new Set<string>();
 
   async function create(frame: Record<string, unknown>, sendOk: Reply, sendError: Refuse): Promise<void> {
     const key = frame.key;
-    const title = frame.title === undefined ? "New thread" : frame.title;
+    const title = frame.title === undefined ? NEW_THREAD_TITLE : frame.title;
     if (typeof key !== "string" || !APP_LIMITS.idPattern.test(key) || !validThreadTitle(title)) {
       return sendError("bad_request");
     }
@@ -160,6 +173,8 @@ export function createAppThreads(options: {
     if (!found) return sendError("bad_request");
     sendOk();
     core.publish();
+    // The new title is the strongest signal; the first message sharpens it when still retained.
+    badge(thread, "rename");
   }
 
   async function archive(frame: Record<string, unknown>, sendOk: Reply, sendError: Refuse): Promise<void> {
@@ -248,5 +263,51 @@ export function createAppThreads(options: {
     core.publish();
   }
 
-  return { create, rename, archive, scanIdle, archiving: (thread) => archiving.has(thread) };
+  /** This thread's first retained owner message, or `undefined` when none is at hand. */
+  function firstOwnerMessage(doc: AppChannelState, thread: string): string | undefined {
+    for (const event of doc.events) {
+      if (event.event === "message" && event.role === "user" && threadOf(event) === thread) return event.text;
+    }
+    return undefined;
+  }
+
+  /**
+   * The one badge trigger, off the request path. It reads the thread once, calls the host's
+   * classifier and, when that answers a listed badge, commits it in one transaction: `badge` is
+   * set, and the title becomes `<emoji> <verb>` only while it is still exactly "New thread", so a
+   * manual rename that won the race is kept. An archived thread is left alone, and nothing here
+   * retries: a classification lost to a restart simply never happens.
+   */
+  function badge(thread: string, reason?: "rename"): void {
+    if (gateway.classifyThreadBadge === undefined || thread === APP_MAIN_THREAD || badging.has(thread)) return;
+    const state = core.state();
+    const info = threadInfo(state, thread);
+    if (info === undefined || info.archived) return;
+    // Only a rename reclassifies an already-badged thread; a first message never does.
+    if (reason !== "rename" && info.badge !== undefined) return;
+    const firstMessage = firstOwnerMessage(state, thread);
+    badging.add(thread);
+    const applied = async (answer: unknown): Promise<void> => {
+      if (!isThreadBadge(answer)) return;
+      await core.mutateState((doc) => {
+        const entry = threadInfo(doc, thread);
+        if (entry === undefined || entry.archived) return;
+        if (reason !== "rename" && entry.badge !== undefined) return;
+        entry.badge = { emoji: answer.emoji, verb: answer.verb };
+        if (entry.title === NEW_THREAD_TITLE) entry.title = `${answer.emoji} ${answer.verb}`;
+        appendEvent(doc, { event: "thread", thread: { ...entry } });
+      });
+      core.publish();
+    };
+    void gateway.classifyThreadBadge(
+      { title: info.title, ...(firstMessage === undefined ? {} : { firstMessage }) },
+      core.context,
+    ).then(applied, () => undefined)
+      // A failed commit (the adapter stopping, a durability fault) leaves the thread unbadged; the
+      // error itself is never journalled.
+      .catch(() => journalEvent("app.threadBadge.unapplied", { reason: "failed" }))
+      .finally(() => { badging.delete(thread); });
+  }
+
+  return { create, rename, archive, scanIdle, badge, archiving: (thread) => archiving.has(thread) };
 }

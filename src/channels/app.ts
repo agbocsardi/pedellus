@@ -126,6 +126,7 @@ import {
   type AppErrorCode,
   type AppPairingRecord,
   type AppPendingInput,
+  type AppThreadBadge,
   type AppThreadInfo,
   type AppThreadOrigin,
   type AppActivityStep,
@@ -141,6 +142,7 @@ import {
   type AppMediaOptions,
 } from "./app-files.js";
 import { createAppActionHost } from "./app-actions.js";
+import type { ThreadBadgeRequest } from "./app-badge.js";
 import { createAppDevices, type AppConsole } from "./app-devices.js";
 import { canOpenSideThread, createAppThreads, openThread, setArchived, threadInfo } from "./app-threads.js";
 import type { AppActionRegistry } from "./app-tool.js";
@@ -275,6 +277,11 @@ export interface AppGateway extends Omit<ChannelGateway, "harness"> {
   appSnapshotRoom?(tx: Tx): Promise<boolean>;
   /** Create the thread's mapping and snapshot now; `full` reports the snapshot-slot cap. */
   reserveAppThread?(thread: string, context: Context): Promise<"ok" | "full">;
+  /**
+   * One off-request-path classification of an app side thread: a fixed-list badge emoji and verb
+   * from its title and, when at hand, its first owner message. Absent leaves badges off.
+   */
+  classifyThreadBadge?(request: ThreadBadgeRequest, context: Context): Promise<AppThreadBadge | undefined>;
   /** Read-only host preset catalog (no conversation involved); `undefined` without named presets. */
   modelPresets?(): GatewayModelPresets | undefined;
   /** Read-only selected model of a mapped key; `undefined` when unmapped, rejects when unreadable. */
@@ -1569,6 +1576,8 @@ export async function runApp(gateway: AppGateway, options: AppOptions, context: 
       journalEvent("app.admitted", { "send.key": key, "queue.depth": state.pending.length });
       void releaseWithheld(thread);
       drain();
+      // The thread's first admitted owner message is the badge trigger; it never delays this send.
+      threads.badge(thread);
     }
     return { kind: "admitted", duplicate };
   }
