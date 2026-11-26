@@ -38,13 +38,13 @@ try {
   await pair(page, stack.url, PAIR_CODE);
 
   for (let run = 1; run <= RUNS; run++) {
-    await page.getByRole("button", { name: /New thread/ }).click();
-    await page.fill("#thread-title", `long ${run}`);
-    await page.getByRole("button", { name: "Create thread" }).click();
-    // The new thread is open once its title is in the header.
+    // New threads are created untitled, without a form.
+    await page.getByRole("button", { name: /^New thread Start/ }).click();
+    // The new thread is open once the header names it and it has no messages yet.
     await page.waitForFunction(
-      (title) => document.querySelector(".switch-title")?.textContent === title,
-      `long ${run}`,
+      () => document.querySelector(".switch-title")?.textContent === "New thread" &&
+        !document.querySelector(".msg[data-message-id]"),
+      null,
       { timeout: 20_000 },
     );
     await page.waitForSelector('textarea[aria-label="Message"]:not([disabled])');
