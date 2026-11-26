@@ -42,6 +42,7 @@ import { MEMORY_TOOL_NAMES, type MemoryService } from "./memory/contracts.js";
 import { TELEGRAM_TOOL_NAME, createTelegramActionRegistry, createTelegramTool } from "./channels/telegram-tool.js";
 import { DISCORD_HISTORY_TOOL_NAME, createDiscordHistoryRegistry, createDiscordHistoryTool } from "./channels/discord-history.js";
 import { APP_TOOL_NAME, createAppActionRegistry, createAppTool } from "./channels/app-tool.js";
+import { classifyThreadBadge, type ThreadBadgeRequest } from "./channels/app-badge.js";
 import {
   AppThreadCapacityError,
   appForkAdmissible,
@@ -886,6 +887,12 @@ export async function openGateway(config: PortConfig, context: Context, options:
       ...(discordHistory === undefined ? {} : { discordHistory }),
       ...(appConsole === undefined ? {} : { appConsole }),
       ...(appActions === undefined ? {} : { appActions }),
+      // App thread badges: one off-path classifier call, only with the explicit app opt-in and the
+      // one configured classifier. Without either, the channel never offers to classify anything.
+      ...(config.app?.threadBadges === true && classifierGrant !== undefined ? {
+        classifyThreadBadge: (request: ThreadBadgeRequest, ctx: Context) =>
+          classifyThreadBadge({ models: () => modelHost.state().models, classifier: classifierGrant }, request, ctx),
+      } : {}),
       // The rollover starts after resume; until then (and without config) there is nothing to decide.
       beforeOwnerInput: async (sessionKey, conversationId, content, ctx) =>
         idleRollover?.beforeOwnerInput(sessionKey, conversationId, content, ctx),

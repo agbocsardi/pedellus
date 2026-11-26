@@ -453,6 +453,12 @@ export interface PortConfig {
     /** Optional absolute directory holding custom avatar sprites and app icons. */
     readonly avatarDir?: string;
     /**
+     * Opt-in classifier badges for side threads. One off-path classifier call picks an emoji and a
+     * verb from fixed lists, and a thread still titled "New thread" becomes "<emoji> <verb>".
+     * Requires `classifierModel`; absent means no classification at all.
+     */
+    readonly threadBadges?: boolean;
+    /**
      * Optional Web Push: off unless this block exists and its private key variable is set at
      * gateway start. The private key itself is named here, never stored in config.
      */
@@ -1260,6 +1266,11 @@ export function parseConfig(value: unknown, baseDir = process.cwd()): PortConfig
   }
   if (raw.app !== undefined) {
     config.app = appConfig(raw.app);
+    // Thread badges classify the thread's first owner message with the one configured classifier;
+    // there is no fallback model, so the pair is a pure config cross-check.
+    if (config.app.threadBadges === true && classifierModel === undefined) {
+      throw new Error("app.threadBadges requires classifierModel");
+    }
   }
   if (raw.web !== undefined) {
     config.web = parseWebConfig(raw.web);
@@ -1416,7 +1427,7 @@ function discordConfig(value: unknown): NonNullable<PortConfig["discord"]> {
 }
 
 /** Exactly the accepted `app` keys; an unknown key is a typo that must not silently widen access. */
-const APP_KEYS = ["port", "staticRoot", "autoArchiveDays", "agentName", "avatarDir", "push"] as const;
+const APP_KEYS = ["port", "staticRoot", "autoArchiveDays", "agentName", "avatarDir", "threadBadges", "push"] as const;
 /** Exactly the accepted `app.push` keys; the private key is an environment variable name. */
 const APP_PUSH_KEYS = ["subject", "publicKey", "privateKeyEnv"] as const;
 
@@ -1463,12 +1474,17 @@ function appConfig(value: unknown): NonNullable<PortConfig["app"]> {
     avatarDir = resolve(a.avatarDir);
   }
   const push = a.push === undefined ? undefined : appPushConfig(a.push);
+  const threadBadges = a.threadBadges === undefined ? false : a.threadBadges;
+  if (typeof threadBadges !== "boolean") {
+    throw new Error("app.threadBadges must be true or false");
+  }
   return Object.freeze({
     port: a.port,
     staticRoot,
     autoArchiveDays,
     agentName,
     ...(avatarDir === undefined ? {} : { avatarDir }),
+    ...(threadBadges ? { threadBadges: true } : {}),
     ...(push === undefined ? {} : { push }),
   });
 }
