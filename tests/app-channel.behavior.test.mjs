@@ -1154,7 +1154,9 @@ test('a reopened gateway recovers an interrupted side turn and routes its notice
   }
 });
 
-test('a cron job created by an app side turn delivers back to that thread', { timeout: 15_000 }, async () => {
+test('a cron job created in an app side thread is placed in Main, runs there and delivers there', { timeout: 25_000 }, async () => {
+  const { CronJobsDoc } = await import(new URL('../dist/automation/cron.js', import.meta.url).href);
+  const { CronDeliveriesDoc } = await import(new URL('../dist/automation/cron-delivery.js', import.meta.url).href);
   await withChannel('side-cron', { cron: true }, async ({ base, store }) => {
     const device = await connectV2(base, await pairedDevice(store, base));
     const side = await createSide(device, 'cron');
@@ -1162,20 +1164,92 @@ test('a cron job created by an app side turn delivers back to that thread', { ti
       () => fauxAssistantMessage([fauxToolCall('cron', {
         action: 'add', message: 'test reminder', at: new Date(Date.now() + 1_000).toISOString(),
       }, { id: 'add-reminder' })], { stopReason: 'toolUse' }),
-      () => fauxAssistantMessage('Reminder scheduled.'),
+      () => fauxAssistantMessage('Reminder scheduled in Main.'),
       () => fauxAssistantMessage('SIDE-CRON-RESULT'),
     ]);
     assert.equal((await request(device, 'add-job', 'send', { thread: side, key: 'add-job', text: 'Add a reminder' })).ok, true);
     await device.wait(() => device.events('settled').some((event) => event.key === 'add-job'), 'cron tool turn settled');
+
+    // The job is Main's: its document and session key live there, the side thread holds no job, and
+    // the model-facing receipt names the chat the job was added to.
+    const main = await store.gateway.conversationFor(APP_CHAT_SESSION_KEY, context);
+    const sideChat = await store.gateway.conversationFor(`app:chat:${side}`, context);
+    const jobs = await store.gateway.harness.snapshot(CronJobsDoc, main.id, context);
+    assert.equal(jobs.jobs.length, 1, 'one job in Main\'s document');
+    assert.equal(jobs.jobs[0].owner.sessionKey, APP_CHAT_SESSION_KEY);
+    const sideJobs = await store.gateway.harness.snapshot(CronJobsDoc, sideChat.id, context);
+    assert.equal(sideJobs?.jobs.length ?? 0, 0, 'the side thread owns no cron job');
+    assert.ok(JSON.stringify(store.captured).includes('Scheduled in Main.'), 'the receipt names Main');
+
+    // Archiving the side thread touches nothing about the job, its timer or its target.
     assert.equal((await request(device, 'archive-cron', 'thread.archive', { thread: side, archived: true })).ok, true);
-    await device.wait(() => device.events('message').some((event) => event.text === 'SIDE-CRON-RESULT'), 'scheduled result');
+
+    // The run settles in its own automation conversation and its result waits in Main's outbox: the
+    // app channel never appends into a chat without its own admission evidence. One Main message
+    // releases it, in Main.
+    await untilAsync(async () => {
+      const doc = await store.gateway.harness.snapshot(CronDeliveriesDoc, main.id, context);
+      return doc?.deliveries?.some((record) => record.id.startsWith('cron:')) === true;
+    }, 'the scheduled result was admitted to Main\'s outbox');
+    assert.equal(device.events('message').some((event) => event.text === 'SIDE-CRON-RESULT'), false,
+      'nothing is delivered before Main has admission evidence');
+    assert.equal((await request(device, 'main-input', 'send', { key: 'main-input', text: 'hello main' })).ok, true);
+    await device.wait(() => device.events('message').some((event) => event.text === 'SIDE-CRON-RESULT'), 'scheduled result in Main');
     const result = device.events('message').find((event) => event.text === 'SIDE-CRON-RESULT');
-    assert.deepEqual([result.thread, result.role, result.key], [side, 'assistant', undefined]);
+    assert.deepEqual([result.thread, result.role, result.key], ['main', 'assistant', undefined]);
     assert.ok(result.id.startsWith('outbox:'));
+    // Delivering into Main never reopens or restores the archived side thread that scheduled it.
     const lifecycle = device.events('thread').filter((event) => event.thread.id === side);
-    assert.deepEqual(lifecycle.map((event) => event.thread.archived), [false, true, false]);
-    assert.ok(lifecycle[2].cursor < result.cursor);
-    assert.equal(lifecycle[2].thread.archivedReason, undefined);
+    assert.deepEqual(lifecycle.map((event) => event.thread.archived), [false, true]);
+    await device.close();
+  });
+});
+
+test('cron list and add from an app side thread address Main\'s jobs', { timeout: 25_000 }, async () => {
+  const { CronJobsDoc } = await import(new URL('../dist/automation/cron.js', import.meta.url).href);
+  await withChannel('side-cron-list', { cron: true }, async ({ base, store }) => {
+    const device = await connectV2(base, await pairedDevice(store, base));
+    const side = await createSide(device, 'cron-list');
+    const lastUser = (messages) => {
+      for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index];
+        if (message.role !== 'user') continue;
+        return typeof message.content === 'string'
+          ? message.content
+          : (message.content ?? []).map((part) => (part.type === 'text' ? part.text : '')).join('');
+      }
+      return '';
+    };
+    let added = false;
+    // Route on the owner's own input, so a turn never consumes another turn's step.
+    store.script(Array.from({ length: 8 }, () => (request) => {
+      const input = lastUser(request.messages);
+      if (input.includes('add standup') && !added) {
+        added = true;
+        return fauxAssistantMessage([fauxToolCall('cron', {
+          action: 'add', message: 'standup reminder', name: 'Standup', every_seconds: 3600,
+        }, { id: 'side-add' })], { stopReason: 'toolUse' });
+      }
+      if (input.includes('which jobs')) {
+        return fauxAssistantMessage([fauxToolCall('cron', { action: 'list' }, { id: 'side-list' })], { stopReason: 'toolUse' });
+      }
+      return fauxAssistantMessage('synthetic reply');
+    }));
+    const turn = async (key, text) => {
+      assert.equal((await request(device, key, 'send', { thread: side, key, text })).ok, true);
+      await device.wait(() => device.events('settled').some((event) => event.key === key), `${key} settled`);
+    };
+    await turn('add-standup', 'add standup');
+    await turn('which-jobs', 'which jobs');
+
+    // The job exists once, in Main, and the side thread's `list` read it from there.
+    const main = await store.gateway.conversationFor(APP_CHAT_SESSION_KEY, context);
+    const jobs = await store.gateway.harness.snapshot(CronJobsDoc, main.id, context);
+    assert.deepEqual(jobs.jobs.map((job) => job.name), ['Standup']);
+    assert.equal(jobs.jobs[0].owner.sessionKey, APP_CHAT_SESSION_KEY);
+    const transcript = JSON.stringify(store.captured);
+    assert.ok(transcript.includes('Scheduled in Main.'), 'the add receipt names Main');
+    assert.ok(transcript.includes('Standup'), 'the side thread\'s list shows Main\'s job');
     await device.close();
   });
 });

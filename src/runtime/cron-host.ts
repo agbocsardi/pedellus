@@ -19,7 +19,7 @@ import {
 } from "@earendil-works/pi-durable";
 import { createCronFoundation, type CronFoundation } from "../automation/cron.js";
 import { automationConversationOf, CronConversationDoc } from "../automation/cron-conversations.js";
-import { createCronTool } from "../automation/cron-tool.js";
+import { createCronTool, type CronToolOrigin } from "../automation/cron-tool.js";
 import {
   CRON_DELIVERY_MAX_TEXT_CHARS,
   CronDeliveriesDoc,
@@ -56,6 +56,12 @@ export interface CronHostOptions {
   readonly contextHost: ContextHost;
   readonly harness: () => HarnessType;
   readonly memoryDigest: () => MemoryDigest;
+  /**
+   * The app channel's Main chat conversation, resolved through the gateway's ordinary mapped-chat
+   * admission (which may create and admit it, as a first Main message would). Absent when the app
+   * channel is not configured, and then no side-thread key exists either.
+   */
+  readonly appMainConversation?: (context: Context) => Promise<Conversation | undefined>;
 }
 
 export function createCronHost(options: CronHostOptions) {
@@ -225,7 +231,28 @@ export function createCronHost(options: CronHostOptions) {
   });
   const tool = createCronTool({
     foundation,
-    ownerFor: (conversationId) => registry.cronOwner(conversationId),
+    // An app side thread is short-lived; its scheduled work belongs to the app's Main chat, so the
+    // job document, the captured authority, every origin-mode answer and every delivery resolve
+    // there. The redirect is one narrow hop inside the same channel and the same chat policy, and it
+    // never happens for a conversation the registry does not name as an authenticated mapped chat.
+    originFor: async (conversationId, ctx): Promise<CronToolOrigin | undefined> => {
+      const owner = registry.cronOwner(conversationId);
+      if (owner === undefined) return undefined;
+      if (!isAppSideThreadSessionKey(owner.sessionKey)) return { conversationId, owner };
+      if (options.appMainConversation === undefined) {
+        throw new Error("the app Main chat is not available");
+      }
+      const main = await options.appMainConversation(ctx);
+      const mainOwner = main === undefined ? undefined : registry.cronOwner(main.id);
+      // Fail closed unless Main is a different conversation and an ordinary app chat. A session map
+      // that points Main at this very side thread is refused here; every other mis-mapping is caught
+      // by the ordinary mapped-chat admission that resolved it.
+      if (main === undefined || mainOwner === undefined || main.id === conversationId
+          || isAppSideThreadSessionKey(mainOwner.sessionKey)) {
+        throw new Error("the app Main chat could not be prepared");
+      }
+      return { conversationId: main.id, owner: mainOwner, label: "Main" };
+    },
     harness: options.harness,
     ...(options.timeZone === undefined ? {} : { timeZone: options.timeZone }),
     digestAvailable: (conversationId) => options.digestConfigured

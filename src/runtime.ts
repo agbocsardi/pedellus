@@ -42,6 +42,7 @@ import { MEMORY_TOOL_NAMES, type MemoryService } from "./memory/contracts.js";
 import { TELEGRAM_TOOL_NAME, createTelegramActionRegistry, createTelegramTool } from "./channels/telegram-tool.js";
 import { DISCORD_HISTORY_TOOL_NAME, createDiscordHistoryRegistry, createDiscordHistoryTool } from "./channels/discord-history.js";
 import { APP_TOOL_NAME, createAppActionRegistry, createAppTool } from "./channels/app-tool.js";
+import { APP_CHAT_SESSION_KEY } from "./channels/app.js";
 import {
   AppThreadCapacityError,
   appForkAdmissible,
@@ -443,6 +444,10 @@ export async function openGateway(config: PortConfig, context: Context, options:
   });
   const { extensionsPolicy, toolFilterFor } = authority;
   const memoryDigestRef: { current?: MemoryDigest } = {};
+  // The gateway object is built after this host, so the app Main resolver is late-bound: a scheduled
+  // job created in an app side thread re-homes to Main, whose conversation only the gateway's own
+  // mapped-chat admission can resolve.
+  const appMainRef: { current?: (context: Context) => Promise<Conversation | undefined> } = {};
   const cronHost = cronEnabled ? createCronHost({
     now,
     ownerSteering: config.followUpMode === "steer",
@@ -456,6 +461,11 @@ export async function openGateway(config: PortConfig, context: Context, options:
     contextHost,
     harness: openHarness,
     memoryDigest: () => memoryDigestRef.current!,
+    // A scheduled job created from an app side thread re-homes to Main: side threads are short-lived
+    // and scheduled results belong in the chat that outlives them.
+    ...(config.app === undefined ? {} : {
+      appMainConversation: (ctx: Context) => appMainRef.current?.(ctx) ?? Promise.resolve(undefined),
+    }),
   }) : undefined;
   // Bounded ordinary background workers. The foundation owns the Durable task, its child conversation
   // and the internal result event; the host supplies capture, model, workspace and retirement. A
@@ -1030,6 +1040,9 @@ export async function openGateway(config: PortConfig, context: Context, options:
         if (failure !== undefined) throw failure.error;
       },
     };
+    // A later tool call in a side thread can now resolve Main through the ordinary mapped-chat
+    // admission, exactly as a Main message would.
+    appMainRef.current = (ctx: Context) => gateway.conversationFor(APP_CHAT_SESSION_KEY, ctx);
     await history.settleSummaries(context);
     // Scheduling begins only after the registry and all persisted conversation policies are ready.
     memoryServiceRef.current = history.memoryService;
