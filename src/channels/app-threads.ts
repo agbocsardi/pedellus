@@ -165,6 +165,20 @@ export function createAppThreads(options: {
     sendOk({ thread, duplicate: false });
     core.publish();
     await options.pushModelEvents([thread]);
+    // A fork is badged from the message it was forked at, so it gets its `<emoji> <verb>` title
+    // before the owner writes in it; an empty thread waits for its first owner message.
+    if (from !== undefined) {
+      const source = forkSourceText(core.state(), from);
+      if (source !== undefined) badge(thread, { message: source });
+    }
+  }
+
+  /** The retained text of the message a fork was made at (its first part when split). */
+  function forkSourceText(doc: AppChannelState, from: AppThreadOrigin): string | undefined {
+    for (const event of doc.events) {
+      if (event.event === "message" && event.id === from.messageId && threadOf(event) === from.thread) return event.text;
+    }
+    return undefined;
   }
 
   async function rename(frame: Record<string, unknown>, sendOk: Reply, sendError: Refuse): Promise<void> {

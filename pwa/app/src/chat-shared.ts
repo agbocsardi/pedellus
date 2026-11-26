@@ -1,6 +1,6 @@
 import { useCallback, useLayoutEffect, useRef } from "react";
 import type { AvatarState } from "./Avatar";
-import { LIMITS, type CommandInfo, type PresetInfo, type ThreadId } from "./protocol";
+import { type CommandInfo, type PresetInfo, type ThreadId } from "./protocol";
 import type { AgentStatus, Store } from "./store";
 
 export const FINE_POINTER = matchMedia("(pointer: fine)").matches;
@@ -41,12 +41,6 @@ export function clock(at: string | number | undefined): string {
   if (at === undefined) return "";
   const d = new Date(at);
   return Number.isNaN(d.getTime()) ? "" : TIME.format(d);
-}
-
-/** A side-thread title from message text: one line, nothing the gateway's title rule refuses. */
-export function suggestedTitle(text: string) {
-  return text.replace(/[\p{Cf}\p{Co}\p{Cn}\p{Cs}]/gu, "").replace(/[\p{Cc}\p{Zl}\p{Zp}\s]+/gu, " ").trim()
-    .slice(0, LIMITS.threadTitleChars).replace(/[\uD800-\uDBFF]$/u, "").trimEnd();
 }
 
 export type CommandState = { online: boolean; writable: boolean; running: boolean };

@@ -177,7 +177,9 @@ its title is still exactly `New thread` the title becomes `<emoji> <verb>`. One 
 the configured `classifierModel` picks one emoji and one verb from fixed gateway lists, from the
 thread's title and the owner message that triggered it: the first owner message admitted into the
 thread, or a later one when no badge was set yet, so a classification lost to a failure or a
-restart is recovered by the thread's next message. `thread.rename` classifies the new title again
+restart is recovered by the thread's next message. A fork (`thread.create {from}`) is classified
+right after it is created, from the retained text of the message it was forked at, so it is titled
+before the owner writes in it. The app creates threads without asking for a title. `thread.rename` classifies the new title again
 (and the first message when it is still retained), keeping the manual title. That message is the
 one the send admitted, handed over directly, never re-read from the transcript. The call runs off
 the request path and never delays or blocks the send or its turn: a failure, an abort or a

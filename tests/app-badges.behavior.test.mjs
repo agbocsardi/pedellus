@@ -196,8 +196,10 @@ test('a rename classifies the new title, keeps it, and a rename during one call 
     key: 't2', from: { thread: 'main', messageId: 'send:main-1' },
   });
   assert.equal(forked.ok, true, JSON.stringify(forked));
-  await request(device, 'send-2', 'send', { key: 'side-2', thread: forked.thread, text: 'the build is broken' });
+  // The fork is classified at once from the message it was forked at; that call is the held one.
   await untilAsync(() => channel.classifier.calls.length === 3, 'held classification started');
+  assert.deepEqual(channel.classifier.calls[2].state, { title: 'New thread', firstMessage: 'good morning' });
+  await request(device, 'send-2', 'send', { key: 'side-2', thread: forked.thread, text: 'the build is broken' });
   await request(device, 'rename-3', 'thread.rename', { thread: forked.thread, title: 'Build failure' });
   release();
   channel.classifier.hold = undefined;

@@ -9,8 +9,7 @@ import { ThreadList } from "./ThreadList";
 import { CommandItem, Icon, PLUS_ICON, SheetItem } from "./ui";
 
 export type Sheet = { kind: "list" | "menu" | "tools" | "tasks" | "confirm-new" | "model" } | { kind: "rename"; title: string }
-  | { kind: "create"; title: string; from?: ThreadOrigin }
-  | { kind: "message"; title: string; from: ThreadOrigin };
+  | { kind: "message"; from: ThreadOrigin };
 
 const LIST_ICON = "M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01";
 const BELL_ICON = "M18 14v-3.5a6 6 0 1 0-12 0V14l-2 3.5h16L18 14M10 21h4";
@@ -19,7 +18,7 @@ const CHECK_ICON = "M5 12.5 10 17 19 7";
 
 const TITLES: Record<Sheet["kind"], string> = {
   list: "Threads", menu: "Thread menu", tasks: "Tasks", message: "Message actions", tools: "Commands",
-  model: "Model", "confirm-new": "New context", rename: "Rename thread", create: "New thread",
+  model: "Model", "confirm-new": "New context", rename: "Rename thread",
 };
 
 /** A typed title the gateway would refuse; blank is "no title" for a new thread. */
@@ -38,13 +37,15 @@ export function SheetHost(props: {
   runCommand: (c: CommandInfo) => void;
   toggleArchive: () => void;
   saveTitle: (title: string) => void;
+  /** Start a side thread right away, untitled (the gateway badges and titles it); `from` forks. */
+  createThread: (from?: ThreadOrigin) => void;
 }) {
   const { sheet, store, conn, thread, online, writable, archived, cmdState, commands, model, pendingModel } = props;
   return (
     <Modal opener={props.opener} panel={sheet.kind} title={TITLES[sheet.kind]} dismiss={props.dismiss}>
       <div className="sheet-grip" aria-hidden="true" />
       {sheet.kind === "list" && !props.wide && <ThreadList store={store} conn={conn} online={online}
-        onNew={() => props.show({ kind: "create", title: "" })} onSelect={props.select} />}
+        onNew={() => props.createThread()} onSelect={props.select} />}
       {sheet.kind === "menu" && <>
         {writable && <>
           {commands.some((c) => c.name === "new") && <SheetItem icon={PLUS_ICON} title="New context"
@@ -100,9 +101,9 @@ export function SheetHost(props: {
       </>}
       {sheet.kind === "message" && <SheetItem icon={LIST_ICON} title="Start side thread from here"
         sub="Fork the conversation at this message"
-        onClick={() => props.show({ kind: "create", title: sheet.title, from: sheet.from })} />}
-      {(sheet.kind === "create" || sheet.kind === "rename") && (
-        <ThreadTitleForm key={sheet.kind} kind={sheet.kind} initial={sheet.title} busy={props.busy} online={online} save={props.saveTitle} />
+        onClick={() => props.createThread(sheet.from)} />}
+      {sheet.kind === "rename" && (
+        <ThreadTitleForm initial={sheet.title} busy={props.busy} online={online} save={props.saveTitle} />
       )}
       {props.error && <p className="error-text" role="alert">{props.error}</p>}
       <button className="sheet-cancel" onClick={props.dismiss}>
@@ -126,7 +127,7 @@ function Modal({ title, panel, opener, dismiss, children }: {
   }, [opener]);
   useLayoutEffect(() => {
     const dialog = ref.current!;
-    const selector = panel === "list" ? ".thread-search" : panel === "create" || panel === "rename" ? "#thread-title" : ".sheet-item:not(:disabled)";
+    const selector = panel === "list" ? ".thread-search" : panel === "rename" ? "#thread-title" : ".sheet-item:not(:disabled)";
     (dialog.querySelector<HTMLElement>(selector) ?? dialog.querySelector<HTMLElement>(".sheet-cancel"))?.focus();
   }, [panel]);
   return (
@@ -138,20 +139,17 @@ function Modal({ title, panel, opener, dismiss, children }: {
   );
 }
 
-function ThreadTitleForm({ kind, initial, busy, online, save }: {
-  kind: "create" | "rename"; initial: string; busy: boolean; online: boolean; save: (title: string) => void;
+function ThreadTitleForm({ initial, busy, online, save }: {
+  initial: string; busy: boolean; online: boolean; save: (title: string) => void;
 }) {
   const [title, setTitle] = useState(initial);
-  const create = kind === "create";
   return <form className="thread-form" onSubmit={(e) => { e.preventDefault(); save(title); }}>
-    <h2 className="sheet-heading">{create ? "New thread" : "Rename thread"}</h2>
-    <label htmlFor="thread-title">{create ? "Title (optional)" : "Title"}</label>
+    <h2 className="sheet-heading">Rename thread</h2>
+    <label htmlFor="thread-title">Title</label>
     <input id="thread-title" value={title} onChange={(e) => setTitle(e.target.value)}
       maxLength={LIMITS.threadTitleChars} placeholder="New thread" />
-    {!online && <p className="sheet-help">{create ? "This thread will sync when you reconnect." : "Reconnect to rename this thread."}</p>}
-    <button className="primary" disabled={busy || badTitle(title) || (!create && (!online || !title.trim()))}>
-      {create ? "Create thread" : "Save title"}
-    </button>
+    {!online && <p className="sheet-help">Reconnect to rename this thread.</p>}
+    <button className="primary" disabled={busy || badTitle(title) || !online || !title.trim()}>Save title</button>
   </form>;
 }
 

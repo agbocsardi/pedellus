@@ -8,7 +8,7 @@ import {
 import { Composer, type ComposerHandle } from "./Composer";
 import type { Connection } from "./conn";
 import { MessageList } from "./MessageList";
-import { LIMITS, MAIN_THREAD, type CommandInfo } from "./protocol";
+import { LIMITS, MAIN_THREAD, type CommandInfo, type ThreadOrigin } from "./protocol";
 import { clearAppBadge } from "./push";
 import { badTitle, SheetHost, type Sheet } from "./Sheets";
 import type { Store } from "./store";
@@ -139,23 +139,32 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
     setBusy(true);
     setError("");
     try {
-      if (sheet?.kind === "rename") {
-        if (!name) return;
-        if (!(await conn.rename(thread, name))?.ok) {
-          setError("Could not rename this thread. Check the connection and try again.");
-          return;
-        }
-        setSheet(null);
-      } else {
-        const count = [...store.threads.values()].filter((t) => t.id !== MAIN_THREAD && !t.archived).length;
-        if (count >= LIMITS.maxOpenThreads) {
-          setError("Archive a side thread before creating another.");
-          return;
-        }
-        const create = await store.queueCreate(name || undefined, sheet?.kind === "create" ? sheet.from : undefined);
-        setSheet(wide ? null : { kind: "list" });
-        conn.sendCreate(create, online ? thread : undefined);
+      if (sheet?.kind !== "rename" || !name) return;
+      if (!(await conn.rename(thread, name))?.ok) {
+        setError("Could not rename this thread. Check the connection and try again.");
+        return;
       }
+      setSheet(null);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /** No title prompt: the gateway names it `<emoji> <verb>` from the fork point or first message. */
+  async function createThread(from?: ThreadOrigin) {
+    if (busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      const count = [...store.threads.values()].filter((t) => t.id !== MAIN_THREAD && !t.archived).length;
+      if (count >= LIMITS.maxOpenThreads) {
+        setError("Archive a side thread before creating another.");
+        return;
+      }
+      const create = await store.queueCreate(undefined, from);
+      // Online, the new thread opens on its ack; offline, the list shows it waiting.
+      setSheet(wide || online ? null : { kind: "list" });
+      conn.sendCreate(create, online ? thread : undefined);
     } catch (err) {
       setError(err instanceof DOMException && err.name === "QuotaExceededError"
         ? "Not enough storage on this device for these files."
@@ -270,7 +279,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
   return (
     <div className="app" data-wide={wide ? "" : undefined}>
       {wide && <aside className="sidebar" aria-label="Threads">
-        <ThreadList store={store} conn={conn} online={online} onNew={() => show({ kind: "create", title: "" })}
+        <ThreadList store={store} conn={conn} online={online} onNew={() => void createThread()}
           onSelect={(id) => store.selectThread(id)} />
       </aside>}
       <header className="top">
@@ -332,7 +341,7 @@ export function Chat({ store, conn }: { store: Store; conn: Connection }) {
         pendingModel={pendingModel} dismiss={dismiss} show={show}
         select={(id) => { setSheet(null); store.selectThread(id); }}
         command={command} runCommand={(c) => runCommand(c)} toggleArchive={() => void toggleArchive()}
-        saveTitle={(value) => void saveTitle(value)} />}
+        saveTitle={(value) => void saveTitle(value)} createThread={(from) => void createThread(from)} />}
 
       {artifact && <ArtifactViewer file={artifact} onClose={() => setArtifact(null)} />}
     </div>

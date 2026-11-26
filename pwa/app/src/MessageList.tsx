@@ -3,7 +3,7 @@ import { Streamdown } from "streamdown";
 import { ActivitySteps } from "./ActivitySteps";
 import { AttachmentList, messageViews, pendingViews, type AttachmentView } from "./Attachments";
 import { Avatar } from "./Avatar";
-import { clock, isRunning, presence, suggestedTitle } from "./chat-shared";
+import { clock, isRunning, presence } from "./chat-shared";
 import type { Connection } from "./conn";
 import { LoginCard } from "./LoginCard";
 import {
@@ -23,7 +23,7 @@ type Row = { kind: "ev"; ev: DurableEvent; text?: string; partial?: boolean } | 
 function forkAction(target: EventTarget | null, thread: string): Sheet | undefined {
   if (!(target instanceof Element) || target.closest("a, button, input, summary")) return;
   const data = target.closest<HTMLElement>("[data-message-id]")?.dataset;
-  if (data?.messageId) return { kind: "message", title: data.threadTitle ?? "", from: { thread, messageId: data.messageId } };
+  if (data?.messageId) return { kind: "message", from: { thread, messageId: data.messageId } };
 }
 
 /**
@@ -173,7 +173,7 @@ export const MessageList = memo(function MessageList({
           <EventRow key={`e${r.ev.cursor}`} ev={r.ev} text={r.text} partial={r.partial}
             store={store} conn={conn} thread={thread} last={i === lastUser}
             forks={r.ev.event === "message" ? forks.get(r.ev.id) : undefined}
-            onActions={(ev, button) => onSheet({ kind: "message", title: suggestedTitle(ev.text),
+            onActions={(ev, button) => onSheet({ kind: "message",
               from: { thread: ev.thread, messageId: ev.id } }, button)}
             onOpenArtifact={onOpenArtifact} openArtifactId={openArtifactId}
             onRetry={canRetry ? (m) => onRetry(m.text, m.key) : undefined} />
@@ -257,7 +257,7 @@ function EventRow({ ev, text, partial, store, conn, thread, last, forks, onActio
   const outgoing = ev.key ? store.outgoing(ev.thread, ev.key) : undefined;
   const spentFiles = outgoing?.state === "failed" && !!outgoing.attachments?.length && store.hasEcho(ev.thread, ev.key!);
   const anchor = Number.isSafeInteger(ev.cursor) && ev.cursor > 0 && ev.role !== "notice"
-    ? { "data-message-id": ev.id, "data-message-cursor": ev.cursor, "data-thread-title": suggestedTitle(ev.text), tabIndex: -1 }
+    ? { "data-message-id": ev.id, "data-message-cursor": ev.cursor, tabIndex: -1 }
     : undefined;
   return <>
     {ev.role === "notice" ? <div className="notice">{body}{incomplete}</div> : ev.role === "user" ? (
