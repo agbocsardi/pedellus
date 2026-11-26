@@ -6,10 +6,17 @@ import { openThreads } from "./ThreadList";
 const MAX_BUBBLES = 5;
 const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
-/** A badgeless thread's face: the first user-perceived character of its title (an emoji stays whole). */
-function initial(title: string) {
-  for (const { segment } of graphemes.segment(title.trim())) return segment;
-  return "?";
+/**
+ * A badgeless thread's face is the first user-perceived character of its title (an emoji stays
+ * whole) and its caption the title, without that character when it is not a letter or digit.
+ */
+function badgeless(title: string) {
+  const text = title.trim();
+  for (const { segment } of graphemes.segment(text)) {
+    const rest = text.slice(segment.length).trim();
+    return { face: segment, caption: /^[\p{L}\p{N}]/u.test(segment) || !rest ? text : rest };
+  }
+  return { face: "?", caption: title };
 }
 
 function Bubble({ store, thread }: { store: Store; thread: ThreadInfo }) {
@@ -19,15 +26,17 @@ function Bubble({ store, thread }: { store: Store; thread: ThreadInfo }) {
   // Same reading as ThreadSignals: anything but idle is running, except an error.
   const signal = state === "idle" ? undefined : state === "error" ? "Error" : "Running";
   const unread = store.isUnread(thread.id);
+  const shown = main ? { face: "🏠", caption: "Main" }
+    : thread.badge ? { face: thread.badge.emoji, caption: thread.badge.verb } : badgeless(thread.title);
   return (
-    <button className="bubble" data-signal={signal?.toLowerCase()}
+    <button className="thread-bubble" data-signal={signal?.toLowerCase()}
       aria-label={[title, unread && "Unread", signal].filter(Boolean).join(", ")}
       onClick={() => store.selectThread(thread.id)}>
-      <span className="bubble-face" aria-hidden="true">
-        {main ? "🏠" : thread.badge?.emoji ?? initial(thread.title)}
-        {unread && <span className="bubble-dot" />}
+      <span className="thread-bubble-face" aria-hidden="true">
+        {shown.face}
+        {unread && <span className="thread-bubble-dot" />}
       </span>
-      <span className="bubble-caption" aria-hidden="true">{main ? "Main" : thread.badge?.verb ?? thread.title}</span>
+      <span className="thread-bubble-caption" aria-hidden="true">{shown.caption}</span>
     </button>
   );
 }
@@ -40,7 +49,7 @@ export function ThreadBubbles({ store }: { store: Store }) {
   const threads = openThreads(store).filter((t) => t.id !== store.openThread).slice(0, MAX_BUBBLES);
   if (!threads.length) return null;
   return (
-    <nav className="bubbles" aria-label="Recent threads">
+    <nav className="thread-bubbles" aria-label="Recent threads">
       {threads.map((t) => <Bubble key={t.id} store={store} thread={t} />)}
     </nav>
   );

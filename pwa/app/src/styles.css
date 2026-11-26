@@ -2062,7 +2062,7 @@ input#pair-code {
 
 /* ── Thread bubbles: the phone-only quick switch above the composer ───────── */
 
-.bubbles {
+.thread-bubbles {
   /* Above the composer's fade, which would otherwise wash out the captions. */
   position: relative;
   z-index: 1;
@@ -2071,7 +2071,7 @@ input#pair-code {
   padding: 2px max(var(--gutter), calc((100% - 44rem) / 2)) 0;
   background: var(--bg);
 }
-.bubbles::before {
+.thread-bubbles::before {
   content: "";
   position: absolute;
   left: 0;
@@ -2082,10 +2082,10 @@ input#pair-code {
   pointer-events: none;
 }
 /* Typing (and, on a phone, the open keyboard) gets the whole height back. */
-.bubbles:has(+ .composer textarea:focus) {
+.thread-bubbles:has(+ .composer textarea:focus) {
   display: none;
 }
-.bubble {
+.thread-bubble {
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -2097,7 +2097,7 @@ input#pair-code {
   border-radius: 12px;
   background: none;
 }
-.bubble-face {
+.thread-bubble-face {
   position: relative;
   display: grid;
   place-items: center;
@@ -2111,15 +2111,15 @@ input#pair-code {
   line-height: 1;
   color: var(--ink);
 }
-.bubble[data-signal="running"] .bubble-face {
+.thread-bubble[data-signal="running"] .thread-bubble-face {
   border-color: var(--accent);
   box-shadow: 0 0 0 1px var(--accent);
 }
-.bubble[data-signal="error"] .bubble-face {
+.thread-bubble[data-signal="error"] .thread-bubble-face {
   border-color: var(--danger);
   box-shadow: 0 0 0 1px var(--danger);
 }
-.bubble-dot {
+.thread-bubble-dot {
   position: absolute;
   top: -1px;
   right: -1px;
@@ -2129,7 +2129,7 @@ input#pair-code {
   background: var(--accent);
   box-shadow: 0 0 0 2px var(--bg);
 }
-.bubble-caption {
+.thread-bubble-caption {
   max-width: 100%;
   overflow: hidden;
   color: var(--muted-ink);
