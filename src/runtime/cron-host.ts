@@ -33,6 +33,7 @@ import {
   type CronDeliveryRecord,
 } from "../automation/cron-delivery.js";
 import { createCronOperator } from "../automation/operator.js";
+import { APP_CHAT_SESSION_KEY } from "../channels/app.js";
 import { isAppSideThreadSessionKey } from "../channels/app-runtime.js";
 import { hasMemoryDigestTools, type MemoryDigest } from "../history/memory-digest.js";
 import { isChatSessionKey, type HistoryChatSession } from "../history/scope.js";
@@ -244,14 +245,15 @@ export function createCronHost(options: CronHostOptions) {
       }
       const main = await options.appMainConversation(ctx);
       const mainOwner = main === undefined ? undefined : registry.cronOwner(main.id);
-      // Fail closed unless Main is a different conversation and an ordinary app chat. A session map
-      // that points Main at this very side thread is refused here; every other mis-mapping is caught
-      // by the ordinary mapped-chat admission that resolved it.
+      // Fail closed unless the resolved conversation is this app channel's Main chat: a different
+      // conversation whose owner carries exactly `app:chat`. A stored map that points Main at this
+      // very side thread is refused by the admission itself, before it can register the side thread
+      // under Main's key; anything else that resolves to another key is refused here.
       if (main === undefined || mainOwner === undefined || main.id === conversationId
-          || isAppSideThreadSessionKey(mainOwner.sessionKey)) {
+          || mainOwner.sessionKey !== APP_CHAT_SESSION_KEY) {
         throw new Error("the app Main chat could not be prepared");
       }
-      return { conversationId: main.id, owner: mainOwner, label: "Main" };
+      return { conversationId: main.id, owner: mainOwner, label: "Main", callerOwner: owner };
     },
     harness: options.harness,
     ...(options.timeZone === undefined ? {} : { timeZone: options.timeZone }),

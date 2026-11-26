@@ -939,6 +939,15 @@ export async function openGateway(config: PortConfig, context: Context, options:
         // become a cron owner or receive chat policy.
         const scopeReason = await root.commit((tx) => sessions.chatScopeForSession(tx, sessionKey, id), ctx);
         if (scopeReason !== undefined) throw new Error(chatScopeMessage(scopeReason));
+        // A mapped conversation is admitted under exactly one host key. A stored map that names a
+        // conversation this host already registered under a different key is an alias: admitting it
+        // would silently move that conversation's authority to the new key, and a later call with the
+        // new key would then find the alias already in place. The scope check above is a read, so
+        // nothing has changed yet; refuse here, before the first registry write.
+        const registeredKey = registry.sessionKeyFor(id);
+        if (registeredKey !== undefined && registeredKey !== sessionKey) {
+          throw new Error("Stored conversation mapping aliases another session");
+        }
         // The exact host-owned session key is what a channel action host revalidates; it is never
         // supplied by the model. Only a chat key becomes a chat; a state key carries no authority.
         if (isChatSessionKey(sessionKey)) registry.admitChat(id, sessionKey);
