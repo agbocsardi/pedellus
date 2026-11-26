@@ -2082,6 +2082,7 @@ input#pair-code {
   pointer-events: none;
 }
 /* Typing (and, on a phone, the open keyboard) gets the whole height back. */
+.kb-open .thread-bubbles,
 .thread-bubbles:has(+ .composer textarea:focus) {
   display: none;
 }

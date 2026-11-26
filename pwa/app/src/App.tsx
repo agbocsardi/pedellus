@@ -76,6 +76,8 @@ export function App({ store }: { store: Store }) {
       const open = kbOpen();
       if (wasOpen && !open && isField(document.activeElement)) document.activeElement.blur();
       wasOpen = open;
+      // The thread bubble row hides while any field's keyboard is up (styles.css).
+      document.documentElement.classList.toggle("kb-open", open);
       if (window.scrollX || window.scrollY) window.scrollTo(0, 0);
       style.setProperty("--app-h", `${vv.height}px`);
       style.setProperty("--inset-bottom", `${open ? 0 : insetBottom()}px`);

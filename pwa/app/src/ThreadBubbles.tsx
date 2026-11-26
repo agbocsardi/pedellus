@@ -46,7 +46,8 @@ function Bubble({ store, thread }: { store: Store; thread: ThreadInfo }) {
  * without the one on screen. The thread sheet stays the full list (search, archive, new thread).
  */
 export function ThreadBubbles({ store }: { store: Store }) {
-  const threads = openThreads(store).filter((t) => t.id !== store.openThread).slice(0, MAX_BUBBLES);
+  // Only confirmed, writable threads: an unconfirmed or placeholder record would open read-only.
+  const threads = openThreads(store).filter((t) => t.id !== store.openThread && store.canWrite(t.id)).slice(0, MAX_BUBBLES);
   if (!threads.length) return null;
   return (
     <nav className="thread-bubbles" aria-label="Recent threads">
