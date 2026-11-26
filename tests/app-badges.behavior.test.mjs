@@ -119,6 +119,21 @@ test('app.threadBadges is off by default, strict, and requires classifierModel',
   }
 });
 
+test('a wire badge is printable, non-blank text and never on main', async () => {
+  const { parseThreadInfo } = await import('../dist/channels/generated/protocol-v2.js');
+  const side = { id: 't_a', title: 'Side', archived: false, createdAt: 'c', lastAt: 'l' };
+  assert.equal(parseThreadInfo(side).badge, undefined, 'a thread without one still parses');
+  assert.deepEqual(parseThreadInfo({ ...side, badge: { emoji: '✈️', verb: 'Look up' } }).badge,
+    { emoji: '✈️', verb: 'Look up' });
+  for (const badge of [
+    { emoji: '   ', verb: 'Fix' }, { emoji: '💻', verb: '\u00a0' }, { emoji: '💻', verb: '' },
+    { emoji: '\u200b', verb: 'Fix' }, { emoji: '💻', verb: 'Fix\n' }, { emoji: '💻' },
+    { emoji: 'x'.repeat(9), verb: 'Fix' }, { emoji: '💻', verb: 'Fix'.repeat(11) },
+  ]) assert.equal(parseThreadInfo({ ...side, badge }), undefined, JSON.stringify(badge));
+  assert.equal(parseThreadInfo({ ...side, id: 'main', badge: { emoji: '💻', verb: 'Fix' } }), undefined,
+    'main never carries a badge');
+});
+
 test('the first side-thread message gets a listed badge and the default title, never main', { timeout: 20_000 }, async (t) => {
   const channel = await openBadgeChannel(t);
   const device = await openDevice(channel, t);
@@ -145,7 +160,7 @@ test('the first side-thread message gets a listed badge and the default title, n
   assert.ok(Object.hasOwn(call.questions.verb.criteria, 'Fix'), 'the verb criteria are the fixed list');
 });
 
-test('a rename classifies the new title, keeps it, and one in-flight call is never doubled', { timeout: 20_000 }, async (t) => {
+test('a rename classifies the new title, keeps it, and a rename during one call runs once more', { timeout: 20_000 }, async (t) => {
   const channel = await openBadgeChannel(t);
   const device = await openDevice(channel, t);
 
@@ -167,11 +182,20 @@ test('a rename classifies the new title, keeps it, and one in-flight call is nev
   info = await threadInfo(channel.store.gateway, created.thread);
   assert.equal(info.title, 'Dinner ideas');
 
-  // A manual rename that wins a held classification keeps its title; the badge still arrives.
+  // A manual rename that wins a held classification keeps its title, and the classification that was
+  // in flight for the old title is dropped with it: the rename trigger runs a second call afterwards.
   let release;
   channel.classifier.hold = new Promise((resolve) => { release = resolve; });
-  channel.classifier.reply = () => choice('💻', 'Debug');
-  const forked = await request(device, 'create-2', 'thread.create', { key: 't2' });
+  // The held call answers first (stale), the run it coalesced answers second (current).
+  const held = [choice('💻', 'Debug'), choice('🎉', 'Plan')];
+  channel.classifier.reply = () => held.shift() ?? choice('🎉', 'Plan');
+  // A real fork of a committed main message: the side thread has the origin and cutoff a real one has.
+  await request(device, 'main-send', 'send', { key: 'main-1', text: 'good morning' });
+  await device.wait(() => device.events('settled').some((event) => event.key === 'main-1'), 'main settled');
+  const forked = await request(device, 'create-2', 'thread.create', {
+    key: 't2', from: { thread: 'main', messageId: 'send:main-1' },
+  });
+  assert.equal(forked.ok, true, JSON.stringify(forked));
   await request(device, 'send-2', 'send', { key: 'side-2', thread: forked.thread, text: 'the build is broken' });
   await untilAsync(() => channel.classifier.calls.length === 3, 'held classification started');
   await request(device, 'rename-3', 'thread.rename', { thread: forked.thread, title: 'Build failure' });
@@ -180,8 +204,40 @@ test('a rename classifies the new title, keeps it, and one in-flight call is nev
   await untilAsync(async () => (await threadInfo(channel.store.gateway, forked.thread)).badge !== undefined, 'held badge applied');
   info = await threadInfo(channel.store.gateway, forked.thread);
   assert.equal(info.title, 'Build failure', 'a manual rename that won the race is kept');
-  assert.deepEqual(info.badge, { emoji: '💻', verb: 'Debug' });
-  assert.equal(channel.classifier.calls.length, 3, 'a rename during one call starts no second call');
+  // The answer for "New thread" is dropped: it no longer names this thread's title.
+  assert.deepEqual(info.badge, { emoji: '🎉', verb: 'Plan' });
+  assert.equal(channel.classifier.calls.length, 4, 'the rename during one call runs once more, never twice');
+  assert.deepEqual(channel.classifier.calls[3].state, {
+    title: 'Build failure', firstMessage: 'the build is broken',
+  });
+});
+
+test('a later message retries the missing badge with its own text, not a re-read first message', { timeout: 20_000 }, async (t) => {
+  const channel = await openBadgeChannel(t);
+  const device = await openDevice(channel, t);
+  channel.classifier.reply = () => { throw new Error('the first attempt fails'); };
+  const created = await request(device, 'create', 'thread.create', { key: 't1' });
+  const side = created.thread;
+  await request(device, 'send-1', 'send', { key: 's1', thread: side, text: 'first words' });
+  await untilAsync(() => channel.classifier.calls.length === 1, 'first classification attempted');
+  assert.equal((await threadInfo(channel.store.gateway, side)).badge, undefined);
+
+  // The next message into the still-unbadged thread is classified with the text it admitted: a
+  // trimmed first message, or one read back from the transcript, is never what the model sees.
+  channel.classifier.reply = () => choice('🛒', 'Buy');
+  await request(device, 'send-2', 'send', { key: 's2', thread: side, text: 'second words' });
+  await untilAsync(async () => (await threadInfo(channel.store.gateway, side)).badge !== undefined, 'retried badge applied');
+  assert.equal(channel.classifier.calls.length, 2);
+  assert.deepEqual(channel.classifier.calls[1].state, { title: 'New thread', firstMessage: 'second words' });
+  let info = await threadInfo(channel.store.gateway, side);
+  assert.deepEqual(info.badge, { emoji: '🛒', verb: 'Buy' });
+  assert.equal(info.title, '🛒 Buy');
+
+  // A badged thread is never classified again by a message.
+  await request(device, 'send-3', 'send', { key: 's3', thread: side, text: 'third words' });
+  info = await threadInfo(channel.store.gateway, side);
+  assert.equal(channel.classifier.calls.length, 2, 'no third call once the thread is badged');
+  assert.equal(info.title, '🛒 Buy');
 });
 
 test('a failed or unlisted classification leaves the thread unbadged and journals no content', { timeout: 20_000 }, async (t) => {
